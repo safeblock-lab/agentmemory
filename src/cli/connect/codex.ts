@@ -22,8 +22,8 @@ const CODEX_TOML = join(CODEX_DIR, "config.toml");
 const CODEX_HOOKS = join(CODEX_DIR, "hooks.json");
 
 const TOML_BLOCK = `[mcp_servers.agentmemory]
-command = "npx"
-args = ["-y", "@agentmemory/mcp"]
+command = "agentmemory"
+args = ["mcp"]
 
 [mcp_servers.agentmemory.env]
 AGENTMEMORY_URL = "http://localhost:3111"
@@ -32,7 +32,7 @@ AGENTMEMORY_URL = "http://localhost:3111"
 const SECTION_HEADER = "[mcp_servers.agentmemory]";
 
 function isWiredText(toml: string): boolean {
-  return toml.includes(SECTION_HEADER);
+  return /\[mcp_servers\.agentmemory\][\s\S]*?command\s*=\s*"agentmemory"[\s\S]*?args\s*=\s*\[\s*"mcp"\s*\]/.test(toml);
 }
 
 function stripExistingBlock(toml: string): string {
@@ -64,7 +64,7 @@ export const adapter: ConnectAdapter = {
   name: "codex",
   displayName: "Codex CLI",
   category: "native",
-  docs: "https://github.com/rohitg00/agentmemory#codex-cli-codex-plugin-platform",
+  docs: "https://github.com/safeblock-lab/agentmemory#codex-cli-codex-plugin-platform",
   protocolNote:
     "→ Using MCP. Hooks ship via the Codex plugin; on Codex Desktop, also pass --with-hooks to install the global hooks.json workaround for openai/codex#16430.",
 
@@ -98,7 +98,7 @@ export const adapter: ConnectAdapter = {
       mkdirSync(dirname(CODEX_TOML), { recursive: true });
     }
 
-    const cleaned = wired ? stripExistingBlock(current) : current;
+    const cleaned = current.includes(SECTION_HEADER) ? stripExistingBlock(current) : current;
     const joiner = cleaned.length === 0 || cleaned.endsWith("\n") ? "" : "\n";
     const next = `${cleaned}${joiner}${cleaned.length > 0 ? "\n" : ""}${TOML_BLOCK}`;
     writeFileSync(CODEX_TOML, next, "utf-8");
@@ -113,7 +113,7 @@ export const adapter: ConnectAdapter = {
 
     logInstalled("Codex CLI", CODEX_TOML);
     p.log.info(
-      "Codex picks up MCP servers on next launch. For the deeper plugin install, run: codex plugin marketplace add rohitg00/agentmemory && codex plugin add agentmemory@agentmemory",
+      "Codex picks up MCP servers on next launch. For hooks and skills, run: /plugin marketplace add safeblock-lab/agentmemory then /plugin install agentmemory.",
     );
 
     if (opts.withHooks) {

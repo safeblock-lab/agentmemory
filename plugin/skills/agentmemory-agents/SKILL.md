@@ -22,7 +22,7 @@ After wiring, restart the host or run its MCP reload (for example `/mcp` in Clau
 
 ## Notes
 
-- The action skills (remember, recall, and the rest) are installed separately with `npx skills add rohitg00/agentmemory`. `connect` makes tools available; skills teach the agent when to use them.
+- The action skills and hooks install with the plugin: `/plugin marketplace add safeblock-lab/agentmemory`, then `/plugin install agentmemory`. `connect` makes the MCP tools available; the plugin teaches the host when to use them and registers hooks.
 - Windows: use WSL2. Native Windows runs the server but `connect` is not supported there.
 
 ## See also

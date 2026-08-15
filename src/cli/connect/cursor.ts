@@ -7,7 +7,7 @@ export const adapter = createJsonMcpAdapter({
   displayName: "Cursor",
   detectDir: join(homedir(), ".cursor"),
   configPath: join(homedir(), ".cursor", "mcp.json"),
-  docs: "https://github.com/rohitg00/agentmemory#other-agents",
+  docs: "https://github.com/safeblock-lab/agentmemory#other-agents",
   protocolNote:
     "→ Using MCP (the only protocol Cursor speaks). Memory bridge runs at :3111 underneath.",
 });

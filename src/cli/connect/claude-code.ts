@@ -31,18 +31,18 @@ type ClaudeConfig = {
 function entryMatches(entry: unknown): boolean {
   if (!entry || typeof entry !== "object") return false;
   const e = entry as Record<string, unknown>;
-  if (e["command"] !== "npx") return false;
+  if (e["command"] !== "agentmemory") return false;
   const args = Array.isArray(e["args"]) ? (e["args"] as string[]) : [];
-  return args.includes("@agentmemory/mcp");
+  return args.length === 1 && args[0] === "mcp";
 }
 
 export const adapter: ConnectAdapter = {
   name: "claude-code",
   displayName: "Claude Code",
   category: "native",
-  docs: "https://github.com/rohitg00/agentmemory#claude-code-one-block-paste-it",
+  docs: "https://github.com/safeblock-lab/agentmemory#claude-code-one-block-paste-it",
   protocolNote:
-    "→ Using MCP. Hooks are also available — see https://github.com/rohitg00/agentmemory#claude-code-one-block-paste-it.",
+    "→ Using MCP. Hooks are also available — see https://github.com/safeblock-lab/agentmemory#claude-code-one-block-paste-it.",
 
   detect(): boolean {
     return existsSync(CLAUDE_DIR);

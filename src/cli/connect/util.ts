@@ -23,8 +23,8 @@ import * as p from "@clack/prompts";
 // reverse-proxied) deployments without doctor-warning duplicates (#375)
 // AND fresh installs that haven't exported envs (#510).
 export const AGENTMEMORY_MCP_BLOCK = {
-  command: "npx",
-  args: ["-y", "@agentmemory/mcp"],
+  command: "agentmemory",
+  args: ["mcp"],
   env: {
     AGENTMEMORY_URL: "${AGENTMEMORY_URL:-http://localhost:3111}",
     AGENTMEMORY_SECRET: "${AGENTMEMORY_SECRET:-}",
@@ -36,11 +36,11 @@ const COPILOT_MCP_COMMAND =
   process.platform === "win32"
     ? {
         command: process.env["ComSpec"] || process.env["COMSPEC"] || "cmd.exe",
-        args: ["/d", "/s", "/c", "npx", "-y", "@agentmemory/mcp"],
+        args: ["/d", "/s", "/c", "agentmemory", "mcp"],
       }
     : {
-        command: "npx",
-        args: ["-y", "@agentmemory/mcp"],
+        command: "agentmemory",
+        args: ["mcp"],
       };
 
 export const AGENTMEMORY_COPILOT_MCP_BLOCK = {

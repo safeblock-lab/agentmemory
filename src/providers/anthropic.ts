@@ -1,5 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk'
 import type { MemoryProvider } from '../types.js'
+import { extractLlmTokenUsage, startLlmCallTelemetry } from './_llm-logging.js'
 
 export class AnthropicProvider implements MemoryProvider {
   name = 'anthropic'
@@ -14,15 +15,17 @@ export class AnthropicProvider implements MemoryProvider {
   }
 
   async compress(systemPrompt: string, userPrompt: string): Promise<string> {
-    return this.call(systemPrompt, userPrompt)
+    return this.call(systemPrompt, userPrompt, 'compress')
   }
 
   async summarize(systemPrompt: string, userPrompt: string): Promise<string> {
-    return this.call(systemPrompt, userPrompt)
+    return this.call(systemPrompt, userPrompt, 'summarize')
   }
 
   async describeImage(imageData: string, mimeType: string, prompt: string): Promise<string> {
-    const response = await this.client.messages.create({
+    const telemetry = startLlmCallTelemetry({ provider: this.name, model: this.model, operation: 'describe_image' })
+    try {
+      const response = await this.client.messages.create({
       model: this.model,
       max_tokens: this.maxTokens,
       messages: [{
@@ -35,21 +38,33 @@ export class AnthropicProvider implements MemoryProvider {
           { type: 'text', text: prompt },
         ],
       }],
-    })
+      })
 
-    const textBlock = response.content.find((b) => b.type === 'text')
-    return textBlock?.text ?? ''
+      const content = response.content.find((b) => b.type === 'text')?.text ?? ''
+      telemetry.success({ usage: extractLlmTokenUsage(response.usage), responseChars: content.length })
+      return content
+    } catch (error) {
+      telemetry.failure({ errorKind: error instanceof Error && error.name === 'AbortError' ? 'timeout' : 'network' })
+      throw error
+    }
   }
 
-  private async call(systemPrompt: string, userPrompt: string): Promise<string> {
-    const response = await this.client.messages.create({
+  private async call(systemPrompt: string, userPrompt: string, operation: 'compress' | 'summarize'): Promise<string> {
+    const telemetry = startLlmCallTelemetry({ provider: this.name, model: this.model, operation })
+    try {
+      const response = await this.client.messages.create({
       model: this.model,
       max_tokens: this.maxTokens,
       system: systemPrompt,
       messages: [{ role: 'user', content: userPrompt }],
-    })
+      })
 
-    const textBlock = response.content.find((b) => b.type === 'text')
-    return textBlock?.text ?? ''
+      const content = response.content.find((b) => b.type === 'text')?.text ?? ''
+      telemetry.success({ usage: extractLlmTokenUsage(response.usage), responseChars: content.length })
+      return content
+    } catch (error) {
+      telemetry.failure({ errorKind: error instanceof Error && error.name === 'AbortError' ? 'timeout' : 'network' })
+      throw error
+    }
   }
 }

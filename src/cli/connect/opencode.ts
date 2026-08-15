@@ -24,11 +24,11 @@ const DETECT_DIR = join(homedir(), ".config", "opencode");
 // `${VAR:-default}` values, and writing them literally would override the
 // user's real shell AGENTMEMORY_URL with an unexpanded string. The stdio
 // child inherits the shell environment (an exported AGENTMEMORY_URL /
-// AGENTMEMORY_SECRET still reaches the server), and the @agentmemory/mcp
-// shim defaults unset vars (URL -> localhost:3111, no secret, all tools).
+// AGENTMEMORY_SECRET still reaches the server), and the local CLI defaults
+// unset vars (URL -> localhost:3111, no secret, all tools).
 const OPENCODE_ENTRY = {
   type: "local",
-  command: ["npx", "-y", "@agentmemory/mcp"],
+  command: ["agentmemory", "mcp"],
   enabled: true,
 };
 
@@ -38,14 +38,14 @@ type McpEntry = Record<string, unknown>;
 function entryMatches(entry: unknown): boolean {
   if (!entry || typeof entry !== "object") return false;
   const command = (entry as McpEntry)["command"];
-  return Array.isArray(command) && command.includes("@agentmemory/mcp");
+  return Array.isArray(command) && command.length === 2 && command[0] === "agentmemory" && command[1] === "mcp";
 }
 
 export const adapter: ConnectAdapter = {
   name: "opencode",
   displayName: "OpenCode",
   category: "mcp",
-  docs: "https://github.com/rohitg00/agentmemory#other-agents",
+  docs: "https://github.com/safeblock-lab/agentmemory#other-agents",
   protocolNote:
     "Using MCP via ~/.config/opencode/opencode.json (top-level `mcp` key). For full auto-capture, also install the bundled plugin in plugin/opencode/.",
 

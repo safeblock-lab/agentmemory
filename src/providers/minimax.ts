@@ -1,6 +1,7 @@
 import type { MemoryProvider } from '../types.js'
 import { getEnvVar } from '../config.js'
 import { fetchWithTimeout } from './_fetch.js'
+import { extractLlmTokenUsage, startLlmCallTelemetry } from './_llm-logging.js'
 
 /**
  * MiniMax provider using raw fetch to call MiniMax's Anthropic-compatible API.
@@ -32,16 +33,19 @@ export class MinimaxProvider implements MemoryProvider {
   }
 
   async compress(systemPrompt: string, userPrompt: string): Promise<string> {
-    return this.call(systemPrompt, userPrompt)
+    return this.call(systemPrompt, userPrompt, 'compress')
   }
 
   async summarize(systemPrompt: string, userPrompt: string): Promise<string> {
-    return this.call(systemPrompt, userPrompt)
+    return this.call(systemPrompt, userPrompt, 'summarize')
   }
 
-  private async call(systemPrompt: string, userPrompt: string): Promise<string> {
+  private async call(systemPrompt: string, userPrompt: string, operation: 'compress' | 'summarize'): Promise<string> {
     const url = `${this.baseUrl}/v1/messages`
-    const response = await fetchWithTimeout(url, {
+    const telemetry = startLlmCallTelemetry({ provider: this.name, model: this.model, operation })
+    let response: Response
+    try {
+      response = await fetchWithTimeout(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -54,17 +58,31 @@ export class MinimaxProvider implements MemoryProvider {
         system: systemPrompt,
         messages: [{ role: 'user', content: userPrompt }],
       }),
-    })
+      })
+    } catch (error) {
+      telemetry.failure({ errorKind: error instanceof Error && error.name === 'AbortError' ? 'timeout' : 'network' })
+      throw error
+    }
 
     if (!response.ok) {
+      telemetry.failure({ httpStatus: response.status, errorKind: 'provider_response' })
       const text = await response.text()
       throw new Error(`MiniMax API error ${response.status}: ${text}`)
     }
 
-    const data = (await response.json()) as {
+    let data: {
       content?: Array<{ type: string; text?: string }>
+      usage?: unknown
+    }
+    try {
+      data = (await response.json()) as typeof data
+    } catch {
+      telemetry.failure({ httpStatus: response.status, errorKind: 'invalid_response' })
+      throw new Error('MiniMax returned an invalid JSON response')
     }
     const textBlock = data.content?.find((b) => b.type === 'text')
-    return textBlock?.text ?? ''
+    const content = textBlock?.text ?? ''
+    telemetry.success({ httpStatus: response.status, usage: extractLlmTokenUsage(data.usage), responseChars: content.length })
+    return content
   }
 }

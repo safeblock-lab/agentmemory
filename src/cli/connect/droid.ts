@@ -13,7 +13,7 @@ export const adapter = createJsonMcpAdapter({
   displayName: "Droid (Factory.ai)",
   detectDir: join(homedir(), ".factory"),
   configPath: join(homedir(), ".factory", "mcp.json"),
-  docs: "https://github.com/rohitg00/agentmemory#other-agents",
+  docs: "https://github.com/safeblock-lab/agentmemory#other-agents",
   protocolNote:
     "→ Using MCP via ~/.factory/mcp.json. The `/mcp` slash command inside droid lists configured servers.",
   // Droid requires `type` per the documented schema. stdio for npx-spawned shim.

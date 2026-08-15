@@ -13,7 +13,7 @@ export const adapter = createJsonMcpAdapter({
   displayName: "Warp",
   detectDir: join(homedir(), ".warp"),
   configPath: join(homedir(), ".warp", ".mcp.json"),
-  docs: "https://github.com/rohitg00/agentmemory#other-agents",
+  docs: "https://github.com/safeblock-lab/agentmemory#other-agents",
   protocolNote:
     "→ Using MCP via ~/.warp/.mcp.json. Skills auto-discover from .claude/skills/ if the Claude Code plugin is also installed.",
 });

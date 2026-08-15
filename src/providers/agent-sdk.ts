@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import type { MemoryProvider } from '../types.js'
+import { startLlmCallTelemetry } from './_llm-logging.js'
 
 // #781: the recursion guard used to live on `process.env.AGENTMEMORY_SDK_CHILD`
 // (#181). #472 then introduced chunked summarize that runs chunks
@@ -50,14 +51,14 @@ export class AgentSDKProvider implements MemoryProvider {
   }
 
   async compress(systemPrompt: string, userPrompt: string): Promise<string> {
-    return this.query(systemPrompt, userPrompt)
+    return this.query(systemPrompt, userPrompt, 'compress')
   }
 
   async summarize(systemPrompt: string, userPrompt: string): Promise<string> {
-    return this.query(systemPrompt, userPrompt)
+    return this.query(systemPrompt, userPrompt, 'summarize')
   }
 
-  private async query(systemPrompt: string, userPrompt: string): Promise<string> {
+  private async query(systemPrompt: string, userPrompt: string, operation: 'compress' | 'summarize'): Promise<string> {
     // In-process recursion guard. Concurrent sibling calls (chunked
     // summarize via Promise.all) each have their own ALS frame, so they
     // do not poison each other.
@@ -73,6 +74,7 @@ export class AgentSDKProvider implements MemoryProvider {
       return ''
     }
 
+    const telemetry = startLlmCallTelemetry({ provider: this.name, model: 'claude-agent-sdk', operation })
     return sdkChildContext.run(true, async () => {
       // Mark spawned subprocesses (the SDK's underlying Claude session
       // + its hook scripts) as SDK children via process.env. Hook scripts
@@ -103,7 +105,11 @@ export class AgentSDKProvider implements MemoryProvider {
             result = (msg as any).result ?? ''
           }
         }
+        telemetry.success({ responseChars: result.length })
         return result
+      } catch (error) {
+        telemetry.failure({ errorKind: error instanceof Error && error.name === 'AbortError' ? 'timeout' : 'network' })
+        throw error
       } finally {
         sdkActiveCount--
         if (sdkActiveCount === 0) {

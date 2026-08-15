@@ -195,6 +195,16 @@ export function getEnvVar(key: string): string | undefined {
   return getMergedEnv()[key];
 }
 
+// DeepSeek thinking is intentionally controlled only by AgentMemory's env
+// file. A process-level setting must not accidentally enable it.
+export function isDeepSeekThinkingEnabled(): boolean {
+  return loadEnvFile()["deepseek_thinking"] === "true";
+}
+
+export function isLlmLoggingEnabled(): boolean {
+  return getMergedEnv()["AGENTMEMORY_LLM_LOGGING"] === "true";
+}
+
 export function isDropStaleIndexEnabled(): boolean {
   return getMergedEnv()["AGENTMEMORY_DROP_STALE_INDEX"] === "true";
 }

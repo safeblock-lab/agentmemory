@@ -6,7 +6,7 @@ import type { ConnectAdapter, ConnectOptions, ConnectResult } from "./types.js";
 
 const PI_DIR = join(homedir(), ".pi");
 const PI_EXT_DIR = join(PI_DIR, "agent", "extensions", "agentmemory");
-const DOCS = "https://github.com/rohitg00/agentmemory/tree/main/integrations/pi";
+const DOCS = "https://github.com/safeblock-lab/agentmemory/tree/main/integrations/pi";
 
 export const adapter: ConnectAdapter = {
   name: "pi",

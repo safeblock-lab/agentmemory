@@ -51,6 +51,7 @@
     ".env.example",
     "LICENSE",
     "README.md",
+    "docs/fork-local-usage.md",
     "AGENTS.md"
   ],
   "author": "Rohit Ghumare <ghumare64@gmail.com>",

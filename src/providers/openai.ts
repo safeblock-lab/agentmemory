@@ -1,6 +1,7 @@
 import type { MemoryProvider } from "../types.js";
-import { getEnvVar } from "../config.js";
+import { getEnvVar, isDeepSeekThinkingEnabled } from "../config.js";
 import { fetchWithTimeout } from "./_fetch.js";
+import { extractLlmTokenUsage, startLlmCallTelemetry } from "./_llm-logging.js";
 import {
   DEFAULT_AZURE_API_VERSION,
   buildAuthHeaders,
@@ -68,15 +69,29 @@ export class OpenAIProvider implements MemoryProvider {
   }
 
   async compress(systemPrompt: string, userPrompt: string): Promise<string> {
-    return this.call(systemPrompt, userPrompt);
+    return this.call(systemPrompt, userPrompt, "compress");
   }
 
   async summarize(systemPrompt: string, userPrompt: string): Promise<string> {
-    return this.call(systemPrompt, userPrompt);
+    return this.call(systemPrompt, userPrompt, "summarize");
   }
 
-  private async call(systemPrompt: string, userPrompt: string): Promise<string> {
+  private async call(
+    systemPrompt: string,
+    userPrompt: string,
+    operation: "compress" | "summarize",
+  ): Promise<string> {
     const url = buildChatUrl(this.baseUrl, this.isAzure, this.azureApiVersion);
+    const isDeepSeek = isDeepSeekUrl(this.baseUrl);
+    const thinkingRequest = isDeepSeek
+      ? (isDeepSeekThinkingEnabled() ? "enabled" : "disabled")
+      : undefined;
+    const telemetry = startLlmCallTelemetry({
+      provider: isDeepSeek ? "deepseek" : "openai",
+      model: this.model,
+      operation,
+      thinkingRequest,
+    });
     const body: Record<string, unknown> = {
       model: this.model,
       max_tokens: this.maxTokens,
@@ -92,8 +107,11 @@ export class OpenAIProvider implements MemoryProvider {
         { role: "user", content: userPrompt },
       ],
     };
-    if (this.reasoningEffort) {
+    if (this.reasoningEffort && (!isDeepSeek || thinkingRequest === "enabled")) {
       body.reasoning_effort = this.reasoningEffort;
+    }
+    if (thinkingRequest) {
+      body.thinking = { type: thinkingRequest };
     }
 
     // Bound the request via the shared fetchWithTimeout helper, which
@@ -115,6 +133,7 @@ export class OpenAIProvider implements MemoryProvider {
       );
     } catch (err) {
       const aborted = err instanceof Error && err.name === "AbortError";
+      telemetry.failure({ errorKind: aborted ? "timeout" : "network" });
       if (aborted) {
         throw new Error(
           `OpenAI API request timed out after ${this.timeoutMs}ms — set OPENAI_TIMEOUT_MS (or AGENTMEMORY_LLM_TIMEOUT_MS) to raise the bound or check the provider status.`,
@@ -124,18 +143,32 @@ export class OpenAIProvider implements MemoryProvider {
     }
 
     if (!response.ok) {
+      telemetry.failure({ httpStatus: response.status, errorKind: "provider_response" });
       const text = await response.text();
       throw new Error(`OpenAI API error (${response.status}): ${text}`);
     }
 
-    const data = (await response.json()) as {
+    let data: {
       choices?: Array<{
         message?: { content?: string; reasoning?: string; reasoning_content?: string };
       }>;
+      usage?: unknown;
     };
+    try {
+      data = (await response.json()) as typeof data;
+    } catch {
+      telemetry.failure({ httpStatus: response.status, errorKind: "invalid_response" });
+      throw new Error("OpenAI returned an invalid JSON response.");
+    }
     const message = data.choices?.[0]?.message;
     const content = message?.content;
     if (content) {
+      telemetry.success({
+        httpStatus: response.status,
+        usage: extractLlmTokenUsage(data.usage),
+        responseChars: content.length,
+        reasoningReturned: Boolean(message?.reasoning || message?.reasoning_content),
+      });
       return content;
     }
     // Fallback: some thinking models return reasoning but no content.
@@ -143,11 +176,27 @@ export class OpenAIProvider implements MemoryProvider {
     // older OpenAI o-series + some compatibles return `reasoning`. #627
     const reasoning = message?.reasoning ?? message?.reasoning_content;
     if (reasoning) {
+      telemetry.success({
+        httpStatus: response.status,
+        usage: extractLlmTokenUsage(data.usage),
+        responseChars: reasoning.length,
+        reasoningReturned: true,
+      });
       return reasoning;
     }
+    telemetry.failure({ httpStatus: response.status, errorKind: "invalid_response" });
     throw new Error(
       `OpenAI returned unexpected response: ${JSON.stringify(data).slice(0, 200)}`,
     );
+  }
+}
+
+function isDeepSeekUrl(baseUrl: string): boolean {
+  try {
+    const hostname = new URL(baseUrl).hostname.toLowerCase().replace(/\.+$/, "");
+    return hostname === "deepseek.com" || hostname.endsWith(".deepseek.com");
+  } catch {
+    return false;
   }
 }
 

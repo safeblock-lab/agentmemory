@@ -4,7 +4,7 @@ import { tmpdir, platform } from "node:os";
 import { join } from "node:path";
 
 // Connect adapters for Qwen Code, Antigravity, and Kiro. Each writes
-// the canonical MCP block (npx @agentmemory/mcp + env defaults) into
+// the canonical MCP block (agentmemory mcp + env defaults) into
 // the agent's documented config path.
 
 function freshHome(): string {
@@ -38,8 +38,8 @@ describe("connect: Qwen Code", () => {
     const cfg = JSON.parse(
       readFileSync(join(home, ".qwen", "settings.json"), "utf-8"),
     );
-    expect(cfg.mcpServers.agentmemory.command).toBe("npx");
-    expect(cfg.mcpServers.agentmemory.args).toContain("@agentmemory/mcp");
+    expect(cfg.mcpServers.agentmemory.command).toBe("agentmemory");
+    expect(cfg.mcpServers.agentmemory.args).toContain("mcp");
     expect(cfg.mcpServers.agentmemory.env.AGENTMEMORY_URL).toMatch(
       /\$\{AGENTMEMORY_URL:-/,
     );
@@ -75,7 +75,7 @@ describe("connect: Antigravity", () => {
     const cfg = JSON.parse(
       readFileSync(join(userDir, "mcp_config.json"), "utf-8"),
     );
-    expect(cfg.mcpServers.agentmemory.command).toBe("npx");
+    expect(cfg.mcpServers.agentmemory.command).toBe("agentmemory");
     expect(cfg.mcpServers.agentmemory.env.AGENTMEMORY_URL).toMatch(
       /\$\{AGENTMEMORY_URL:-/,
     );
@@ -109,8 +109,8 @@ describe("connect: Kiro", () => {
     const cfgPath = join(home, ".kiro", "settings", "mcp.json");
     expect(existsSync(cfgPath)).toBe(true);
     const cfg = JSON.parse(readFileSync(cfgPath, "utf-8"));
-    expect(cfg.mcpServers.agentmemory.command).toBe("npx");
-    expect(cfg.mcpServers.agentmemory.args).toContain("@agentmemory/mcp");
+    expect(cfg.mcpServers.agentmemory.command).toBe("agentmemory");
+    expect(cfg.mcpServers.agentmemory.args).toContain("mcp");
   });
 });
 
@@ -141,8 +141,8 @@ describe("connect: Warp", () => {
     const cfgPath = join(home, ".warp", ".mcp.json");
     expect(existsSync(cfgPath)).toBe(true);
     const cfg = JSON.parse(readFileSync(cfgPath, "utf-8"));
-    expect(cfg.mcpServers.agentmemory.command).toBe("npx");
-    expect(cfg.mcpServers.agentmemory.args).toContain("@agentmemory/mcp");
+    expect(cfg.mcpServers.agentmemory.command).toBe("agentmemory");
+    expect(cfg.mcpServers.agentmemory.args).toContain("mcp");
     expect(cfg.mcpServers.agentmemory.env.AGENTMEMORY_URL).toMatch(
       /\$\{AGENTMEMORY_URL:-/,
     );
@@ -176,8 +176,8 @@ describe("connect: Cline", () => {
     const cfg = JSON.parse(
       readFileSync(join(home, ".cline", "mcp.json"), "utf-8"),
     );
-    expect(cfg.mcpServers.agentmemory.command).toBe("npx");
-    expect(cfg.mcpServers.agentmemory.args).toContain("@agentmemory/mcp");
+    expect(cfg.mcpServers.agentmemory.command).toBe("agentmemory");
+    expect(cfg.mcpServers.agentmemory.args).toContain("mcp");
   });
 });
 
@@ -208,8 +208,8 @@ describe("connect: Droid (Factory.ai)", () => {
     const cfg = JSON.parse(
       readFileSync(join(home, ".factory", "mcp.json"), "utf-8"),
     );
-    expect(cfg.mcpServers.agentmemory.command).toBe("npx");
-    expect(cfg.mcpServers.agentmemory.args).toContain("@agentmemory/mcp");
+    expect(cfg.mcpServers.agentmemory.command).toBe("agentmemory");
+    expect(cfg.mcpServers.agentmemory.args).toContain("mcp");
     // Droid requires `type` per its documented schema
     expect(cfg.mcpServers.agentmemory.type).toBe("stdio");
   });
@@ -242,8 +242,8 @@ describe("connect: Zed", () => {
     const cfg = JSON.parse(
       readFileSync(join(home, ".config", "zed", "settings.json"), "utf-8"),
     );
-    expect(cfg.context_servers.agentmemory.command).toBe("npx");
-    expect(cfg.context_servers.agentmemory.args).toContain("@agentmemory/mcp");
+    expect(cfg.context_servers.agentmemory.command).toBe("agentmemory");
+    expect(cfg.context_servers.agentmemory.args).toContain("mcp");
     expect(cfg.mcpServers).toBeUndefined();
   });
 });
@@ -278,7 +278,7 @@ describe("connect: Continue.dev", () => {
     const yaml = readFileSync(yamlPath, "utf-8");
     expect(yaml).toContain("mcpServers:");
     expect(yaml).toContain("name: agentmemory");
-    expect(yaml).toContain("@agentmemory/mcp");
+    expect(yaml).toContain("mcp");
     expect(yaml).toContain("AGENTMEMORY_URL");
   });
 
@@ -299,8 +299,8 @@ describe("connect: Continue.dev", () => {
     const entry = cfg.mcpServers.find(
       (s: { name: string }) => s.name === "agentmemory",
     );
-    expect(entry.command).toBe("npx");
-    expect(entry.args).toContain("@agentmemory/mcp");
+    expect(entry.command).toBe("agentmemory");
+    expect(entry.args).toContain("mcp");
   });
 
   it("returns stub when config.yaml already exists (refuses silent yaml mutation)", async () => {

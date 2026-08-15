@@ -11,7 +11,7 @@ export const adapter = createJsonMcpAdapter({
   displayName: "Qwen Code",
   detectDir: join(homedir(), ".qwen"),
   configPath: join(homedir(), ".qwen", "settings.json"),
-  docs: "https://github.com/rohitg00/agentmemory#other-agents",
+  docs: "https://github.com/safeblock-lab/agentmemory#other-agents",
   protocolNote:
     "→ Using MCP via ~/.qwen/settings.json. Qwen Code's hook system can also be wired separately — see docs.",
 });

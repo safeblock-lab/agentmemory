@@ -6,7 +6,7 @@ import type { ConnectAdapter, ConnectOptions, ConnectResult } from "./types.js";
 
 const HERMES_DIR = join(homedir(), ".hermes");
 const HERMES_CONFIG = join(HERMES_DIR, "config.yaml");
-const DOCS = "https://github.com/rohitg00/agentmemory/tree/main/integrations/hermes";
+const DOCS = "https://github.com/safeblock-lab/agentmemory/tree/main/integrations/hermes";
 
 export const adapter: ConnectAdapter = {
   name: "hermes",
@@ -14,7 +14,7 @@ export const adapter: ConnectAdapter = {
   category: "native",
   docs: DOCS,
   protocolNote:
-    "→ Using MCP. Hooks are also available — see https://github.com/rohitg00/agentmemory/tree/main/integrations/hermes.",
+    "→ Using MCP. Hooks are also available — see https://github.com/safeblock-lab/agentmemory/tree/main/integrations/hermes.",
 
   detect(): boolean {
     return existsSync(HERMES_DIR);
@@ -30,8 +30,8 @@ export const adapter: ConnectAdapter = {
         "",
         "  mcp_servers:",
         "    agentmemory:",
-        "      command: npx",
-        '      args: ["-y", "@agentmemory/mcp"]',
+        "      command: agentmemory",
+        '      args: ["mcp"]',
         "",
         "  memory:",
         "    provider: agentmemory",

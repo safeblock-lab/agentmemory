@@ -1410,8 +1410,8 @@
           '<div style="font-family:var(--font-ui);font-size:11px;letter-spacing:0.15em;text-transform:uppercase;color:var(--accent);font-weight:700;margin-bottom:8px;">First run &rarr; magical moment in 10 seconds</div>' +
           '<div style="font-family:var(--font-display,Lora,Georgia,serif);font-size:22px;font-weight:700;color:var(--ink);margin-bottom:8px;">Seed sample data + prove semantic recall works</div>' +
           '<div style="font-size:13px;color:var(--ink-muted);margin-bottom:12px;line-height:1.5;max-width:640px;">agentmemory is running but hasn&rsquo;t seen any sessions yet. Run the demo command in a second terminal: it seeds 3 realistic coding sessions and proves the hybrid search finds semantically-related memories that keyword search would miss.</div>' +
-          '<pre style="display:inline-block;margin:0;padding:10px 14px;background:var(--bg);border:1px solid var(--border);border-radius:4px;font-family:var(--font-mono);font-size:12px;color:var(--ink);">npx @agentmemory/agentmemory demo</pre>' +
-          '<div style="margin-top:10px;"><a class="empty-link" href="https://github.com/rohitg00/agentmemory#quick-start" target="_blank" rel="noopener" style="font-size:12px;">Or: wire up your real agent &rarr;</a></div>' +
+          '<pre style="display:inline-block;margin:0;padding:10px 14px;background:var(--bg);border:1px solid var(--border);border-radius:4px;font-family:var(--font-mono);font-size:12px;color:var(--ink);">agentmemory demo</pre>' +
+          '<div style="margin-top:10px;"><a class="empty-link" href="https://github.com/safeblock-lab/agentmemory#quick-start" target="_blank" rel="noopener" style="font-size:12px;">Or: wire up your real agent &rarr;</a></div>' +
           '</div>';
       }
       html += '<div class="stats-grid">';
@@ -3749,8 +3749,8 @@
           title: 'No LLM provider key set',
           keyLabel: 'ANTHROPIC_API_KEY',
           desc: 'Compression, summarization, and graph extraction stay disabled until a key is provided.',
-          enable: 'export ANTHROPIC_API_KEY=sk-ant-...\n# then restart: npx @agentmemory/agentmemory',
-          docs: 'https://github.com/rohitg00/agentmemory#quick-start',
+          enable: 'export ANTHROPIC_API_KEY=sk-ant-...\n# then restart: agentmemory',
+          docs: 'https://github.com/safeblock-lab/agentmemory#quick-start',
           dismissKey: '__provider_noop',
         });
       }

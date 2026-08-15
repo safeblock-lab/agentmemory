@@ -47,7 +47,7 @@ function buildEntry(): ContinueEntry {
 
 function entryIsAgentmemory(entry: ContinueEntry | undefined): boolean {
   if (!entry) return false;
-  return entry.name === "agentmemory" && entry.args.includes("@agentmemory/mcp");
+  return entry.name === "agentmemory" && entry.command === "agentmemory" && entry.args.length === 1 && entry.args[0] === "mcp";
 }
 
 // Minimal YAML emitter for the agentmemory entry. Quotes string values
@@ -74,7 +74,7 @@ export const adapter: ConnectAdapter = {
   name: "continue",
   displayName: "Continue",
   category: "mcp",
-  docs: "https://github.com/rohitg00/agentmemory#other-agents",
+  docs: "https://github.com/safeblock-lab/agentmemory#other-agents",
   protocolNote:
     "→ Using MCP via ~/.continue/config.yaml (preferred) or config.json (legacy, only when no yaml).",
 

@@ -7,7 +7,7 @@
     "url": "https://github.com/rohitg00"
   },
   "license": "Apache-2.0",
-  "homepage": "https://github.com/rohitg00/agentmemory",
-  "repository": "https://github.com/rohitg00/agentmemory",
+  "homepage": "https://github.com/safeblock-lab/agentmemory",
+  "repository": "https://github.com/safeblock-lab/agentmemory",
   "skills": ["./skills/"]
 }

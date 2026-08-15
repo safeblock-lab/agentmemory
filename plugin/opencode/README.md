@@ -5,7 +5,7 @@
 
 <p align="center">
   <strong>Your OpenCode agents remember everything. No more re-explaining.</strong><br/>
-  <sub>Persistent cross-session memory via <a href="https://github.com/rohitg00/agentmemory">agentmemory</a> — 95.2% retrieval accuracy on <a href="https://arxiv.org/abs/2410.10813">LongMemEval-S</a>.</sub>
+  <sub>Persistent cross-session memory via <a href="https://github.com/safeblock-lab/agentmemory">agentmemory</a> — 95.2% retrieval accuracy on <a href="https://arxiv.org/abs/2410.10813">LongMemEval-S</a>.</sub>
 </p>
 
 <p align="center">
@@ -22,7 +22,7 @@
 ### 1. Start the agentmemory server
 
 ```bash
-npx @agentmemory/agentmemory
+agentmemory
 ```
 
 The server starts on `http://localhost:3111`.
@@ -36,7 +36,7 @@ Add to `~/.config/opencode/opencode.json` or your project's `.opencode/opencode.
   "mcp": {
     "agentmemory": {
       "type": "local",
-      "command": ["npx", "-y", "@agentmemory/mcp"],
+      "command": ["agentmemory", "mcp"],
       "enabled": true
     }
   }

@@ -30,6 +30,8 @@ describe("loadEnvFile", () => {
     delete process.env["GRAPH_EXTRACTION_ENABLED"];
     delete process.env["TOKEN"];
     delete process.env["HASHVAL"];
+    delete process.env["deepseek_thinking"];
+    delete process.env["AGENTMEMORY_LLM_LOGGING"];
   });
 
   afterEach(() => {
@@ -88,5 +90,31 @@ describe("loadEnvFile", () => {
     writeEnv("AGENTMEMORY_DROP_STALE_INDEX=true");
     const cfg = await freshConfig();
     expect(cfg.isDropStaleIndexEnabled()).toBe(true);
+  });
+
+  it("enables DeepSeek thinking only from the AgentMemory env file", async () => {
+    process.env["deepseek_thinking"] = "true";
+    let cfg = await freshConfig();
+    expect(cfg.isDeepSeekThinkingEnabled()).toBe(false);
+
+    writeEnv("deepseek_thinking=true");
+    cfg = await freshConfig();
+    expect(cfg.isDeepSeekThinkingEnabled()).toBe(true);
+
+    process.env["deepseek_thinking"] = "false";
+    expect(cfg.isDeepSeekThinkingEnabled()).toBe(true);
+
+    writeEnv("deepseek_thinking=True");
+    cfg = await freshConfig();
+    expect(cfg.isDeepSeekThinkingEnabled()).toBe(false);
+  });
+
+  it("keeps LLM telemetry disabled unless explicitly enabled", async () => {
+    let cfg = await freshConfig();
+    expect(cfg.isLlmLoggingEnabled()).toBe(false);
+
+    process.env["AGENTMEMORY_LLM_LOGGING"] = "true";
+    cfg = await freshConfig();
+    expect(cfg.isLlmLoggingEnabled()).toBe(true);
   });
 });

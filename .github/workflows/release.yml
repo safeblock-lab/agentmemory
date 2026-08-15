@@ -1,0 +1,82 @@
+name: Build release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    # Releases are created only from a pushed tag. Protect tag creation in
+    # GitHub repository settings so untrusted pull-request code cannot publish.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - name: Validate tag and package version
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const tag = process.env.GITHUB_REF_NAME;
+          const version = pkg.version;
+          const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+          if (typeof version !== "string" || !semver.test(version) || tag !== `v${version}`) {
+            throw new Error(`Release tag must exactly match package.json version (expected v${version}, got ${tag}).`);
+          }
+          fs.appendFileSync(process.env.GITHUB_ENV, `VERSION=${version}\n`);
+          NODE
+
+      - run: npm install --legacy-peer-deps --no-audit --no-fund
+      - run: npm run build
+      - run: npm run skills:check
+      - run: npm test
+
+      - name: Create and verify release archive
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          node <<'NODE'
+          const { execFileSync } = require("node:child_process");
+          const fs = require("node:fs");
+          const path = require("node:path");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const packed = JSON.parse(execFileSync("npm", ["pack", "--json", "--pack-destination", "artifacts"], { encoding: "utf8" }));
+          if (!Array.isArray(packed) || packed.length !== 1 || typeof packed[0].filename !== "string") {
+            throw new Error("npm pack did not return exactly one archive.");
+          }
+          const source = path.join("artifacts", packed[0].filename);
+          const target = path.join("artifacts", `agentmemory-v${pkg.version}.tgz`);
+          fs.renameSync(source, target);
+          NODE
+          TARBALL="artifacts/agentmemory-v${VERSION}.tgz"
+          test -f "$TARBALL"
+          tar -tzf "$TARBALL" | grep -qx "package/dist/index.mjs"
+          tar -tzf "$TARBALL" | grep -qx "package/dist/cli.mjs"
+          if tar -tzf "$TARBALL" | grep -Eq '(^|/)\.env($|/)' ; then
+            echo "Release archive must not contain an env file." >&2
+            exit 1
+          fi
+          sha256sum "$TARBALL" | sed 's#  artifacts/#  #' > artifacts/SHA256SUMS.txt
+          cp scripts/Install-AgentMemory.ps1 artifacts/Install-AgentMemory.ps1
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "artifacts/agentmemory-v${VERSION}.tgz" \
+            artifacts/SHA256SUMS.txt \
+            artifacts/Install-AgentMemory.ps1 \
+            --generate-notes

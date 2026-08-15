@@ -48,12 +48,12 @@ function announceMode(handle: Handle): void {
   modeAnnounced = true;
   if (handle.mode === "proxy") {
     process.stderr.write(
-      `[@agentmemory/mcp] proxying to agentmemory server at ${handle.baseUrl}\n`,
+      `[agentmemory:mcp] proxying to agentmemory server at ${handle.baseUrl}\n`,
     );
   } else {
     const fullToolCount = getAllTools().length;
     process.stderr.write(
-      `[@agentmemory/mcp] no server reachable at ${displayAgentmemoryUrl()}; running reduced LOCAL FALLBACK with ${IMPLEMENTED_TOOLS.size} of ${fullToolCount} tools. Start 'npx @agentmemory/agentmemory' (and point AGENTMEMORY_URL at it) to unlock all ${fullToolCount} tools.\n`,
+      `[agentmemory:mcp] no server reachable at ${displayAgentmemoryUrl()}; running reduced LOCAL FALLBACK with ${IMPLEMENTED_TOOLS.size} of ${fullToolCount} tools. Start 'agentmemory' (and point AGENTMEMORY_URL at it) to unlock all ${fullToolCount} tools.\n`,
     );
   }
 }

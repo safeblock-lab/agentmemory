@@ -19,7 +19,7 @@ export const adapter = createJsonMcpAdapter({
   displayName: "Antigravity",
   detectDir: ANTIGRAVITY_DIR,
   configPath: join(ANTIGRAVITY_DIR, "mcp_config.json"),
-  docs: "https://github.com/rohitg00/agentmemory#other-agents",
+  docs: "https://github.com/safeblock-lab/agentmemory#other-agents",
   protocolNote:
     "→ Using MCP via mcp_config.json. Antigravity replaces Gemini CLI (sunset 2026-06-18).",
 });

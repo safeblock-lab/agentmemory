@@ -10,7 +10,7 @@ export const adapter = createJsonMcpAdapter({
   displayName: "Kiro",
   detectDir: join(homedir(), ".kiro"),
   configPath: join(homedir(), ".kiro", "settings", "mcp.json"),
-  docs: "https://github.com/rohitg00/agentmemory#other-agents",
+  docs: "https://github.com/safeblock-lab/agentmemory#other-agents",
   protocolNote:
     "→ Using MCP via ~/.kiro/settings/mcp.json (user-level). Workspace overrides live in .kiro/settings/mcp.json.",
 });

@@ -8,7 +8,7 @@ export const adapter = createJsonMcpAdapter({
   category: "native",
   detectDir: join(homedir(), ".openclaw"),
   configPath: join(homedir(), ".openclaw", "openclaw.json"),
-  docs: "https://github.com/rohitg00/agentmemory/tree/main/integrations/openclaw",
+  docs: "https://github.com/safeblock-lab/agentmemory/tree/main/integrations/openclaw",
   protocolNote:
-    "→ Using MCP. Hooks are also available — see https://github.com/rohitg00/agentmemory/tree/main/integrations/openclaw.",
+    "→ Using MCP. Hooks are also available — see https://github.com/safeblock-lab/agentmemory/tree/main/integrations/openclaw.",
 });

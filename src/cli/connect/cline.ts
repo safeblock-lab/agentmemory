@@ -13,7 +13,7 @@ export const adapter = createJsonMcpAdapter({
   displayName: "Cline",
   detectDir: join(homedir(), ".cline"),
   configPath: join(homedir(), ".cline", "mcp.json"),
-  docs: "https://github.com/rohitg00/agentmemory#other-agents",
+  docs: "https://github.com/safeblock-lab/agentmemory#other-agents",
   protocolNote:
     "→ Using MCP via ~/.cline/mcp.json (CLI). VS Code users: add the same block via Cline Settings → MCP Servers → Edit JSON.",
 });
