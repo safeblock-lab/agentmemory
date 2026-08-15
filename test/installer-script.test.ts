@@ -22,7 +22,7 @@ function runInstallerWhatIf(...args: string[]): string {
   );
 }
 
-describe("Install-AgentMemory.ps1", () => {
+describe.skipIf(process.platform !== "win32")("Install-AgentMemory.ps1", () => {
   it("accepts an omitted version without downloading or installing", () => {
     expect(runInstallerWhatIf()).toContain("the latest release");
   });
