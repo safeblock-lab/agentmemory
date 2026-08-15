@@ -83,8 +83,11 @@ Fastest path if you use a coding agent: hand it this one instruction and it inst
 On Windows the fast path is WSL2. Native Windows engine setup is manual (about 10 to 20 minutes) and `agentmemory connect` is currently unsupported there. See the [Windows notes](#windows) below for the step-by-step.
 
 ```powershell
-# Download Install-AgentMemory.ps1 from the matching GitHub Release.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-AgentMemory.ps1 -Version v0.9.30
+# Download Install-AgentMemory.ps1 from a GitHub Release.
+# Omit -Version to install the latest stable release.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-AgentMemory.ps1
+# Or install a specific release:
+# powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-AgentMemory.ps1 -Version v0.9.30
 agentmemory
 ```
 
@@ -450,7 +453,10 @@ Open `http://localhost:3113` to watch the memory build live.
 Install this fork from its matching GitHub Release; do not use `npx` for the upstream package. On Windows, download `Install-AgentMemory.ps1` and run:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-AgentMemory.ps1 -Version v0.9.30
+# Omit -Version to install the latest stable release.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-AgentMemory.ps1
+# Or pin the installation to a specific release:
+# powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-AgentMemory.ps1 -Version v0.9.30
 ```
 
 This replaces any existing global `@agentmemory/agentmemory` installation. Afterwards the normal command works everywhere:

@@ -1,18 +1,45 @@
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-  [Parameter(Mandatory = $true)]
+  [Parameter(Mandatory = $false)]
   [ValidatePattern("^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$")]
   [string]$Version
 )
 
 $ErrorActionPreference = "Stop"
 $Repository = "safeblock-lab/agentmemory"
-$TarballName = "agentmemory-$Version.tgz"
-$ReleaseBase = "https://github.com/$Repository/releases/download/$Version"
+$ReleaseHost = "github.com"
 
-if (-not $PSCmdlet.ShouldProcess("the global npm installation", "Install agentmemory $Version")) {
+function Resolve-LatestReleaseTag {
+  $latestUrl = "https://$ReleaseHost/$Repository/releases/latest"
+  $response = Invoke-WebRequest -Uri $latestUrl -MaximumRedirection 5 -TimeoutSec 60
+  # PowerShell returns an HttpResponseMessage whose final redirect target is
+  # carried by RequestMessage.RequestUri.
+  $resolvedUri = [Uri]$response.BaseResponse.RequestMessage.RequestUri
+  $expectedPrefix = "/$Repository/releases/tag/"
+
+  if ($resolvedUri.Host -ne $ReleaseHost -or -not $resolvedUri.AbsolutePath.StartsWith($expectedPrefix, [System.StringComparison]::Ordinal)) {
+    throw "Could not resolve the latest AgentMemory release from $latestUrl."
+  }
+
+  $tag = $resolvedUri.AbsolutePath.Substring($expectedPrefix.Length)
+  if ($tag -notmatch "^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$") {
+    throw "Latest release tag is not a supported version: $tag."
+  }
+
+  return $tag
+}
+
+$requestedRelease = if ($Version) { $Version } else { "the latest release" }
+if (-not $PSCmdlet.ShouldProcess("the global npm installation", "Install agentmemory $requestedRelease")) {
   return
 }
+
+if (-not $Version) {
+  $Version = Resolve-LatestReleaseTag
+}
+
+$TarballName = "agentmemory-$Version.tgz"
+$ReleaseBase = "https://$ReleaseHost/$Repository/releases/download/$Version"
 
 $node = Get-Command node -ErrorAction SilentlyContinue
 $npm = Get-Command npm -ErrorAction SilentlyContinue

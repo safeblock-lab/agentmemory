@@ -22,10 +22,14 @@ GitHub Actions builds and tests the tag, creates the package archive, verifies i
 3. In PowerShell, run:
 
    ```powershell
-   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-AgentMemory.ps1 -Version v0.9.30
+   # Omit -Version to install the latest stable release.
+   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-AgentMemory.ps1
+
+   # Or pin the installation to a specific release.
+   # powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-AgentMemory.ps1 -Version v0.9.30
    ```
 
-The installer downloads the matching archive and checksum from that release, verifies the checksum, then installs the archive globally with npm. It replaces any existing global `@agentmemory/agentmemory` installation. It does not alter `~/.agentmemory`, its `.env`, MCP configuration, hooks, or running services.
+Without `-Version`, the installer resolves the latest stable GitHub Release, then downloads its archive and checksum, verifies the checksum, and installs the archive globally with npm. It replaces any existing global `@agentmemory/agentmemory` installation. It does not alter `~/.agentmemory`, its `.env`, MCP configuration, hooks, or running services.
 
 ## Install the plugin, skills, hooks, and MCP server
 
