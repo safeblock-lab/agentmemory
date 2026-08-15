@@ -62,9 +62,10 @@ jobs:
           NODE
           TARBALL="artifacts/agentmemory-v${VERSION}.tgz"
           test -f "$TARBALL"
-          tar -tzf "$TARBALL" | grep -qx "package/dist/index.mjs"
-          tar -tzf "$TARBALL" | grep -qx "package/dist/cli.mjs"
-          if tar -tzf "$TARBALL" | grep -Eq '(^|/)\.env($|/)' ; then
+          tar -tzf "$TARBALL" > artifacts/archive-contents.txt
+          grep -Fxq "package/dist/index.mjs" artifacts/archive-contents.txt
+          grep -Fxq "package/dist/cli.mjs" artifacts/archive-contents.txt
+          if grep -Eq '(^|/)\.env($|/)' artifacts/archive-contents.txt ; then
             echo "Release archive must not contain an env file." >&2
             exit 1
           fi
