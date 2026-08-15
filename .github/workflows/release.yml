@@ -52,11 +52,11 @@ jobs:
           const fs = require("node:fs");
           const path = require("node:path");
           const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
-          const packed = JSON.parse(execFileSync("npm", ["pack", "--json", "--pack-destination", "artifacts"], { encoding: "utf8" }));
+          const packed = JSON.parse(execFileSync("npm", ["pack", "--json"], { encoding: "utf8" }));
           if (!Array.isArray(packed) || packed.length !== 1 || typeof packed[0].filename !== "string") {
             throw new Error("npm pack did not return exactly one archive.");
           }
-          const source = path.join("artifacts", packed[0].filename);
+          const source = packed[0].filename;
           const target = path.join("artifacts", `agentmemory-v${pkg.version}.tgz`);
           fs.renameSync(source, target);
           NODE
