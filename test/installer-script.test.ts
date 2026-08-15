@@ -28,6 +28,6 @@ describe("Install-AgentMemory.ps1", () => {
   });
 
   it("keeps an explicit version install path", () => {
-    expect(runInstallerWhatIf("-Version", "v0.9.30")).toContain("v0.9.30");
+    expect(runInstallerWhatIf("-Version", "v0.9.31")).toContain("v0.9.31");
   });
 });
