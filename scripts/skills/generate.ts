@@ -8,6 +8,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..", "..");
 const SKILLS = join(ROOT, "plugin", "skills");
 const SRC = join(ROOT, "src");
+const documentedUnprefixedVariables = ["deepseek_thinking"] as const;
 
 const check = process.argv.includes("--check");
 
@@ -122,6 +123,7 @@ function env(): string {
       if (!m[0].endsWith("__")) vars.add(m[0]);
     }
   }
+  for (const variable of documentedUnprefixedVariables) vars.add(variable);
   const sorted = [...vars].sort();
   const lines = [
     `Configuration is read from the environment and from \`~/.agentmemory/.env\` (no \`export\` prefix). ${sorted.length} recognized variables:`,
