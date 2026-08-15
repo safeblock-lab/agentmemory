@@ -201,7 +201,7 @@ function summarize(
   );
   if (wiredAny) {
     p.log.info(
-      "Next: install agentmemory's bundled skills and hooks through the plugin marketplace:\n  /plugin marketplace add safeblock-lab/agentmemory\n  /plugin install agentmemory",
+      "Next: install agentmemory's 12 hooks and 15 skills through the plugin marketplace:\n  /plugin marketplace add safeblock-lab/agentmemory\n  /plugin install agentmemory",
     );
   }
 
