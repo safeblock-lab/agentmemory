@@ -14,6 +14,9 @@ describe("createEmbeddingProvider", () => {
     process.env = { ...originalEnv };
     delete process.env["GEMINI_API_KEY"];
     delete process.env["OPENAI_API_KEY"];
+    delete process.env["OPENAI_EMBEDDING_API_KEY"];
+    delete process.env["OPENAI_BASE_URL"];
+    delete process.env["OPENAI_EMBEDDING_BASE_URL"];
     delete process.env["VOYAGE_API_KEY"];
     delete process.env["COHERE_API_KEY"];
     delete process.env["OPENROUTER_API_KEY"];
@@ -41,6 +44,35 @@ describe("createEmbeddingProvider", () => {
     const provider = createEmbeddingProvider();
     expect(provider).toBeInstanceOf(OpenAIEmbeddingProvider);
     expect(provider!.name).toBe("openai");
+  });
+
+  it("keeps embedding credentials and endpoint separate from OpenAI LLM settings", async () => {
+    process.env["OPENAI_API_KEY"] = "llm-key";
+    process.env["OPENAI_BASE_URL"] = "https://chat.example.test/v1";
+    process.env["OPENAI_EMBEDDING_API_KEY"] = "embedding-key";
+    process.env["OPENAI_EMBEDDING_BASE_URL"] = "https://embeddings.example.test/v1";
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ data: [{ embedding: [0.1, 0.2, 0.3] }] }), {
+        status: 200,
+      }),
+    );
+
+    const provider = createEmbeddingProvider();
+    await provider!.embed("hello");
+
+    expect(fetchSpy).toHaveBeenCalledWith(
+      "https://embeddings.example.test/v1/embeddings",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({
+          Authorization: "Bearer embedding-key",
+        }),
+      }),
+    );
+    const [, request] = fetchSpy.mock.calls[0];
+    expect((request?.headers as Record<string, string>)["Authorization"]).not.toBe(
+      "Bearer llm-key",
+    );
   });
 
   it("EMBEDDING_PROVIDER override takes precedence", () => {

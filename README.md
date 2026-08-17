@@ -1212,6 +1212,7 @@ agentmemory auto-detects from your environment. By default, no LLM calls are mad
 | Gemini | `GEMINI_API_KEY` | Also enables embeddings |
 | OpenRouter | `OPENROUTER_API_KEY` | Any model |
 | OpenAI API | `OPENAI_API_KEY` | Default `gpt-4o-mini`, override with `OPENAI_MODEL` |
+| Fireworks.ai | `OPENAI_API_KEY` + `OPENAI_BASE_URL` | OpenAI-compatible chat API; set `OPENAI_MODEL` and optionally `OPENAI_REASONING_EFFORT`. See [Fireworks.ai (OpenAI-compatible)](#fireworksai-openai-compatible). |
 | **Local (Ollama / LM Studio / vLLM / llama.cpp)** | `OPENAI_API_KEY=local` + `OPENAI_BASE_URL=http://localhost:11434/v1` (Ollama) or `http://localhost:1234/v1` (LM Studio) + `OPENAI_MODEL=<your model>` | Anything OpenAI-API-compatible. Zero cost, runs on your hardware. See [Local models](#local-models-ollama-lm-studio-vllm) below. |
 | Claude subscription fallback | `AGENTMEMORY_ALLOW_AGENT_SDK=true` | Opt-in only. Spawns `@anthropic-ai/claude-agent-sdk` sessions — used to cause unbounded Stop-hook recursion so it is no longer the default. |
 
@@ -1258,6 +1259,19 @@ OPENAI_MODEL=qwen2.5-coder-7b-instruct         # match the model name from LM St
 Reasoning-class models (`o1`-style with `<think>` blocks) can return empty `content` with a `reasoning` field your local server may not surface. If extractions come back blank, switch to a non-reasoning model first. The `OPENAI_REASONING_EFFORT=none` env can also disable thinking on Ollama Cloud thinking models that mirror the OpenAI reasoning schema.
 
 Local embeddings ship out of the box via `@xenova/transformers` — `EMBEDDING_PROVIDER=local` (default) gives you BGE-small entirely on-device. No extra config needed.
+
+### Fireworks.ai (OpenAI-compatible)
+
+Fireworks provides an OpenAI-compatible chat endpoint. Configure it through the OpenAI provider:
+
+```env
+OPENAI_API_KEY=<your-fireworks-api-key>
+OPENAI_BASE_URL=https://api.fireworks.ai/inference/v1
+OPENAI_MODEL=<your-fireworks-model>
+OPENAI_REASONING_EFFORT=none
+```
+
+Replace `<your-fireworks-model>` with a model identifier available in your Fireworks account. Keep embedding access separate with `OPENAI_EMBEDDING_*` overrides when needed.
 
 ### Cost-aware model selection
 
@@ -1368,11 +1382,9 @@ Create `~/.agentmemory/.env`:
 # GEMINI_API_KEY=...
 # OPENROUTER_API_KEY=...
 # MINIMAX_API_KEY=...
-# OPENAI_API_KEY=***                       # NOTE: this same key auto-activates BOTH the
-#                                          # OpenAI LLM provider (here) AND the OpenAI
-#                                          # embedding provider (further below). Set
-#                                          # OPENAI_API_KEY_FOR_LLM=false to scope it
-#                                          # to embeddings only.
+# OPENAI_API_KEY=***                       # OpenAI-compatible LLM key; also a fallback
+#                                          # for embeddings. Set OPENAI_API_KEY_FOR_LLM=false
+#                                          # to reserve it for embeddings only.
 # OPENAI_BASE_URL=https://api.openai.com   # Optional: override for Azure / vLLM / LM Studio / proxies
 #                                          # Azure: https://<resource>.openai.azure.com/openai/deployments/<deployment>
 #                                          # Auto-detected from `.openai.azure.com` hostname; uses
@@ -1399,8 +1411,8 @@ Create `~/.agentmemory/.env`:
 # Embedding provider (auto-detected, or override)
 # EMBEDDING_PROVIDER=local
 # VOYAGE_API_KEY=...
-# OPENAI_API_KEY=sk-...
-# OPENAI_BASE_URL=https://api.openai.com   # Override for Azure / vLLM / LM Studio / proxies
+# OPENAI_EMBEDDING_API_KEY=...             # Optional separate key; falls back to OPENAI_API_KEY
+# OPENAI_EMBEDDING_BASE_URL=https://api.openai.com # Optional separate base URL; falls back to OPENAI_BASE_URL
 # OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 # OPENAI_EMBEDDING_DIMENSIONS=1536        # Required when the model is not in the known-models table
 

@@ -100,4 +100,33 @@ describe("OpenAIProvider direct DeepSeek thinking control and telemetry", () => 
 
     expect(sentBody?.thinking).toEqual({ type: "disabled" });
   });
+
+  it("sends the Fireworks DeepSeek model unchanged without thinking", async () => {
+    writeAgentMemoryEnv("OPENAI_REASONING_EFFORT=none");
+    let requestUrl: string | undefined;
+    let sentBody: Record<string, unknown> | undefined;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      requestUrl = String(url);
+      sentBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), {
+        status: 200,
+      });
+    });
+
+    const { OpenAIProvider } = await loadProvider();
+    const provider = new OpenAIProvider(
+      "test-fireworks-key",
+      "accounts/fireworks/models/deepseek-v4-flash-0731",
+      128,
+      "https://api.fireworks.ai/inference/v1",
+    );
+    await provider.compress("system", "user");
+
+    expect(requestUrl).toBe("https://api.fireworks.ai/inference/v1/chat/completions");
+    expect(sentBody).toMatchObject({
+      model: "accounts/fireworks/models/deepseek-v4-flash-0731",
+      reasoning_effort: "none",
+    });
+    expect(sentBody).not.toHaveProperty("thinking");
+  });
 });
