@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.32] — 2026-08-17
+
+### Fixed
+
+- Kept embedding credentials isolated from compatible chat-provider credentials.
+
+### Docs
+
+- Documented Fireworks configuration and the `reasoning_effort: none` setting.
+
 ## [0.9.28] — 2026-07-19
 
 Patch release: hardens the hook runner against malformed payloads and closes a cross-agent context leak. No breaking changes; drop-in upgrade.

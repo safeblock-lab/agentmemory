@@ -1,17 +1,47 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import {
-  createEmbeddingProvider,
-  withDimensionGuard,
-} from "../src/providers/embedding/index.js";
-import { GeminiEmbeddingProvider } from "../src/providers/embedding/gemini.js";
-import { OpenAIEmbeddingProvider } from "../src/providers/embedding/openai.js";
+import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { EmbeddingProvider } from "../src/types.js";
 
-describe("createEmbeddingProvider", () => {
-  const originalEnv = { ...process.env };
+const originalEnv = { ...process.env };
+let sandboxHome: string;
+let createEmbeddingProvider: typeof import("../src/providers/embedding/index.js").createEmbeddingProvider;
+let withDimensionGuard: typeof import("../src/providers/embedding/index.js").withDimensionGuard;
+let GeminiEmbeddingProvider: typeof import("../src/providers/embedding/gemini.js").GeminiEmbeddingProvider;
+let OpenAIEmbeddingProvider: typeof import("../src/providers/embedding/openai.js").OpenAIEmbeddingProvider;
 
+function restoreOriginalEnv(): void {
+  for (const key of Object.keys(process.env)) {
+    if (!(key in originalEnv)) delete process.env[key];
+  }
+  Object.assign(process.env, originalEnv);
+}
+
+function resetTestEnv(): void {
+  restoreOriginalEnv();
+  process.env["HOME"] = sandboxHome;
+  process.env["USERPROFILE"] = sandboxHome;
+}
+
+beforeAll(async () => {
+  sandboxHome = mkdtempSync(join(tmpdir(), "agentmemory-embedding-"));
+  resetTestEnv();
+  vi.resetModules();
+  ({ createEmbeddingProvider, withDimensionGuard } = await import("../src/providers/embedding/index.js"));
+  ({ GeminiEmbeddingProvider } = await import("../src/providers/embedding/gemini.js"));
+  ({ OpenAIEmbeddingProvider } = await import("../src/providers/embedding/openai.js"));
+});
+
+afterAll(() => {
+  restoreOriginalEnv();
+  rmSync(sandboxHome, { recursive: true, force: true });
+  vi.resetModules();
+});
+
+describe("createEmbeddingProvider", () => {
   beforeEach(() => {
-    process.env = { ...originalEnv };
+    resetTestEnv();
     delete process.env["GEMINI_API_KEY"];
     delete process.env["OPENAI_API_KEY"];
     delete process.env["OPENAI_EMBEDDING_API_KEY"];
@@ -24,7 +54,7 @@ describe("createEmbeddingProvider", () => {
   });
 
   afterEach(() => {
-    process.env = originalEnv;
+    resetTestEnv();
   });
 
   it("returns null when no API keys are set", () => {
@@ -52,7 +82,7 @@ describe("createEmbeddingProvider", () => {
     process.env["OPENAI_EMBEDDING_API_KEY"] = "embedding-key";
     process.env["OPENAI_EMBEDDING_BASE_URL"] = "https://embeddings.example.test/v1";
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({ data: [{ embedding: [0.1, 0.2, 0.3] }] }), {
+      new Response(JSON.stringify({ data: [{ embedding: Array(1536).fill(0.1) }] }), {
         status: 200,
       }),
     );
@@ -85,10 +115,8 @@ describe("createEmbeddingProvider", () => {
 });
 
 describe("OpenAIEmbeddingProvider", () => {
-  const originalEnv = { ...process.env };
-
   beforeEach(() => {
-    process.env = { ...originalEnv };
+    resetTestEnv();
     delete process.env["OPENAI_BASE_URL"];
     delete process.env["OPENAI_EMBEDDING_BASE_URL"];
     delete process.env["OPENAI_EMBEDDING_API_KEY"];
@@ -97,7 +125,7 @@ describe("OpenAIEmbeddingProvider", () => {
   });
 
   afterEach(() => {
-    process.env = originalEnv;
+    resetTestEnv();
   });
 
   it("uses default base URL and model when env vars are not set", () => {

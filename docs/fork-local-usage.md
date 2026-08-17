@@ -5,12 +5,12 @@ This repository builds its own GitHub Release archives. It does not publish to n
 ## Create a release
 
 1. Commit and push the changes to `main`.
-2. Ensure the Git tag exactly matches the existing `package.json` version. For example, version `0.9.31` requires tag `v0.9.31`.
+2. Ensure the Git tag exactly matches the existing `package.json` version. For example, version `0.9.32` requires tag `v0.9.32`.
 3. Push the tag:
 
    ```powershell
-   git tag v0.9.31
-   git push origin v0.9.31
+   git tag v0.9.32
+   git push origin v0.9.32
    ```
 
 GitHub Actions builds and tests the tag, creates the package archive, verifies it, creates a SHA-256 checksum, and attaches all three release assets.
@@ -26,7 +26,7 @@ GitHub Actions builds and tests the tag, creates the package archive, verifies i
    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-AgentMemory.ps1
 
    # Or pin the installation to a specific release.
-   # powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-AgentMemory.ps1 -Version v0.9.31
+   # powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-AgentMemory.ps1 -Version v0.9.32
    ```
 
 Without `-Version`, the installer resolves the latest stable GitHub Release, then downloads its archive and checksum, verifies the checksum, and installs the archive globally with npm. It replaces any existing global `@agentmemory/agentmemory` installation. It does not alter `~/.agentmemory`, its `.env`, MCP configuration, hooks, or running services.

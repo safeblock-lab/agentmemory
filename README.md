@@ -87,7 +87,7 @@ On Windows the fast path is WSL2. Native Windows engine setup is manual (about 1
 # Omit -Version to install the latest stable release.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-AgentMemory.ps1
 # Or install a specific release:
-# powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-AgentMemory.ps1 -Version v0.9.31
+# powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-AgentMemory.ps1 -Version v0.9.32
 agentmemory
 ```
 
@@ -456,7 +456,7 @@ Install this fork from its matching GitHub Release; do not use `npx` for the ups
 # Omit -Version to install the latest stable release.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-AgentMemory.ps1
 # Or pin the installation to a specific release:
-# powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-AgentMemory.ps1 -Version v0.9.31
+# powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-AgentMemory.ps1 -Version v0.9.32
 ```
 
 This replaces any existing global `@agentmemory/agentmemory` installation. Afterwards the normal command works everywhere:

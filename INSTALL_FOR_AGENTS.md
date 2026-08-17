@@ -23,7 +23,7 @@ Several commands prompt on a TTY (for example the first-run "install globally?" 
 For this fork on Windows, download `Install-AgentMemory.ps1` from the matching GitHub Release, then run:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-AgentMemory.ps1 -Version v0.9.31
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-AgentMemory.ps1 -Version v0.9.32
 ```
 
 The installer downloads the tarball from this fork's GitHub Release, verifies its SHA-256 checksum, then installs it globally. It does not use npm publishing.
