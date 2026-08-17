@@ -11,10 +11,15 @@ $ReleaseHost = "github.com"
 
 function Resolve-LatestReleaseTag {
   $latestUrl = "https://$ReleaseHost/$Repository/releases/latest"
-  $response = Invoke-WebRequest -Uri $latestUrl -MaximumRedirection 5 -TimeoutSec 60
-  # PowerShell returns an HttpResponseMessage whose final redirect target is
-  # carried by RequestMessage.RequestUri.
-  $resolvedUri = [Uri]$response.BaseResponse.RequestMessage.RequestUri
+  $response = Invoke-WebRequest -Uri $latestUrl -MaximumRedirection 5 -TimeoutSec 60 -UseBasicParsing
+  $resolvedUri = $response.BaseResponse.ResponseUri
+  if ($null -eq $resolvedUri) {
+    $resolvedUri = $response.BaseResponse.RequestMessage.RequestUri
+  }
+  if ($null -eq $resolvedUri) {
+    throw "Could not determine the final AgentMemory release URL from $latestUrl."
+  }
+  $resolvedUri = [Uri]$resolvedUri
   $expectedPrefix = "/$Repository/releases/tag/"
 
   if ($resolvedUri.Host -ne $ReleaseHost -or -not $resolvedUri.AbsolutePath.StartsWith($expectedPrefix, [System.StringComparison]::Ordinal)) {
@@ -61,8 +66,8 @@ $checksumsPath = Join-Path $temporaryDirectory "SHA256SUMS.txt"
 
 try {
   New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
-  Invoke-WebRequest -Uri "$ReleaseBase/$TarballName" -OutFile $tarballPath -MaximumRedirection 5 -TimeoutSec 60
-  Invoke-WebRequest -Uri "$ReleaseBase/SHA256SUMS.txt" -OutFile $checksumsPath -MaximumRedirection 5 -TimeoutSec 60
+  Invoke-WebRequest -Uri "$ReleaseBase/$TarballName" -OutFile $tarballPath -MaximumRedirection 5 -TimeoutSec 60 -UseBasicParsing
+  Invoke-WebRequest -Uri "$ReleaseBase/SHA256SUMS.txt" -OutFile $checksumsPath -MaximumRedirection 5 -TimeoutSec 60 -UseBasicParsing
 
   $checksumLine = Get-Content -LiteralPath $checksumsPath | Where-Object {
     $_ -match "^(?<hash>[A-Fa-f0-9]{64})\s+\*?$([regex]::Escape($TarballName))$"
