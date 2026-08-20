@@ -15,6 +15,7 @@ import {
 } from "../prompts/graph-extraction.js";
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
+import type { LlmTaskRouter } from "../providers/task-router.js";
 
 // #753: keep the response payload below the iii state channel ceiling.
 // 500 nodes + their incident edges hold well under the limit on the
@@ -454,6 +455,7 @@ export function registerGraphFunction(
   sdk: ISdk,
   kv: StateKV,
   provider: MemoryProvider,
+  llmRouter?: LlmTaskRouter,
 ): void {
   sdk.registerFunction("mem::graph-extract", 
     async (data: { observations: CompressedObservation[] }) => {
@@ -472,10 +474,19 @@ export function registerGraphFunction(
       );
 
       try {
-        const response = await provider.compress(
-          GRAPH_EXTRACTION_SYSTEM,
-          prompt,
-        );
+        const response = llmRouter
+          ? await llmRouter.run(
+            "graph_extraction",
+            (selectedProvider) => selectedProvider.compress(
+              GRAPH_EXTRACTION_SYSTEM,
+              prompt,
+            ),
+            (candidate) => {
+              const parsed = parseGraphXml(candidate, data.observations.map((o) => o.id));
+              return parsed.nodes.length > 0 || parsed.edges.length > 0;
+            },
+          )
+          : await provider.compress(GRAPH_EXTRACTION_SYSTEM, prompt);
 
         const obsIds = data.observations.map((o) => o.id);
         const { nodes, edges } = parseGraphXml(response, obsIds);

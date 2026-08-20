@@ -155,6 +155,9 @@ export function buildAuthHeaders(
       "api-key": apiKey,
     };
   }
+  if (!apiKey) {
+    return { "Content-Type": "application/json" };
+  }
   return {
     "Content-Type": "application/json",
     Authorization: `Bearer ${apiKey}`,

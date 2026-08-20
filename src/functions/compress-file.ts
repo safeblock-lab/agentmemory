@@ -5,6 +5,7 @@ import type { ISdk } from "iii-sdk";
 import type { MemoryProvider } from "../types.js";
 import type { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
+import type { LlmTaskRouter } from "../providers/task-router.js";
 
 const SENSITIVE_PATH_TERMS = [
   "secret",
@@ -96,6 +97,7 @@ export function registerCompressFileFunction(
   sdk: ISdk,
   kv: StateKV,
   provider: MemoryProvider,
+  llmRouter?: LlmTaskRouter,
 ): void {
   sdk.registerFunction(
     "mem::compress-file",
@@ -133,10 +135,17 @@ export function registerCompressFileFunction(
         return { success: true, skipped: true, reason: "file is empty" };
       }
 
-      const response = await provider.summarize(
-        COMPRESS_FILE_SYSTEM_PROMPT,
-        `Compress this markdown file while preserving structure and code blocks:\n\n${original}`,
-      );
+      const userPrompt = `Compress this markdown file while preserving structure and code blocks:\n\n${original}`;
+      const response = llmRouter
+        ? await llmRouter.run(
+          "compression",
+          (selectedProvider) => selectedProvider.summarize(
+            COMPRESS_FILE_SYSTEM_PROMPT,
+            userPrompt,
+          ),
+          (candidate) => validateCompression(original, stripMarkdownFence(candidate)).length === 0,
+        )
+        : await provider.summarize(COMPRESS_FILE_SYSTEM_PROMPT, userPrompt);
       const compressed = stripMarkdownFence(response);
       const validationErrors = validateCompression(original, compressed);
       if (validationErrors.length > 0) {

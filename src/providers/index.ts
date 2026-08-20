@@ -2,6 +2,7 @@ import type {
   MemoryProvider,
   ProviderConfig,
   FallbackConfig,
+  AuxiliaryLlmConfig,
 } from "../types.js";
 import { AgentSDKProvider } from "./agent-sdk.js";
 import { AnthropicProvider } from "./anthropic.js";
@@ -56,6 +57,25 @@ function defaultModelFor(providerType: ProviderConfig["provider"]): string {
 
 export function createProvider(config: ProviderConfig): ResilientProvider {
   return new ResilientProvider(createBaseProvider(config));
+}
+
+export function createAuxiliaryProvider(
+  config: AuxiliaryLlmConfig,
+): ResilientProvider {
+  return new ResilientProvider(
+    new OpenAIProvider(
+      config.apiKey,
+      config.model,
+      config.maxTokens,
+      config.baseURL,
+      {
+        timeoutMs: config.timeoutMs,
+        reasoningEffort: config.reasoningEffort,
+        noThink: config.noThink,
+        keepAlive: config.keepAlive,
+      },
+    ),
+  );
 }
 
 export function createFallbackProvider(

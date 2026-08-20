@@ -20,6 +20,7 @@ import { scoreSummary } from "../eval/quality.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import { safeAudit } from "./audit.js";
 import { logger } from "../logger.js";
+import type { LlmTaskRouter } from "../providers/task-router.js";
 
 // Per-chunk observation budget when a session is too large to fit in one
 // LLM call. Default ≈ 50k input tokens per chunk at ~110 tok/obs — fits
@@ -59,6 +60,7 @@ function getChunkConcurrency(): number {
 // chunk (auth, model down) will trip the bailout naturally.
 async function summarizeChunkWithRetry(
   provider: MemoryProvider,
+  llmRouter: LlmTaskRouter | undefined,
   chunk: CompressedObservation[],
   sessionId: string,
   project: string,
@@ -67,10 +69,14 @@ async function summarizeChunkWithRetry(
 ): Promise<SessionSummary | null> {
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      const xml = await provider.summarize(
-        SUMMARY_SYSTEM,
-        buildSummaryPrompt(chunk),
-      );
+      const prompt = buildSummaryPrompt(chunk);
+      const xml = llmRouter
+        ? await llmRouter.run(
+          "summary",
+          (selectedProvider) => selectedProvider.summarize(SUMMARY_SYSTEM, prompt),
+          (candidate) => parseSummaryXml(candidate, sessionId, project, chunk.length) !== null,
+        )
+        : await provider.summarize(SUMMARY_SYSTEM, prompt);
       const parsed = parseSummaryXml(xml, sessionId, project, chunk.length);
       if (parsed) return parsed;
       logger.warn("Summarize chunk parse failed", {
@@ -97,6 +103,7 @@ async function summarizeChunkWithRetry(
 // partials merged via a reduce call.
 async function produceSummaryXml(
   provider: MemoryProvider,
+  llmRouter: LlmTaskRouter | undefined,
   compressed: CompressedObservation[],
   sessionId: string,
   project: string,
@@ -108,10 +115,14 @@ async function produceSummaryXml(
 }> {
   const chunkSize = getChunkSize();
   if (compressed.length <= chunkSize) {
-    const response = await provider.summarize(
-      SUMMARY_SYSTEM,
-      buildSummaryPrompt(compressed),
-    );
+    const prompt = buildSummaryPrompt(compressed);
+    const response = llmRouter
+      ? await llmRouter.run(
+        "summary",
+        (selectedProvider) => selectedProvider.summarize(SUMMARY_SYSTEM, prompt),
+        (candidate) => parseSummaryXml(candidate, sessionId, project, compressed.length) !== null,
+      )
+      : await provider.summarize(SUMMARY_SYSTEM, prompt);
     return { response, mode: "single", chunks: 1 };
   }
 
@@ -139,6 +150,7 @@ async function produceSummaryXml(
         const idx = batchStart + j;
         partialByIdx[idx] = await summarizeChunkWithRetry(
           provider,
+          llmRouter,
           chunk,
           sessionId,
           project,
@@ -177,10 +189,14 @@ async function produceSummaryXml(
       obsRangeEnd: Math.min((originalIdx + 1) * chunkSize, compressed.length),
     };
   });
-  const response = await provider.summarize(
-    REDUCE_SYSTEM,
-    buildReducePrompt(reduceInput),
-  );
+  const reducePrompt = buildReducePrompt(reduceInput);
+  const response = llmRouter
+    ? await llmRouter.run(
+      "summary",
+      (selectedProvider) => selectedProvider.summarize(REDUCE_SYSTEM, reducePrompt),
+      (candidate) => parseSummaryXml(candidate, sessionId, project, compressed.length) !== null,
+    )
+    : await provider.summarize(REDUCE_SYSTEM, reducePrompt);
   return { response, mode: "chunked", chunks: chunks.length, skipped };
 }
 
@@ -231,6 +247,7 @@ export function registerSummarizeFunction(
   kv: StateKV,
   provider: MemoryProvider,
   metricsStore?: MetricsStore,
+  llmRouter?: LlmTaskRouter,
 ): void {
   sdk.registerFunction("mem::summarize", 
     async (data: { sessionId: string } | undefined) => {
@@ -285,6 +302,7 @@ export function registerSummarizeFunction(
         for (let attempt = 1; attempt <= 2; attempt++) {
           const produced = await produceSummaryXml(
             provider,
+            llmRouter,
             compressed,
             sessionId,
             session.project,

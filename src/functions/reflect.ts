@@ -12,6 +12,7 @@ import type {
 } from "../types.js";
 import { recordAudit } from "./audit.js";
 import { REFLECT_SYSTEM, buildReflectPrompt } from "../prompts/reflect.js";
+import type { LlmTaskRouter } from "../providers/task-router.js";
 
 interface ConceptCluster {
   concepts: string[];
@@ -164,6 +165,7 @@ export function registerReflectFunctions(
   sdk: ISdk,
   kv: StateKV,
   provider: MemoryProvider,
+  llmRouter?: LlmTaskRouter,
 ): void {
   sdk.registerFunction("mem::reflect", 
     async (data: { maxClusters?: number; project?: string }) => {
@@ -255,7 +257,13 @@ export function registerReflectFunctions(
 
         try {
           const prompt = buildReflectPrompt(cluster);
-          const response = await provider.summarize(REFLECT_SYSTEM, prompt);
+          const response = llmRouter
+            ? await llmRouter.run(
+              "reflection",
+              (selectedProvider) => selectedProvider.summarize(REFLECT_SYSTEM, prompt),
+              (candidate) => /<insight\s+confidence="[^"]+"\s+title="[^"]+">[\s\S]*?<\/insight>/.test(candidate),
+            )
+            : await provider.summarize(REFLECT_SYSTEM, prompt);
 
           const insightRegex =
             /<insight\s+confidence="([^"]+)"\s+title="([^"]+)">([\s\S]*?)<\/insight>/g;

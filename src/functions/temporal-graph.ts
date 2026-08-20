@@ -10,6 +10,7 @@ import type {
 import { KV, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { logger } from "../logger.js";
+import type { LlmTaskRouter } from "../providers/task-router.js";
 
 const TEMPORAL_EXTRACTION_SYSTEM = `You are a temporal knowledge extraction engine. Given observations, extract entities AND their temporal relationships with full context metadata.
 
@@ -153,6 +154,7 @@ export function registerTemporalGraphFunctions(
   sdk: ISdk,
   kv: StateKV,
   provider: MemoryProvider,
+  llmRouter?: LlmTaskRouter,
 ): void {
   sdk.registerFunction("mem::temporal-graph-extract", 
     async (data: {
@@ -178,10 +180,17 @@ export function registerTemporalGraphFunctions(
         .join("\n\n");
 
       try {
-        const response = await provider.compress(
-          TEMPORAL_EXTRACTION_SYSTEM,
-          `Extract temporal knowledge graph from:\n\n${items}`,
-        );
+        const prompt = `Extract temporal knowledge graph from:\n\n${items}`;
+        const response = llmRouter
+          ? await llmRouter.run(
+            "temporal_graph_extraction",
+            (selectedProvider) => selectedProvider.compress(TEMPORAL_EXTRACTION_SYSTEM, prompt),
+            (candidate) => {
+              const parsed = parseTemporalGraphXml(candidate, data.observations.map((o) => o.id));
+              return parsed.nodes.length > 0 || parsed.edges.length > 0;
+            },
+          )
+          : await provider.compress(TEMPORAL_EXTRACTION_SYSTEM, prompt);
 
         const obsIds = data.observations.map((o) => o.id);
         const { nodes, edges } = parseTemporalGraphXml(response, obsIds);

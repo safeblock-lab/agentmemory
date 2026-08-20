@@ -1216,6 +1216,53 @@ agentmemory auto-detects from your environment. By default, no LLM calls are mad
 | **Local (Ollama / LM Studio / vLLM / llama.cpp)** | `OPENAI_API_KEY=local` + `OPENAI_BASE_URL=http://localhost:11434/v1` (Ollama) or `http://localhost:1234/v1` (LM Studio) + `OPENAI_MODEL=<your model>` | Anything OpenAI-API-compatible. Zero cost, runs on your hardware. See [Local models](#local-models-ollama-lm-studio-vllm) below. |
 | Claude subscription fallback | `AGENTMEMORY_ALLOW_AGENT_SDK=true` | Opt-in only. Spawns `@anthropic-ai/claude-agent-sdk` sessions — used to cause unbounded Stop-hook recursion so it is no longer the default. |
 
+### Dual LLM routing
+
+Keep existing provider as `primary` for high-reasoning work. Add optional OpenAI-compatible `aux` provider for routine work. Names are roles: Fireworks/DeepSeek can be `primary`; local Ollama/Qwen can be `aux`. Without valid auxiliary configuration, every task safely stays on `primary`.
+
+```env
+# Primary: Fireworks / DeepSeek
+OPENAI_BASE_URL=https://api.fireworks.ai/inference/v1
+OPENAI_API_KEY=${FIREWORKS_API_KEY}
+OPENAI_MODEL=accounts/fireworks/models/deepseek-v4-flash-0731
+
+# Auxiliary: local Ollama
+AGENTMEMORY_AUX_LLM_BASE_URL=http://127.0.0.1:11434/v1
+AGENTMEMORY_AUX_LLM_API_KEY=ollama
+AGENTMEMORY_AUX_LLM_MODEL=qwen3:4b
+AGENTMEMORY_AUX_LLM_NOTHINK=true
+AGENTMEMORY_AUX_LLM_KEEP_ALIVE=10m
+
+# Every workload: primary | aux
+AGENTMEMORY_GRAPH_LLM=aux
+AGENTMEMORY_TEMPORAL_GRAPH_LLM=aux
+AGENTMEMORY_CONSOLIDATION_LLM=aux
+AGENTMEMORY_COMPRESSION_LLM=aux
+AGENTMEMORY_SUMMARY_LLM=aux
+AGENTMEMORY_ENTITY_EXTRACTION_LLM=aux
+AGENTMEMORY_CLASSIFICATION_LLM=aux
+AGENTMEMORY_REFLECTION_LLM=primary
+AGENTMEMORY_CONFLICT_RESOLUTION_LLM=primary
+AGENTMEMORY_SKILL_EXTRACTION_LLM=aux
+AGENTMEMORY_QUERY_EXPANSION_LLM=aux
+AGENTMEMORY_FLOW_COMPRESSION_LLM=aux
+```
+
+Routine defaults select `aux`; reflection and conflict resolution select `primary`. Auxiliary network/timeout/empty/invalid output triggers one deterministic primary fallback before persistence. Complex consolidation selects `primary` for conflicting structured values, temporal conflict markers, or input above `AGENTMEMORY_AUX_LLM_MAX_INPUT_CHARS`. Routing logs task, provider role, model, fallback category, latency; never prompts, memories, keys, or raw responses.
+
+Classification is embedded in the compression response in this fork. `AGENTMEMORY_COMPRESSION_LLM` controls it normally; an explicit `AGENTMEMORY_CLASSIFICATION_LLM` takes precedence when you need to evaluate classification on a different provider.
+
+Ollama remains host-managed. Install models once:
+
+```bash
+ollama pull qwen3:4b
+ollama pull qwen3-embedding:0.6b
+```
+
+Use independent `OPENAI_EMBEDDING_*` variables for local embeddings. They are never used for generative routing. Run mocked tests first; run paid primary evaluations only after explicit operator approval.
+
+`npm run eval:llm-routing` compares auxiliary and primary on deterministic retention fixtures and reports per-task output validity, required-fact retention, model, and latency. It refuses to call the primary provider unless `AGENTMEMORY_LLM_EVAL_ALLOW_PRIMARY=true` is set.
+
 ### Local models (Ollama / LM Studio / vLLM)
 
 agentmemory talks to any OpenAI-API-compatible server, so anything that exposes `/v1/chat/completions` works without code changes. No paid keys, no cloud, no rate limits — runs entirely on your hardware.

@@ -9,6 +9,11 @@ import type {
   FallbackConfig,
   ClaudeBridgeConfig,
   TeamConfig,
+  AuxiliaryLlmConfig,
+  LlmRouteTarget,
+  LlmRoutingConfig,
+  LlmTask,
+  OpenAIReasoningEffort,
 } from "./types.js";
 
 function safeParseInt(value: string | undefined, fallback: number): number {
@@ -21,6 +26,50 @@ const DATA_DIR = join(homedir(), ".agentmemory");
 const ENV_FILE = join(DATA_DIR, ".env");
 
 let warnPremiumModelShown = false;
+
+const AUX_LLM_DEFAULT_TIMEOUT_MS = 60_000;
+const AUX_LLM_DEFAULT_MAX_TOKENS = 4096;
+const AUX_LLM_DEFAULT_MAX_INPUT_CHARS = 120_000;
+const AUX_LLM_MAX_TIMEOUT_MS = 10 * 60_000;
+const AUX_LLM_MAX_TOKENS = 1_000_000;
+const AUX_LLM_MAX_INPUT_CHARS = 10_000_000;
+
+const LLM_ROUTE_ENV = {
+  graph_extraction: "AGENTMEMORY_GRAPH_LLM",
+  temporal_graph_extraction: "AGENTMEMORY_TEMPORAL_GRAPH_LLM",
+  consolidation: "AGENTMEMORY_CONSOLIDATION_LLM",
+  compression: "AGENTMEMORY_COMPRESSION_LLM",
+  summary: "AGENTMEMORY_SUMMARY_LLM",
+  entity_extraction: "AGENTMEMORY_ENTITY_EXTRACTION_LLM",
+  classification: "AGENTMEMORY_CLASSIFICATION_LLM",
+  reflection: "AGENTMEMORY_REFLECTION_LLM",
+  conflict_resolution: "AGENTMEMORY_CONFLICT_RESOLUTION_LLM",
+  skill_extraction: "AGENTMEMORY_SKILL_EXTRACTION_LLM",
+  query_expansion: "AGENTMEMORY_QUERY_EXPANSION_LLM",
+  flow_compression: "AGENTMEMORY_FLOW_COMPRESSION_LLM",
+} as const satisfies Record<LlmTask, string>;
+
+const DEFAULT_LLM_ROUTES = {
+  graph_extraction: "aux",
+  temporal_graph_extraction: "aux",
+  consolidation: "aux",
+  compression: "aux",
+  summary: "aux",
+  entity_extraction: "aux",
+  classification: "aux",
+  reflection: "primary",
+  conflict_resolution: "primary",
+  skill_extraction: "aux",
+  query_expansion: "aux",
+  flow_compression: "aux",
+} as const satisfies Record<LlmTask, LlmRouteTarget>;
+
+type EnvSource = Record<string, string | undefined>;
+
+interface AuxiliaryLlmConfigResult {
+  config?: AuxiliaryLlmConfig;
+  warnings: string[];
+}
 
 function loadEnvFile(): Record<string, string> {
   if (!existsSync(ENV_FILE)) return {};
@@ -48,6 +97,196 @@ function loadEnvFile(): Record<string, string> {
 
 function hasRealValue(v: string | undefined): v is string {
   return typeof v === "string" && v.trim().length > 0;
+}
+
+function parseBoundedAuxInt(
+  env: EnvSource,
+  key: string,
+  fallback: number,
+  max: number,
+  warnings: string[],
+): number {
+  const raw = env[key];
+  if (!hasRealValue(raw)) return fallback;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    warnings.push(`${key} must be a positive integer; using ${fallback}.`);
+    return fallback;
+  }
+  const parsed = Number(trimmed);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > max) {
+    warnings.push(`${key} must be between 1 and ${max}; using ${fallback}.`);
+    return fallback;
+  }
+  return parsed;
+}
+
+function parseAuxBoolean(
+  env: EnvSource,
+  key: string,
+  fallback: boolean,
+  warnings: string[],
+): boolean {
+  const raw = env[key];
+  if (!hasRealValue(raw)) return fallback;
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "true" || normalized === "1") return true;
+  if (normalized === "false" || normalized === "0") return false;
+  warnings.push(`${key} must be true, false, 1, or 0; using ${fallback}.`);
+  return fallback;
+}
+
+function parseAuxBaseUrl(raw: string | undefined): string | undefined {
+  if (!hasRealValue(raw) || raw.length > 2048) return undefined;
+  try {
+    const url = new URL(raw.trim());
+    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+    if (url.username || url.password) return undefined;
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return undefined;
+  }
+}
+
+function parseKeepAlive(raw: string | undefined): string | undefined {
+  if (!hasRealValue(raw) || raw.length > 64) return undefined;
+  const trimmed = raw.trim();
+  return /^(?:-1|0|(?:\d+(?:\.\d+)?(?:ms|s|m|h))+)$/.test(trimmed)
+    ? trimmed
+    : undefined;
+}
+
+function parseAuxiliaryLlmConfig(env: EnvSource): AuxiliaryLlmConfigResult {
+  const warnings: string[] = [];
+  const auxKeys = [
+    "AGENTMEMORY_AUX_LLM_BASE_URL",
+    "AGENTMEMORY_AUX_LLM_API_KEY",
+    "AGENTMEMORY_AUX_LLM_MODEL",
+    "AGENTMEMORY_AUX_LLM_TIMEOUT_MS",
+    "AGENTMEMORY_AUX_LLM_MAX_TOKENS",
+    "AGENTMEMORY_AUX_LLM_MAX_INPUT_CHARS",
+    "AGENTMEMORY_AUX_LLM_REASONING_EFFORT",
+    "AGENTMEMORY_AUX_LLM_NOTHINK",
+    "AGENTMEMORY_AUX_LLM_KEEP_ALIVE",
+  ];
+  if (!auxKeys.some((key) => hasRealValue(env[key]))) {
+    return { warnings };
+  }
+
+  const baseURL = parseAuxBaseUrl(env["AGENTMEMORY_AUX_LLM_BASE_URL"]);
+  const model = env["AGENTMEMORY_AUX_LLM_MODEL"]?.trim();
+  if (!baseURL || !model || model.length > 512) {
+    warnings.push(
+      "Auxiliary LLM configuration ignored: AGENTMEMORY_AUX_LLM_BASE_URL must be an absolute http(s) URL without credentials and AGENTMEMORY_AUX_LLM_MODEL must be set.",
+    );
+    return { warnings };
+  }
+
+  const timeoutMs = parseBoundedAuxInt(
+    env,
+    "AGENTMEMORY_AUX_LLM_TIMEOUT_MS",
+    AUX_LLM_DEFAULT_TIMEOUT_MS,
+    AUX_LLM_MAX_TIMEOUT_MS,
+    warnings,
+  );
+  const maxTokens = parseBoundedAuxInt(
+    env,
+    "AGENTMEMORY_AUX_LLM_MAX_TOKENS",
+    AUX_LLM_DEFAULT_MAX_TOKENS,
+    AUX_LLM_MAX_TOKENS,
+    warnings,
+  );
+  const maxInputChars = parseBoundedAuxInt(
+    env,
+    "AGENTMEMORY_AUX_LLM_MAX_INPUT_CHARS",
+    AUX_LLM_DEFAULT_MAX_INPUT_CHARS,
+    AUX_LLM_MAX_INPUT_CHARS,
+    warnings,
+  );
+  const noThink = parseAuxBoolean(
+    env,
+    "AGENTMEMORY_AUX_LLM_NOTHINK",
+    false,
+    warnings,
+  );
+
+  const reasoningRaw = env["AGENTMEMORY_AUX_LLM_REASONING_EFFORT"]?.trim().toLowerCase();
+  const validReasoning = new Set<OpenAIReasoningEffort>([
+    "none",
+    "low",
+    "medium",
+    "high",
+  ]);
+  const reasoningEffort = reasoningRaw && validReasoning.has(reasoningRaw as OpenAIReasoningEffort)
+    ? reasoningRaw as OpenAIReasoningEffort
+    : undefined;
+  if (reasoningRaw && !reasoningEffort) {
+    warnings.push(
+      "AGENTMEMORY_AUX_LLM_REASONING_EFFORT must be none, low, medium, or high; omitting it.",
+    );
+  }
+  if (noThink && reasoningEffort && reasoningEffort !== "none") {
+    warnings.push(
+      "AGENTMEMORY_AUX_LLM_NOTHINK overrides AGENTMEMORY_AUX_LLM_REASONING_EFFORT with none.",
+    );
+  }
+
+  const keepAliveRaw = env["AGENTMEMORY_AUX_LLM_KEEP_ALIVE"];
+  const keepAlive = parseKeepAlive(keepAliveRaw);
+  if (hasRealValue(keepAliveRaw) && !keepAlive) {
+    warnings.push(
+      "AGENTMEMORY_AUX_LLM_KEEP_ALIVE must be -1, 0, or a duration using ms, s, m, or h; omitting it.",
+    );
+  }
+
+  return {
+    config: {
+      provider: "openai",
+      baseURL,
+      apiKey: env["AGENTMEMORY_AUX_LLM_API_KEY"]?.trim() || "",
+      model,
+      timeoutMs,
+      maxTokens,
+      maxInputChars,
+      reasoningEffort: noThink ? "none" : reasoningEffort,
+      noThink,
+      keepAlive,
+    },
+    warnings,
+  };
+}
+
+function parseLlmRoutingConfig(
+  env: EnvSource,
+  hasAuxiliaryProvider: boolean,
+  initialWarnings: string[] = [],
+): LlmRoutingConfig {
+  const warnings = [...initialWarnings];
+  const routes = { ...DEFAULT_LLM_ROUTES } as Record<LlmTask, LlmRouteTarget>;
+  const explicitRoutes: Partial<Record<LlmTask, LlmRouteTarget>> = {};
+  let explicitlyRequestsAuxiliary = false;
+
+  for (const task of Object.keys(LLM_ROUTE_ENV) as LlmTask[]) {
+    const key = LLM_ROUTE_ENV[task];
+    const raw = env[key];
+    if (!hasRealValue(raw)) continue;
+    const value = raw.trim().toLowerCase();
+    if (value !== "primary" && value !== "aux") {
+      warnings.push(`${key} must be primary or aux; using ${routes[task]}.`);
+      continue;
+    }
+    routes[task] = value;
+    explicitRoutes[task] = value;
+    explicitlyRequestsAuxiliary ||= value === "aux";
+  }
+
+  if (explicitlyRequestsAuxiliary && !hasAuxiliaryProvider) {
+    warnings.push(
+      "An LLM route explicitly selects aux, but no valid auxiliary provider is configured; primary fallback will be used.",
+    );
+  }
+
+  return { routes, explicitRoutes, warnings };
 }
 
 function detectProvider(env: Record<string, string>): ProviderConfig {
@@ -157,6 +396,12 @@ export function loadConfig(): AgentMemoryConfig {
   const env = getMergedEnv();
 
   const provider = detectProvider(env);
+  const auxiliary = parseAuxiliaryLlmConfig(env);
+  const llmRouting = parseLlmRoutingConfig(
+    env,
+    Boolean(auxiliary.config),
+    auxiliary.warnings,
+  );
 
   // Port quartet: REST is the anchor; streams/engine derive from it
   // unless individually overridden. Default anchor 3111 yields the
@@ -177,6 +422,8 @@ export function loadConfig(): AgentMemoryConfig {
     restPort,
     streamsPort,
     provider,
+    auxiliaryProvider: auxiliary.config,
+    llmRouting,
     tokenBudget: safeParseInt(env["TOKEN_BUDGET"], 2000),
     maxObservationsPerSession: safeParseInt(env["MAX_OBS_PER_SESSION"], 500),
     compressionModel: provider.model,
@@ -218,7 +465,8 @@ export function detectLlmProviderKind(): "llm" | "noop" {
     hasRealValue(env["OPENROUTER_API_KEY"]) ||
     hasRealValue(env["MINIMAX_API_KEY"]) ||
     (hasRealValue(env["OPENAI_API_KEY"]) &&
-      env["OPENAI_API_KEY_FOR_LLM"] !== "false")
+      env["OPENAI_API_KEY_FOR_LLM"] !== "false") ||
+    Boolean(parseAuxiliaryLlmConfig(env).config)
   ) {
     return "llm";
   }
@@ -379,7 +627,8 @@ function hasLLMProviderConfigured(env: Record<string, string | undefined>): bool
       env["GOOGLE_API_KEY"] ||
       env["MINIMAX_API_KEY"] ||
       env["OPENAI_BASE_URL"] ||
-      provider === "agent-sdk",
+      provider === "agent-sdk" ||
+      parseAuxiliaryLlmConfig(env).config,
   );
 }
 

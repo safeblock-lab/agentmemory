@@ -149,6 +149,41 @@ export interface ProviderConfig {
 
 export type ProviderType = "agent-sdk" | "anthropic" | "gemini" | "openrouter" | "minimax" | "openai" | "noop";
 
+export type OpenAIReasoningEffort = "none" | "low" | "medium" | "high";
+
+export interface AuxiliaryLlmConfig extends ProviderConfig {
+  provider: "openai";
+  baseURL: string;
+  apiKey: string;
+  timeoutMs: number;
+  reasoningEffort?: OpenAIReasoningEffort;
+  noThink: boolean;
+  keepAlive?: string;
+  maxInputChars: number;
+}
+
+export type LlmTask =
+  | "graph_extraction"
+  | "temporal_graph_extraction"
+  | "consolidation"
+  | "compression"
+  | "summary"
+  | "entity_extraction"
+  | "classification"
+  | "reflection"
+  | "conflict_resolution"
+  | "skill_extraction"
+  | "query_expansion"
+  | "flow_compression";
+
+export type LlmRouteTarget = "primary" | "aux";
+
+export interface LlmRoutingConfig {
+  routes: Record<LlmTask, LlmRouteTarget>;
+  explicitRoutes: Partial<Record<LlmTask, LlmRouteTarget>>;
+  warnings: string[];
+}
+
 export interface MemoryProvider {
   name: string;
   compress(systemPrompt: string, userPrompt: string): Promise<string>;
@@ -161,6 +196,8 @@ export interface AgentMemoryConfig {
   restPort: number;
   streamsPort: number;
   provider: ProviderConfig;
+  auxiliaryProvider?: AuxiliaryLlmConfig;
+  llmRouting: LlmRoutingConfig;
   tokenBudget: number;
   maxObservationsPerSession: number;
   compressionModel: string;
