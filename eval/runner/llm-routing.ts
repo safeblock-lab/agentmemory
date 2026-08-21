@@ -18,6 +18,7 @@ interface EvaluationResult {
   requiredTerms: number;
   retainedTerms: number;
   valid: boolean;
+  failure?: "provider_request";
 }
 
 const CASES: EvaluationCase[] = [
@@ -65,22 +66,35 @@ async function evaluateCase(
   model: string,
 ): Promise<EvaluationResult> {
   const startedAt = Date.now();
-  const response = testCase.operation === "compress"
-    ? await provider.compress(testCase.system, testCase.prompt)
-    : await provider.summarize(testCase.system, testCase.prompt);
-  const normalized = response.toLowerCase();
-  const retainedTerms = testCase.requiredTerms.filter((term) =>
-    normalized.includes(term.toLowerCase()),
-  ).length;
-  return {
-    task: testCase.task,
-    provider: role,
-    model,
-    latencyMs: Date.now() - startedAt,
-    requiredTerms: testCase.requiredTerms.length,
-    retainedTerms,
-    valid: response.trim().length > 0,
-  };
+  try {
+    const response = testCase.operation === "compress"
+      ? await provider.compress(testCase.system, testCase.prompt)
+      : await provider.summarize(testCase.system, testCase.prompt);
+    const normalized = response.toLowerCase();
+    const retainedTerms = testCase.requiredTerms.filter((term) =>
+      normalized.includes(term.toLowerCase()),
+    ).length;
+    return {
+      task: testCase.task,
+      provider: role,
+      model,
+      latencyMs: Date.now() - startedAt,
+      requiredTerms: testCase.requiredTerms.length,
+      retainedTerms,
+      valid: response.trim().length > 0,
+    };
+  } catch {
+    return {
+      task: testCase.task,
+      provider: role,
+      model,
+      latencyMs: Date.now() - startedAt,
+      requiredTerms: testCase.requiredTerms.length,
+      retainedTerms: 0,
+      valid: false,
+      failure: "provider_request",
+    };
+  }
 }
 
 async function main(): Promise<void> {
