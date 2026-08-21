@@ -61,6 +61,17 @@ describe("LlmTaskRouter", () => {
     expect(primary.compress).not.toHaveBeenCalled();
   });
 
+  it("passes the routed task to the selected provider", async () => {
+    const primary = provider("primary");
+    const auxiliary = provider("auxiliary");
+    await router(primary, auxiliary).run(
+      "classification",
+      (selected) => selected.compress("system", "user"),
+      (value) => value === "auxiliary",
+    );
+    expect(auxiliary.compress).toHaveBeenCalledWith("system", "user", { task: "classification" });
+  });
+
   it("allows a complex workload to override its configured auxiliary route", async () => {
     const primary = provider("primary");
     const auxiliary = provider("auxiliary");

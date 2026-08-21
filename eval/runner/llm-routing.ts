@@ -68,8 +68,8 @@ async function evaluateCase(
   const startedAt = Date.now();
   try {
     const response = testCase.operation === "compress"
-      ? await provider.compress(testCase.system, testCase.prompt)
-      : await provider.summarize(testCase.system, testCase.prompt);
+      ? await provider.compress(testCase.system, testCase.prompt, { task: testCase.task })
+      : await provider.summarize(testCase.system, testCase.prompt, { task: testCase.task });
     const normalized = response.toLowerCase();
     const retainedTerms = testCase.requiredTerms.filter((term) =>
       normalized.includes(term.toLowerCase()),

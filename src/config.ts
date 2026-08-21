@@ -148,6 +148,17 @@ function parseAuxBaseUrl(raw: string | undefined): string | undefined {
   }
 }
 
+function isLocalOllamaBaseUrl(baseURL: string): boolean {
+  try {
+    const url = new URL(baseURL);
+    return url.protocol === "http:"
+      && url.port === "11434"
+      && ["localhost", "127.0.0.1", "[::1]", "::1"].includes(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
 function parseKeepAlive(raw: string | undefined): string | undefined {
   if (!hasRealValue(raw) || raw.length > 64) return undefined;
   const trimmed = raw.trim();
@@ -159,6 +170,7 @@ function parseKeepAlive(raw: string | undefined): string | undefined {
 function parseAuxiliaryLlmConfig(env: EnvSource): AuxiliaryLlmConfigResult {
   const warnings: string[] = [];
   const auxKeys = [
+    "AGENTMEMORY_AUX_LLM_PROVIDER",
     "AGENTMEMORY_AUX_LLM_BASE_URL",
     "AGENTMEMORY_AUX_LLM_API_KEY",
     "AGENTMEMORY_AUX_LLM_MODEL",
@@ -179,6 +191,17 @@ function parseAuxiliaryLlmConfig(env: EnvSource): AuxiliaryLlmConfigResult {
     warnings.push(
       "Auxiliary LLM configuration ignored: AGENTMEMORY_AUX_LLM_BASE_URL must be an absolute http(s) URL without credentials and AGENTMEMORY_AUX_LLM_MODEL must be set.",
     );
+    return { warnings };
+  }
+
+  const providerRaw = env["AGENTMEMORY_AUX_LLM_PROVIDER"]?.trim().toLowerCase();
+  const provider = providerRaw || (isLocalOllamaBaseUrl(baseURL) ? "ollama" : "openai");
+  if (provider !== "openai" && provider !== "ollama") {
+    warnings.push("AGENTMEMORY_AUX_LLM_PROVIDER must be openai or ollama; auxiliary configuration ignored.");
+    return { warnings };
+  }
+  if (provider === "ollama" && !isLocalOllamaBaseUrl(baseURL)) {
+    warnings.push("AGENTMEMORY_AUX_LLM_PROVIDER=ollama requires a local http://localhost:11434 base URL; auxiliary configuration ignored.");
     return { warnings };
   }
 
@@ -206,7 +229,7 @@ function parseAuxiliaryLlmConfig(env: EnvSource): AuxiliaryLlmConfigResult {
   const noThink = parseAuxBoolean(
     env,
     "AGENTMEMORY_AUX_LLM_NOTHINK",
-    false,
+    provider === "ollama",
     warnings,
   );
 
@@ -241,7 +264,7 @@ function parseAuxiliaryLlmConfig(env: EnvSource): AuxiliaryLlmConfigResult {
 
   return {
     config: {
-      provider: "openai",
+      provider,
       baseURL,
       apiKey: env["AGENTMEMORY_AUX_LLM_API_KEY"]?.trim() || "",
       model,

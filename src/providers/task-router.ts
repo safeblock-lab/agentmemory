@@ -65,7 +65,7 @@ export class LlmTaskRouter {
 
     const startedAt = Date.now();
     try {
-      const candidate = await operation(this.auxiliary.provider);
+      const candidate = await operation(this.withTask(this.auxiliary.provider, task));
       const failureReason = this.getCandidateFailure(candidate, validate);
       if (!failureReason) {
         this.emit({
@@ -91,7 +91,7 @@ export class LlmTaskRouter {
     failureReason?: LlmFallbackReason,
   ): Promise<T> {
     const startedAt = Date.now();
-    const candidate = await operation(this.primary.provider);
+    const candidate = await operation(this.withTask(this.primary.provider, task));
     const primaryFailure = this.getCandidateFailure(candidate, validate);
     if (primaryFailure) {
       throw new Error(`LLM ${task} response failed deterministic validation`);
@@ -116,5 +116,16 @@ export class LlmTaskRouter {
 
   private emit(event: LlmRoutingEvent): void {
     this.onEvent?.(event);
+  }
+
+  private withTask(provider: MemoryProvider, task: LlmTask): MemoryProvider {
+    return {
+      name: provider.name,
+      compress: (systemPrompt, userPrompt) => provider.compress(systemPrompt, userPrompt, { task }),
+      summarize: (systemPrompt, userPrompt) => provider.summarize(systemPrompt, userPrompt, { task }),
+      ...(provider.describeImage
+        ? { describeImage: provider.describeImage.bind(provider) }
+        : {}),
+    };
   }
 }

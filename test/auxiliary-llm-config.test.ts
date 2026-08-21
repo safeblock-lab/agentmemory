@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.js";
 
 const AUX_KEYS = [
+  "AGENTMEMORY_AUX_LLM_PROVIDER",
   "AGENTMEMORY_AUX_LLM_BASE_URL",
   "AGENTMEMORY_AUX_LLM_API_KEY",
   "AGENTMEMORY_AUX_LLM_MODEL",
@@ -50,6 +51,7 @@ describe("auxiliary LLM configuration", () => {
     process.env["AGENTMEMORY_GRAPH_LLM"] = "primary";
     const config = loadConfig();
     expect(config.auxiliaryProvider).toMatchObject({
+      provider: "ollama",
       baseURL: "http://127.0.0.1:11434/v1",
       apiKey: "ollama",
       model: "local-model",
@@ -59,6 +61,15 @@ describe("auxiliary LLM configuration", () => {
     });
     expect(config.llmRouting.routes.graph_extraction).toBe("primary");
     expect(config.llmRouting.explicitRoutes.graph_extraction).toBe("primary");
+  });
+
+  it("rejects native Ollama on a non-local endpoint", () => {
+    process.env["AGENTMEMORY_AUX_LLM_PROVIDER"] = "ollama";
+    process.env["AGENTMEMORY_AUX_LLM_BASE_URL"] = "https://example.test/v1";
+    process.env["AGENTMEMORY_AUX_LLM_MODEL"] = "local-model";
+    const config = loadConfig();
+    expect(config.auxiliaryProvider).toBeUndefined();
+    expect(config.llmRouting.warnings.join(" ")).toContain("requires a local");
   });
 
   it("rejects partial auxiliary configuration without changing primary routing", () => {

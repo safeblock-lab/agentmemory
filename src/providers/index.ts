@@ -9,6 +9,7 @@ import { AnthropicProvider } from "./anthropic.js";
 import { MinimaxProvider } from "./minimax.js";
 import { NoopProvider } from "./noop.js";
 import { OpenAIProvider } from "./openai.js";
+import { OllamaProvider } from "./ollama.js";
 import { OpenRouterProvider } from "./openrouter.js";
 import { ResilientProvider } from "./resilient.js";
 import { FallbackChainProvider } from "./fallback-chain.js";
@@ -62,8 +63,9 @@ export function createProvider(config: ProviderConfig): ResilientProvider {
 export function createAuxiliaryProvider(
   config: AuxiliaryLlmConfig,
 ): ResilientProvider {
-  return new ResilientProvider(
-    new OpenAIProvider(
+  const provider = config.provider === "ollama"
+    ? new OllamaProvider(config)
+    : new OpenAIProvider(
       config.apiKey,
       config.model,
       config.maxTokens,
@@ -74,8 +76,8 @@ export function createAuxiliaryProvider(
         noThink: config.noThink,
         keepAlive: config.keepAlive,
       },
-    ),
-  );
+    );
+  return new ResilientProvider(provider);
 }
 
 export function createFallbackProvider(

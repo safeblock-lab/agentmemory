@@ -152,7 +152,7 @@ export type ProviderType = "agent-sdk" | "anthropic" | "gemini" | "openrouter" |
 export type OpenAIReasoningEffort = "none" | "low" | "medium" | "high";
 
 export interface AuxiliaryLlmConfig extends ProviderConfig {
-  provider: "openai";
+  provider: "openai" | "ollama";
   baseURL: string;
   apiKey: string;
   timeoutMs: number;
@@ -178,6 +178,10 @@ export type LlmTask =
 
 export type LlmRouteTarget = "primary" | "aux";
 
+export interface LlmCallOptions {
+  task?: LlmTask;
+}
+
 export interface LlmRoutingConfig {
   routes: Record<LlmTask, LlmRouteTarget>;
   explicitRoutes: Partial<Record<LlmTask, LlmRouteTarget>>;
@@ -186,8 +190,8 @@ export interface LlmRoutingConfig {
 
 export interface MemoryProvider {
   name: string;
-  compress(systemPrompt: string, userPrompt: string): Promise<string>;
-  summarize(systemPrompt: string, userPrompt: string): Promise<string>;
+  compress(systemPrompt: string, userPrompt: string, options?: LlmCallOptions): Promise<string>;
+  summarize(systemPrompt: string, userPrompt: string, options?: LlmCallOptions): Promise<string>;
   describeImage?(imageData: string, mimeType: string, prompt: string): Promise<string>;
 }
 

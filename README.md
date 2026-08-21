@@ -1227,8 +1227,8 @@ OPENAI_API_KEY=${FIREWORKS_API_KEY}
 OPENAI_MODEL=accounts/fireworks/models/deepseek-v4-flash-0731
 
 # Auxiliary: local Ollama
+AGENTMEMORY_AUX_LLM_PROVIDER=ollama
 AGENTMEMORY_AUX_LLM_BASE_URL=http://127.0.0.1:11434/v1
-AGENTMEMORY_AUX_LLM_API_KEY=ollama
 AGENTMEMORY_AUX_LLM_MODEL=qwen3:4b
 AGENTMEMORY_AUX_LLM_NOTHINK=true
 AGENTMEMORY_AUX_LLM_KEEP_ALIVE=10m
@@ -1248,7 +1248,7 @@ AGENTMEMORY_QUERY_EXPANSION_LLM=aux
 AGENTMEMORY_FLOW_COMPRESSION_LLM=aux
 ```
 
-Routine defaults select `aux`; reflection and conflict resolution select `primary`. Auxiliary network/timeout/empty/invalid output triggers one deterministic primary fallback before persistence. Complex consolidation selects `primary` for conflicting structured values, temporal conflict markers, or input above `AGENTMEMORY_AUX_LLM_MAX_INPUT_CHARS`. Routing logs task, provider role, model, fallback category, latency; never prompts, memories, keys, or raw responses.
+Routine defaults select `aux`; reflection and conflict resolution select `primary`. Local Ollama uses `/api/chat` with `think:false`, deterministic temperature, and task-specific output caps; native mode only accepts local port 11434 endpoints and never sends the auxiliary API key. Set `AGENTMEMORY_AUX_LLM_PROVIDER=openai` for a remote OpenAI-compatible auxiliary. Auxiliary network/timeout/empty/invalid output triggers one deterministic primary fallback before persistence. Complex consolidation selects `primary` for conflicting structured values, temporal conflict markers, or input above `AGENTMEMORY_AUX_LLM_MAX_INPUT_CHARS`. Routing logs task, provider role, model, fallback category, latency; never prompts, memories, keys, or raw responses.
 
 Classification is embedded in the compression response in this fork. `AGENTMEMORY_COMPRESSION_LLM` controls it normally; an explicit `AGENTMEMORY_CLASSIFICATION_LLM` takes precedence when you need to evaluate classification on a different provider.
 
