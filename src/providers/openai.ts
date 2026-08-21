@@ -7,6 +7,7 @@ import {
   buildAuthHeaders,
   buildChatUrl,
   detectAzure,
+  isLocalOllamaUrl,
   normalizeBaseUrl,
 } from "./_openai-shared.js";
 
@@ -125,8 +126,12 @@ export class OpenAIProvider implements MemoryProvider {
       ],
     };
     if (this.noThink) {
-      body.reasoning_effort = "none";
-      if (!isDeepSeek) body.think = false;
+      if (isLocalOllamaUrl(this.baseUrl)) {
+        body.think = false;
+      } else {
+        body.reasoning_effort = "none";
+        if (!isDeepSeek) body.think = false;
+      }
     } else if (this.reasoningEffort && (!isDeepSeek || thinkingRequest === "enabled")) {
       body.reasoning_effort = this.reasoningEffort;
     }
