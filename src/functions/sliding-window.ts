@@ -8,6 +8,7 @@ import { KV, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
+import type { LlmTaskRouter } from "../providers/task-router.js";
 
 const SLIDING_WINDOW_SYSTEM = `You are a contextual enrichment engine. Given a primary observation and its surrounding context window (previous and next observations from the same session), produce an enriched version.
 
@@ -117,6 +118,7 @@ export function registerSlidingWindowFunction(
   sdk: ISdk,
   kv: StateKV,
   provider: MemoryProvider,
+  llmRouter?: LlmTaskRouter,
 ): void {
   sdk.registerFunction("mem::enrich-window", 
     async (data: {
@@ -166,10 +168,13 @@ export function registerSlidingWindowFunction(
 
       try {
         const prompt = buildWindowPrompt(primary, before, after);
-        const response = await provider.compress(
-          SLIDING_WINDOW_SYSTEM,
-          prompt,
-        );
+        const response = llmRouter
+          ? await llmRouter.run(
+            "entity_extraction",
+            (selectedProvider) => selectedProvider.compress(SLIDING_WINDOW_SYSTEM, prompt),
+            (candidate) => parseEnrichedXml(candidate) !== null,
+          )
+          : await provider.compress(SLIDING_WINDOW_SYSTEM, prompt);
         const parsed = parseEnrichedXml(response);
 
         if (!parsed) {

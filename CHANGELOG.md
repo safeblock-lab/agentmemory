@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.33] — 2026-08-22
+
+### Added
+
+- Dual LLM task routing with an optional local auxiliary provider and deterministic primary fallback.
+- A quality-gated evaluation harness with fifteen fixtures per routed task and structured-output repair before semantic validation.
+
+### Fixed
+
+- Repaired recoverable malformed JSON from local structured model responses without accepting missing or invented facts.
+
+### Docs
+
+- Documented the evaluated Qwen3 4B no-thinking Ollama setup, independent local embeddings, and the validated summary/flow-compression route split.
+
 ## [0.9.32] — 2026-08-17
 
 ### Fixed

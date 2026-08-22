@@ -155,6 +155,9 @@ export function buildAuthHeaders(
       "api-key": apiKey,
     };
   }
+  if (!apiKey) {
+    return { "Content-Type": "application/json" };
+  }
   return {
     "Content-Type": "application/json",
     Authorization: `Bearer ${apiKey}`,
@@ -163,4 +166,13 @@ export function buildAuthHeaders(
 
 export function normalizeBaseUrl(raw: string | undefined): string {
   return (raw || DEFAULT_OPENAI_BASE_URL).replace(/\/+$/, "");
+}
+
+export function isLocalOllamaUrl(baseUrl: string): boolean {
+  try {
+    const url = new URL(baseUrl);
+    return url.port === "11434" && ["localhost", "127.0.0.1", "::1"].includes(url.hostname);
+  } catch {
+    return false;
+  }
 }
