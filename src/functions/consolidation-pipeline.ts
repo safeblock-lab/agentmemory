@@ -17,6 +17,8 @@ import {
 import { recordAudit } from "./audit.js";
 import { getConsolidationDecayDays, isConsolidationEnabled } from "../config.js";
 import { logger } from "../logger.js";
+import { assessConsolidationComplexity } from "./consolidation-complexity.js";
+import type { LlmTaskRouter } from "../providers/task-router.js";
 
 function applyDecay(
   items: Array<{
@@ -46,6 +48,8 @@ export function registerConsolidationPipelineFunction(
   sdk: ISdk,
   kv: StateKV,
   provider: MemoryProvider,
+  llmRouter?: LlmTaskRouter,
+  auxiliaryMaxInputChars?: number,
 ): void {
   sdk.registerFunction("mem::consolidate-pipeline", 
     async (data?: { tier?: string; force?: boolean; project?: string }) => {
@@ -78,10 +82,20 @@ export function registerConsolidationPipelineFunction(
           );
 
           try {
-            const response = await provider.summarize(
-              SEMANTIC_MERGE_SYSTEM,
+            const complexity = assessConsolidationComplexity({
               prompt,
-            );
+              maxAuxiliaryInputChars: auxiliaryMaxInputChars,
+            });
+            const response = llmRouter
+              ? await llmRouter.run(
+                complexity.complex ? "conflict_resolution" : "consolidation",
+                (selectedProvider) => selectedProvider.summarize(
+                  SEMANTIC_MERGE_SYSTEM,
+                  prompt,
+                ),
+                (candidate) => /<fact\s+confidence="[^"]+">[^<]+<\/fact>/.test(candidate),
+              )
+              : await provider.summarize(SEMANTIC_MERGE_SYSTEM, prompt);
 
             const factRegex = /<fact\s+confidence="([^"]+)">([^<]+)<\/fact>/g;
             let match;
@@ -161,10 +175,20 @@ export function registerConsolidationPipelineFunction(
           const prompt = buildProceduralExtractionPrompt(patterns);
 
           try {
-            const response = await provider.summarize(
-              PROCEDURAL_EXTRACTION_SYSTEM,
+            const complexity = assessConsolidationComplexity({
               prompt,
-            );
+              maxAuxiliaryInputChars: auxiliaryMaxInputChars,
+            });
+            const response = llmRouter
+              ? await llmRouter.run(
+                complexity.complex ? "conflict_resolution" : "consolidation",
+                (selectedProvider) => selectedProvider.summarize(
+                  PROCEDURAL_EXTRACTION_SYSTEM,
+                  prompt,
+                ),
+                (candidate) => /<procedure\s+name="[^"]+"\s+trigger="[^"]+">[\s\S]*?<\/procedure>/.test(candidate),
+              )
+              : await provider.summarize(PROCEDURAL_EXTRACTION_SYSTEM, prompt);
 
             const procRegex =
               /<procedure\s+name="([^"]+)"\s+trigger="([^"]+)">([\s\S]*?)<\/procedure>/g;

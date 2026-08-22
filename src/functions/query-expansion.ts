@@ -1,6 +1,7 @@
 import type { ISdk } from "iii-sdk";
 import type { MemoryProvider, QueryExpansion } from "../types.js";
 import { logger } from "../logger.js";
+import type { LlmTaskRouter } from "../providers/task-router.js";
 
 const QUERY_EXPANSION_SYSTEM = `You are a query expansion engine for a memory retrieval system. Given a user query, generate diverse reformulations to maximize recall.
 
@@ -69,6 +70,7 @@ function parseExpansionXml(xml: string): QueryExpansion | null {
 export function registerQueryExpansionFunction(
   sdk: ISdk,
   provider: MemoryProvider,
+  llmRouter?: LlmTaskRouter,
 ): void {
   sdk.registerFunction("mem::expand-query", 
     async (data: { query: string; maxReformulations?: number } | undefined) => {
@@ -83,10 +85,14 @@ export function registerQueryExpansionFunction(
       const query = data.query.trim();
 
       try {
-        const response = await provider.compress(
-          QUERY_EXPANSION_SYSTEM,
-          `Expand this query for memory retrieval:\n\n"${query}"`,
-        );
+        const prompt = `Expand this query for memory retrieval:\n\n"${query}"`;
+        const response = llmRouter
+          ? await llmRouter.run(
+            "query_expansion",
+            (selectedProvider) => selectedProvider.compress(QUERY_EXPANSION_SYSTEM, prompt),
+            (candidate) => parseExpansionXml(candidate) !== null,
+          )
+          : await provider.compress(QUERY_EXPANSION_SYSTEM, prompt);
 
         const parsed = parseExpansionXml(response);
         if (!parsed) {
