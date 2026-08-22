@@ -1,4 +1,5 @@
 import type { AuxiliaryLlmConfig, LlmCallOptions, LlmTask, MemoryProvider } from "../types.js";
+import { jsonrepair } from "jsonrepair";
 import { fetchWithTimeout } from "./_fetch.js";
 import { startLlmCallTelemetry } from "./_llm-logging.js";
 
@@ -16,6 +17,13 @@ const TASK_OUTPUT_TOKENS: Record<LlmTask, number> = {
   query_expansion: 384,
   flow_compression: 768,
 };
+
+const NO_THINK_OUTPUT_FORMAT = {
+  type: "object",
+  properties: { output: { type: "string" } },
+  required: ["output"],
+  additionalProperties: false,
+} as const;
 
 export class OllamaProvider implements MemoryProvider {
   name = "ollama";
@@ -57,18 +65,28 @@ export class OllamaProvider implements MemoryProvider {
     });
     let response: Response;
     try {
+      const messages = this.noThink
+        ? [
+          {
+            role: "system",
+            content: `${systemPrompt}\n\nReturn exactly one JSON object with one string field named output. Put the complete final response in output. Do not include reasoning or any other field.`,
+          },
+          { role: "user", content: userPrompt },
+        ]
+        : [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ];
       response = await fetchWithTimeout(this.endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           model: this.model,
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: userPrompt },
-          ],
+          messages,
           stream: false,
           think: !this.noThink,
-          ...(this.keepAlive ? { keep_alive: this.keepAlive } : {}),
+          ...(this.noThink ? { format: NO_THINK_OUTPUT_FORMAT } : {}),
+          ...(this.keepAlive ? { keep_alive: this.keepAlive === "-1" ? -1 : this.keepAlive } : {}),
           options: {
             num_predict: Math.min(this.maxTokens, task ? TASK_OUTPUT_TOKENS[task] : this.maxTokens),
             temperature: 0,
@@ -91,7 +109,9 @@ export class OllamaProvider implements MemoryProvider {
       telemetry.failure({ errorKind: "invalid_response" });
       throw new Error("Ollama returned invalid JSON");
     }
-    const content = readContent(payload);
+    const rawContent = readContent(payload);
+    const unwrapped = rawContent && this.noThink ? unwrapOutput(rawContent) : rawContent;
+    const content = unwrapped && this.noThink ? repairStructuredJson(stripThinking(unwrapped)) : unwrapped;
     if (!content) {
       telemetry.failure({ errorKind: "invalid_response" });
       throw new Error("Ollama response did not contain assistant content");
@@ -121,4 +141,64 @@ function readContent(payload: unknown): string | undefined {
   if (!message || typeof message !== "object") return undefined;
   const content = (message as Record<string, unknown>)["content"];
   return typeof content === "string" && content.trim() ? content : undefined;
+}
+
+function stripThinking(content: string): string {
+  const closedTrace = content.lastIndexOf("</think>");
+  if (closedTrace !== -1) return content.slice(closedTrace + "</think>".length).trim();
+  return content.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+}
+
+function unwrapOutput(content: string): string {
+  const parsed = parseObjectEnvelope(content);
+  if (parsed) {
+    const output = parsed.output;
+    if (typeof output === "string" && output.trim()) return output;
+  }
+  return content;
+}
+
+function parseObjectEnvelope(content: string): Record<string, unknown> | undefined {
+  const trimmed = content.trim();
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)?.[1] ?? trimmed;
+  for (const candidate of [fenced, extractObjectCandidate(fenced)]) {
+    if (!candidate) continue;
+    try {
+      const parsed: unknown = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      try {
+        const parsed: unknown = JSON.parse(jsonrepair(candidate));
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          return parsed as Record<string, unknown>;
+        }
+      } catch {
+        // An unrepairable envelope stays unusable.
+      }
+    }
+  }
+  return undefined;
+}
+
+function repairStructuredJson(content: string): string {
+  const trimmed = content.trim();
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return content;
+  try {
+    JSON.parse(trimmed);
+    return content;
+  } catch {
+    try {
+      return jsonrepair(trimmed);
+    } catch {
+      return content;
+    }
+  }
+}
+
+function extractObjectCandidate(content: string): string | undefined {
+  const first = content.indexOf("{");
+  const last = content.lastIndexOf("}");
+  return first >= 0 && last > first ? content.slice(first, last + 1) : undefined;
 }
