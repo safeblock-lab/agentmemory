@@ -2,6 +2,7 @@ import type { ISdk } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
 import { KV, generateId } from "../state/schema.js";
 import type { Action, ActionEdge, Crystal, MemoryProvider } from "../types.js";
+import type { LlmTaskRouter } from "../providers/task-router.js";
 
 interface CrystalDigest {
   narrative: string;
@@ -19,6 +20,7 @@ export function registerCrystallizeFunction(
   sdk: ISdk,
   kv: StateKV,
   provider: MemoryProvider,
+  llmRouter?: LlmTaskRouter,
 ): void {
   sdk.registerFunction("mem::crystallize", 
     async (data: {
@@ -54,7 +56,25 @@ export function registerCrystallizeFunction(
       const prompt = buildChainText(actions, relevantEdges);
 
       try {
-        const response = await provider.summarize(CRYSTALLIZE_SYSTEM, prompt);
+        const response = llmRouter
+          ? await llmRouter.run(
+            "reflection",
+            (selectedProvider) => selectedProvider.summarize(CRYSTALLIZE_SYSTEM, prompt),
+            (candidate) => {
+              const json = candidate.match(/\{[\s\S]*\}/)?.[0];
+              if (!json) return false;
+              try {
+                const digest = JSON.parse(json) as Record<string, unknown>;
+                return typeof digest.narrative === "string" && digest.narrative.trim().length > 0 &&
+                  ["keyOutcomes", "filesAffected", "lessons"].every((key) =>
+                    Array.isArray(digest[key]) && digest[key].every((value) => typeof value === "string"),
+                  );
+              } catch {
+                return false;
+              }
+            },
+          )
+          : await provider.summarize(CRYSTALLIZE_SYSTEM, prompt);
         const digest = parseDigest(response);
 
         const crystal: Crystal = {

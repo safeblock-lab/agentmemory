@@ -3,6 +3,7 @@ import type { StateKV } from "../state/kv.js";
 import { KV, generateId } from "../state/schema.js";
 import type { Action, ActionEdge, RoutineRun, MemoryProvider } from "../types.js";
 import { recordAudit } from "./audit.js";
+import type { LlmTaskRouter } from "../providers/task-router.js";
 
 const FLOW_COMPRESS_SYSTEM = `You are a workflow summarizer. Given a completed action chain, produce a concise summary capturing:
 1. The overall goal and outcome
@@ -23,6 +24,7 @@ export function registerFlowCompressFunction(
   sdk: ISdk,
   kv: StateKV,
   provider: MemoryProvider,
+  llmRouter?: LlmTaskRouter,
 ): void {
   sdk.registerFunction("mem::flow-compress", 
     async (data: { runId?: string; actionIds?: string[]; project?: string }) => {
@@ -76,10 +78,13 @@ export function registerFlowCompressFunction(
       const prompt = buildFlowPrompt(doneActions, relevantEdges);
 
       try {
-        const response = await provider.summarize(
-          FLOW_COMPRESS_SYSTEM,
-          prompt,
-        );
+        const response = llmRouter
+          ? await llmRouter.run(
+            "flow_compression",
+            (selectedProvider) => selectedProvider.summarize(FLOW_COMPRESS_SYSTEM, prompt),
+            (candidate) => Boolean(parseFlowSummary(candidate).goal),
+          )
+          : await provider.summarize(FLOW_COMPRESS_SYSTEM, prompt);
         const summary = parseFlowSummary(response);
         const ts = new Date().toISOString();
 

@@ -1216,6 +1216,59 @@ agentmemory auto-detects from your environment. By default, no LLM calls are mad
 | **Local (Ollama / LM Studio / vLLM / llama.cpp)** | `OPENAI_API_KEY=local` + `OPENAI_BASE_URL=http://localhost:11434/v1` (Ollama) or `http://localhost:1234/v1` (LM Studio) + `OPENAI_MODEL=<your model>` | Anything OpenAI-API-compatible. Zero cost, runs on your hardware. See [Local models](#local-models-ollama-lm-studio-vllm) below. |
 | Claude subscription fallback | `AGENTMEMORY_ALLOW_AGENT_SDK=true` | Opt-in only. Spawns `@anthropic-ai/claude-agent-sdk` sessions — used to cause unbounded Stop-hook recursion so it is no longer the default. |
 
+### Dual LLM routing
+
+Keep existing provider as `primary` for high-reasoning work. Add optional OpenAI-compatible `aux` provider for routine work. Names are roles: Fireworks/Nemotron can be `primary`; local Ollama/Qwen can be `aux`. Without valid auxiliary configuration, every task safely stays on `primary`.
+
+```env
+# Primary: Fireworks / Nemotron
+OPENAI_BASE_URL=https://api.fireworks.ai/inference/v1
+OPENAI_API_KEY=${FIREWORKS_API_KEY}
+OPENAI_MODEL=accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b
+
+# Auxiliary: local Ollama with a no-thinking derived model
+AGENTMEMORY_AUX_LLM_PROVIDER=ollama
+AGENTMEMORY_AUX_LLM_BASE_URL=http://127.0.0.1:11434/v1
+AGENTMEMORY_AUX_LLM_API_KEY=ollama
+AGENTMEMORY_AUX_LLM_MODEL=agentmemory-qwen3:4b-nothink
+AGENTMEMORY_AUX_LLM_NOTHINK=true
+AGENTMEMORY_AUX_LLM_KEEP_ALIVE=-1
+
+# Locally validated workloads: auxiliary with deterministic primary fallback
+AGENTMEMORY_SUMMARY_LLM=aux
+AGENTMEMORY_FLOW_COMPRESSION_LLM=aux
+
+# All remaining workloads: primary
+AGENTMEMORY_GRAPH_LLM=primary
+AGENTMEMORY_TEMPORAL_GRAPH_LLM=primary
+AGENTMEMORY_CONSOLIDATION_LLM=primary
+AGENTMEMORY_COMPRESSION_LLM=primary
+AGENTMEMORY_ENTITY_EXTRACTION_LLM=primary
+AGENTMEMORY_CLASSIFICATION_LLM=primary
+AGENTMEMORY_REFLECTION_LLM=primary
+AGENTMEMORY_CONFLICT_RESOLUTION_LLM=primary
+AGENTMEMORY_SKILL_EXTRACTION_LLM=primary
+AGENTMEMORY_QUERY_EXPANSION_LLM=primary
+```
+
+These routes follow the evaluated Qwen3 4B result: only summary and flow compression met the auxiliary-with-fallback threshold. Local Ollama uses `/api/chat` with `think:false`, deterministic temperature, task-specific output caps, and structured output for no-thinking requests; native mode only accepts local port 11434 endpoints and never sends the auxiliary API key. Set `AGENTMEMORY_AUX_LLM_PROVIDER=openai` for a remote OpenAI-compatible auxiliary. Auxiliary network/timeout/empty/invalid output triggers one deterministic primary fallback before persistence. Complex consolidation selects `primary` for conflicting structured values, temporal conflict markers, or input above `AGENTMEMORY_AUX_LLM_MAX_INPUT_CHARS`. Routing logs task, provider role, model, fallback category, latency; never prompts, memories, keys, or raw responses.
+
+Classification is embedded in the compression response in this fork. `AGENTMEMORY_COMPRESSION_LLM` controls it normally; an explicit `AGENTMEMORY_CLASSIFICATION_LLM` takes precedence when you need to evaluate classification on a different provider.
+
+Ollama remains host-managed. Create the derived model once, then install embeddings:
+
+```bash
+ollama pull qwen3:4b
+ollama create agentmemory-qwen3:4b-nothink -f eval/ollama/Modelfile.agentmemory-qwen3-4b-nothink
+ollama pull qwen3-embedding:0.6b
+```
+
+The derived template emits `/no_think` for the configured auxiliary request. After it is created, the `qwen3:4b` tag may be removed: the derived model keeps its referenced blob.
+
+Use independent `OPENAI_EMBEDDING_*` variables for local embeddings. They are never used for generative routing. Run mocked tests first; run paid primary evaluations only after explicit operator approval.
+
+`npm run eval:llm-routing` runs fifteen demanding fixtures for every independently routed LLM task against both providers. The set includes temporal conflicts, noisy command results, directed relationships, versions, secrets boundaries, procedures, and strict JSON schemas. It scores schema validity, repaired syntax, required and critical fact retention, asserted hallucinations, semantic score, and latency; it writes a gitignored JSON scorecard under `eval/reports/`. The comparison disables fallback so its paid-call bound is exact (180 auxiliary + 180 primary calls). It refuses to call the primary provider unless `AGENTMEMORY_LLM_EVAL_ALLOW_PRIMARY=true` is set. A task stays on auxiliary only when at least 90% of answers are valid, mean semantic score is at least 85, critical retention is at least 95%, and there are no critical hallucinations; weaker but recoverable output at 80% or above is marked auxiliary-with-fallback, otherwise primary. Structured auxiliary JSON is repaired deterministically before the same schema and semantic checks; repair never turns missing or invented facts into a passing result.
+
 ### Local models (Ollama / LM Studio / vLLM)
 
 agentmemory talks to any OpenAI-API-compatible server, so anything that exposes `/v1/chat/completions` works without code changes. No paid keys, no cloud, no rate limits — runs entirely on your hardware.

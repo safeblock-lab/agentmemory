@@ -2,12 +2,14 @@ import type {
   MemoryProvider,
   ProviderConfig,
   FallbackConfig,
+  AuxiliaryLlmConfig,
 } from "../types.js";
 import { AgentSDKProvider } from "./agent-sdk.js";
 import { AnthropicProvider } from "./anthropic.js";
 import { MinimaxProvider } from "./minimax.js";
 import { NoopProvider } from "./noop.js";
 import { OpenAIProvider } from "./openai.js";
+import { OllamaProvider } from "./ollama.js";
 import { OpenRouterProvider } from "./openrouter.js";
 import { ResilientProvider } from "./resilient.js";
 import { FallbackChainProvider } from "./fallback-chain.js";
@@ -56,6 +58,26 @@ function defaultModelFor(providerType: ProviderConfig["provider"]): string {
 
 export function createProvider(config: ProviderConfig): ResilientProvider {
   return new ResilientProvider(createBaseProvider(config));
+}
+
+export function createAuxiliaryProvider(
+  config: AuxiliaryLlmConfig,
+): ResilientProvider {
+  const provider = config.provider === "ollama"
+    ? new OllamaProvider(config)
+    : new OpenAIProvider(
+      config.apiKey,
+      config.model,
+      config.maxTokens,
+      config.baseURL,
+      {
+        timeoutMs: config.timeoutMs,
+        reasoningEffort: config.reasoningEffort,
+        noThink: config.noThink,
+        keepAlive: config.keepAlive,
+      },
+    );
+  return new ResilientProvider(provider);
 }
 
 export function createFallbackProvider(

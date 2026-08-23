@@ -22,6 +22,7 @@ import { scoreCompression } from "../eval/quality.js";
 import { compressWithRetry } from "../eval/self-correct.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import { logger } from "../logger.js";
+import type { LlmTaskRouter } from "../providers/task-router.js";
 
 const VALID_TYPES = new Set<string>([
   "file_read",
@@ -69,6 +70,7 @@ export function registerCompressFunction(
   kv: StateKV,
   provider: MemoryProvider,
   metricsStore?: MetricsStore,
+  llmRouter?: LlmTaskRouter,
 ): void {
   sdk.registerFunction("mem::compress", 
     async (data: {
@@ -133,13 +135,22 @@ export function registerCompressFunction(
             : { valid: false, errors: result.result.errors };
         };
 
-        const { response, retried } = await compressWithRetry(
-          provider,
-          COMPRESSION_SYSTEM,
-          prompt,
-          validator,
-          1,
-        );
+        const routedResponse = llmRouter?.hasAuxiliaryProvider
+          ? await llmRouter.run(
+            llmRouter.hasExplicitRoute("classification") ? "classification" : "compression",
+            (selectedProvider) => selectedProvider.compress(COMPRESSION_SYSTEM, prompt),
+            (response) => validator(response).valid,
+          )
+          : undefined;
+        const { response, retried } = routedResponse === undefined
+          ? await compressWithRetry(
+            provider,
+            COMPRESSION_SYSTEM,
+            prompt,
+            validator,
+            1,
+          )
+          : { response: routedResponse, retried: false };
 
         const parsed = parseCompressionXml(response);
         if (!parsed) {

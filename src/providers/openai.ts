@@ -1,4 +1,4 @@
-import type { MemoryProvider } from "../types.js";
+import type { MemoryProvider, OpenAIReasoningEffort } from "../types.js";
 import { getEnvVar, isDeepSeekThinkingEnabled } from "../config.js";
 import { fetchWithTimeout } from "./_fetch.js";
 import { extractLlmTokenUsage, startLlmCallTelemetry } from "./_llm-logging.js";
@@ -7,11 +7,18 @@ import {
   buildAuthHeaders,
   buildChatUrl,
   detectAzure,
+  isLocalOllamaUrl,
   normalizeBaseUrl,
 } from "./_openai-shared.js";
 
-const DEFAULT_MODEL = "gpt-4o-mini";
 const DEFAULT_TIMEOUT_MS = 60_000;
+
+export interface OpenAIProviderOptions {
+  timeoutMs?: number;
+  reasoningEffort?: OpenAIReasoningEffort;
+  noThink?: boolean;
+  keepAlive?: string;
+}
 
 /**
  * OpenAI-compatible LLM provider.
@@ -53,16 +60,27 @@ export class OpenAIProvider implements MemoryProvider {
   private baseUrl: string;
   private reasoningEffort?: string;
   private timeoutMs: number;
+  private noThink: boolean;
+  private keepAlive?: string;
   private isAzure: boolean;
   private azureApiVersion: string;
 
-  constructor(apiKey: string, model: string, maxTokens: number, baseURL?: string) {
+  constructor(
+    apiKey: string,
+    model: string,
+    maxTokens: number,
+    baseURL?: string,
+    options: OpenAIProviderOptions = {},
+  ) {
     this.apiKey = apiKey;
     this.model = model;
     this.maxTokens = maxTokens;
     this.baseUrl = normalizeBaseUrl(baseURL || getEnvVar("OPENAI_BASE_URL"));
-    this.reasoningEffort = getEnvVar("OPENAI_REASONING_EFFORT") || undefined;
-    this.timeoutMs = resolveTimeout();
+    this.reasoningEffort = options.reasoningEffort ??
+      getEnvVar("OPENAI_REASONING_EFFORT") ?? undefined;
+    this.timeoutMs = options.timeoutMs ?? resolveTimeout();
+    this.noThink = options.noThink ?? false;
+    this.keepAlive = options.keepAlive;
     this.azureApiVersion =
       getEnvVar("OPENAI_API_VERSION") || DEFAULT_AZURE_API_VERSION;
     this.isAzure = detectAzure(this.baseUrl);
@@ -84,7 +102,7 @@ export class OpenAIProvider implements MemoryProvider {
     const url = buildChatUrl(this.baseUrl, this.isAzure, this.azureApiVersion);
     const isDeepSeek = isDeepSeekUrl(this.baseUrl);
     const thinkingRequest = isDeepSeek
-      ? (isDeepSeekThinkingEnabled() ? "enabled" : "disabled")
+      ? (this.noThink || !isDeepSeekThinkingEnabled() ? "disabled" : "enabled")
       : undefined;
     const telemetry = startLlmCallTelemetry({
       provider: isDeepSeek ? "deepseek" : "openai",
@@ -107,12 +125,20 @@ export class OpenAIProvider implements MemoryProvider {
         { role: "user", content: userPrompt },
       ],
     };
-    if (this.reasoningEffort && (!isDeepSeek || thinkingRequest === "enabled")) {
+    if (this.noThink) {
+      if (isLocalOllamaUrl(this.baseUrl)) {
+        body.think = false;
+      } else {
+        body.reasoning_effort = "none";
+        if (!isDeepSeek) body.think = false;
+      }
+    } else if (this.reasoningEffort && (!isDeepSeek || thinkingRequest === "enabled")) {
       body.reasoning_effort = this.reasoningEffort;
     }
     if (thinkingRequest) {
       body.thinking = { type: thinkingRequest };
     }
+    if (this.keepAlive) body.keep_alive = this.keepAlive;
 
     // Bound the request via the shared fetchWithTimeout helper, which
     // owns the AbortController + clearTimeout cleanup for every raw-fetch
@@ -228,4 +254,5 @@ function parsePositiveInt(raw: string | null | undefined): number | undefined {
   const n = Number(trimmed);
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
+
 

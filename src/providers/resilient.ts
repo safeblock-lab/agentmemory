@@ -1,4 +1,4 @@
-import type { MemoryProvider, CircuitBreakerState } from "../types.js";
+import type { MemoryProvider, CircuitBreakerState, LlmCallOptions } from "../types.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
 
 export class ResilientProvider implements MemoryProvider {
@@ -23,12 +23,12 @@ export class ResilientProvider implements MemoryProvider {
     }
   }
 
-  async compress(systemPrompt: string, userPrompt: string): Promise<string> {
-    return this.call(() => this.inner.compress(systemPrompt, userPrompt));
+  async compress(systemPrompt: string, userPrompt: string, options?: LlmCallOptions): Promise<string> {
+    return this.call(() => this.inner.compress(systemPrompt, userPrompt, options));
   }
 
-  async summarize(systemPrompt: string, userPrompt: string): Promise<string> {
-    return this.call(() => this.inner.summarize(systemPrompt, userPrompt));
+  async summarize(systemPrompt: string, userPrompt: string, options?: LlmCallOptions): Promise<string> {
+    return this.call(() => this.inner.summarize(systemPrompt, userPrompt, options));
   }
 
   get circuitState(): CircuitBreakerState {
