@@ -460,7 +460,7 @@ export function registerGraphFunction(
   batchQueue?: FireworksBatchQueue,
 ): void {
   sdk.registerFunction("mem::graph-extract", 
-    async (data: { observations: CompressedObservation[]; batchResponse?: string }) => {
+    async (data: { observations: CompressedObservation[]; batchResponse?: string; deferred?: boolean }) => {
       if (!data.observations || data.observations.length === 0) {
         return { success: false, error: "No observations provided" };
       }
@@ -476,7 +476,7 @@ export function registerGraphFunction(
       );
 
       try {
-        if (!data.batchResponse && batchQueue) {
+        if (!data.batchResponse && data.deferred && batchQueue) {
           const queued = await batchQueue.enqueue({
             correlationId: generateId("fwbgraph"),
             task: "graph_extraction",

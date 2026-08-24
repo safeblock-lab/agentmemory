@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.35] — 2026-08-24
+
+### Changed
+
+- Fireworks Batch now queues only deferred work, groups compatible requests, and submits when 16 requests accumulate or after one hour.
+
 ## [0.9.34] — 2026-08-24
 
 ### Added

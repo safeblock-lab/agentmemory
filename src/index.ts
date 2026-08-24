@@ -633,7 +633,7 @@ async function main() {
   if (isConsolidationEnabled()) {
     const consolidationTimer = setInterval(async () => {
       try {
-        await sdk.trigger({ function_id: "mem::consolidate-pipeline", payload: {} });
+        await sdk.trigger({ function_id: "mem::consolidate-pipeline", payload: { deferred: true } });
       } catch {}
     }, consolidationIntervalMs);
     consolidationTimer.unref();

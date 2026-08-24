@@ -42,7 +42,8 @@ async function main() {
 			headers: authHeaders(),
 			body: JSON.stringify({
 				tier: "all",
-				force: true
+				force: true,
+				deferred: true
 			}),
 			signal: AbortSignal.timeout(12e4)
 		}).catch(() => {});

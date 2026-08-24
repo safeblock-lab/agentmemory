@@ -31,6 +31,8 @@ const config: FireworksBatchConfig = {
   apiKey: "test-key",
   model: "accounts/test/models/test",
   timeoutMs: 1_000,
+  minBatchItems: 1,
+  maxWaitMs: 60_000,
   maxBatchItems: 10,
   maxRequestChars: 10_000,
   maxRequestBytes: 10_000,
@@ -47,6 +49,42 @@ const config: FireworksBatchConfig = {
 };
 
 describe("FireworksBatchCoordinator", () => {
+  it("holds compatible work until the minimum batch size or maximum wait", async () => {
+    const calls: string[] = [];
+    const transport: FireworksBatchTransport = {
+      async createDataset() { calls.push("dataset"); },
+      async uploadDataset() { calls.push("upload"); },
+      async submitJob() { calls.push("submit"); return { remoteJobId: "job-1" }; },
+      async getJobStatus() { return { state: "PENDING" }; },
+      async downloadResults() { return ""; },
+    };
+    const coordinator = new FireworksBatchCoordinator(createKv(), { ...config, minBatchItems: 2 }, transport, async () => {});
+
+    await coordinator.enqueue({ correlationId: "graph-1", task: "graph_extraction", systemPrompt: "system", userPrompt: "one" });
+    await coordinator.process();
+    expect(calls).toEqual([]);
+
+    await coordinator.enqueue({ correlationId: "graph-2", task: "graph_extraction", systemPrompt: "system", userPrompt: "two" });
+    await coordinator.process();
+    expect(calls).toContain("submit");
+  });
+
+  it("flushes one compatible item once it reaches its maximum wait", async () => {
+    const calls: string[] = [];
+    const transport: FireworksBatchTransport = {
+      async createDataset() { calls.push("dataset"); },
+      async uploadDataset() { calls.push("upload"); },
+      async submitJob() { calls.push("submit"); return { remoteJobId: "job-1" }; },
+      async getJobStatus() { return { state: "PENDING" }; },
+      async downloadResults() { return ""; },
+    };
+    const coordinator = new FireworksBatchCoordinator(createKv(), { ...config, minBatchItems: 2, maxWaitMs: 0 }, transport, async () => {});
+
+    await coordinator.enqueue({ correlationId: "graph-1", task: "graph_extraction", systemPrompt: "system", userPrompt: "one" });
+    await coordinator.process();
+    expect(calls).toContain("submit");
+  });
+
   it("submits correlated JSONL work and only applies its matching result", async () => {
     const calls: string[] = [];
     const transport: FireworksBatchTransport = {

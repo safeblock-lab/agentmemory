@@ -51,7 +51,7 @@ async function main() {
     fetch(`${REST_URL}/agentmemory/consolidate-pipeline`, {
       method: "POST",
       headers: authHeaders(),
-      body: JSON.stringify({ tier: "all", force: true }),
+      body: JSON.stringify({ tier: "all", force: true, deferred: true }),
       signal: AbortSignal.timeout(120000),
     }).catch(() => {});
   }

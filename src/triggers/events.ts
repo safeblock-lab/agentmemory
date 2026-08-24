@@ -84,7 +84,7 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
         if (compressed.length > 0) {
           sdk.trigger({
             function_id: "mem::graph-extract",
-            payload: { observations: compressed },
+            payload: { observations: compressed, deferred: true },
             action: TriggerAction.Void(),
           });
         }

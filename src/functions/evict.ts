@@ -83,7 +83,7 @@ async function runRecoveredSessionConsolidation(sdk: ISdk): Promise<void> {
   try {
     await sdk.trigger({
       function_id: "mem::consolidate-pipeline",
-      payload: { tier: "all" },
+      payload: { tier: "all", deferred: true },
     });
   } catch (err) {
     logger.warn("Recovered session consolidation failed", {

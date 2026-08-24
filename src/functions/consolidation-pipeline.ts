@@ -54,7 +54,7 @@ export function registerConsolidationPipelineFunction(
   batchQueue?: FireworksBatchQueue,
 ): void {
   sdk.registerFunction("mem::consolidate-pipeline", 
-    async (data?: { tier?: string; force?: boolean; project?: string; batchResponse?: string }) => {
+    async (data?: { tier?: string; force?: boolean; project?: string; batchResponse?: string; deferred?: boolean }) => {
       if (!data?.force && !isConsolidationEnabled()) {
         return { success: false, skipped: true, reason: "Consolidation disabled: set CONSOLIDATION_ENABLED=true or configure an LLM provider (ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY / MINIMAX_API_KEY / OPENAI_BASE_URL / AGENTMEMORY_PROVIDER=agent-sdk)" };
       }
@@ -89,7 +89,7 @@ export function registerConsolidationPipelineFunction(
               maxAuxiliaryInputChars: auxiliaryMaxInputChars,
             });
             let queued = false;
-            if (!data?.batchResponse && batchQueue) {
+            if (!data?.batchResponse && data?.deferred && batchQueue) {
               const enqueueResult = await batchQueue.enqueue({
                 correlationId: generateId("fwbcon-sem"),
                 task: "consolidation",
@@ -198,7 +198,7 @@ export function registerConsolidationPipelineFunction(
               maxAuxiliaryInputChars: auxiliaryMaxInputChars,
             });
             let queued = false;
-            if (!data?.batchResponse && batchQueue) {
+            if (!data?.batchResponse && data?.deferred && batchQueue) {
               const enqueueResult = await batchQueue.enqueue({
                 correlationId: generateId("fwbcon-proc"),
                 task: "consolidation",

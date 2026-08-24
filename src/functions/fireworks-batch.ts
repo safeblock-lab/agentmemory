@@ -32,6 +32,14 @@ function resultContent(value: unknown): string | undefined {
   return typeof content === "string" ? content : undefined;
 }
 
+function compatibilityKey(item: FireworksBatchWorkItem): string {
+  return `${item.task}\0${item.model}\0${item.maxTokens}\0${item.systemPrompt}`;
+}
+
+function oldestCreatedAt(items: FireworksBatchWorkItem[]): number {
+  return Math.min(...items.map((item) => Date.parse(item.createdAt)).filter(Number.isFinite));
+}
+
 export class FireworksBatchCoordinator implements FireworksBatchQueue {
   constructor(
     private readonly kv: StateKV,
@@ -81,11 +89,13 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
       this.kv.set(KV.fireworksBatchWorkItems, item.id, item),
       this.kv.set(KV.fireworksBatchFingerprints, fingerprint, item.id),
     ]);
+    logger.info("Fireworks Batch work queued", { task: item.task, workItemId: item.id });
     return { queued: true, workItemId: item.id };
   }
 
   async process(): Promise<void> {
     if (!this.config.enabled || !this.transport) return;
+    await this.pollSubmitted();
     await this.submitQueued();
     await this.pollSubmitted();
   }
@@ -94,16 +104,33 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
     const transport = this.transport;
     if (!transport) return;
     const now = new Date().toISOString();
-    const items = (await this.kv.list<FireworksBatchWorkItem>(KV.fireworksBatchWorkItems))
-      .filter((item) => item.state === "queued" && item.nextAttemptAt <= now)
-      .slice(0, this.config.maxBatchItems);
-    if (items.length === 0) return;
-    const first = items[0]!;
-    const compatible = items.filter((item) => item.task === first.task && item.model === first.model && item.systemPrompt === first.systemPrompt && item.maxTokens === first.maxTokens);
+    const [items, jobs] = await Promise.all([
+      this.kv.list<FireworksBatchWorkItem>(KV.fireworksBatchWorkItems),
+      this.kv.list<FireworksBatchJob>(KV.fireworksBatchJobs),
+    ]);
+    if (jobs.filter((job) => job.state === "submitted" || job.state === "polling").length >= this.config.maxConcurrency) return;
+    const groups = new Map<string, FireworksBatchWorkItem[]>();
+    for (const item of items.filter((candidate) => candidate.state === "queued" && candidate.nextAttemptAt <= now)) {
+      const key = compatibilityKey(item);
+      const group = groups.get(key) ?? [];
+      group.push(item);
+      groups.set(key, group);
+    }
+    const eligible = [...groups.values()]
+      .map((group) => group.sort((left, right) => left.createdAt.localeCompare(right.createdAt)).slice(0, this.config.maxBatchItems))
+      .filter((group) => group.length >= this.config.minBatchItems || Date.now() - oldestCreatedAt(group) >= this.config.maxWaitMs)
+      .sort((left, right) => oldestCreatedAt(left) - oldestCreatedAt(right));
+    const compatible = eligible[0];
+    if (!compatible || compatible.length === 0) return;
+    const first = compatible[0];
     const jobId = generateId("fwbjob");
     const inputDatasetId = `${jobId}-input`;
     const outputDatasetId = `${jobId}-output`;
     const jsonl = compatible.map((item) => JSON.stringify({ custom_id: item.customId, body: { model: item.model, messages: [{ role: "system", content: item.systemPrompt }, { role: "user", content: item.userPrompt }], max_tokens: item.maxTokens } })).join("\n");
+    if (Buffer.byteLength(jsonl, "utf8") > this.config.maxRequestBytes) {
+      logger.warn("Fireworks Batch compatible work exceeds request byte limit", { task: first.task, itemCount: compatible.length });
+      return;
+    }
     const job: FireworksBatchJob = { id: jobId, inputDatasetId, outputDatasetId, model: first.model, task: first.task, workItemIds: compatible.map((item) => item.id), state: "submitted", attempts: 1, nextAttemptAt: new Date(Date.now() + this.config.pollIntervalMs).toISOString(), createdAt: now, updatedAt: now, remoteJobId: jobId };
     await this.kv.set(KV.fireworksBatchJobs, job.id, job);
     await Promise.all(compatible.map(async (item) => {
@@ -112,6 +139,7 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
       item.updatedAt = now;
       await this.kv.set(KV.fireworksBatchWorkItems, item.id, item);
     }));
+    logger.info("Fireworks Batch submitting work", { jobId, task: first.task, itemCount: compatible.length });
     try {
       await transport.createDataset(inputDatasetId, compatible.length);
       await transport.uploadDataset(inputDatasetId, jsonl);
