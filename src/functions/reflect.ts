@@ -1,6 +1,6 @@
 import type { ISdk } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
-import { KV, fingerprintId } from "../state/schema.js";
+import { KV, fingerprintId, generateId } from "../state/schema.js";
 import type {
   Insight,
   GraphNode,
@@ -13,6 +13,7 @@ import type {
 import { recordAudit } from "./audit.js";
 import { REFLECT_SYSTEM, buildReflectPrompt } from "../prompts/reflect.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
+import type { FireworksBatchQueue } from "./fireworks-batch.js";
 
 interface ConceptCluster {
   concepts: string[];
@@ -22,6 +23,95 @@ interface ConceptCluster {
   factIds: string[];
   lessonIds: string[];
   crystalIds: string[];
+}
+
+function reflectSourceFingerprint(
+  cluster: ConceptCluster,
+  facts: SemanticMemory[],
+  lessons: Lesson[],
+  crystals: Crystal[],
+): string {
+  return fingerprintId("fwbreflect", JSON.stringify({
+    concepts: cluster.concepts,
+    facts: facts.map((fact) => [fact.id, fact.fact, fact.confidence, fact.updatedAt]).sort(),
+    lessons: lessons.map((lesson) => [lesson.id, lesson.content, lesson.confidence, lesson.updatedAt]).sort(),
+    crystals: crystals.map((crystal) => [crystal.id, crystal.narrative, crystal.createdAt]).sort(),
+  }));
+}
+
+async function currentReflectSourceFingerprint(
+  kv: StateKV,
+  cluster: ConceptCluster,
+): Promise<string | undefined> {
+  const [facts, lessons, crystals] = await Promise.all([
+    Promise.all(cluster.factIds.map((id) => kv.get<SemanticMemory>(KV.semantic, id))),
+    Promise.all(cluster.lessonIds.map((id) => kv.get<Lesson>(KV.lessons, id))),
+    Promise.all(cluster.crystalIds.map((id) => kv.get<Crystal>(KV.crystals, id))),
+  ]);
+  if (facts.some((item) => !item) || lessons.some((item) => !item) || crystals.some((item) => !item)) {
+    return undefined;
+  }
+  return reflectSourceFingerprint(
+    cluster,
+    facts as SemanticMemory[],
+    lessons as Lesson[],
+    crystals as Crystal[],
+  );
+}
+
+async function applyInsights(
+  kv: StateKV,
+  response: string,
+  cluster: ConceptCluster,
+  project: string | undefined,
+  maxInsights: number,
+): Promise<{ newInsights: number; reinforced: number; count: number }> {
+  const insightRegex =
+    /<insight\s+confidence="([^"]+)"\s+title="([^"]+)">([\s\S]*?)<\/insight>/g;
+  let match: RegExpExecArray | null;
+  let newInsights = 0;
+  let reinforced = 0;
+  let count = 0;
+
+  while ((match = insightRegex.exec(response)) !== null && count < maxInsights) {
+    const parsedConfidence = parseFloat(match[1]);
+    const confidence = Number.isNaN(parsedConfidence)
+      ? 0.5
+      : Math.max(0, Math.min(1, parsedConfidence));
+    const title = match[2].trim();
+    const content = match[3].trim();
+    if (!content) continue;
+
+    const id = fingerprintId("ins", content.toLowerCase());
+    const existing = await kv.get<Insight>(KV.insights, id);
+    if (existing && !existing.deleted) {
+      reinforceInsight(existing);
+      await kv.set(KV.insights, existing.id, existing);
+      reinforced++;
+    } else {
+      const now = new Date().toISOString();
+      await kv.set(KV.insights, id, {
+        id,
+        title,
+        content,
+        confidence,
+        reinforcements: 0,
+        sourceConceptCluster: cluster.concepts,
+        sourceMemoryIds: cluster.factIds,
+        sourceLessonIds: cluster.lessonIds,
+        sourceCrystalIds: cluster.crystalIds,
+        project,
+        tags: cluster.concepts,
+        createdAt: now,
+        updatedAt: now,
+        decayRate: 0.05,
+      } satisfies Insight);
+      newInsights++;
+    }
+    count++;
+  }
+
+  return { newInsights, reinforced, count };
 }
 
 function reinforceInsight(insight: Insight): void {
@@ -166,9 +256,17 @@ export function registerReflectFunctions(
   kv: StateKV,
   provider: MemoryProvider,
   llmRouter?: LlmTaskRouter,
+  batchQueue?: FireworksBatchQueue,
 ): void {
   sdk.registerFunction("mem::reflect", 
-    async (data: { maxClusters?: number; project?: string }) => {
+    async (data: {
+      maxClusters?: number;
+      project?: string;
+      deferred?: boolean;
+      batchResponse?: string;
+      batchCluster?: string;
+      batchSourceFingerprint?: string;
+    }) => {
       const maxClusters = Math.min(data?.maxClusters ?? 10, 20);
       const maxInsightsPerCluster = 5;
       const maxTotal = 50;
@@ -202,10 +300,36 @@ export function registerReflectFunctions(
         );
       }
 
+      if (data?.batchResponse && data.batchCluster) {
+        let cluster: ConceptCluster;
+        try {
+          cluster = JSON.parse(data.batchCluster) as ConceptCluster;
+        } catch {
+          return { success: false, error: "Invalid batch reflection cluster" };
+        }
+        const fingerprint = await currentReflectSourceFingerprint(kv, cluster);
+        if (!fingerprint || fingerprint !== data.batchSourceFingerprint) {
+          return { success: true, stale: true };
+        }
+        const applied = await applyInsights(
+          kv,
+          data.batchResponse,
+          cluster,
+          data.project,
+          maxInsightsPerCluster,
+        );
+        await recordAudit(kv, "reflect", "mem::reflect", [], {
+          ...applied,
+          source: "fireworks-batch",
+        });
+        return { success: true, ...applied };
+      }
+
       let newInsights = 0;
       let reinforced = 0;
       let clustersSkipped = 0;
       let totalInsights = 0;
+      let queued = 0;
 
       for (const conceptNames of conceptClusters) {
         if (totalInsights >= maxTotal) break;
@@ -257,6 +381,29 @@ export function registerReflectFunctions(
 
         try {
           const prompt = buildReflectPrompt(cluster);
+          if (data?.deferred && batchQueue) {
+            const sourceFingerprint = reflectSourceFingerprint(
+              cluster,
+              clusterFacts,
+              clusterLessons,
+              clusterCrystals,
+            );
+            const enqueueResult = await batchQueue.enqueue({
+              correlationId: generateId("fwbreflect"),
+              task: "reflection",
+              systemPrompt: REFLECT_SYSTEM,
+              userPrompt: prompt,
+              metadata: {
+                cluster: JSON.stringify(cluster),
+                project: data.project || "",
+                sourceFingerprint,
+              },
+            });
+            if (enqueueResult.queued) {
+              queued++;
+              continue;
+            }
+          }
           const response = llmRouter
             ? await llmRouter.run(
               "reflection",
@@ -265,57 +412,16 @@ export function registerReflectFunctions(
             )
             : await provider.summarize(REFLECT_SYSTEM, prompt);
 
-          const insightRegex =
-            /<insight\s+confidence="([^"]+)"\s+title="([^"]+)">([\s\S]*?)<\/insight>/g;
-          let match;
-          let clusterCount = 0;
-
-          while (
-            (match = insightRegex.exec(response)) !== null &&
-            clusterCount < maxInsightsPerCluster &&
-            totalInsights < maxTotal
-          ) {
-            const parsedConf = parseFloat(match[1]);
-            const confidence = Number.isNaN(parsedConf)
-              ? 0.5
-              : Math.max(0, Math.min(1, parsedConf));
-            const title = match[2].trim();
-            const content = match[3].trim();
-
-            if (!content) continue;
-
-            const fp = fingerprintId("ins", content.trim().toLowerCase());
-            const existing = await kv.get<Insight>(KV.insights, fp);
-
-            if (existing && !existing.deleted) {
-              reinforceInsight(existing);
-              await kv.set(KV.insights, existing.id, existing);
-              reinforced++;
-            } else {
-              const now = new Date().toISOString();
-              const insight: Insight = {
-                id: fp,
-                title,
-                content,
-                confidence,
-                reinforcements: 0,
-                sourceConceptCluster: conceptNames,
-                sourceMemoryIds: cluster.factIds,
-                sourceLessonIds: cluster.lessonIds,
-                sourceCrystalIds: cluster.crystalIds,
-                project: data?.project,
-                tags: conceptNames,
-                createdAt: now,
-                updatedAt: now,
-                decayRate: 0.05,
-              };
-              await kv.set(KV.insights, insight.id, insight);
-              newInsights++;
-            }
-
-            clusterCount++;
-            totalInsights++;
-          }
+          const applied = await applyInsights(
+            kv,
+            response,
+            cluster,
+            data?.project,
+            Math.min(maxInsightsPerCluster, maxTotal - totalInsights),
+          );
+          newInsights += applied.newInsights;
+          reinforced += applied.reinforced;
+          totalInsights += applied.count;
         } catch {
           continue;
         }
@@ -328,6 +434,7 @@ export function registerReflectFunctions(
           clustersProcessed: conceptClusters.length - clustersSkipped,
           clustersSkipped,
           usedFallback,
+          queued,
         });
       } catch {}
 
@@ -338,6 +445,7 @@ export function registerReflectFunctions(
         clustersProcessed: conceptClusters.length - clustersSkipped,
         clustersSkipped,
         usedFallback,
+        queued,
       };
     },
   );

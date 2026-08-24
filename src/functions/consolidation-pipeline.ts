@@ -6,7 +6,7 @@ import type {
   Memory,
   MemoryProvider,
 } from "../types.js";
-import { KV, generateId } from "../state/schema.js";
+import { KV, fingerprintId, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import {
   SEMANTIC_MERGE_SYSTEM,
@@ -54,7 +54,14 @@ export function registerConsolidationPipelineFunction(
   batchQueue?: FireworksBatchQueue,
 ): void {
   sdk.registerFunction("mem::consolidate-pipeline", 
-    async (data?: { tier?: string; force?: boolean; project?: string; batchResponse?: string; deferred?: boolean }) => {
+    async (data?: {
+      tier?: string;
+      force?: boolean;
+      project?: string;
+      batchResponse?: string;
+      batchSourceFingerprint?: string;
+      deferred?: boolean;
+    }) => {
       if (!data?.force && !isConsolidationEnabled()) {
         return { success: false, skipped: true, reason: "Consolidation disabled: set CONSOLIDATION_ENABLED=true or configure an LLM provider (ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY / MINIMAX_API_KEY / OPENAI_BASE_URL / AGENTMEMORY_PROVIDER=agent-sdk)" };
       }
@@ -82,6 +89,19 @@ export function registerConsolidationPipelineFunction(
               concepts: s.concepts,
             })),
           );
+          const sourceFingerprint = fingerprintId("fwbconsem", JSON.stringify(
+            recentSummaries.map((summary) => [
+              summary.sessionId,
+              summary.title,
+              summary.narrative,
+              summary.concepts,
+              summary.createdAt,
+            ]),
+          ));
+
+          if (data?.batchResponse && data.batchSourceFingerprint !== sourceFingerprint) {
+            return { success: true, stale: true };
+          }
 
           try {
             const complexity = assessConsolidationComplexity({
@@ -95,7 +115,7 @@ export function registerConsolidationPipelineFunction(
                 task: "consolidation",
                 systemPrompt: SEMANTIC_MERGE_SYSTEM,
                 userPrompt: prompt,
-                metadata: { tier: "semantic" },
+                metadata: { tier: "semantic", sourceFingerprint },
               });
               if (enqueueResult.queued) {
                 queued = true;
@@ -170,6 +190,7 @@ export function registerConsolidationPipelineFunction(
           const reflectResult = await sdk.trigger({ function_id: "mem::reflect", payload: {
             maxClusters: 10,
             project: data?.project,
+            deferred: data?.deferred,
           } });
           results.reflect = reflectResult;
         } catch (err) {
@@ -191,6 +212,11 @@ export function registerConsolidationPipelineFunction(
 
         if (patterns.length >= 2) {
           const prompt = buildProceduralExtractionPrompt(patterns);
+          const sourceFingerprint = fingerprintId("fwbconproc", JSON.stringify(patterns));
+
+          if (data?.batchResponse && data.batchSourceFingerprint !== sourceFingerprint) {
+            return { success: true, stale: true };
+          }
 
           try {
             const complexity = assessConsolidationComplexity({
@@ -204,7 +230,7 @@ export function registerConsolidationPipelineFunction(
                 task: "consolidation",
                 systemPrompt: PROCEDURAL_EXTRACTION_SYSTEM,
                 userPrompt: prompt,
-                metadata: { tier: "procedural" },
+                metadata: { tier: "procedural", sourceFingerprint },
               });
               if (enqueueResult.queued) {
                 queued = true;

@@ -1,6 +1,6 @@
 # Fireworks Batch
 
-Batch is disabled by default. It runs only explicitly deferred consolidation and graph work; direct API, MCP, and runtime calls remain synchronous. Summaries and flow compression continue to use the local auxiliary route.
+Batch is disabled by default. It runs only explicitly deferred consolidation, graph extraction, reflection, and automatic crystallization; direct API, MCP, and runtime calls remain synchronous. Summaries and flow compression continue to use the local auxiliary route.
 
 ```env
 AGENTMEMORY_FIREWORKS_BATCH_ENABLED=true
@@ -18,6 +18,8 @@ Queued work, job IDs, and completed responses are stored through iii-engine stat
 
 The default poll interval is one minute. Polling only observes remote jobs and checks the local queue; it does not force a submission before the size or age policy is met.
 
-Batch is eventual work: Fireworks can take up to 24 hours. Session-stop graph extraction and scheduled or session-end consolidation are eligible because their callers do not wait for a result. Direct graph extraction and consolidation calls do not enter Batch, so they preserve their normal response behavior.
+Batch is eventual work: Fireworks can take up to 24 hours. Session-stop graph extraction, scheduled or session-end consolidation, deferred reflection, and automatic crystallization are eligible because their callers do not wait for a result. Direct graph extraction, consolidation, reflection, and crystallization calls do not enter Batch, so they preserve their normal response behavior.
+
+Each queued maintenance request carries a fingerprint of the source data used to create its prompt. Before a completed Batch response mutates local state, AgentMemory recomputes that fingerprint. If the source changed during the delay, the old response is marked stale, discarded, and a fresh deferred request is queued. This prevents delayed work from overwriting newer maintenance state.
 
 Each job uploads only its input JSONL dataset and declares its exact row count as `exampleCount`. Fireworks creates the output dataset named by the job, which is later downloaded to apply the completed responses.

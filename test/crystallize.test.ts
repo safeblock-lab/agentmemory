@@ -85,6 +85,30 @@ describe("Crystallize Functions", () => {
   });
 
   describe("mem::crystallize", () => {
+    it("queues explicitly deferred crystallization without calling the online provider", async () => {
+      const batchQueue = {
+        enqueue: vi.fn().mockResolvedValue({ queued: true, workItemId: "fwbwork_1" }),
+      };
+      registerCrystallizeFunction(
+        sdk as never,
+        kv as never,
+        provider,
+        undefined,
+        batchQueue as never,
+      );
+      const action = makeAction({ id: "act_deferred", status: "done" });
+      await kv.set("mem:actions", action.id, action);
+
+      const result = (await sdk.trigger("mem::crystallize", {
+        actionIds: [action.id],
+        deferred: true,
+      })) as { success: boolean; queued?: boolean; workItemId?: string };
+
+      expect(result).toMatchObject({ success: true, queued: true, workItemId: "fwbwork_1" });
+      expect(batchQueue.enqueue).toHaveBeenCalledOnce();
+      expect(provider.summarize).not.toHaveBeenCalled();
+    });
+
     it("crystallizes completed actions with valid JSON response", async () => {
       const action = makeAction({ id: "act_1", title: "Fix bug", status: "done" });
       await kv.set("mem:actions", action.id, action);

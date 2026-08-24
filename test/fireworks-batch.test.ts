@@ -119,4 +119,43 @@ describe("FireworksBatchCoordinator", () => {
     expect(calls).toContain("submit");
     expect(applied).toEqual(["graph-1:<graph />"]);
   });
+
+  it("marks stale results and permits a current replacement to be queued", async () => {
+    const transport: FireworksBatchTransport = {
+      async createDataset() {},
+      async uploadDataset() {},
+      async submitJob() { return { remoteJobId: "job-1" }; },
+      async getJobStatus() { return { state: "COMPLETED" }; },
+      async downloadResults() {
+        return JSON.stringify({
+          custom_id: "reflect-1",
+          response: { body: { choices: [{ message: { content: "<insight />" } }] } },
+        });
+      },
+    };
+    const coordinator = new FireworksBatchCoordinator(
+      createKv(),
+      config,
+      transport,
+      async () => "stale",
+    );
+
+    const first = await coordinator.enqueue({
+      correlationId: "reflect-1",
+      task: "reflection",
+      systemPrompt: "system",
+      userPrompt: "user",
+    });
+    await coordinator.process();
+    const replacement = await coordinator.enqueue({
+      correlationId: "reflect-2",
+      task: "reflection",
+      systemPrompt: "system",
+      userPrompt: "user",
+    });
+
+    expect(first.workItemId).toBeDefined();
+    expect(replacement.workItemId).toBeDefined();
+    expect(replacement.workItemId).not.toBe(first.workItemId);
+  });
 });

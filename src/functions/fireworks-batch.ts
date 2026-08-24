@@ -8,7 +8,10 @@ export interface FireworksBatchQueue {
   enqueue(request: FireworksBatchRequest): Promise<{ queued: boolean; workItemId?: string; reason?: string }>;
 }
 
-type CompletedHandler = (item: FireworksBatchWorkItem, content: string) => Promise<void>;
+type CompletedHandler = (
+  item: FireworksBatchWorkItem,
+  content: string,
+) => Promise<"stale" | void>;
 
 function retryAt(config: FireworksBatchConfig, attempts: number): string {
   const delay = Math.min(config.retryMaxMs, config.retryBaseMs * 2 ** Math.max(0, attempts - 1));
@@ -60,7 +63,7 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
     const existingId = await this.kv.get<string>(KV.fireworksBatchFingerprints, fingerprint);
     if (existingId) {
       const existing = await this.kv.get<FireworksBatchWorkItem>(KV.fireworksBatchWorkItems, existingId);
-      if (existing && existing.state !== "dead-letter" && existing.state !== "failed") {
+      if (existing && existing.state !== "dead-letter" && existing.state !== "failed" && existing.state !== "stale") {
         return { queued: true, workItemId: existing.id };
       }
     }
@@ -211,8 +214,8 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
       if (!item || !allowed.has(item.id) || item.state === "completed") continue;
       const content = resultContent(parsed);
       if (!content) continue;
-      await this.onCompleted(item, content);
-      item.state = "completed";
+      const completion = await this.onCompleted(item, content);
+      item.state = completion === "stale" ? "stale" : "completed";
       const receivedAt = new Date().toISOString();
       item.result = { customId, content, receivedAt };
       item.updatedAt = receivedAt;

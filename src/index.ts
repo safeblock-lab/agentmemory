@@ -255,10 +255,74 @@ async function main() {
         });
         return;
       }
-      await sdk.trigger({
+      if (item.task === "reflection") {
+        const cluster = item.metadata?.cluster;
+        if (!cluster) throw new Error("batch reflection result is missing its cluster");
+        const result = await sdk.trigger({
+          function_id: "mem::reflect",
+          payload: {
+            batchResponse: content,
+            batchCluster: cluster,
+            batchSourceFingerprint: item.metadata?.sourceFingerprint,
+            project: item.metadata?.project || undefined,
+          },
+        });
+        if (typeof result === "object" && result !== null && (result as { stale?: unknown }).stale === true) {
+          await sdk.trigger({
+            function_id: "mem::reflect",
+            payload: { deferred: true, project: item.metadata?.project || undefined },
+          });
+          return "stale";
+        }
+        return;
+      }
+      if (item.task === "crystallization") {
+        const rawActionIds = item.metadata?.actionIds;
+        if (!rawActionIds) throw new Error("batch crystallization result is missing action IDs");
+        const actionIds: unknown = JSON.parse(rawActionIds);
+        if (!Array.isArray(actionIds) || actionIds.some((id) => typeof id !== "string")) {
+          throw new Error("batch crystallization action IDs are invalid");
+        }
+        const result = await sdk.trigger({
+          function_id: "mem::crystallize",
+          payload: {
+            actionIds,
+            sessionId: item.metadata?.sessionId || undefined,
+            project: item.metadata?.project || undefined,
+            batchResponse: content,
+            batchSourceFingerprint: item.metadata?.sourceFingerprint,
+          },
+        });
+        if (typeof result === "object" && result !== null && (result as { stale?: unknown }).stale === true) {
+          await sdk.trigger({
+            function_id: "mem::crystallize",
+            payload: {
+              actionIds,
+              sessionId: item.metadata?.sessionId || undefined,
+              project: item.metadata?.project || undefined,
+              deferred: true,
+            },
+          });
+          return "stale";
+        }
+        return;
+      }
+      const result = await sdk.trigger({
         function_id: "mem::consolidate-pipeline",
-        payload: { tier: item.metadata?.tier, force: true, batchResponse: content },
+        payload: {
+          tier: item.metadata?.tier,
+          force: true,
+          batchResponse: content,
+          batchSourceFingerprint: item.metadata?.sourceFingerprint,
+        },
       });
+      if (typeof result === "object" && result !== null && (result as { stale?: unknown }).stale === true) {
+        await sdk.trigger({
+          function_id: "mem::consolidate-pipeline",
+          payload: { tier: item.metadata?.tier, force: true, deferred: true },
+        });
+        return "stale";
+      }
     },
   );
   const secret = getEnvVar("AGENTMEMORY_SECRET");
@@ -366,13 +430,25 @@ async function main() {
   registerFlowCompressFunction(sdk, kv, provider, taskRouter);
   registerSentinelsFunction(sdk, kv);
   registerSketchesFunction(sdk, kv);
-  registerCrystallizeFunction(sdk, kv, provider, taskRouter);
+  registerCrystallizeFunction(
+    sdk,
+    kv,
+    provider,
+    taskRouter,
+    config.fireworksBatch.enabled ? fireworksBatch : undefined,
+  );
   registerDiagnosticsFunction(sdk, kv);
   registerFacetsFunction(sdk, kv);
   registerVerifyFunction(sdk, kv);
   registerLessonsFunctions(sdk, kv);
   registerObsidianExportFunction(sdk, kv);
-  registerReflectFunctions(sdk, kv, provider, taskRouter);
+  registerReflectFunctions(
+    sdk,
+    kv,
+    provider,
+    taskRouter,
+    config.fireworksBatch.enabled ? fireworksBatch : undefined,
+  );
   registerWorkingMemoryFunctions(sdk, kv, config.tokenBudget);
   registerSkillExtractFunctions(sdk, kv, provider, taskRouter);
   registerCascadeFunction(sdk, kv);

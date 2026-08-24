@@ -138,6 +138,32 @@ describe("Reflect", () => {
   });
 
   describe("mem::reflect", () => {
+    it("queues explicitly deferred reflection without calling the online provider", async () => {
+      const batchQueue = {
+        enqueue: vi.fn().mockResolvedValue({ queued: true, workItemId: "fwbwork_1" }),
+      };
+      registerReflectFunctions(
+        sdk as never,
+        kv as never,
+        provider as never,
+        undefined,
+        batchQueue as never,
+      );
+      await kv.set("mem:semantic", "sem_1", makeSemantic("security checks validate inputs", "sem_1"));
+      await kv.set("mem:semantic", "sem_2", makeSemantic("security checks prevent regressions", "sem_2"));
+      await kv.set("mem:semantic", "sem_3", makeSemantic("security testing validates boundaries", "sem_3"));
+
+      const result = (await sdk.trigger("mem::reflect", { deferred: true })) as {
+        success: boolean;
+        queued?: number;
+      };
+
+      expect(result.success).toBe(true);
+      expect(result.queued).toBeGreaterThan(0);
+      expect(batchQueue.enqueue).toHaveBeenCalled();
+      expect(provider.summarize).not.toHaveBeenCalled();
+    });
+
     it("returns empty when no graph nodes or memories exist", async () => {
       const result = (await sdk.trigger("mem::reflect", {})) as {
         success: boolean;

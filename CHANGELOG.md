@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.38] — 2026-08-24
+
+### Changed
+
+- Deferred reflection and automatic crystallization now use Fireworks Batch alongside existing deferred graph extraction and consolidation.
+- Batch responses now carry source fingerprints: results produced from stale maintenance input are discarded and a current replacement is queued.
+- Direct API and MCP calls remain synchronous; local auxiliary summary and flow-compression routes remain local.
+
 ## [0.9.37] — 2026-08-24
 
 ### Changed

@@ -1,8 +1,9 @@
 import type { ISdk } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
-import { KV, generateId } from "../state/schema.js";
+import { KV, fingerprintId, generateId } from "../state/schema.js";
 import type { Action, ActionEdge, Crystal, MemoryProvider } from "../types.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
+import type { FireworksBatchQueue } from "./fireworks-batch.js";
 
 interface CrystalDigest {
   narrative: string;
@@ -16,17 +17,44 @@ Extract: (1) what was accomplished in 1-2 sentences, (2) key decisions as bullet
 (3) files affected, (4) any lessons or patterns worth remembering.
 Return as JSON: { "narrative": "...", "keyOutcomes": ["..."], "filesAffected": ["..."], "lessons": ["..."] }`;
 
+function crystallizationSourceFingerprint(
+  actions: Action[],
+  edges: ActionEdge[],
+): string {
+  return fingerprintId("fwbcrys", JSON.stringify({
+    actions: actions.map((action) => [
+      action.id,
+      action.title,
+      action.description,
+      action.status,
+      action.updatedAt,
+      action.crystallizedInto,
+    ]).sort(),
+    edges: edges.map((edge) => [
+      edge.id,
+      edge.sourceActionId,
+      edge.targetActionId,
+      edge.type,
+      edge.createdAt,
+    ]).sort(),
+  }));
+}
+
 export function registerCrystallizeFunction(
   sdk: ISdk,
   kv: StateKV,
   provider: MemoryProvider,
   llmRouter?: LlmTaskRouter,
+  batchQueue?: FireworksBatchQueue,
 ): void {
   sdk.registerFunction("mem::crystallize", 
     async (data: {
       actionIds: string[];
       sessionId?: string;
       project?: string;
+      deferred?: boolean;
+      batchResponse?: string;
+      batchSourceFingerprint?: string;
     }) => {
       if (!data.actionIds || data.actionIds.length === 0) {
         return { success: false, error: "actionIds is required" };
@@ -54,9 +82,32 @@ export function registerCrystallizeFunction(
       );
 
       const prompt = buildChainText(actions, relevantEdges);
+      const sourceFingerprint = crystallizationSourceFingerprint(actions, relevantEdges);
+
+      if (data.deferred && !data.batchResponse && batchQueue) {
+        const enqueueResult = await batchQueue.enqueue({
+          correlationId: generateId("fwbcrys"),
+          task: "crystallization",
+          systemPrompt: CRYSTALLIZE_SYSTEM,
+          userPrompt: prompt,
+          metadata: {
+            actionIds: JSON.stringify(data.actionIds),
+            sessionId: data.sessionId || "",
+            project: data.project || "",
+            sourceFingerprint,
+          },
+        });
+        if (enqueueResult.queued) {
+          return { success: true, queued: true, workItemId: enqueueResult.workItemId };
+        }
+      }
+
+      if (data.batchResponse && data.batchSourceFingerprint !== sourceFingerprint) {
+        return { success: true, stale: true };
+      }
 
       try {
-        const response = llmRouter
+        const response = data.batchResponse ?? (llmRouter
           ? await llmRouter.run(
             "reflection",
             (selectedProvider) => selectedProvider.summarize(CRYSTALLIZE_SYSTEM, prompt),
@@ -74,7 +125,7 @@ export function registerCrystallizeFunction(
               }
             },
           )
-          : await provider.summarize(CRYSTALLIZE_SYSTEM, prompt);
+          : await provider.summarize(CRYSTALLIZE_SYSTEM, prompt));
         const digest = parseDigest(response);
 
         const crystal: Crystal = {
@@ -170,6 +221,7 @@ export function registerCrystallizeFunction(
       olderThanDays?: number;
       project?: string;
       dryRun?: boolean;
+      deferred?: boolean;
     }) => {
       const olderThanDays = data.olderThanDays ?? 7;
       const dryRun = data.dryRun ?? false;
@@ -229,6 +281,7 @@ export function registerCrystallizeFunction(
           const result = (await sdk.trigger({ function_id: "mem::crystallize", payload: {
             actionIds,
             project,
+            deferred: data.deferred,
           } })) as { success: boolean; crystal?: Crystal };
 
           if (result.success && result.crystal) {

@@ -44,7 +44,7 @@ async function main() {
     fetch(`${REST_URL}/agentmemory/crystals/auto`, {
       method: "POST",
       headers: authHeaders(),
-      body: JSON.stringify({ olderThanDays: 0 }),
+      body: JSON.stringify({ olderThanDays: 0, deferred: true }),
       signal: AbortSignal.timeout(60000),
     }).catch(() => {});
 
