@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { CASES_PER_TASK, LLM_ROUTING_CASES } from "../eval/fixtures/llm-routing-cases.js";
+import { evaluationCallOptions } from "../eval/runner/llm-routing-options.js";
 import { recommendRoute, scoreResponse, summarizeTaskProvider, type RawEvaluationResult } from "../eval/runner/llm-routing-scoring.js";
 
 const testCase = LLM_ROUTING_CASES.find((candidate) => candidate.task === "compression")!;
@@ -11,6 +12,12 @@ describe("LLM routing evaluation", () => {
     for (const candidate of LLM_ROUTING_CASES) byTask.set(candidate.task, (byTask.get(candidate.task) ?? 0) + 1);
     expect([...byTask.values()]).toHaveLength(12);
     expect([...byTask.values()]).toEqual(Array(12).fill(15));
+  });
+
+  it("passes each task's explicit thinking override to the evaluated provider", () => {
+    expect(evaluationCallOptions("summary", true)).toEqual({ task: "summary", thinking: true });
+    expect(evaluationCallOptions("summary", false)).toEqual({ task: "summary", thinking: false });
+    expect(evaluationCallOptions("summary", undefined)).toEqual({ task: "summary" });
   });
 
   it("rewards schema-valid answers that preserve critical identifiers", () => {

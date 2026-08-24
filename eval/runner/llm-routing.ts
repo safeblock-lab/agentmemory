@@ -2,11 +2,17 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { loadConfig } from "../../src/config.js";
 import { createAuxiliaryProvider, createProvider } from "../../src/providers/index.js";
-import type { MemoryProvider } from "../../src/types.js";
+import type { LlmTask, MemoryProvider } from "../../src/types.js";
 import { CASES_PER_TASK, LLM_ROUTING_CASES, type LlmRoutingCase } from "../fixtures/llm-routing-cases.js";
+import { evaluationCallOptions } from "./llm-routing-options.js";
 import { recommendRoute, scoreResponse, summarizeTaskProvider, type RawEvaluationResult } from "./llm-routing-scoring.js";
 
 type ProviderSelection = "aux" | "primary" | "both";
+
+function requestErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message.slice(0, 300);
+  return "Unknown provider error";
+}
 
 function reportPath(): string {
   const explicit = process.argv.find((value) => value.startsWith("--report="))?.slice("--report=".length);
@@ -19,19 +25,26 @@ function providerSelection(): ProviderSelection {
   throw new Error("--provider must be aux, primary, or both.");
 }
 
-async function evaluateCase(testCase: LlmRoutingCase, provider: MemoryProvider, role: "aux" | "primary"): Promise<RawEvaluationResult> {
+async function evaluateCase(
+  testCase: LlmRoutingCase,
+  provider: MemoryProvider,
+  role: "aux" | "primary",
+  thinking?: boolean,
+): Promise<RawEvaluationResult> {
   const startedAt = Date.now();
+  const options = evaluationCallOptions(testCase.task, thinking);
   try {
     const response = testCase.operation === "compress"
-      ? await provider.compress(testCase.system, testCase.prompt, { task: testCase.task })
-      : await provider.summarize(testCase.system, testCase.prompt, { task: testCase.task });
+      ? await provider.compress(testCase.system, testCase.prompt, options)
+      : await provider.summarize(testCase.system, testCase.prompt, options);
     return { task: testCase.task, provider: role, latencyMs: Date.now() - startedAt, response, ...scoreResponse(testCase, response) };
-  } catch {
+  } catch (error) {
     return {
       task: testCase.task,
       provider: role,
       latencyMs: Date.now() - startedAt,
       requestFailure: "provider_request",
+      requestError: requestErrorMessage(error),
       schemaValid: false,
       syntaxRepaired: false,
       valid: false,
@@ -61,14 +74,22 @@ async function main(): Promise<void> {
   const auxiliary = selected === "primary" ? undefined : createAuxiliaryProvider(config.auxiliaryProvider);
   const results: RawEvaluationResult[] = [];
   for (const testCase of LLM_ROUTING_CASES) {
-    if (auxiliary) results.push(await evaluateCase(testCase, auxiliary, "aux"));
+    if (auxiliary) {
+      results.push(await evaluateCase(testCase, auxiliary, "aux", config.llmRouting.thinking[testCase.task]));
+    }
     if (primary) results.push(await evaluateCase(testCase, primary, "primary"));
   }
   const summaries = summarizeTaskProvider(results);
   const recommendations = Object.fromEntries(summaries.filter((summary) => summary.provider === "aux").map((summary) => [summary.task, recommendRoute(summary)]));
   const report = {
     generatedAt: new Date().toISOString(),
-    contract: { casesPerTask: CASES_PER_TASK, providerCalls: calls, fallbackCalls: 0, selectedProvider: selected },
+    contract: {
+      casesPerTask: CASES_PER_TASK,
+      providerCalls: calls,
+      fallbackCalls: 0,
+      selectedProvider: selected,
+      auxiliaryThinking: config.llmRouting.thinking,
+    },
     models: { auxiliary: config.auxiliaryProvider.model, primary: config.provider.model },
     summaries,
     recommendations,

@@ -162,6 +162,99 @@ export interface AuxiliaryLlmConfig extends ProviderConfig {
   maxInputChars: number;
 }
 
+export type FireworksBatchTask = "consolidation" | "graph_extraction";
+
+export type FireworksBatchWorkState =
+  | "queued"
+  | "submitted"
+  | "polling"
+  | "completed"
+  | "failed"
+  | "dead-letter";
+
+export type FireworksBatchJobState =
+  | "queued"
+  | "submitted"
+  | "polling"
+  | "completed"
+  | "failed"
+  | "dead-letter";
+
+export interface FireworksBatchConfig {
+  enabled: boolean;
+  accountId?: string;
+  apiKey?: string;
+  model?: string;
+  timeoutMs: number;
+  maxBatchItems: number;
+  maxRequestChars: number;
+  maxRequestBytes: number;
+  maxResponseBytes: number;
+  maxResultChars: number;
+  maxConcurrency: number;
+  maxAttempts: number;
+  retryBaseMs: number;
+  retryMaxMs: number;
+  pollIntervalMs: number;
+  pollMaxIntervalMs: number;
+  recoveryStaleMs: number;
+  maxQueuedItems: number;
+}
+
+export interface FireworksBatchRequest {
+  correlationId: string;
+  task: FireworksBatchTask;
+  systemPrompt: string;
+  userPrompt: string;
+  model?: string;
+  maxTokens?: number;
+  metadata?: Record<string, string>;
+}
+
+export interface FireworksBatchWorkResult {
+  customId: string;
+  content: string;
+  receivedAt: string;
+}
+
+export interface FireworksBatchWorkItem {
+  id: string;
+  customId: string;
+  correlationId: string;
+  task: FireworksBatchTask;
+  model: string;
+  systemPrompt: string;
+  userPrompt: string;
+  maxTokens: number;
+  metadata?: Record<string, string>;
+  state: FireworksBatchWorkState;
+  attempts: number;
+  nextAttemptAt: string;
+  createdAt: string;
+  updatedAt: string;
+  batchJobId?: string;
+  result?: FireworksBatchWorkResult;
+  lastError?: string;
+  deadLetteredAt?: string;
+}
+
+export interface FireworksBatchJob {
+  id: string;
+  remoteJobId?: string;
+  inputDatasetId: string;
+  outputDatasetId: string;
+  model: string;
+  task: FireworksBatchTask;
+  workItemIds: string[];
+  state: FireworksBatchJobState;
+  attempts: number;
+  nextAttemptAt: string;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  lastError?: string;
+}
+
 export type LlmTask =
   | "graph_extraction"
   | "temporal_graph_extraction"
@@ -180,11 +273,13 @@ export type LlmRouteTarget = "primary" | "aux";
 
 export interface LlmCallOptions {
   task?: LlmTask;
+  thinking?: boolean;
 }
 
 export interface LlmRoutingConfig {
   routes: Record<LlmTask, LlmRouteTarget>;
   explicitRoutes: Partial<Record<LlmTask, LlmRouteTarget>>;
+  thinking?: Partial<Record<LlmTask, boolean>>;
   warnings: string[];
 }
 
@@ -201,6 +296,7 @@ export interface AgentMemoryConfig {
   streamsPort: number;
   provider: ProviderConfig;
   auxiliaryProvider?: AuxiliaryLlmConfig;
+  fireworksBatch: FireworksBatchConfig;
   llmRouting: LlmRoutingConfig;
   tokenBudget: number;
   maxObservationsPerSession: number;
@@ -348,7 +444,7 @@ export interface ExportPagination {
 }
 
 export interface ExportData {
-  version: "0.3.0" | "0.4.0" | "0.5.0" | "0.6.0" | "0.6.1" | "0.7.0" | "0.7.2" | "0.7.3" | "0.7.4" | "0.7.5" | "0.7.6" | "0.7.7" | "0.7.9" | "0.8.0" | "0.8.1" | "0.8.2" | "0.8.3" | "0.8.4" | "0.8.5" | "0.8.6" | "0.8.7" | "0.8.8" | "0.8.9" | "0.8.10" | "0.8.11" | "0.8.12" | "0.8.13" | "0.9.0" | "0.9.1" | "0.9.2" | "0.9.3" | "0.9.4" | "0.9.5" | "0.9.6" | "0.9.7" | "0.9.8" | "0.9.9" | "0.9.10" | "0.9.11" | "0.9.12" | "0.9.13" | "0.9.14" | "0.9.15" | "0.9.16" | "0.9.17" | "0.9.18" | "0.9.19" | "0.9.20" | "0.9.21" | "0.9.22" | "0.9.23" | "0.9.24" | "0.9.25" | "0.9.26" | "0.9.27" | "0.9.28" | "0.9.29" | "0.9.30" | "0.9.31" | "0.9.32" | "0.9.33";
+  version: "0.3.0" | "0.4.0" | "0.5.0" | "0.6.0" | "0.6.1" | "0.7.0" | "0.7.2" | "0.7.3" | "0.7.4" | "0.7.5" | "0.7.6" | "0.7.7" | "0.7.9" | "0.8.0" | "0.8.1" | "0.8.2" | "0.8.3" | "0.8.4" | "0.8.5" | "0.8.6" | "0.8.7" | "0.8.8" | "0.8.9" | "0.8.10" | "0.8.11" | "0.8.12" | "0.8.13" | "0.9.0" | "0.9.1" | "0.9.2" | "0.9.3" | "0.9.4" | "0.9.5" | "0.9.6" | "0.9.7" | "0.9.8" | "0.9.9" | "0.9.10" | "0.9.11" | "0.9.12" | "0.9.13" | "0.9.14" | "0.9.15" | "0.9.16" | "0.9.17" | "0.9.18" | "0.9.19" | "0.9.20" | "0.9.21" | "0.9.22" | "0.9.23" | "0.9.24" | "0.9.25" | "0.9.26" | "0.9.27" | "0.9.28" | "0.9.29" | "0.9.30" | "0.9.31" | "0.9.32" | "0.9.33" | "0.9.34";
   exportedAt: string;
   sessions: Session[];
   observations: Record<string, CompressedObservation[]>;

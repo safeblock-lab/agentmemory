@@ -101,6 +101,29 @@ describe("OpenAIProvider direct DeepSeek thinking control and telemetry", () => 
     expect(sentBody?.thinking).toEqual({ type: "disabled" });
   });
 
+  it("gives task thinking overrides priority over legacy DeepSeek settings", async () => {
+    writeAgentMemoryEnv("deepseek_thinking=true");
+    const bodies: Record<string, unknown>[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), { status: 200 });
+    });
+
+    const { OpenAIProvider } = await loadProvider();
+    const provider = new OpenAIProvider(
+      "key",
+      "deepseek-v4-pro",
+      128,
+      "https://api.deepseek.com/v1",
+      { noThink: true },
+    );
+    await provider.compress("system", "user", { task: "summary", thinking: false });
+    await provider.compress("system", "user", { task: "summary", thinking: true });
+
+    expect(bodies[0]?.thinking).toEqual({ type: "disabled" });
+    expect(bodies[1]?.thinking).toEqual({ type: "enabled" });
+  });
+
   it("sends the Fireworks DeepSeek model unchanged without thinking", async () => {
     writeAgentMemoryEnv("OPENAI_REASONING_EFFORT=none");
     let requestUrl: string | undefined;

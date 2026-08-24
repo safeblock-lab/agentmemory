@@ -43,6 +43,56 @@ describe("OllamaProvider", () => {
     expect((body?.messages as Array<{ content: string }>)[0]?.content).toContain("field named output");
   });
 
+  it("uses the configured token budget for task thinking", async () => {
+    let body: Record<string, unknown> | undefined;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({ message: { content: "reasoned reply" } }), { status: 200 });
+    });
+    const provider = new OllamaProvider({
+      provider: "ollama", model: "qwen3:4b", maxTokens: 4096,
+      baseURL: "http://127.0.0.1:11434/v1", apiKey: "", timeoutMs: 5_000,
+      noThink: true, maxInputChars: 1_000,
+    });
+
+    await expect(provider.compress("system", "user", {
+      task: "summary",
+      thinking: true,
+    })).resolves.toBe("reasoned reply");
+    expect(body).toMatchObject({
+      think: true,
+      options: { num_predict: 4096, temperature: 0 },
+    });
+    expect(body).not.toHaveProperty("format");
+    expect((body?.messages as Array<{ content: string }>)[0]?.content).toBe("system");
+  });
+
+  it("applies task no-thinking override over a thinking provider default", async () => {
+    let body: Record<string, unknown> | undefined;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({
+        message: { content: JSON.stringify({ output: "deterministic reply" }) },
+      }), { status: 200 });
+    });
+    const provider = new OllamaProvider({
+      provider: "ollama", model: "qwen3:4b", maxTokens: 4096,
+      baseURL: "http://127.0.0.1:11434/v1", apiKey: "", timeoutMs: 5_000,
+      noThink: false, maxInputChars: 1_000,
+    });
+
+    await expect(provider.compress("system", "user", {
+      task: "classification",
+      thinking: false,
+    })).resolves.toBe("deterministic reply");
+    expect(body).toMatchObject({
+      think: false,
+      options: { num_predict: 384, temperature: 0 },
+      format: { type: "object", required: ["output"] },
+    });
+    expect((body?.messages as Array<{ content: string }>)[0]?.content).toContain("field named output");
+  });
+
   it("rejects reasoning-only native responses", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
       message: { thinking: "hidden reasoning" },

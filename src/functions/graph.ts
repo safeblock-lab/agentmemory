@@ -16,6 +16,7 @@ import {
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
+import type { FireworksBatchQueue } from "./fireworks-batch.js";
 
 // #753: keep the response payload below the iii state channel ceiling.
 // 500 nodes + their incident edges hold well under the limit on the
@@ -456,9 +457,10 @@ export function registerGraphFunction(
   kv: StateKV,
   provider: MemoryProvider,
   llmRouter?: LlmTaskRouter,
+  batchQueue?: FireworksBatchQueue,
 ): void {
   sdk.registerFunction("mem::graph-extract", 
-    async (data: { observations: CompressedObservation[] }) => {
+    async (data: { observations: CompressedObservation[]; batchResponse?: string }) => {
       if (!data.observations || data.observations.length === 0) {
         return { success: false, error: "No observations provided" };
       }
@@ -474,7 +476,19 @@ export function registerGraphFunction(
       );
 
       try {
-        const response = llmRouter
+        if (!data.batchResponse && batchQueue) {
+          const queued = await batchQueue.enqueue({
+            correlationId: generateId("fwbgraph"),
+            task: "graph_extraction",
+            systemPrompt: GRAPH_EXTRACTION_SYSTEM,
+            userPrompt: prompt,
+            metadata: { observations: JSON.stringify(data.observations) },
+          });
+          if (queued.queued) {
+            return { success: true, queued: true, workItemId: queued.workItemId };
+          }
+        }
+        const response = data.batchResponse ?? (llmRouter
           ? await llmRouter.run(
             "graph_extraction",
             (selectedProvider) => selectedProvider.compress(
@@ -486,7 +500,7 @@ export function registerGraphFunction(
               return parsed.nodes.length > 0 || parsed.edges.length > 0;
             },
           )
-          : await provider.compress(GRAPH_EXTRACTION_SYSTEM, prompt);
+          : await provider.compress(GRAPH_EXTRACTION_SYSTEM, prompt));
 
         const obsIds = data.observations.map((o) => o.id);
         const { nodes, edges } = parseGraphXml(response, obsIds);

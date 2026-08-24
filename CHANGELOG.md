@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.34] — 2026-08-24
+
+### Added
+
+- Fireworks Batch provider with cost-efficient asynchronous processing for supported memory workloads.
+- Per-workload LLM routing controls, including explicit reasoning-budget settings and local thinking-model compatibility.
+
+### Changed
+
+- Extended auxiliary-provider routing and evaluation coverage for local Ollama and OpenAI-compatible deployments.
+
+### Docs
+
+- Added Fireworks Batch configuration and operating guidance.
+
 ## [0.9.33] — 2026-08-22
 
 ### Added

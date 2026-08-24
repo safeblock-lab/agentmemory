@@ -10,6 +10,7 @@ import type {
   ClaudeBridgeConfig,
   TeamConfig,
   AuxiliaryLlmConfig,
+  FireworksBatchConfig,
   LlmRouteTarget,
   LlmRoutingConfig,
   LlmTask,
@@ -34,6 +35,21 @@ const AUX_LLM_MAX_TIMEOUT_MS = 10 * 60_000;
 const AUX_LLM_MAX_TOKENS = 1_000_000;
 const AUX_LLM_MAX_INPUT_CHARS = 10_000_000;
 
+const FIREWORKS_BATCH_DEFAULT_TIMEOUT_MS = 120_000;
+const FIREWORKS_BATCH_DEFAULT_MAX_ITEMS = 32;
+const FIREWORKS_BATCH_DEFAULT_MAX_REQUEST_CHARS = 120_000;
+const FIREWORKS_BATCH_DEFAULT_MAX_REQUEST_BYTES = 8 * 1024 * 1024;
+const FIREWORKS_BATCH_DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
+const FIREWORKS_BATCH_DEFAULT_MAX_RESULT_CHARS = 120_000;
+const FIREWORKS_BATCH_DEFAULT_MAX_CONCURRENCY = 1;
+const FIREWORKS_BATCH_DEFAULT_MAX_ATTEMPTS = 3;
+const FIREWORKS_BATCH_DEFAULT_RETRY_BASE_MS = 2_000;
+const FIREWORKS_BATCH_DEFAULT_RETRY_MAX_MS = 60_000;
+const FIREWORKS_BATCH_DEFAULT_POLL_INTERVAL_MS = 10_000;
+const FIREWORKS_BATCH_DEFAULT_POLL_MAX_INTERVAL_MS = 120_000;
+const FIREWORKS_BATCH_DEFAULT_RECOVERY_STALE_MS = 15 * 60_000;
+const FIREWORKS_BATCH_DEFAULT_MAX_QUEUED_ITEMS = 1_000;
+
 const LLM_ROUTE_ENV = {
   graph_extraction: "AGENTMEMORY_GRAPH_LLM",
   temporal_graph_extraction: "AGENTMEMORY_TEMPORAL_GRAPH_LLM",
@@ -47,6 +63,21 @@ const LLM_ROUTE_ENV = {
   skill_extraction: "AGENTMEMORY_SKILL_EXTRACTION_LLM",
   query_expansion: "AGENTMEMORY_QUERY_EXPANSION_LLM",
   flow_compression: "AGENTMEMORY_FLOW_COMPRESSION_LLM",
+} as const satisfies Record<LlmTask, string>;
+
+const LLM_THINKING_ENV = {
+  graph_extraction: `${LLM_ROUTE_ENV.graph_extraction}_THINKING`,
+  temporal_graph_extraction: `${LLM_ROUTE_ENV.temporal_graph_extraction}_THINKING`,
+  consolidation: `${LLM_ROUTE_ENV.consolidation}_THINKING`,
+  compression: `${LLM_ROUTE_ENV.compression}_THINKING`,
+  summary: `${LLM_ROUTE_ENV.summary}_THINKING`,
+  entity_extraction: `${LLM_ROUTE_ENV.entity_extraction}_THINKING`,
+  classification: `${LLM_ROUTE_ENV.classification}_THINKING`,
+  reflection: `${LLM_ROUTE_ENV.reflection}_THINKING`,
+  conflict_resolution: `${LLM_ROUTE_ENV.conflict_resolution}_THINKING`,
+  skill_extraction: `${LLM_ROUTE_ENV.skill_extraction}_THINKING`,
+  query_expansion: `${LLM_ROUTE_ENV.query_expansion}_THINKING`,
+  flow_compression: `${LLM_ROUTE_ENV.flow_compression}_THINKING`,
 } as const satisfies Record<LlmTask, string>;
 
 const DEFAULT_LLM_ROUTES = {
@@ -68,6 +99,11 @@ type EnvSource = Record<string, string | undefined>;
 
 interface AuxiliaryLlmConfigResult {
   config?: AuxiliaryLlmConfig;
+  warnings: string[];
+}
+
+interface FireworksBatchConfigResult {
+  config: FireworksBatchConfig;
   warnings: string[];
 }
 
@@ -134,6 +170,20 @@ function parseAuxBoolean(
   if (normalized === "false" || normalized === "0") return false;
   warnings.push(`${key} must be true, false, 1, or 0; using ${fallback}.`);
   return fallback;
+}
+
+function parseOptionalAuxBoolean(
+  env: EnvSource,
+  key: string,
+  warnings: string[],
+): boolean | undefined {
+  const raw = env[key];
+  if (!hasRealValue(raw)) return undefined;
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "true" || normalized === "1") return true;
+  if (normalized === "false" || normalized === "0") return false;
+  warnings.push(`${key} must be true, false, 1, or 0; ignoring thinking override.`);
+  return undefined;
 }
 
 function parseAuxBaseUrl(raw: string | undefined): string | undefined {
@@ -279,6 +329,168 @@ function parseAuxiliaryLlmConfig(env: EnvSource): AuxiliaryLlmConfigResult {
   };
 }
 
+function parseFireworksBatchConfig(
+  env: EnvSource,
+  auxiliaryProvider: AuxiliaryLlmConfig | undefined,
+): FireworksBatchConfigResult {
+  const warnings: string[] = [];
+  const parse = (key: string, fallback: number, max: number): number =>
+    parseBoundedAuxInt(env, key, fallback, max, warnings);
+
+  const defaults: FireworksBatchConfig = {
+    enabled: false,
+    timeoutMs: parse(
+      "AGENTMEMORY_FIREWORKS_BATCH_TIMEOUT_MS",
+      FIREWORKS_BATCH_DEFAULT_TIMEOUT_MS,
+      10 * 60_000,
+    ),
+    maxBatchItems: parse(
+      "AGENTMEMORY_FIREWORKS_BATCH_MAX_ITEMS",
+      FIREWORKS_BATCH_DEFAULT_MAX_ITEMS,
+      1_000,
+    ),
+    maxRequestChars: parse(
+      "AGENTMEMORY_FIREWORKS_BATCH_MAX_REQUEST_CHARS",
+      FIREWORKS_BATCH_DEFAULT_MAX_REQUEST_CHARS,
+      10_000_000,
+    ),
+    maxRequestBytes: parse(
+      "AGENTMEMORY_FIREWORKS_BATCH_MAX_REQUEST_BYTES",
+      FIREWORKS_BATCH_DEFAULT_MAX_REQUEST_BYTES,
+      128 * 1024 * 1024,
+    ),
+    maxResponseBytes: parse(
+      "AGENTMEMORY_FIREWORKS_BATCH_MAX_RESPONSE_BYTES",
+      FIREWORKS_BATCH_DEFAULT_MAX_RESPONSE_BYTES,
+      128 * 1024 * 1024,
+    ),
+    maxResultChars: parse(
+      "AGENTMEMORY_FIREWORKS_BATCH_MAX_RESULT_CHARS",
+      FIREWORKS_BATCH_DEFAULT_MAX_RESULT_CHARS,
+      10_000_000,
+    ),
+    maxConcurrency: parse(
+      "AGENTMEMORY_FIREWORKS_BATCH_MAX_CONCURRENCY",
+      FIREWORKS_BATCH_DEFAULT_MAX_CONCURRENCY,
+      32,
+    ),
+    maxAttempts: parse(
+      "AGENTMEMORY_FIREWORKS_BATCH_MAX_ATTEMPTS",
+      FIREWORKS_BATCH_DEFAULT_MAX_ATTEMPTS,
+      10,
+    ),
+    retryBaseMs: parse(
+      "AGENTMEMORY_FIREWORKS_BATCH_RETRY_BASE_MS",
+      FIREWORKS_BATCH_DEFAULT_RETRY_BASE_MS,
+      10 * 60_000,
+    ),
+    retryMaxMs: parse(
+      "AGENTMEMORY_FIREWORKS_BATCH_RETRY_MAX_MS",
+      FIREWORKS_BATCH_DEFAULT_RETRY_MAX_MS,
+      60 * 60_000,
+    ),
+    pollIntervalMs: parse(
+      "AGENTMEMORY_FIREWORKS_BATCH_POLL_INTERVAL_MS",
+      FIREWORKS_BATCH_DEFAULT_POLL_INTERVAL_MS,
+      60 * 60_000,
+    ),
+    pollMaxIntervalMs: parse(
+      "AGENTMEMORY_FIREWORKS_BATCH_POLL_MAX_INTERVAL_MS",
+      FIREWORKS_BATCH_DEFAULT_POLL_MAX_INTERVAL_MS,
+      24 * 60 * 60_000,
+    ),
+    recoveryStaleMs: parse(
+      "AGENTMEMORY_FIREWORKS_BATCH_RECOVERY_STALE_MS",
+      FIREWORKS_BATCH_DEFAULT_RECOVERY_STALE_MS,
+      7 * 24 * 60 * 60_000,
+    ),
+    maxQueuedItems: parse(
+      "AGENTMEMORY_FIREWORKS_BATCH_MAX_QUEUED_ITEMS",
+      FIREWORKS_BATCH_DEFAULT_MAX_QUEUED_ITEMS,
+      100_000,
+    ),
+  };
+
+  const enabledRaw = env["AGENTMEMORY_FIREWORKS_BATCH_ENABLED"];
+  const explicitlyEnabled = hasRealValue(enabledRaw) &&
+    (enabledRaw!.trim().toLowerCase() === "true" || enabledRaw!.trim() === "1");
+  const explicitlyDisabled = hasRealValue(enabledRaw) &&
+    (enabledRaw!.trim().toLowerCase() === "false" || enabledRaw!.trim() === "0");
+  if (hasRealValue(enabledRaw) && !explicitlyEnabled && !explicitlyDisabled) {
+    warnings.push(
+      "AGENTMEMORY_FIREWORKS_BATCH_ENABLED must be true, false, 1, or 0; Batch remains disabled.",
+    );
+  }
+  if (!explicitlyEnabled) return { config: defaults, warnings };
+
+  const accountRaw =
+    env["AGENTMEMORY_FIREWORKS_BATCH_ACCOUNT_ID"] || env["FIREWORKS_ACCOUNT_ID"];
+  const accountId = accountRaw?.trim();
+  if (!accountId || accountId.length > 128 || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(accountId)) {
+    warnings.push(
+      "Fireworks Batch ignored: set AGENTMEMORY_FIREWORKS_BATCH_ACCOUNT_ID (or FIREWORKS_ACCOUNT_ID) to a valid account identifier.",
+    );
+    return { config: defaults, warnings };
+  }
+  let primaryHost = "";
+  try {
+    primaryHost = new URL(env["OPENAI_BASE_URL"] ?? "").hostname.toLowerCase();
+  } catch {}
+  const primaryIsFireworks = primaryHost === "api.fireworks.ai";
+  const configuredApiKey =
+    env["AGENTMEMORY_FIREWORKS_BATCH_API_KEY"]?.trim() ||
+    env["FIREWORKS_API_KEY"]?.trim() ||
+    (primaryIsFireworks ? env["OPENAI_API_KEY"]?.trim() : undefined);
+  const configuredModel =
+    env["AGENTMEMORY_FIREWORKS_BATCH_MODEL"]?.trim() ||
+    env["FIREWORKS_MODEL"]?.trim() ||
+    (primaryIsFireworks ? env["OPENAI_MODEL"]?.trim() : undefined);
+  let apiKey = configuredApiKey;
+  let model = configuredModel;
+  let auxiliaryHost = "";
+  try {
+    auxiliaryHost = auxiliaryProvider ? new URL(auxiliaryProvider.baseURL).hostname.toLowerCase() : "";
+  } catch {}
+  if ((!apiKey || !model) && auxiliaryHost === "api.fireworks.ai") {
+    apiKey ||= auxiliaryProvider?.apiKey;
+    model ||= auxiliaryProvider?.model;
+  }
+  if (!apiKey || !model) {
+    warnings.push(
+      "Fireworks Batch ignored: set Fireworks credentials/model directly, or configure OPENAI_BASE_URL=https://api.fireworks.ai with OPENAI_API_KEY and OPENAI_MODEL. A Fireworks auxiliary provider remains a legacy fallback.",
+    );
+    return { config: defaults, warnings };
+  }
+  if (defaults.retryMaxMs < defaults.retryBaseMs) {
+    warnings.push(
+      "AGENTMEMORY_FIREWORKS_BATCH_RETRY_MAX_MS must be at least AGENTMEMORY_FIREWORKS_BATCH_RETRY_BASE_MS; using the retry base for the maximum.",
+    );
+    defaults.retryMaxMs = defaults.retryBaseMs;
+  }
+  if (defaults.pollMaxIntervalMs < defaults.pollIntervalMs) {
+    warnings.push(
+      "AGENTMEMORY_FIREWORKS_BATCH_POLL_MAX_INTERVAL_MS must be at least AGENTMEMORY_FIREWORKS_BATCH_POLL_INTERVAL_MS; using the poll interval for the maximum.",
+    );
+    defaults.pollMaxIntervalMs = defaults.pollIntervalMs;
+  }
+  if (defaults.maxRequestBytes < defaults.maxRequestChars) {
+    warnings.push(
+      "AGENTMEMORY_FIREWORKS_BATCH_MAX_REQUEST_BYTES is below the character limit; request bytes remain the enforced lower bound.",
+    );
+  }
+
+  return {
+    config: {
+      ...defaults,
+      enabled: true,
+      accountId,
+      apiKey,
+      model,
+    },
+    warnings,
+  };
+}
+
 function parseLlmRoutingConfig(
   env: EnvSource,
   hasAuxiliaryProvider: boolean,
@@ -287,6 +499,7 @@ function parseLlmRoutingConfig(
   const warnings = [...initialWarnings];
   const routes = { ...DEFAULT_LLM_ROUTES } as Record<LlmTask, LlmRouteTarget>;
   const explicitRoutes: Partial<Record<LlmTask, LlmRouteTarget>> = {};
+  const thinking: Partial<Record<LlmTask, boolean>> = {};
   let explicitlyRequestsAuxiliary = false;
 
   for (const task of Object.keys(LLM_ROUTE_ENV) as LlmTask[]) {
@@ -303,13 +516,18 @@ function parseLlmRoutingConfig(
     explicitlyRequestsAuxiliary ||= value === "aux";
   }
 
+  for (const task of Object.keys(LLM_THINKING_ENV) as LlmTask[]) {
+    const value = parseOptionalAuxBoolean(env, LLM_THINKING_ENV[task], warnings);
+    if (value !== undefined) thinking[task] = value;
+  }
+
   if (explicitlyRequestsAuxiliary && !hasAuxiliaryProvider) {
     warnings.push(
       "An LLM route explicitly selects aux, but no valid auxiliary provider is configured; primary fallback will be used.",
     );
   }
 
-  return { routes, explicitRoutes, warnings };
+  return { routes, explicitRoutes, thinking, warnings };
 }
 
 function detectProvider(env: Record<string, string>): ProviderConfig {
@@ -420,10 +638,11 @@ export function loadConfig(): AgentMemoryConfig {
 
   const provider = detectProvider(env);
   const auxiliary = parseAuxiliaryLlmConfig(env);
+  const fireworksBatch = parseFireworksBatchConfig(env, auxiliary.config);
   const llmRouting = parseLlmRoutingConfig(
     env,
     Boolean(auxiliary.config),
-    auxiliary.warnings,
+    [...auxiliary.warnings, ...fireworksBatch.warnings],
   );
 
   // Port quartet: REST is the anchor; streams/engine derive from it
@@ -446,6 +665,7 @@ export function loadConfig(): AgentMemoryConfig {
     streamsPort,
     provider,
     auxiliaryProvider: auxiliary.config,
+    fireworksBatch: fireworksBatch.config,
     llmRouting,
     tokenBudget: safeParseInt(env["TOKEN_BUDGET"], 2000),
     maxObservationsPerSession: safeParseInt(env["MAX_OBS_PER_SESSION"], 500),

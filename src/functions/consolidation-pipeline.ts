@@ -19,6 +19,7 @@ import { getConsolidationDecayDays, isConsolidationEnabled } from "../config.js"
 import { logger } from "../logger.js";
 import { assessConsolidationComplexity } from "./consolidation-complexity.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
+import type { FireworksBatchQueue } from "./fireworks-batch.js";
 
 function applyDecay(
   items: Array<{
@@ -50,9 +51,10 @@ export function registerConsolidationPipelineFunction(
   provider: MemoryProvider,
   llmRouter?: LlmTaskRouter,
   auxiliaryMaxInputChars?: number,
+  batchQueue?: FireworksBatchQueue,
 ): void {
   sdk.registerFunction("mem::consolidate-pipeline", 
-    async (data?: { tier?: string; force?: boolean; project?: string }) => {
+    async (data?: { tier?: string; force?: boolean; project?: string; batchResponse?: string }) => {
       if (!data?.force && !isConsolidationEnabled()) {
         return { success: false, skipped: true, reason: "Consolidation disabled: set CONSOLIDATION_ENABLED=true or configure an LLM provider (ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY / MINIMAX_API_KEY / OPENAI_BASE_URL / AGENTMEMORY_PROVIDER=agent-sdk)" };
       }
@@ -86,7 +88,22 @@ export function registerConsolidationPipelineFunction(
               prompt,
               maxAuxiliaryInputChars: auxiliaryMaxInputChars,
             });
-            const response = llmRouter
+            let queued = false;
+            if (!data?.batchResponse && batchQueue) {
+              const enqueueResult = await batchQueue.enqueue({
+                correlationId: generateId("fwbcon-sem"),
+                task: "consolidation",
+                systemPrompt: SEMANTIC_MERGE_SYSTEM,
+                userPrompt: prompt,
+                metadata: { tier: "semantic" },
+              });
+              if (enqueueResult.queued) {
+                queued = true;
+                results.semantic = { queued: true, workItemId: enqueueResult.workItemId, totalSummaries: summaries.length };
+              }
+            }
+            if (!queued) {
+            const response = data?.batchResponse ?? (llmRouter
               ? await llmRouter.run(
                 complexity.complex ? "conflict_resolution" : "consolidation",
                 (selectedProvider) => selectedProvider.summarize(
@@ -95,7 +112,7 @@ export function registerConsolidationPipelineFunction(
                 ),
                 (candidate) => /<fact\s+confidence="[^"]+">[^<]+<\/fact>/.test(candidate),
               )
-              : await provider.summarize(SEMANTIC_MERGE_SYSTEM, prompt);
+              : await provider.summarize(SEMANTIC_MERGE_SYSTEM, prompt));
 
             const factRegex = /<fact\s+confidence="([^"]+)">([^<]+)<\/fact>/g;
             let match;
@@ -134,6 +151,7 @@ export function registerConsolidationPipelineFunction(
               }
             }
             results.semantic = { newFacts, totalSummaries: summaries.length };
+            }
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             logger.error("Semantic consolidation failed", { error: msg });
@@ -179,7 +197,22 @@ export function registerConsolidationPipelineFunction(
               prompt,
               maxAuxiliaryInputChars: auxiliaryMaxInputChars,
             });
-            const response = llmRouter
+            let queued = false;
+            if (!data?.batchResponse && batchQueue) {
+              const enqueueResult = await batchQueue.enqueue({
+                correlationId: generateId("fwbcon-proc"),
+                task: "consolidation",
+                systemPrompt: PROCEDURAL_EXTRACTION_SYSTEM,
+                userPrompt: prompt,
+                metadata: { tier: "procedural" },
+              });
+              if (enqueueResult.queued) {
+                queued = true;
+                results.procedural = { queued: true, workItemId: enqueueResult.workItemId, patternsAnalyzed: patterns.length };
+              }
+            }
+            if (!queued) {
+            const response = data?.batchResponse ?? (llmRouter
               ? await llmRouter.run(
                 complexity.complex ? "conflict_resolution" : "consolidation",
                 (selectedProvider) => selectedProvider.summarize(
@@ -188,7 +221,7 @@ export function registerConsolidationPipelineFunction(
                 ),
                 (candidate) => /<procedure\s+name="[^"]+"\s+trigger="[^"]+">[\s\S]*?<\/procedure>/.test(candidate),
               )
-              : await provider.summarize(PROCEDURAL_EXTRACTION_SYSTEM, prompt);
+              : await provider.summarize(PROCEDURAL_EXTRACTION_SYSTEM, prompt));
 
             const procRegex =
               /<procedure\s+name="([^"]+)"\s+trigger="([^"]+)">([\s\S]*?)<\/procedure>/g;
@@ -239,6 +272,7 @@ export function registerConsolidationPipelineFunction(
               newProcedures: newProcs,
               patternsAnalyzed: patterns.length,
             };
+            }
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             logger.error("Procedural extraction failed", { error: msg });

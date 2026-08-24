@@ -36,6 +36,7 @@ export interface RawEvaluationResult extends ScoredResponse {
   latencyMs: number;
   response?: string;
   requestFailure?: "provider_request";
+  requestError?: string;
 }
 
 function normalize(value: string): string {

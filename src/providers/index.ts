@@ -3,6 +3,7 @@ import type {
   ProviderConfig,
   FallbackConfig,
   AuxiliaryLlmConfig,
+  FireworksBatchConfig,
 } from "../types.js";
 import { AgentSDKProvider } from "./agent-sdk.js";
 import { AnthropicProvider } from "./anthropic.js";
@@ -14,8 +15,27 @@ import { OpenRouterProvider } from "./openrouter.js";
 import { ResilientProvider } from "./resilient.js";
 import { FallbackChainProvider } from "./fallback-chain.js";
 import { getEnvVar } from "../config.js";
+import {
+  FireworksBatchClient,
+  type FireworksBatchTransport,
+} from "./fireworks-batch.js";
 
 export { createEmbeddingProvider, createImageEmbeddingProvider } from "./embedding/index.js";
+export { FireworksBatchClient, FireworksBatchError } from "./fireworks-batch.js";
+export type {
+  FireworksBatchTransport,
+  FireworksBatchRemoteStatus,
+  FireworksBatchSubmitInput,
+} from "./fireworks-batch.js";
+
+export function createFireworksBatchClient(
+  config: FireworksBatchConfig,
+): FireworksBatchTransport | undefined {
+  if (!config.enabled || !config.accountId || !config.apiKey || !config.model) {
+    return undefined;
+  }
+  return new FireworksBatchClient(config);
+}
 
 function requireEnvVar(key: string): string {
   const value = getEnvVar(key);

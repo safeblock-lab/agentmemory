@@ -17,6 +17,7 @@ import {
   createProvider,
   createFallbackProvider,
   createAuxiliaryProvider,
+  createFireworksBatchClient,
   createEmbeddingProvider,
   createImageEmbeddingProvider,
 } from "./providers/index.js";
@@ -90,6 +91,7 @@ import { registerTemporalGraphFunctions } from "./functions/temporal-graph.js";
 import { registerRetentionFunctions } from "./functions/retention.js";
 import { registerCompressFileFunction } from "./functions/compress-file.js";
 import { registerReplayFunctions } from "./functions/replay.js";
+import { FireworksBatchCoordinator } from "./functions/fireworks-batch.js";
 import { registerApiTriggers } from "./triggers/api.js";
 import { registerEventTriggers } from "./triggers/events.js";
 import { registerMcpEndpoints } from "./mcp/server.js";
@@ -237,6 +239,28 @@ async function main() {
   writeWorkerPidfile();
 
   const kv = new StateKV(sdk);
+  const fireworksBatch = new FireworksBatchCoordinator(
+    kv,
+    config.fireworksBatch,
+    createFireworksBatchClient(config.fireworksBatch),
+    async (item, content) => {
+      if (item.task === "graph_extraction") {
+        const rawObservations = item.metadata?.observations;
+        if (!rawObservations) throw new Error("batch graph result is missing observations");
+        const observations: unknown = JSON.parse(rawObservations);
+        if (!Array.isArray(observations)) throw new Error("batch graph observations are invalid");
+        await sdk.trigger({
+          function_id: "mem::graph-extract",
+          payload: { observations, batchResponse: content },
+        });
+        return;
+      }
+      await sdk.trigger({
+        function_id: "mem::consolidate-pipeline",
+        payload: { tier: item.metadata?.tier, force: true, batchResponse: content },
+      });
+    },
+  );
   const secret = getEnvVar("AGENTMEMORY_SECRET");
   const metricsStore = new MetricsStore(kv);
   const dedupMap = new DedupMap();
@@ -287,7 +311,7 @@ async function main() {
   }
 
   if (isGraphExtractionEnabled()) {
-    registerGraphFunction(sdk, kv, provider, taskRouter);
+    registerGraphFunction(sdk, kv, provider, taskRouter, config.fireworksBatch.enabled ? fireworksBatch : undefined);
     bootLog(`Knowledge graph: extraction enabled`);
   }
 
@@ -297,6 +321,7 @@ async function main() {
     provider,
     taskRouter,
     config.auxiliaryProvider?.maxInputChars,
+    config.fireworksBatch.enabled ? fireworksBatch : undefined,
   );
   bootLog(`Consolidation pipeline: registered (CONSOLIDATION_ENABLED=${isConsolidationEnabled() ? "true" : "false"})`);
 
@@ -613,6 +638,21 @@ async function main() {
     }, consolidationIntervalMs);
     consolidationTimer.unref();
     bootLog(`Auto-consolidation: enabled (every ${consolidationIntervalMs / 60000}m)`);
+  }
+
+  if (config.fireworksBatch.enabled) {
+    const fireworksBatchTimer = setInterval(() => {
+      void fireworksBatch.process().catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        bootLog(`Fireworks Batch processing failed: ${message}`);
+      });
+    }, Math.min(config.fireworksBatch.pollIntervalMs, 10 * 60 * 1000));
+    fireworksBatchTimer.unref();
+    void fireworksBatch.process().catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      bootLog(`Fireworks Batch startup reconciliation failed: ${message}`);
+    });
+    bootLog(`Fireworks Batch: enabled for consolidation and graph extraction`);
   }
 
   const shutdown = async () => {

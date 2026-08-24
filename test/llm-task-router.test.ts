@@ -29,11 +29,15 @@ function provider(name: string, response = name): MemoryProvider {
   };
 }
 
-function router(primary: MemoryProvider, auxiliary?: MemoryProvider): LlmTaskRouter {
+function router(
+  primary: MemoryProvider,
+  auxiliary?: MemoryProvider,
+  routing: LlmRoutingConfig = routes,
+): LlmTaskRouter {
   return new LlmTaskRouter({
     primary: { provider: primary, model: "primary-model" },
     ...(auxiliary ? { auxiliary: { provider: auxiliary, model: "aux-model" } } : {}),
-    routing: routes,
+    routing,
   });
 }
 
@@ -70,6 +74,23 @@ describe("LlmTaskRouter", () => {
       (value) => value === "auxiliary",
     );
     expect(auxiliary.compress).toHaveBeenCalledWith("system", "user", { task: "classification" });
+  });
+
+  it.each([true, false])("passes configured task thinking override (%s)", async (thinking) => {
+    const primary = provider("primary");
+    const auxiliary = provider("auxiliary");
+    await router(primary, auxiliary, {
+      ...routes,
+      thinking: { classification: thinking },
+    }).run(
+      "classification",
+      (selected) => selected.compress("system", "user"),
+      (value) => value === "auxiliary",
+    );
+    expect(auxiliary.compress).toHaveBeenCalledWith("system", "user", {
+      task: "classification",
+      thinking,
+    });
   });
 
   it("allows a complex workload to override its configured auxiliary route", async () => {

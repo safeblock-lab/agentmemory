@@ -119,10 +119,12 @@ export class LlmTaskRouter {
   }
 
   private withTask(provider: MemoryProvider, task: LlmTask): MemoryProvider {
+    const thinking = this.routing.thinking?.[task];
+    const options = thinking === undefined ? { task } : { task, thinking };
     return {
       name: provider.name,
-      compress: (systemPrompt, userPrompt) => provider.compress(systemPrompt, userPrompt, { task }),
-      summarize: (systemPrompt, userPrompt) => provider.summarize(systemPrompt, userPrompt, { task }),
+      compress: (systemPrompt, userPrompt) => provider.compress(systemPrompt, userPrompt, options),
+      summarize: (systemPrompt, userPrompt) => provider.summarize(systemPrompt, userPrompt, options),
       ...(provider.describeImage
         ? { describeImage: provider.describeImage.bind(provider) }
         : {}),

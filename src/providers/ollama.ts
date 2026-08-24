@@ -44,28 +44,35 @@ export class OllamaProvider implements MemoryProvider {
   }
 
   async compress(systemPrompt: string, userPrompt: string, options?: LlmCallOptions): Promise<string> {
-    return this.call(systemPrompt, userPrompt, "compress", options?.task);
+    return this.call(systemPrompt, userPrompt, "compress", options);
   }
 
   async summarize(systemPrompt: string, userPrompt: string, options?: LlmCallOptions): Promise<string> {
-    return this.call(systemPrompt, userPrompt, "summarize", options?.task);
+    return this.call(systemPrompt, userPrompt, "summarize", options);
   }
 
   private async call(
     systemPrompt: string,
     userPrompt: string,
     operation: "compress" | "summarize",
-    task?: LlmTask,
+    options?: LlmCallOptions,
   ): Promise<string> {
+    const task = options?.task;
+    const noThink = options?.thinking === undefined
+      ? this.noThink
+      : !options.thinking;
+    const outputTokens = noThink
+      ? Math.min(this.maxTokens, task ? TASK_OUTPUT_TOKENS[task] : this.maxTokens)
+      : this.maxTokens;
     const telemetry = startLlmCallTelemetry({
       provider: "ollama",
       model: this.model,
       operation,
-      thinkingRequest: this.noThink ? "disabled" : "enabled",
+      thinkingRequest: noThink ? "disabled" : "enabled",
     });
     let response: Response;
     try {
-      const messages = this.noThink
+      const messages = noThink
         ? [
           {
             role: "system",
@@ -84,11 +91,11 @@ export class OllamaProvider implements MemoryProvider {
           model: this.model,
           messages,
           stream: false,
-          think: !this.noThink,
-          ...(this.noThink ? { format: NO_THINK_OUTPUT_FORMAT } : {}),
+          think: !noThink,
+          ...(noThink ? { format: NO_THINK_OUTPUT_FORMAT } : {}),
           ...(this.keepAlive ? { keep_alive: this.keepAlive === "-1" ? -1 : this.keepAlive } : {}),
           options: {
-            num_predict: Math.min(this.maxTokens, task ? TASK_OUTPUT_TOKENS[task] : this.maxTokens),
+            num_predict: outputTokens,
             temperature: 0,
           },
         }),
@@ -110,8 +117,8 @@ export class OllamaProvider implements MemoryProvider {
       throw new Error("Ollama returned invalid JSON");
     }
     const rawContent = readContent(payload);
-    const unwrapped = rawContent && this.noThink ? unwrapOutput(rawContent) : rawContent;
-    const content = unwrapped && this.noThink ? repairStructuredJson(stripThinking(unwrapped)) : unwrapped;
+    const unwrapped = rawContent && noThink ? unwrapOutput(rawContent) : rawContent;
+    const content = unwrapped && noThink ? repairStructuredJson(stripThinking(unwrapped)) : unwrapped;
     if (!content) {
       telemetry.failure({ errorKind: "invalid_response" });
       throw new Error("Ollama response did not contain assistant content");

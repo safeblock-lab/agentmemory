@@ -1,4 +1,4 @@
-import type { MemoryProvider, OpenAIReasoningEffort } from "../types.js";
+import type { LlmCallOptions, MemoryProvider, OpenAIReasoningEffort } from "../types.js";
 import { getEnvVar, isDeepSeekThinkingEnabled } from "../config.js";
 import { fetchWithTimeout } from "./_fetch.js";
 import { extractLlmTokenUsage, startLlmCallTelemetry } from "./_llm-logging.js";
@@ -86,23 +86,28 @@ export class OpenAIProvider implements MemoryProvider {
     this.isAzure = detectAzure(this.baseUrl);
   }
 
-  async compress(systemPrompt: string, userPrompt: string): Promise<string> {
-    return this.call(systemPrompt, userPrompt, "compress");
+  async compress(systemPrompt: string, userPrompt: string, options?: LlmCallOptions): Promise<string> {
+    return this.call(systemPrompt, userPrompt, "compress", options);
   }
 
-  async summarize(systemPrompt: string, userPrompt: string): Promise<string> {
-    return this.call(systemPrompt, userPrompt, "summarize");
+  async summarize(systemPrompt: string, userPrompt: string, options?: LlmCallOptions): Promise<string> {
+    return this.call(systemPrompt, userPrompt, "summarize", options);
   }
 
   private async call(
     systemPrompt: string,
     userPrompt: string,
     operation: "compress" | "summarize",
+    options?: LlmCallOptions,
   ): Promise<string> {
     const url = buildChatUrl(this.baseUrl, this.isAzure, this.azureApiVersion);
     const isDeepSeek = isDeepSeekUrl(this.baseUrl);
+    const thinkingOverride = options?.thinking;
+    const noThink = thinkingOverride === undefined ? this.noThink : !thinkingOverride;
     const thinkingRequest = isDeepSeek
-      ? (this.noThink || !isDeepSeekThinkingEnabled() ? "disabled" : "enabled")
+      ? (thinkingOverride === undefined
+        ? (this.noThink || !isDeepSeekThinkingEnabled() ? "disabled" : "enabled")
+        : (thinkingOverride ? "enabled" : "disabled"))
       : undefined;
     const telemetry = startLlmCallTelemetry({
       provider: isDeepSeek ? "deepseek" : "openai",
@@ -125,15 +130,23 @@ export class OpenAIProvider implements MemoryProvider {
         { role: "user", content: userPrompt },
       ],
     };
-    if (this.noThink) {
+    if (noThink) {
       if (isLocalOllamaUrl(this.baseUrl)) {
         body.think = false;
       } else {
         body.reasoning_effort = "none";
         if (!isDeepSeek) body.think = false;
       }
-    } else if (this.reasoningEffort && (!isDeepSeek || thinkingRequest === "enabled")) {
-      body.reasoning_effort = this.reasoningEffort;
+    } else {
+      if (thinkingOverride === true && isLocalOllamaUrl(this.baseUrl)) {
+        body.think = true;
+      }
+      const reasoningEffort = thinkingOverride === true && this.reasoningEffort === "none"
+        ? undefined
+        : this.reasoningEffort;
+      if (reasoningEffort && (!isDeepSeek || thinkingRequest === "enabled")) {
+        body.reasoning_effort = reasoningEffort;
+      }
     }
     if (thinkingRequest) {
       body.thinking = { type: thinkingRequest };
