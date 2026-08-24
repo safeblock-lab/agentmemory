@@ -17,6 +17,146 @@ import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
 import type { FireworksBatchQueue } from "./fireworks-batch.js";
+import {
+  estimateGraphObservationChars,
+  isProtectedGraphObservation,
+  splitGraphCompactionUnits,
+  toGraphPromptObservation,
+  type GraphExtractionUnit,
+} from "./graph-input.js";
+import { getGraphExtractionInputTargetChars } from "../config.js";
+
+const GRAPH_INPUT_COMPACTION_SYSTEM = `You compact coding-session observations before knowledge-graph extraction.
+Return one concise factual digest. Preserve every decision, error, file write/edit, named entity, file path, command result, and causal relationship present in the input. Do not invent facts, merge unrelated names, or use vague summaries. Keep exact identifiers and paths. The digest is an intermediate representation, not XML.`;
+
+type LocalGraphCompactor = Pick<MemoryProvider, "summarize">;
+
+function buildGraphInputCompactionPrompt(
+  observations: CompressedObservation[],
+): string {
+  return observations.map((observation, index) => [
+    `[${index + 1}] Source ID: ${observation.id}`,
+    `Type: ${observation.type}`,
+    `Title: ${observation.title}`,
+    `Narrative: ${observation.narrative}`,
+    `Facts: ${observation.facts.join("; ")}`,
+    `Concepts: ${observation.concepts.join(", ")}`,
+    `Files: ${observation.files.join(", ")}`,
+  ].join("\n")).join("\n\n");
+}
+
+function unitPromptChars(unit: GraphExtractionUnit): number {
+  return unit.promptObservations.reduce(
+    (total, observation) => total + estimateGraphObservationChars(observation),
+    0,
+  );
+}
+
+function packGraphInputUnits(
+  units: GraphExtractionUnit[],
+  targetChars: number,
+): GraphExtractionUnit[][] {
+  const target = Math.max(1, targetChars);
+  const partitions: GraphExtractionUnit[][] = [];
+  let current: GraphExtractionUnit[] = [];
+  let currentChars = 0;
+  for (const unit of units) {
+    const size = unitPromptChars(unit);
+    if (current.length > 0 && currentChars + size > target) {
+      partitions.push(current);
+      current = [];
+      currentChars = 0;
+    }
+    current.push(unit);
+    currentChars += size;
+    if (currentChars >= target) {
+      partitions.push(current);
+      current = [];
+      currentChars = 0;
+    }
+  }
+  if (current.length > 0) partitions.push(current);
+  return partitions;
+}
+
+function mergeGraphInputUnits(units: GraphExtractionUnit[]): GraphExtractionUnit {
+  return {
+    sourceObservations: units.flatMap((unit) => unit.sourceObservations),
+    promptObservations: units.flatMap((unit) => unit.promptObservations),
+  };
+}
+
+async function compactGraphInputUnit(
+  sourceObservations: CompressedObservation[],
+  targetChars: number,
+  localCompactor: LocalGraphCompactor | undefined,
+): Promise<GraphExtractionUnit> {
+  const completeUnit: GraphExtractionUnit = {
+    sourceObservations,
+    promptObservations: sourceObservations.map(toGraphPromptObservation),
+  };
+  const unitChars = sourceObservations.reduce(
+    (total, observation) => total + estimateGraphObservationChars(observation),
+    0,
+  );
+  const hasOversizedProtectedObservation = sourceObservations.some(
+    isProtectedGraphObservation,
+  ) && unitChars > targetChars;
+  if (!localCompactor || (!hasOversizedProtectedObservation && sourceObservations.some(isProtectedGraphObservation))) {
+    return completeUnit;
+  }
+  try {
+    const digest = await localCompactor.summarize(
+      GRAPH_INPUT_COMPACTION_SYSTEM,
+      buildGraphInputCompactionPrompt(sourceObservations),
+      { task: "graph_extraction", thinking: false },
+    );
+    if (!digest.trim()) return completeUnit;
+    const concepts = [...new Set(sourceObservations.flatMap((item) => item.concepts))];
+    const files = [...new Set(sourceObservations.flatMap((item) => item.files))];
+    return {
+      sourceObservations,
+      promptObservations: [{
+        title: `Local digest of ${sourceObservations.length} routine observations`,
+        narrative: digest.trim(),
+        concepts,
+        files,
+        type: sourceObservations.length === 1
+          ? sourceObservations[0].type
+          : "discovery",
+      }],
+    };
+  } catch (error) {
+    logger.warn("Local graph input compaction failed; preserving complete observations", {
+      error: error instanceof Error ? error.message : String(error),
+      observations: sourceObservations.length,
+    });
+    return completeUnit;
+  }
+}
+
+async function prepareGraphExtractionInputs(
+  sourceObservations: CompressedObservation[],
+  targetChars: number,
+  localCompactor?: LocalGraphCompactor,
+): Promise<GraphExtractionUnit[]> {
+  const complete = {
+    sourceObservations,
+    promptObservations: sourceObservations.map(toGraphPromptObservation),
+  } satisfies GraphExtractionUnit;
+  const totalChars = sourceObservations.reduce(
+    (total, observation) => total + estimateGraphObservationChars(observation),
+    0,
+  );
+  if (totalChars <= targetChars) return [complete];
+
+  const fullUnits = splitGraphCompactionUnits(sourceObservations, targetChars);
+  const compactedUnits: GraphExtractionUnit[] = [];
+  for (const unit of fullUnits) {
+    compactedUnits.push(await compactGraphInputUnit(unit, targetChars, localCompactor));
+  }
+  return packGraphInputUnits(compactedUnits, targetChars).map(mergeGraphInputUnits);
+}
 
 // #753: keep the response payload below the iii state channel ceiling.
 // 500 nodes + their incident edges hold well under the limit on the
@@ -458,6 +598,7 @@ export function registerGraphFunction(
   provider: MemoryProvider,
   llmRouter?: LlmTaskRouter,
   batchQueue?: FireworksBatchQueue,
+  localCompactor?: LocalGraphCompactor,
 ): void {
   sdk.registerFunction("mem::graph-extract", 
     async (data: { observations: CompressedObservation[]; batchResponse?: string; deferred?: boolean }) => {
@@ -465,45 +606,79 @@ export function registerGraphFunction(
         return { success: false, error: "No observations provided" };
       }
 
-      const prompt = buildGraphExtractionPrompt(
-        data.observations.map((o) => ({
-          title: o.title,
-          narrative: o.narrative,
-          concepts: o.concepts,
-          files: o.files,
-          type: o.type,
-        })),
-      );
+      const inputUnits = data.batchResponse
+        ? [{
+          sourceObservations: data.observations,
+          promptObservations: data.observations.map(toGraphPromptObservation),
+        } satisfies GraphExtractionUnit]
+        : await prepareGraphExtractionInputs(
+          data.observations,
+          getGraphExtractionInputTargetChars(),
+          localCompactor,
+        );
 
       try {
         if (!data.batchResponse && data.deferred && batchQueue) {
-          const queued = await batchQueue.enqueue({
-            correlationId: generateId("fwbgraph"),
-            task: "graph_extraction",
-            systemPrompt: GRAPH_EXTRACTION_SYSTEM,
-            userPrompt: prompt,
-            metadata: { observations: JSON.stringify(data.observations) },
-          });
-          if (queued.queued) {
-            return { success: true, queued: true, workItemId: queued.workItemId };
+          const workItemIds: string[] = [];
+          for (const unit of inputUnits) {
+            const prompt = buildGraphExtractionPrompt(unit.promptObservations);
+            const queued = await batchQueue.enqueue({
+              correlationId: generateId("fwbgraph"),
+              task: "graph_extraction",
+              systemPrompt: GRAPH_EXTRACTION_SYSTEM,
+              userPrompt: prompt,
+              metadata: { observations: JSON.stringify(unit.sourceObservations) },
+            });
+            if (!queued.queued || !queued.workItemId) {
+              logger.warn("Graph extraction batch unit was not queued; retaining source locally", {
+                queuedUnits: workItemIds.length,
+                totalUnits: inputUnits.length,
+                reason: queued.reason,
+              });
+              return {
+                success: false,
+                deferred: true,
+                queued: false,
+                queuedWorkItemIds: workItemIds,
+                error: queued.reason ?? "Graph extraction batch queue rejected a complete unit",
+              };
+            }
+            workItemIds.push(queued.workItemId);
           }
+          return {
+            success: true,
+            queued: true,
+            workItemId: workItemIds[0],
+            workItemIds,
+          };
         }
-        const response = data.batchResponse ?? (llmRouter
-          ? await llmRouter.run(
-            "graph_extraction",
-            (selectedProvider) => selectedProvider.compress(
-              GRAPH_EXTRACTION_SYSTEM,
-              prompt,
-            ),
-            (candidate) => {
-              const parsed = parseGraphXml(candidate, data.observations.map((o) => o.id));
-              return parsed.nodes.length > 0 || parsed.edges.length > 0;
-            },
-          )
-          : await provider.compress(GRAPH_EXTRACTION_SYSTEM, prompt));
 
-        const obsIds = data.observations.map((o) => o.id);
-        const { nodes, edges } = parseGraphXml(response, obsIds);
+        let totalNodesAdded = 0;
+        let totalEdgesAdded = 0;
+        if (data.batchResponse && inputUnits.length !== 1) {
+          return {
+            success: false,
+            error: "Batch response requires exactly one graph input unit",
+          };
+        }
+        for (const unit of inputUnits) {
+          const prompt = buildGraphExtractionPrompt(unit.promptObservations);
+          const response = data.batchResponse ?? (llmRouter
+            ? await llmRouter.run(
+              "graph_extraction",
+              (selectedProvider) => selectedProvider.compress(
+                GRAPH_EXTRACTION_SYSTEM,
+                prompt,
+              ),
+              (candidate) => {
+                const parsed = parseGraphXml(candidate, unit.sourceObservations.map((o) => o.id));
+                return parsed.nodes.length > 0 || parsed.edges.length > 0;
+              },
+            )
+            : await provider.compress(GRAPH_EXTRACTION_SYSTEM, prompt));
+
+          const obsIds = unit.sourceObservations.map((o) => o.id);
+          const { nodes, edges } = parseGraphXml(response, obsIds);
 
         // #814 v2: targeted name-index lookups replace the O(n) scan
         // over `kv.list<GraphNode>(KV.graphNodes)`. At 75K nodes the
@@ -634,10 +809,13 @@ export function registerGraphFunction(
           newNodes: newNodeCount,
           newEdges: newEdgeCount,
         });
+          totalNodesAdded += nodes.length;
+          totalEdgesAdded += edges.length;
+        }
         return {
           success: true,
-          nodesAdded: nodes.length,
-          edgesAdded: edges.length,
+          nodesAdded: totalNodesAdded,
+          edgesAdded: totalEdgesAdded,
         };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

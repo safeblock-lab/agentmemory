@@ -2,6 +2,7 @@ import type { LlmCallOptions, MemoryProvider, OpenAIReasoningEffort } from "../t
 import { getEnvVar, isDeepSeekThinkingEnabled } from "../config.js";
 import { fetchWithTimeout } from "./_fetch.js";
 import { extractLlmTokenUsage, startLlmCallTelemetry } from "./_llm-logging.js";
+import { taskOutputTokens } from "./task-output-limits.js";
 import {
   DEFAULT_AZURE_API_VERSION,
   buildAuthHeaders,
@@ -117,7 +118,7 @@ export class OpenAIProvider implements MemoryProvider {
     });
     const body: Record<string, unknown> = {
       model: this.model,
-      max_tokens: this.maxTokens,
+      max_tokens: taskOutputTokens(options?.task, this.maxTokens),
       // OpenAI API spec defines `stream` as defaulting to false, so omitting
       // it should yield a JSON response. Some OpenAI-compatible proxies
       // (notably 9Router < 0.4.56 — see decolua/9router#1260) default to
@@ -202,12 +203,14 @@ export class OpenAIProvider implements MemoryProvider {
     const message = data.choices?.[0]?.message;
     const content = message?.content;
     if (content) {
+      const usage = extractLlmTokenUsage(data.usage);
       telemetry.success({
         httpStatus: response.status,
-        usage: extractLlmTokenUsage(data.usage),
+        usage,
         responseChars: content.length,
         reasoningReturned: Boolean(message?.reasoning || message?.reasoning_content),
       });
+      options?.onUsage?.({ ...usage, responseChars: content.length });
       return content;
     }
     // Fallback: some thinking models return reasoning but no content.
@@ -215,12 +218,14 @@ export class OpenAIProvider implements MemoryProvider {
     // older OpenAI o-series + some compatibles return `reasoning`. #627
     const reasoning = message?.reasoning ?? message?.reasoning_content;
     if (reasoning) {
+      const usage = extractLlmTokenUsage(data.usage);
       telemetry.success({
         httpStatus: response.status,
-        usage: extractLlmTokenUsage(data.usage),
+        usage,
         responseChars: reasoning.length,
         reasoningReturned: true,
       });
+      options?.onUsage?.({ ...usage, responseChars: reasoning.length });
       return reasoning;
     }
     telemetry.failure({ httpStatus: response.status, errorKind: "invalid_response" });

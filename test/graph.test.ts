@@ -76,6 +76,17 @@ const testObs: CompressedObservation = {
   importance: 7,
 };
 
+async function withGraphInputTarget<T>(work: () => Promise<T>): Promise<T> {
+  const previous = process.env["AGENTMEMORY_GRAPH_INPUT_TARGET_CHARS"];
+  process.env["AGENTMEMORY_GRAPH_INPUT_TARGET_CHARS"] = "4000";
+  try {
+    return await work();
+  } finally {
+    if (previous === undefined) delete process.env["AGENTMEMORY_GRAPH_INPUT_TARGET_CHARS"];
+    else process.env["AGENTMEMORY_GRAPH_INPUT_TARGET_CHARS"] = previous;
+  }
+}
+
 describe("Graph Functions", () => {
   let sdk: ReturnType<typeof mockSdk>;
   let kv: ReturnType<typeof mockKV>;
@@ -213,6 +224,131 @@ describe("Graph Functions", () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toContain("No observations");
+  });
+
+  it("compacts an oversized routine locally and preserves complete source metadata", async () => {
+    await withGraphInputTarget(async () => {
+      const primary = {
+        name: "primary",
+        compress: vi.fn(),
+        summarize: vi.fn(),
+      };
+      const localCompactor = {
+        name: "resilient(ollama)",
+        compress: vi.fn(),
+        summarize: vi.fn().mockResolvedValue("routine digest with exact file src/routine.ts"),
+      };
+      let request: { userPrompt: string; metadata?: Record<string, string> } | undefined;
+      const batchQueue = {
+        enqueue: vi.fn(async (input: { userPrompt: string; metadata?: Record<string, string> }) => {
+          request = input;
+          return { queued: true, workItemId: "work-routine" };
+        }),
+      };
+      const localSdk = mockSdk();
+      registerGraphFunction(
+        localSdk as never,
+        mockKV() as never,
+        primary as never,
+        undefined,
+        batchQueue as never,
+        localCompactor as never,
+      );
+      const source: CompressedObservation = {
+        ...testObs,
+        id: "routine-large",
+        type: "conversation",
+        title: "Routine context",
+        narrative: "ROUTINE-NARRATIVE-".repeat(1_000),
+        files: ["src/routine.ts"],
+      };
+
+      const result = await localSdk.trigger("mem::graph-extract", {
+        observations: [source],
+        deferred: true,
+      }) as { success: boolean; queued: boolean };
+
+      expect(result).toMatchObject({ success: true, queued: true });
+      expect(localCompactor.summarize).toHaveBeenCalledTimes(1);
+      expect(primary.compress).not.toHaveBeenCalled();
+      expect(request?.userPrompt).toContain("routine digest with exact file");
+      expect(request?.userPrompt).not.toContain(source.narrative);
+      const persisted = JSON.parse(request!.metadata!.observations);
+      expect(persisted).toHaveLength(1);
+      expect(persisted[0]).toMatchObject({ id: source.id, narrative: source.narrative });
+    });
+  });
+
+  it("compacts an oversized decision locally instead of truncating it", async () => {
+    await withGraphInputTarget(async () => {
+      const localCompactor = {
+        name: "resilient(ollama)",
+        compress: vi.fn(),
+        summarize: vi.fn().mockResolvedValue("decision digest preserving the selected architecture"),
+      };
+      let request: { userPrompt: string } | undefined;
+      const batchQueue = {
+        enqueue: vi.fn(async (input: { userPrompt: string }) => {
+          request = input;
+          return { queued: true, workItemId: "work-decision" };
+        }),
+      };
+      const localSdk = mockSdk();
+      registerGraphFunction(
+        localSdk as never,
+        mockKV() as never,
+        mockProvider as never,
+        undefined,
+        batchQueue as never,
+        localCompactor as never,
+      );
+      const source: CompressedObservation = {
+        ...testObs,
+        id: "decision-large",
+        type: "decision",
+        title: "Architecture decision",
+        narrative: "DECISION-NARRATIVE-".repeat(1_000),
+      };
+
+      const result = await localSdk.trigger("mem::graph-extract", {
+        observations: [source],
+        deferred: true,
+      }) as { success: boolean; queued: boolean };
+
+      expect(result).toMatchObject({ success: true, queued: true });
+      expect(localCompactor.summarize).toHaveBeenCalledTimes(1);
+      expect(request?.userPrompt).toContain("decision digest preserving");
+      expect(request?.userPrompt).not.toContain(source.narrative);
+    });
+  });
+
+  it("does not call the primary when deferred batch queue rejects work", async () => {
+    const primary = {
+      name: "primary",
+      compress: vi.fn(),
+      summarize: vi.fn(),
+    };
+    const batchQueue = {
+      enqueue: vi.fn().mockResolvedValue({ queued: false, reason: "Batch queue is full" }),
+    };
+    const localSdk = mockSdk();
+    registerGraphFunction(
+      localSdk as never,
+      mockKV() as never,
+      primary as never,
+      undefined,
+      batchQueue as never,
+    );
+
+    const result = await localSdk.trigger("mem::graph-extract", {
+      observations: [testObs],
+      deferred: true,
+    }) as { success: boolean; deferred: boolean; queued: boolean; error: string };
+
+    expect(result).toMatchObject({ success: false, deferred: true, queued: false });
+    expect(result.error).toContain("full");
+    expect(batchQueue.enqueue).toHaveBeenCalledTimes(1);
+    expect(primary.compress).not.toHaveBeenCalled();
   });
 
   // #753: an unbounded {} body used to materialize every node+edge in

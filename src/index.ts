@@ -98,11 +98,13 @@ import { registerMcpEndpoints } from "./mcp/server.js";
 import { getAllTools } from "./mcp/tools-registry.js";
 import { startViewerServer } from "./viewer/server.js";
 import { MetricsStore } from "./eval/metrics-store.js";
+import { batchTaskLlmTask } from "./providers/task-output-limits.js";
 import { DedupMap } from "./functions/dedup.js";
 import { registerHealthMonitor } from "./health/monitor.js";
 import { initMetrics, OTEL_CONFIG } from "./telemetry/setup.js";
 import { VERSION } from "./version.js";
 import { bootLog } from "./logger.js";
+import type { AuxiliaryLlmConfig } from "./types.js";
 import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -142,6 +144,20 @@ function hasGetMeter(
   );
 }
 
+function isLocalOllamaAuxiliary(
+  auxiliary: AuxiliaryLlmConfig | undefined,
+): boolean {
+  if (!auxiliary || auxiliary.provider !== "ollama") return false;
+  try {
+    const url = new URL(auxiliary.baseURL);
+    return url.protocol === "http:" &&
+      url.port === "11434" &&
+      ["localhost", "127.0.0.1", "[::1]", "::1"].includes(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
 // Top-level safety net for iii-engine invocation timeouts (issue #204).
 // Under sustained write load (e.g. Claude Code hooks across many
 // projects) `state::set` can occasionally exceed the SDK's 30s timeout.
@@ -173,6 +189,7 @@ async function main() {
   const auxiliaryProvider = config.auxiliaryProvider
     ? createAuxiliaryProvider(config.auxiliaryProvider)
     : undefined;
+  let metricsStore: MetricsStore | undefined;
   const llmRouter = new LlmTaskRouter({
     primary: { provider, model: config.provider.model },
     ...(auxiliaryProvider && config.auxiliaryProvider
@@ -186,8 +203,16 @@ async function main() {
         (event.failureReason ? ` reason=${event.failureReason}` : ""),
       );
     },
+    onUsage: async (event) => {
+      await metricsStore?.recordLlmUsage(
+        event.task,
+        event.provider,
+        event.model,
+        event,
+      );
+    },
   });
-  const taskRouter = auxiliaryProvider ? llmRouter : undefined;
+  const taskRouter = llmRouter;
 
   const embeddingProvider = createEmbeddingProvider();
   const imageEmbeddingProvider = createImageEmbeddingProvider();
@@ -239,6 +264,7 @@ async function main() {
   writeWorkerPidfile();
 
   const kv = new StateKV(sdk);
+  metricsStore = new MetricsStore(kv);
   const fireworksBatch = new FireworksBatchCoordinator(
     kv,
     config.fireworksBatch,
@@ -324,9 +350,16 @@ async function main() {
         return "stale";
       }
     },
+    async (item, usage) => {
+      await metricsStore?.recordLlmUsage(
+        batchTaskLlmTask(item.task),
+        "fireworks-batch",
+        item.model,
+        usage,
+      );
+    },
   );
   const secret = getEnvVar("AGENTMEMORY_SECRET");
-  const metricsStore = new MetricsStore(kv);
   const dedupMap = new DedupMap();
 
   const vectorIndex = embeddingProvider ? new VectorIndex() : null;
@@ -375,7 +408,17 @@ async function main() {
   }
 
   if (isGraphExtractionEnabled()) {
-    registerGraphFunction(sdk, kv, provider, taskRouter, config.fireworksBatch.enabled ? fireworksBatch : undefined);
+    const localGraphCompactor = isLocalOllamaAuxiliary(config.auxiliaryProvider)
+      ? auxiliaryProvider
+      : undefined;
+    registerGraphFunction(
+      sdk,
+      kv,
+      provider,
+      taskRouter,
+      config.fireworksBatch.enabled ? fireworksBatch : undefined,
+      localGraphCompactor,
+    );
     bootLog(`Knowledge graph: extraction enabled`);
   }
 

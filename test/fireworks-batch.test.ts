@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { FireworksBatchCoordinator } from "../src/functions/fireworks-batch.js";
 import { StateKV } from "../src/state/kv.js";
+import { KV } from "../src/state/schema.js";
 import type { FireworksBatchConfig } from "../src/types.js";
 import type { FireworksBatchTransport } from "../src/providers/fireworks-batch.js";
 
@@ -91,7 +92,10 @@ describe("FireworksBatchCoordinator", () => {
       async createDataset(_id, exampleCount) { calls.push(`dataset:${exampleCount}`); },
       async uploadDataset(_id, jsonl) {
         calls.push(jsonl);
-        expect(JSON.parse(jsonl)).toMatchObject({ custom_id: "graph-1" });
+        expect(JSON.parse(jsonl)).toMatchObject({
+          custom_id: "graph-1",
+          body: { max_tokens: 512 },
+        });
       },
       async submitJob() { calls.push("submit"); return { remoteJobId: "job-1" }; },
       async getJobStatus() { return { state: "COMPLETED" }; },
@@ -118,6 +122,35 @@ describe("FireworksBatchCoordinator", () => {
     expect(calls.filter((call) => call.startsWith("dataset:"))).toEqual(["dataset:1"]);
     expect(calls).toContain("submit");
     expect(applied).toEqual(["graph-1:<graph />"]);
+  });
+
+  it("keeps large persisted provenance outside the remote prompt budget", async () => {
+    const kv = createKv();
+    const coordinator = new FireworksBatchCoordinator(
+      kv,
+      config,
+      {
+        async createDataset() {},
+        async uploadDataset() {},
+        async submitJob() { return { remoteJobId: "job-metadata" }; },
+        async getJobStatus() { return { state: "PENDING" }; },
+        async downloadResults() { return ""; },
+      },
+      async () => {},
+    );
+    const metadata = { observations: JSON.stringify({ narrative: "x".repeat(25_000) }) };
+
+    const queued = await coordinator.enqueue({
+      correlationId: "graph-large-provenance",
+      task: "graph_extraction",
+      systemPrompt: "system",
+      userPrompt: "compact remote prompt",
+      metadata,
+    });
+
+    expect(queued.queued).toBe(true);
+    const persisted = await kv.list<{ metadata?: Record<string, string> }>(KV.fireworksBatchWorkItems);
+    expect(persisted[0]?.metadata).toEqual(metadata);
   });
 
   it("marks stale results and permits a current replacement to be queued", async () => {

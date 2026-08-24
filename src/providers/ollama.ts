@@ -2,21 +2,7 @@ import type { AuxiliaryLlmConfig, LlmCallOptions, LlmTask, MemoryProvider } from
 import { jsonrepair } from "jsonrepair";
 import { fetchWithTimeout } from "./_fetch.js";
 import { startLlmCallTelemetry } from "./_llm-logging.js";
-
-const TASK_OUTPUT_TOKENS: Record<LlmTask, number> = {
-  graph_extraction: 512,
-  temporal_graph_extraction: 512,
-  consolidation: 768,
-  compression: 768,
-  summary: 768,
-  entity_extraction: 384,
-  classification: 384,
-  reflection: 1024,
-  conflict_resolution: 1024,
-  skill_extraction: 768,
-  query_expansion: 384,
-  flow_compression: 768,
-};
+import { taskOutputTokens } from "./task-output-limits.js";
 
 const NO_THINK_OUTPUT_FORMAT = {
   type: "object",
@@ -62,7 +48,7 @@ export class OllamaProvider implements MemoryProvider {
       ? this.noThink
       : !options.thinking;
     const outputTokens = noThink
-      ? Math.min(this.maxTokens, task ? TASK_OUTPUT_TOKENS[task] : this.maxTokens)
+      ? taskOutputTokens(task, this.maxTokens)
       : this.maxTokens;
     const telemetry = startLlmCallTelemetry({
       provider: "ollama",
@@ -124,6 +110,7 @@ export class OllamaProvider implements MemoryProvider {
       throw new Error("Ollama response did not contain assistant content");
     }
     telemetry.success({ httpStatus: response.status, responseChars: content.length });
+    options?.onUsage?.({ responseChars: content.length });
     return content;
   }
 }

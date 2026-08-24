@@ -1,4 +1,5 @@
-import type { LlmRouteTarget, LlmRoutingConfig, LlmTask, MemoryProvider } from "../types.js";
+import type { LlmRouteTarget, LlmRoutingConfig, LlmTask, LlmUsage, MemoryProvider } from "../types.js";
+import { logger } from "../logger.js";
 
 export type LlmFallbackReason =
   | "auxiliary_unavailable"
@@ -20,11 +21,18 @@ export interface LlmRoutingEvent {
   failureReason?: LlmFallbackReason;
 }
 
+export interface LlmUsageEvent extends LlmUsage {
+  task: LlmTask;
+  provider: LlmRouteTarget;
+  model: string;
+}
+
 export interface LlmTaskRouterOptions {
   primary: LlmProviderTarget;
   auxiliary?: LlmProviderTarget;
   routing: LlmRoutingConfig;
   onEvent?: (event: LlmRoutingEvent) => void;
+  onUsage?: (event: LlmUsageEvent) => Promise<void>;
 }
 
 export class LlmTaskRouter {
@@ -32,12 +40,14 @@ export class LlmTaskRouter {
   private readonly auxiliary?: LlmProviderTarget;
   private readonly routing: LlmRoutingConfig;
   private readonly onEvent?: (event: LlmRoutingEvent) => void;
+  private readonly onUsage?: (event: LlmUsageEvent) => Promise<void>;
 
   constructor(options: LlmTaskRouterOptions) {
     this.primary = options.primary;
     this.auxiliary = options.auxiliary;
     this.routing = options.routing;
     this.onEvent = options.onEvent;
+    this.onUsage = options.onUsage;
   }
 
   get hasAuxiliaryProvider(): boolean {
@@ -64,8 +74,10 @@ export class LlmTaskRouter {
     }
 
     const startedAt = Date.now();
+    const usage: LlmUsage[] = [];
     try {
-      const candidate = await operation(this.withTask(this.auxiliary.provider, task));
+      const candidate = await operation(this.withTask(this.auxiliary, task, usage));
+      await this.emitUsage(task, "aux", this.auxiliary.model, usage);
       const failureReason = this.getCandidateFailure(candidate, validate);
       if (!failureReason) {
         this.emit({
@@ -91,7 +103,9 @@ export class LlmTaskRouter {
     failureReason?: LlmFallbackReason,
   ): Promise<T> {
     const startedAt = Date.now();
-    const candidate = await operation(this.withTask(this.primary.provider, task));
+    const usage: LlmUsage[] = [];
+    const candidate = await operation(this.withTask(this.primary, task, usage));
+    await this.emitUsage(task, "primary", this.primary.model, usage);
     const primaryFailure = this.getCandidateFailure(candidate, validate);
     if (primaryFailure) {
       throw new Error(`LLM ${task} response failed deterministic validation`);
@@ -118,9 +132,38 @@ export class LlmTaskRouter {
     this.onEvent?.(event);
   }
 
-  private withTask(provider: MemoryProvider, task: LlmTask): MemoryProvider {
+  private async emitUsage(
+    task: LlmTask,
+    provider: LlmRouteTarget,
+    model: string,
+    usage: LlmUsage[],
+  ): Promise<void> {
+    if (!this.onUsage) return;
+    for (const item of usage) {
+      try {
+        await this.onUsage({ task, provider, model, ...item });
+      } catch (error) {
+        logger.warn("LLM usage metrics recording failed", {
+          task,
+          provider,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  private withTask(
+    target: LlmProviderTarget,
+    task: LlmTask,
+    usage: LlmUsage[],
+  ): MemoryProvider {
     const thinking = this.routing.thinking?.[task];
-    const options = thinking === undefined ? { task } : { task, thinking };
+    const options = {
+      task,
+      ...(thinking === undefined ? {} : { thinking }),
+      onUsage: (item: LlmUsage) => usage.push(item),
+    };
+    const provider = target.provider;
     return {
       name: provider.name,
       compress: (systemPrompt, userPrompt) => provider.compress(systemPrompt, userPrompt, options),

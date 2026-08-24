@@ -51,6 +51,8 @@ const FIREWORKS_BATCH_DEFAULT_POLL_INTERVAL_MS = 60_000;
 const FIREWORKS_BATCH_DEFAULT_POLL_MAX_INTERVAL_MS = 120_000;
 const FIREWORKS_BATCH_DEFAULT_RECOVERY_STALE_MS = 15 * 60_000;
 const FIREWORKS_BATCH_DEFAULT_MAX_QUEUED_ITEMS = 1_000;
+const GRAPH_EXTRACTION_DEFAULT_INPUT_TARGET_CHARS = 32_000;
+const CONSOLIDATION_DEFAULT_MIN_NEW_SUMMARIES = 5;
 
 const LLM_ROUTE_ENV = {
   graph_extraction: "AGENTMEMORY_GRAPH_LLM",
@@ -847,6 +849,21 @@ export function getGraphBatchSize(): number {
   return safeParseInt(getMergedEnv()["GRAPH_EXTRACTION_BATCH_SIZE"], 10);
 }
 
+export function getGraphExtractionInputTargetChars(): number {
+  const env = getMergedEnv();
+  const configured = safeParseInt(
+    env["AGENTMEMORY_GRAPH_INPUT_TARGET_CHARS"] ??
+      env["AGENTMEMORY_GRAPH_MAX_INPUT_CHARS"],
+    GRAPH_EXTRACTION_DEFAULT_INPUT_TARGET_CHARS,
+  );
+  return Math.max(4_000, Math.min(120_000, configured));
+}
+
+/** Backwards-compatible alias for integrations using the old name. */
+export function getGraphExtractionMaxInputChars(): number {
+  return getGraphExtractionInputTargetChars();
+}
+
 // window for the smart-search followup-rate diagnostic. A second
 // search arriving within this many seconds (with disjoint results)
 // counts as a "follow-up" — a directional signal that the first result
@@ -913,6 +930,14 @@ export function isContextInjectionEnabled(): boolean {
 
 export function getConsolidationDecayDays(): number {
   return safeParseInt(getMergedEnv()["CONSOLIDATION_DECAY_DAYS"], 30);
+}
+
+export function getConsolidationMinNewSummaries(): number {
+  const configured = safeParseInt(
+    getMergedEnv()["AGENTMEMORY_CONSOLIDATION_MIN_NEW_SUMMARIES"],
+    CONSOLIDATION_DEFAULT_MIN_NEW_SUMMARIES,
+  );
+  return Math.max(1, Math.min(20, configured));
 }
 
 export function isStandaloneMcp(): boolean {

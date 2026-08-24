@@ -1,8 +1,9 @@
-import type { FireworksBatchConfig, FireworksBatchJob, FireworksBatchRequest, FireworksBatchWorkItem } from "../types.js";
+import type { FireworksBatchConfig, FireworksBatchJob, FireworksBatchRequest, FireworksBatchWorkItem, LlmUsage } from "../types.js";
 import { fingerprintId, generateId, KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import type { FireworksBatchTransport } from "../providers/fireworks-batch.js";
 import { logger } from "../logger.js";
+import { batchTaskLlmTask, taskOutputTokens } from "../providers/task-output-limits.js";
 
 export interface FireworksBatchQueue {
   enqueue(request: FireworksBatchRequest): Promise<{ queued: boolean; workItemId?: string; reason?: string }>;
@@ -12,6 +13,13 @@ type CompletedHandler = (
   item: FireworksBatchWorkItem,
   content: string,
 ) => Promise<"stale" | void>;
+
+type UsageHandler = (item: FireworksBatchWorkItem, usage: LlmUsage) => Promise<void>;
+
+// Metadata is persisted in the local queue and is not part of the JSONL
+// request uploaded to Fireworks. Keep a separate local bound so provenance
+// can be retained without consuming the remote prompt budget.
+const MAX_PERSISTED_METADATA_CHARS = 2_000_000;
 
 function retryAt(config: FireworksBatchConfig, attempts: number): string {
   const delay = Math.min(config.retryMaxMs, config.retryBaseMs * 2 ** Math.max(0, attempts - 1));
@@ -35,6 +43,24 @@ function resultContent(value: unknown): string | undefined {
   return typeof content === "string" ? content : undefined;
 }
 
+function resultUsage(value: unknown): LlmUsage | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const response = (value as Record<string, unknown>).response;
+  if (!response || typeof response !== "object") return undefined;
+  const body = (response as Record<string, unknown>).body;
+  if (!body || typeof body !== "object") return undefined;
+  const usage = (body as Record<string, unknown>).usage;
+  if (!usage || typeof usage !== "object") return undefined;
+  const raw = usage as Record<string, unknown>;
+  const count = (value: unknown): number | undefined =>
+    typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+  const inputTokens = count(raw.prompt_tokens ?? raw.input_tokens);
+  const outputTokens = count(raw.completion_tokens ?? raw.output_tokens);
+  const totalTokens = count(raw.total_tokens);
+  if (inputTokens === undefined && outputTokens === undefined && totalTokens === undefined) return undefined;
+  return { inputTokens, outputTokens, totalTokens, responseChars: 0 };
+}
+
 function compatibilityKey(item: FireworksBatchWorkItem): string {
   return `${item.task}\0${item.model}\0${item.maxTokens}\0${item.systemPrompt}`;
 }
@@ -49,15 +75,21 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
     private readonly config: FireworksBatchConfig,
     private readonly transport: FireworksBatchTransport | undefined,
     private readonly onCompleted: CompletedHandler,
+    private readonly onUsage?: UsageHandler,
   ) {}
 
   async enqueue(request: FireworksBatchRequest): Promise<{ queued: boolean; workItemId?: string; reason?: string }> {
     if (!this.config.enabled || !this.transport || !this.config.model) {
       return { queued: false, reason: "Fireworks Batch is disabled" };
     }
-    const requestChars = request.systemPrompt.length + request.userPrompt.length + (Object.values(request.metadata ?? {}) as string[]).reduce((total, value) => total + value.length, 0);
-    if (!request.systemPrompt || !request.userPrompt || requestChars > this.config.maxRequestChars) {
+    const remotePromptChars = request.systemPrompt.length + request.userPrompt.length;
+    const metadataChars = (Object.values(request.metadata ?? {}) as string[])
+      .reduce((total, value) => total + value.length, 0);
+    if (!request.systemPrompt || !request.userPrompt || remotePromptChars > this.config.maxRequestChars) {
       return { queued: false, reason: "Batch request exceeded configured limits" };
+    }
+    if (metadataChars > MAX_PERSISTED_METADATA_CHARS) {
+      return { queued: false, reason: "Batch provenance metadata exceeded local limits" };
     }
     const fingerprint = fingerprintId("fwb", `${request.task}\0${request.systemPrompt}\0${request.userPrompt}`);
     const existingId = await this.kv.get<string>(KV.fireworksBatchFingerprints, fingerprint);
@@ -80,7 +112,7 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
       model: request.model || this.config.model,
       systemPrompt: request.systemPrompt,
       userPrompt: request.userPrompt,
-      maxTokens: request.maxTokens || 1024,
+      maxTokens: request.maxTokens ?? taskOutputTokens(batchTaskLlmTask(request.task), 1024),
       metadata: request.metadata,
       state: "queued",
       attempts: 0,
@@ -214,6 +246,8 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
       if (!item || !allowed.has(item.id) || item.state === "completed") continue;
       const content = resultContent(parsed);
       if (!content) continue;
+      const usage = resultUsage(parsed);
+      if (usage && this.onUsage) await this.onUsage(item, usage);
       const completion = await this.onCompleted(item, content);
       item.state = completion === "stale" ? "stale" : "completed";
       const receivedAt = new Date().toISOString();

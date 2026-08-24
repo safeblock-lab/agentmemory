@@ -6,6 +6,7 @@ vi.mock("../src/logger.js", () => ({
 
 vi.mock("../src/config.js", () => ({
   getConsolidationDecayDays: () => 30,
+  getConsolidationMinNewSummaries: () => 5,
   isConsolidationEnabled: vi.fn(() => true),
 }));
 
@@ -165,6 +166,35 @@ describe("Consolidation Pipeline", () => {
     expect(stored.length).toBe(1);
     expect(stored[0].fact).toBe("TypeScript is the primary language");
     expect(stored[0].confidence).toBe(0.9);
+  });
+
+  it("waits for enough new summaries after its initial semantic checkpoint", async () => {
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockResolvedValue(
+        `<facts><fact confidence="0.9">TypeScript is the primary language</fact></facts>`,
+      ),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 0; i < 5; i++) {
+      await kv.set("mem:summaries", `ses_${i}`, makeSummary(i));
+    }
+
+    await sdk.trigger("mem::consolidate-pipeline", { tier: "semantic" });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+
+    await kv.set("mem:summaries", "ses_new", {
+      ...makeSummary(20),
+      sessionId: "ses_new",
+      createdAt: new Date(Date.now() + 86400000).toISOString(),
+    });
+    const result = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+    })) as { results: { semantic: { skipped?: boolean } } };
+
+    expect(result.results.semantic.skipped).toBe(true);
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
   });
 
   it("with enough patterns, creates procedural memories from provider response", async () => {

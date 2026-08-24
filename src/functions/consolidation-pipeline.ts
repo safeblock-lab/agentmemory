@@ -15,11 +15,71 @@ import {
   buildProceduralExtractionPrompt,
 } from "../prompts/consolidation.js";
 import { recordAudit } from "./audit.js";
-import { getConsolidationDecayDays, isConsolidationEnabled } from "../config.js";
+import {
+  getConsolidationDecayDays,
+  getConsolidationMinNewSummaries,
+  isConsolidationEnabled,
+} from "../config.js";
 import { logger } from "../logger.js";
 import { assessConsolidationComplexity } from "./consolidation-complexity.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
 import type { FireworksBatchQueue } from "./fireworks-batch.js";
+
+const SEMANTIC_CHECKPOINT_KEY = "semantic-consolidation";
+const SEMANTIC_ANCHOR_SUMMARIES = 5;
+const SEMANTIC_NEW_SUMMARIES_PER_RUN = 15;
+
+interface SemanticCheckpoint {
+  processedThrough: string;
+  processedSessionIdsAtThrough: string[];
+}
+
+interface SemanticInput {
+  summaries: SessionSummary[];
+  checkpoint?: SemanticCheckpoint;
+}
+
+function isAfterCheckpoint(summary: SessionSummary, checkpoint: SemanticCheckpoint): boolean {
+  if (summary.createdAt > checkpoint.processedThrough) return true;
+  return summary.createdAt === checkpoint.processedThrough &&
+    !checkpoint.processedSessionIdsAtThrough.includes(summary.sessionId);
+}
+
+function checkpointFor(summary: SessionSummary): SemanticCheckpoint {
+  return {
+    processedThrough: summary.createdAt,
+    processedSessionIdsAtThrough: [summary.sessionId],
+  };
+}
+
+function selectSemanticInput(
+  summaries: SessionSummary[],
+  checkpoint: SemanticCheckpoint | null,
+  minNewSummaries: number,
+): SemanticInput {
+  const newestFirst = [...summaries].sort((left, right) =>
+    right.createdAt.localeCompare(left.createdAt),
+  );
+  if (!checkpoint) {
+    const selected = newestFirst.slice(0, 20);
+    const newest = newestFirst[0];
+    return { summaries: selected, checkpoint: newest ? checkpointFor(newest) : undefined };
+  }
+
+  const newSummaries = newestFirst
+    .filter((summary) => isAfterCheckpoint(summary, checkpoint))
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  if (newSummaries.length < minNewSummaries) return { summaries: [] };
+
+  const selectedNew = newSummaries.slice(0, SEMANTIC_NEW_SUMMARIES_PER_RUN);
+  const anchors = newestFirst
+    .filter((summary) => !isAfterCheckpoint(summary, checkpoint))
+    .slice(0, SEMANTIC_ANCHOR_SUMMARIES);
+  return {
+    summaries: [...anchors, ...selectedNew],
+    checkpoint: checkpointFor(selectedNew[selectedNew.length - 1]),
+  };
+}
 
 function applyDecay(
   items: Array<{
@@ -74,13 +134,22 @@ export function registerConsolidationPipelineFunction(
         const existingSemantic = await kv.list<SemanticMemory>(KV.semantic);
 
         if (summaries.length >= 5) {
-          const recentSummaries = summaries
-            .sort(
-              (a, b) =>
-                new Date(b.createdAt).getTime() -
-                new Date(a.createdAt).getTime(),
-            )
-            .slice(0, 20);
+          const checkpoint = await kv.get<SemanticCheckpoint>(
+            KV.state,
+            SEMANTIC_CHECKPOINT_KEY,
+          );
+          const semanticInput = selectSemanticInput(
+            summaries,
+            checkpoint,
+            getConsolidationMinNewSummaries(),
+          );
+          const recentSummaries = semanticInput.summaries;
+          if (recentSummaries.length === 0) {
+            results.semantic = {
+              skipped: true,
+              reason: `fewer than ${getConsolidationMinNewSummaries()} new summaries`,
+            };
+          } else {
 
           const prompt = buildSemanticMergePrompt(
             recentSummaries.map((s) => ({
@@ -171,11 +240,15 @@ export function registerConsolidationPipelineFunction(
               }
             }
             results.semantic = { newFacts, totalSummaries: summaries.length };
+            if (semanticInput.checkpoint) {
+              await kv.set(KV.state, SEMANTIC_CHECKPOINT_KEY, semanticInput.checkpoint);
+            }
             }
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             logger.error("Semantic consolidation failed", { error: msg });
             results.semantic = { error: msg };
+          }
           }
         } else {
           results.semantic = {

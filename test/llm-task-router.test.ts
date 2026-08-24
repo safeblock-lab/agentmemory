@@ -73,7 +73,7 @@ describe("LlmTaskRouter", () => {
       (selected) => selected.compress("system", "user"),
       (value) => value === "auxiliary",
     );
-    expect(auxiliary.compress).toHaveBeenCalledWith("system", "user", { task: "classification" });
+    expect(auxiliary.compress).toHaveBeenCalledWith("system", "user", expect.objectContaining({ task: "classification" }));
   });
 
   it.each([true, false])("passes configured task thinking override (%s)", async (thinking) => {
@@ -87,10 +87,38 @@ describe("LlmTaskRouter", () => {
       (selected) => selected.compress("system", "user"),
       (value) => value === "auxiliary",
     );
-    expect(auxiliary.compress).toHaveBeenCalledWith("system", "user", {
+    expect(auxiliary.compress).toHaveBeenCalledWith("system", "user", expect.objectContaining({
       task: "classification",
       thinking,
+    }));
+  });
+
+  it("persists reported provider usage with the routed task identity", async () => {
+    const primary = provider("primary");
+    primary.compress = vi.fn(async (_system, _user, options) => {
+      options?.onUsage?.({ inputTokens: 12, outputTokens: 4, totalTokens: 16, responseChars: 20 });
+      return "primary";
     });
+    const usage: unknown[] = [];
+    const taskRouter = new LlmTaskRouter({
+      primary: { provider: primary, model: "primary-model" },
+      routing: routes,
+      onUsage: async (event) => { usage.push(event); },
+    });
+
+    await taskRouter.run(
+      "compression",
+      (selected) => selected.compress("system", "user"),
+      (value) => value === "primary",
+    );
+
+    expect(usage).toEqual([expect.objectContaining({
+      task: "compression",
+      provider: "primary",
+      model: "primary-model",
+      inputTokens: 12,
+      totalTokens: 16,
+    })]);
   });
 
   it("allows a complex workload to override its configured auxiliary route", async () => {
