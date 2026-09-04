@@ -69,6 +69,10 @@ function oldestCreatedAt(items: FireworksBatchWorkItem[]): number {
   return Math.min(...items.map((item) => Date.parse(item.createdAt)).filter(Number.isFinite));
 }
 
+function fireworksResourceId(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "batch";
+}
+
 function isSafeRemoteJobId(value: unknown): value is string {
   return typeof value === "string"
     && value.length > 0
@@ -197,7 +201,7 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
     const compatible = eligible[0];
     if (!compatible || compatible.length === 0) return;
     const first = compatible[0];
-    const jobId = generateId("fwbjob");
+    const jobId = fireworksResourceId(generateId("fwbjob"));
     const inputDatasetId = `${jobId}-input`;
     const outputDatasetId = `${jobId}-output`;
     const jsonl = compatible.map((item) => JSON.stringify({ custom_id: item.customId, body: { messages: [{ role: "system", content: item.systemPrompt }, { role: "user", content: item.userPrompt }], max_tokens: item.maxTokens } })).join("\n");

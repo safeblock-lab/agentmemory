@@ -124,10 +124,15 @@ describe("FireworksBatchCoordinator", () => {
 
   it("submits correlated JSONL work and only applies its matching result", async () => {
     const calls: string[] = [];
+    const datasetIds: string[] = [];
+    const submittedJobIds: string[] = [];
     const statusIds: string[] = [];
     const kv = createKv();
     const transport: FireworksBatchTransport = {
-      async createDataset(_id, exampleCount) { calls.push(`dataset:${exampleCount}`); },
+      async createDataset(id, exampleCount) {
+        datasetIds.push(id);
+        calls.push(`dataset:${exampleCount}`);
+      },
       async uploadDataset(_id, jsonl) {
         calls.push(jsonl);
         const row = JSON.parse(jsonl);
@@ -137,7 +142,12 @@ describe("FireworksBatchCoordinator", () => {
         });
         expect(row.body).not.toHaveProperty("model");
       },
-      async submitJob() { calls.push("submit"); return { remoteJobId: "remote-job-1" }; },
+      async submitJob(request) {
+        datasetIds.push(request.outputDatasetId);
+        submittedJobIds.push(request.jobId);
+        calls.push("submit");
+        return { remoteJobId: "remote-job-1" };
+      },
       async getJobStatus(id) { statusIds.push(id); return { state: "COMPLETED" }; },
       async downloadResults() {
         return JSON.stringify({
@@ -160,6 +170,13 @@ describe("FireworksBatchCoordinator", () => {
     await coordinator.process();
 
     expect(calls.filter((call) => call.startsWith("dataset:"))).toEqual(["dataset:1"]);
+    expect(datasetIds).toEqual([
+      expect.stringMatching(/^fwbjob-[a-z0-9-]+-input$/),
+      expect.stringMatching(/^fwbjob-[a-z0-9-]+-output$/),
+    ]);
+    expect(datasetIds.every((id) => !id.includes("_"))).toBe(true);
+    expect(submittedJobIds).toEqual([expect.stringMatching(/^fwbjob-[a-z0-9-]+$/)]);
+    expect(submittedJobIds.every((id) => !id.includes("_"))).toBe(true);
     expect(calls).toContain("submit");
     expect(statusIds).toEqual(["remote-job-1"]);
     await expect(kv.list<{ remoteJobId?: string }>(KV.fireworksBatchJobs)).resolves.toEqual([
