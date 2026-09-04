@@ -16,6 +16,11 @@ export interface FireworksBatchRemoteStatus {
   message?: string;
 }
 
+export interface FireworksBatchErrorDiagnostic {
+  code?: string;
+  message?: string;
+}
+
 export interface FireworksBatchTransport {
   createDataset(datasetId: string, exampleCount: number): Promise<void>;
   uploadDataset(datasetId: string, jsonl: string): Promise<void>;
@@ -28,17 +33,22 @@ export class FireworksBatchError extends Error {
   readonly retryable: boolean;
   readonly status?: number;
   readonly operation: string;
+  readonly diagnostic: FireworksBatchErrorDiagnostic;
 
   constructor(
     operation: string,
     message: string,
-    options: { retryable?: boolean; status?: number } = {},
+    options: { retryable?: boolean; status?: number; diagnostic?: FireworksBatchErrorDiagnostic } = {},
   ) {
-    super(message);
+    super(sanitizeDiagnosticText(message) ?? "Fireworks Batch request failed");
     this.name = "FireworksBatchError";
     this.operation = operation;
     this.retryable = options.retryable ?? false;
     this.status = options.status;
+    this.diagnostic = {
+      code: sanitizeDiagnosticText(options.diagnostic?.code),
+      message: sanitizeDiagnosticText(options.diagnostic?.message),
+    };
   }
 }
 
@@ -57,6 +67,59 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function lastPathSegment(value: string): string {
   const segment = value.split("/").filter(Boolean).at(-1);
   return segment || value;
+}
+
+const MAX_DIAGNOSTIC_CHARS = 512;
+
+function sanitizeDiagnosticText(value: unknown): string | undefined {
+  if (typeof value !== "string" && typeof value !== "number") return undefined;
+  const text = String(value)
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\bhttps?:\/\/[^\s<>"']+/gi, "[redacted-url]")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
+    .replace(/(["']?)(authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)\1\s*[:=]\s*(?:"[^"]*"|'[^']*'|(?:bearer\s+)?[^,;\s}]+)/gi, "$2=[redacted]")
+    .replace(/(["']?)((?:user|system)?prompt|messages?|jsonl)\1\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^,;\s}]+)/gi, "$2=[redacted]");
+  return text ? text.slice(0, MAX_DIAGNOSTIC_CHARS) : undefined;
+}
+
+function parseErrorDiagnostic(body: string): FireworksBatchErrorDiagnostic {
+  let parsed: unknown;
+  try {
+    parsed = body ? JSON.parse(body) : undefined;
+  } catch {
+    return {};
+  }
+  if (!isRecord(parsed)) return {};
+  const error = isRecord(parsed.error) ? parsed.error : parsed;
+  return {
+    code: sanitizeDiagnosticText(error.code ?? parsed.code ?? error.status ?? parsed.status),
+    message: sanitizeDiagnosticText(error.message ?? parsed.message),
+  };
+}
+
+function formatRemoteFailure(status: number, diagnostic: FireworksBatchErrorDiagnostic): string {
+  const details = [
+    diagnostic.code ? `code=${diagnostic.code}` : undefined,
+    diagnostic.message ? `message=${diagnostic.message}` : undefined,
+  ].filter((detail): detail is string => Boolean(detail));
+  return `remote request failed (${status})${details.length > 0 ? `: ${details.join("; ")}` : ""}`;
+}
+
+async function readResponseBody(response: Response, maxBytes: number, operation: string): Promise<string> {
+  try {
+    return await readLimitedBody(response, maxBytes, operation);
+  } catch (error) {
+    const message = error instanceof FireworksBatchError ? error.message : "failed to read remote response";
+    throw new FireworksBatchError(operation, message, { status: response.status });
+  }
+}
+
+function isSafeRemoteJobId(value: string): boolean {
+  return value.length > 0
+    && value.length <= 512
+    && !/[\u0000-\u0020\u007f/?#\\]/.test(value);
 }
 
 async function readLimitedBody(response: Response, maxBytes: number, operation: string): Promise<string> {
@@ -139,11 +202,13 @@ export class FireworksBatchClient implements FireworksBatchTransport {
       throw new FireworksBatchError(operation, "network request failed", { retryable: true });
     }
 
-    const body = await readLimitedBody(response, this.config.maxResponseBytes, operation);
+    const body = await readResponseBody(response, this.config.maxResponseBytes, operation);
     if (!response.ok) {
-      throw new FireworksBatchError(operation, `remote request failed (${response.status})`, {
+      const diagnostic = parseErrorDiagnostic(body);
+      throw new FireworksBatchError(operation, formatRemoteFailure(response.status, diagnostic), {
         retryable: response.status === 408 || response.status === 409 || response.status === 425 || response.status === 429 || response.status >= 500,
         status: response.status,
+        diagnostic,
       });
     }
     try {
@@ -151,7 +216,7 @@ export class FireworksBatchClient implements FireworksBatchTransport {
       if (!isRecord(parsed)) throw new Error("not an object");
       return parsed as T;
     } catch {
-      throw new FireworksBatchError(operation, "remote response was not valid JSON");
+      throw new FireworksBatchError(operation, "remote response was not valid JSON", { status: response.status });
     }
   }
 
@@ -192,11 +257,13 @@ export class FireworksBatchClient implements FireworksBatchTransport {
     } catch {
       throw new FireworksBatchError("dataset-upload", "network request failed", { retryable: true });
     }
-    await readLimitedBody(response, this.config.maxResponseBytes, "dataset-upload");
+    const body = await readResponseBody(response, this.config.maxResponseBytes, "dataset-upload");
     if (!response.ok) {
-      throw new FireworksBatchError("dataset-upload", `remote request failed (${response.status})`, {
+      const diagnostic = parseErrorDiagnostic(body);
+      throw new FireworksBatchError("dataset-upload", formatRemoteFailure(response.status, diagnostic), {
         retryable: response.status === 408 || response.status === 409 || response.status === 425 || response.status === 429 || response.status >= 500,
         status: response.status,
+        diagnostic,
       });
     }
   }
@@ -214,8 +281,12 @@ export class FireworksBatchClient implements FireworksBatchTransport {
       `${accountPath(this.config.accountId!)}/batchInferenceJobs?${query.toString()}`,
       { method: "POST", body },
     );
-    const name = typeof response.name === "string" ? response.name : input.jobId;
-    return { remoteJobId: lastPathSegment(name) };
+    const name = typeof response.name === "string" ? response.name : undefined;
+    const remoteJobId = name ? lastPathSegment(name) : undefined;
+    if (!remoteJobId || !isSafeRemoteJobId(remoteJobId)) {
+      throw new FireworksBatchError("job-submit", "remote response did not include a safe job ID");
+    }
+    return { remoteJobId };
   }
 
   async getJobStatus(remoteJobId: string): Promise<FireworksBatchRemoteStatus> {
@@ -227,7 +298,7 @@ export class FireworksBatchClient implements FireworksBatchTransport {
     return {
       state: typeof response.state === "string" ? response.state : "JOB_STATE_UNSPECIFIED",
       message: isRecord(response.status) && typeof response.status.message === "string"
-        ? response.status.message.slice(0, 512)
+        ? sanitizeDiagnosticText(response.status.message)
         : undefined,
     };
   }
@@ -265,11 +336,13 @@ export class FireworksBatchClient implements FireworksBatchTransport {
     } catch {
       throw new FireworksBatchError("dataset-download", "network request failed", { retryable: true });
     }
-    const text = await readLimitedBody(download, this.config.maxResponseBytes, "dataset-download");
+    const text = await readResponseBody(download, this.config.maxResponseBytes, "dataset-download");
     if (!download.ok) {
-      throw new FireworksBatchError("dataset-download", `remote request failed (${download.status})`, {
+      const diagnostic = parseErrorDiagnostic(text);
+      throw new FireworksBatchError("dataset-download", formatRemoteFailure(download.status, diagnostic), {
         retryable: download.status === 408 || download.status === 425 || download.status === 429 || download.status >= 500,
         status: download.status,
+        diagnostic,
       });
     }
     return text;

@@ -1,7 +1,7 @@
 import type { FireworksBatchConfig, FireworksBatchJob, FireworksBatchRequest, FireworksBatchWorkItem, LlmUsage } from "../types.js";
 import { fingerprintId, generateId, KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
-import type { FireworksBatchTransport } from "../providers/fireworks-batch.js";
+import { FireworksBatchError, type FireworksBatchTransport } from "../providers/fireworks-batch.js";
 import { logger } from "../logger.js";
 import { batchTaskLlmTask, taskOutputTokens } from "../providers/task-output-limits.js";
 
@@ -67,6 +67,45 @@ function compatibilityKey(item: FireworksBatchWorkItem): string {
 
 function oldestCreatedAt(items: FireworksBatchWorkItem[]): number {
   return Math.min(...items.map((item) => Date.parse(item.createdAt)).filter(Number.isFinite));
+}
+
+function isSafeRemoteJobId(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= 512
+    && !/[\u0000-\u0020\u007f/?#\\]/.test(value);
+}
+
+function safeRemoteStatusMessage(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  return value
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\bhttps?:\/\/[^\s<>"']+/gi, "[redacted-url]")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
+    .replace(/(["']?)(authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)\1\s*[:=]\s*(?:"[^"]*"|'[^']*'|(?:bearer\s+)?[^,;\s}]+)/gi, "$2=[redacted]")
+    .replace(/(["']?)((?:user|system)?prompt|messages?|jsonl)\1\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^,;\s}]+)/gi, "$2=[redacted]")
+    .slice(0, 512) || undefined;
+}
+
+function safeBatchErrorMessage(error: unknown, fallback: string): string {
+  if (!(error instanceof FireworksBatchError)) return fallback;
+  const status = error.status === undefined ? "" : ` (${error.status})`;
+  const details = [
+    error.diagnostic.code ? `code=${error.diagnostic.code}` : undefined,
+    error.diagnostic.message ? `message=${error.diagnostic.message}` : undefined,
+    error.diagnostic.code || error.diagnostic.message ? undefined : error.message,
+  ].filter((detail): detail is string => Boolean(detail));
+  return `${error.operation}${status}: ${details.join("; ")}`.slice(0, 1024);
+}
+
+function isAmbiguousSubmitError(error: unknown): boolean {
+  if (error instanceof FireworksBatchError) {
+    return error.operation === "job-submit" && error.status === undefined && error.retryable;
+  }
+  if (!(error instanceof Error)) return false;
+  return /\b(?:network|transport|timeout|timed out|connection|socket|fetch failed|abort)\b/i.test(error.message);
 }
 
 export class FireworksBatchCoordinator implements FireworksBatchQueue {
@@ -161,12 +200,12 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
     const jobId = generateId("fwbjob");
     const inputDatasetId = `${jobId}-input`;
     const outputDatasetId = `${jobId}-output`;
-    const jsonl = compatible.map((item) => JSON.stringify({ custom_id: item.customId, body: { model: item.model, messages: [{ role: "system", content: item.systemPrompt }, { role: "user", content: item.userPrompt }], max_tokens: item.maxTokens } })).join("\n");
+    const jsonl = compatible.map((item) => JSON.stringify({ custom_id: item.customId, body: { messages: [{ role: "system", content: item.systemPrompt }, { role: "user", content: item.userPrompt }], max_tokens: item.maxTokens } })).join("\n");
     if (Buffer.byteLength(jsonl, "utf8") > this.config.maxRequestBytes) {
       logger.warn("Fireworks Batch compatible work exceeds request byte limit", { task: first.task, itemCount: compatible.length });
       return;
     }
-    const job: FireworksBatchJob = { id: jobId, inputDatasetId, outputDatasetId, model: first.model, task: first.task, workItemIds: compatible.map((item) => item.id), state: "submitted", attempts: 1, nextAttemptAt: new Date(Date.now() + this.config.pollIntervalMs).toISOString(), createdAt: now, updatedAt: now, remoteJobId: jobId };
+    const job: FireworksBatchJob = { id: jobId, inputDatasetId, outputDatasetId, model: first.model, task: first.task, workItemIds: compatible.map((item) => item.id), state: "submitted", attempts: 1, nextAttemptAt: new Date(Date.now() + this.config.pollIntervalMs).toISOString(), createdAt: now, updatedAt: now };
     await this.kv.set(KV.fireworksBatchJobs, job.id, job);
     await Promise.all(compatible.map(async (item) => {
       item.state = "submitted";
@@ -175,17 +214,31 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
       await this.kv.set(KV.fireworksBatchWorkItems, item.id, item);
     }));
     logger.info("Fireworks Batch submitting work", { jobId, task: first.task, itemCount: compatible.length });
+    let submitAttempted = false;
     try {
       await transport.createDataset(inputDatasetId, compatible.length);
       await transport.uploadDataset(inputDatasetId, jsonl);
-      await transport.submitJob({ jobId, inputDatasetId, outputDatasetId, model: job.model, maxTokens: first.maxTokens });
+      submitAttempted = true;
+      const submission = await transport.submitJob({ jobId, inputDatasetId, outputDatasetId, model: job.model, maxTokens: first.maxTokens });
+      if (!isSafeRemoteJobId(submission.remoteJobId)) {
+        throw new FireworksBatchError("job-submit", "remote response did not include a safe job ID");
+      }
+      job.remoteJobId = submission.remoteJobId;
+      job.updatedAt = new Date().toISOString();
+      await this.kv.set(KV.fireworksBatchJobs, job.id, job);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "batch submission failed";
-      job.state = "polling";
+      const message = safeBatchErrorMessage(error, "batch submission failed");
+      const ambiguous = submitAttempted && isAmbiguousSubmitError(error);
+      job.state = ambiguous ? "polling" : "dead-letter";
       job.lastError = message;
       job.updatedAt = new Date().toISOString();
       await this.kv.set(KV.fireworksBatchJobs, job.id, job);
-      logger.warn("Fireworks Batch submit uncertain; reconciling by job ID", { jobId: job.id, error: message });
+      if (ambiguous) {
+        logger.warn("Fireworks Batch submit uncertain; reconciling by requested job ID", { jobId: job.id, error: message });
+      } else {
+        await this.markDeadLetter(job.workItemIds, message);
+        logger.warn("Fireworks Batch submit failed; work dead-lettered", { jobId: job.id, error: message });
+      }
     }
   }
 
@@ -193,8 +246,17 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
     const now = new Date().toISOString();
     const jobs = await this.kv.list<{ id: string; remoteJobId?: string; outputDatasetId: string; workItemIds: string[]; state: string; attempts: number; nextAttemptAt: string; updatedAt: string; lastError?: string }>(KV.fireworksBatchJobs);
     for (const job of jobs.filter((candidate) => (candidate.state === "submitted" || candidate.state === "polling") && candidate.nextAttemptAt <= now).slice(0, this.config.maxConcurrency)) {
+      const remoteJobId = job.remoteJobId || (job.state === "polling" ? job.id : undefined);
+      if (!remoteJobId) {
+        job.state = "dead-letter";
+        job.lastError = "batch submission did not produce a remote job ID";
+        job.updatedAt = new Date().toISOString();
+        await this.kv.set(KV.fireworksBatchJobs, job.id, job);
+        await this.markDeadLetter(job.workItemIds, job.lastError);
+        continue;
+      }
       try {
-        const status = await this.transport!.getJobStatus(job.remoteJobId || job.id);
+        const status = await this.transport!.getJobStatus(remoteJobId);
         const state = status.state.toUpperCase();
         if (state.includes("SUCCEEDED") || state.includes("COMPLETED")) {
           await this.applyResults(job);
@@ -203,7 +265,7 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
           await this.kv.set(KV.fireworksBatchJobs, job.id, job);
         } else if (state.includes("FAILED") || state.includes("CANCELLED")) {
           job.state = "dead-letter";
-          job.lastError = status.message || "remote batch failed";
+          job.lastError = safeRemoteStatusMessage(status.message) || "remote batch failed";
           job.updatedAt = new Date().toISOString();
           await this.kv.set(KV.fireworksBatchJobs, job.id, job);
           await this.markDeadLetter(job.workItemIds, job.lastError);
@@ -217,7 +279,7 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
       } catch (error) {
         job.attempts += 1;
         job.updatedAt = new Date().toISOString();
-        job.lastError = error instanceof Error ? error.message : "batch polling failed";
+        job.lastError = safeBatchErrorMessage(error, "batch polling failed");
         if (job.attempts >= this.config.maxAttempts) {
           job.state = "dead-letter";
           await this.markDeadLetter(job.workItemIds, job.lastError);
