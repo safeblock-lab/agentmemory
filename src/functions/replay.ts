@@ -2,6 +2,7 @@ import { homedir } from "node:os";
 import { lstat, readFile, readdir } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import type { ISdk } from "iii-sdk";
+import { withBatchWriterLocks, withBatchRecordLocks, preserveBatchProvenance } from "../state/batch-effects.js";
 import type {
   CompressedObservation,
   Crystal,
@@ -155,7 +156,7 @@ async function deriveCrystalAndLessons(
         await kv.set(KV.lessons, lessonId, lesson);
       }
       lessonIds.push(lessonId);
-    } catch {}
+    } catch { }
   }
 
   // Content-addressed on sessionId so re-importing the same session
@@ -164,27 +165,29 @@ async function deriveCrystalAndLessons(
   const narrativePreview = firstPrompt
     ? firstPrompt.slice(0, 300)
     : compressed
-        .slice(0, 5)
-        .map((c) => c.narrative || c.title)
-        .filter(Boolean)
-        .join(" · ")
-        .slice(0, 300);
+      .slice(0, 5)
+      .map((c) => c.narrative || c.title)
+      .filter(Boolean)
+      .join(" · ")
+      .slice(0, 300);
 
   try {
-    const existingCrystal = await kv.get<Crystal>(KV.crystals, crystalId);
-    const crystal: Crystal = {
-      id: crystalId,
-      narrative: narrativePreview || `Session ${sessionId.slice(0, 12)} (${rawObs.length} observations)`,
-      keyOutcomes: Array.from(tools).slice(0, 8),
-      filesAffected: Array.from(files).slice(0, 20),
-      lessons: lessonIds,
-      sourceActionIds: existingCrystal?.sourceActionIds ?? [],
-      sessionId,
-      project,
-      createdAt: existingCrystal?.createdAt ?? createdAt,
-    };
-    await kv.set(KV.crystals, crystalId, crystal);
-  } catch {}
+    await withBatchRecordLocks([[KV.crystals, crystalId]], async () => {
+      const existingCrystal = await kv.get<Crystal>(KV.crystals, crystalId);
+      const crystal: Crystal = {
+        id: crystalId,
+        narrative: narrativePreview || `Session ${sessionId.slice(0, 12)} (${rawObs.length} observations)`,
+        keyOutcomes: Array.from(tools).slice(0, 8),
+        filesAffected: Array.from(files).slice(0, 20),
+        lessons: lessonIds,
+        sourceActionIds: existingCrystal?.sourceActionIds ?? [],
+        sessionId,
+        project,
+        createdAt: existingCrystal?.createdAt ?? createdAt,
+      };
+      await kv.set(KV.crystals, crystalId, preserveBatchProvenance(existingCrystal, crystal));
+    });
+  } catch { }
 }
 
 function isRawShape(o: unknown): o is RawObservation {
@@ -290,18 +293,18 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
       data: { path?: string; maxFiles?: number } = {},
     ): Promise<
       | {
-          success: true;
-          imported: number;
-          sessionIds: string[];
-          observations: number;
-          discovered: number;
-          truncated: boolean;
-          traversalCapped: boolean;
-          maxFiles: number;
-          maxFilesUpperBound: number;
-        }
+        success: true;
+        imported: number;
+        sessionIds: string[];
+        observations: number;
+        discovered: number;
+        truncated: boolean;
+        traversalCapped: boolean;
+        maxFiles: number;
+        maxFilesUpperBound: number;
+      }
       | { success: false; error: string }
-    > => {
+    > => withBatchWriterLocks(kv, ["crystallize", "lessons"], async () => {
       const defaultRoot = join(homedir(), ".claude", "projects");
       const rawPath = data.path || defaultRoot;
       if (typeof rawPath !== "string" || rawPath.length === 0) {
@@ -473,6 +476,6 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
         maxFiles,
         maxFilesUpperBound: MAX_FILES_UPPER_BOUND,
       };
-    },
+    }),
   );
 }

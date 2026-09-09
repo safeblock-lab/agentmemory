@@ -24,6 +24,7 @@ import { logger } from "../logger.js";
 import { assessConsolidationComplexity } from "./consolidation-complexity.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
 import type { FireworksBatchQueue } from "./fireworks-batch.js";
+import { applyBatchEffect, batchEffectKey, runBatchCallback } from "../state/batch-effects.js";
 
 const SEMANTIC_CHECKPOINT_KEY = "semantic-consolidation";
 const SEMANTIC_ANCHOR_SUMMARIES = 5;
@@ -88,9 +89,9 @@ function applyDecay(
     updatedAt: string;
   }>,
   decayDays: number,
+  now = Date.now(),
 ): void {
   if (decayDays <= 0 || !Number.isFinite(decayDays)) return;
-  const now = Date.now();
   for (const item of items) {
     const lastAccess = item.lastAccessedAt || item.updatedAt;
     const daysSince =
@@ -113,7 +114,7 @@ export function registerConsolidationPipelineFunction(
   auxiliaryMaxInputChars?: number,
   batchQueue?: FireworksBatchQueue,
 ): void {
-  sdk.registerFunction("mem::consolidate-pipeline", 
+  sdk.registerFunction("mem::consolidate-pipeline",
     async (data?: {
       tier?: string;
       force?: boolean;
@@ -121,7 +122,8 @@ export function registerConsolidationPipelineFunction(
       batchResponse?: string;
       batchSourceFingerprint?: string;
       deferred?: boolean;
-    }) => {
+      batchEffectKey?: string;
+    }) => runBatchCallback(kv, "consolidation", data?.batchEffectKey, async (resuming, admit, receipt) => {
       if (!data?.force && !isConsolidationEnabled()) {
         return { success: false, skipped: true, reason: "Consolidation disabled: set CONSOLIDATION_ENABLED=true or configure an LLM provider (ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY / MINIMAX_API_KEY / OPENAI_BASE_URL / AGENTMEMORY_PROVIDER=agent-sdk)" };
       }
@@ -133,122 +135,138 @@ export function registerConsolidationPipelineFunction(
         const summaries = await kv.list<SessionSummary>(KV.summaries);
         const existingSemantic = await kv.list<SemanticMemory>(KV.semantic);
 
-        if (summaries.length >= 5) {
+        if (summaries.length >= 5 || (resuming && data?.batchResponse)) {
           const checkpoint = await kv.get<SemanticCheckpoint>(
             KV.state,
             SEMANTIC_CHECKPOINT_KEY,
           );
-          const semanticInput = selectSemanticInput(
+          const semanticInput = receipt?.semanticSourceIds ? {
+            summaries: summaries.filter((summary) => receipt.semanticSourceIds!.includes(summary.sessionId)),
+            checkpoint: receipt.semanticCheckpoint,
+          } : selectSemanticInput(
             summaries,
-            checkpoint,
+            resuming ? null : checkpoint,
             getConsolidationMinNewSummaries(),
           );
           const recentSummaries = semanticInput.summaries;
-          if (recentSummaries.length === 0) {
+          if (recentSummaries.length === 0 && !resuming) {
             results.semantic = {
               skipped: true,
               reason: `fewer than ${getConsolidationMinNewSummaries()} new summaries`,
             };
           } else {
 
-          const prompt = buildSemanticMergePrompt(
-            recentSummaries.map((s) => ({
-              title: s.title,
-              narrative: s.narrative,
-              concepts: s.concepts,
-            })),
-          );
-          const sourceFingerprint = fingerprintId("fwbconsem", JSON.stringify(
-            recentSummaries.map((summary) => [
-              summary.sessionId,
-              summary.title,
-              summary.narrative,
-              summary.concepts,
-              summary.createdAt,
-            ]),
-          ));
+            const prompt = buildSemanticMergePrompt(
+              recentSummaries.map((s) => ({
+                title: s.title,
+                narrative: s.narrative,
+                concepts: s.concepts,
+              })),
+            );
+            const sourceFingerprint = fingerprintId("fwbconsem", JSON.stringify(
+              recentSummaries.map((summary) => [
+                summary.sessionId,
+                summary.title,
+                summary.narrative,
+                summary.concepts,
+                summary.createdAt,
+              ]),
+            ));
 
-          if (data?.batchResponse && data.batchSourceFingerprint !== sourceFingerprint) {
-            return { success: true, stale: true };
-          }
+            if (!resuming && data?.batchResponse && data.batchSourceFingerprint !== sourceFingerprint) {
+              return { success: true, stale: true };
+            }
 
-          try {
-            const complexity = assessConsolidationComplexity({
-              prompt,
-              maxAuxiliaryInputChars: auxiliaryMaxInputChars,
-            });
-            let queued = false;
-            if (!data?.batchResponse && data?.deferred && batchQueue) {
-              const enqueueResult = await batchQueue.enqueue({
-                correlationId: generateId("fwbcon-sem"),
-                task: "consolidation",
-                systemPrompt: SEMANTIC_MERGE_SYSTEM,
-                userPrompt: prompt,
-                metadata: { tier: "semantic", sourceFingerprint },
+            try {
+              const complexity = assessConsolidationComplexity({
+                prompt,
+                maxAuxiliaryInputChars: auxiliaryMaxInputChars,
               });
-              if (enqueueResult.queued) {
-                queued = true;
-                results.semantic = { queued: true, workItemId: enqueueResult.workItemId, totalSummaries: summaries.length };
+              let queued = false;
+              if (!data?.batchResponse && data?.deferred && batchQueue) {
+                const enqueueResult = await batchQueue.enqueue({
+                  correlationId: data.batchEffectKey ? fingerprintId("fwbcon-sem", data.batchEffectKey) : generateId("fwbcon-sem"),
+                  task: "consolidation",
+                  systemPrompt: SEMANTIC_MERGE_SYSTEM,
+                  userPrompt: prompt,
+                  metadata: { tier: "semantic", sourceFingerprint, ...(data.batchEffectKey ? { batchEffectKey: data.batchEffectKey } : {}) },
+                });
+                if (enqueueResult.queued) {
+                  queued = true;
+                  results.semantic = { queued: true, workItemId: enqueueResult.workItemId, totalSummaries: summaries.length };
+                }
               }
-            }
-            if (!queued) {
-            const response = data?.batchResponse ?? (llmRouter
-              ? await llmRouter.run(
-                complexity.complex ? "conflict_resolution" : "consolidation",
-                (selectedProvider) => selectedProvider.summarize(
-                  SEMANTIC_MERGE_SYSTEM,
-                  prompt,
-                ),
-                (candidate) => /<fact\s+confidence="[^"]+">[^<]+<\/fact>/.test(candidate),
-              )
-              : await provider.summarize(SEMANTIC_MERGE_SYSTEM, prompt));
+              if (!queued) {
+                const response = data?.batchResponse ?? (llmRouter
+                  ? await llmRouter.run(
+                    complexity.complex ? "conflict_resolution" : "consolidation",
+                    (selectedProvider) => selectedProvider.summarize(
+                      SEMANTIC_MERGE_SYSTEM,
+                      prompt,
+                    ),
+                    (candidate) => /<fact\s+confidence="[^"]+">[^<]+<\/fact>/.test(candidate),
+                  )
+                  : await provider.summarize(SEMANTIC_MERGE_SYSTEM, prompt));
 
-            const factRegex = /<fact\s+confidence="([^"]+)">([^<]+)<\/fact>/g;
-            let match;
-            let newFacts = 0;
-            const now = new Date().toISOString();
+                const factRegex = /<fact\s+confidence="([^"]+)">([^<]+)<\/fact>/g;
+                await admit({ semanticSourceIds: recentSummaries.map((summary) => summary.sessionId), semanticCheckpoint: semanticInput.checkpoint });
+                let match;
+                let newFacts = 0;
+                const now = new Date().toISOString();
 
-            while ((match = factRegex.exec(response)) !== null) {
-              const parsedConf = parseFloat(match[1]);
-              const confidence = Number.isNaN(parsedConf) ? 0.5 : parsedConf;
-              const fact = match[2].trim();
+                while ((match = factRegex.exec(response)) !== null) {
+                  const parsedConf = parseFloat(match[1]);
+                  const confidence = Number.isNaN(parsedConf) ? 0.5 : parsedConf;
+                  const fact = match[2].trim();
 
-              const existing = existingSemantic.find(
-                (s) => s.fact.toLowerCase() === fact.toLowerCase(),
-              );
-              if (existing) {
-                existing.accessCount++;
-                existing.lastAccessedAt = now;
-                existing.updatedAt = now;
-                existing.confidence = Math.max(existing.confidence, confidence);
-                await kv.set(KV.semantic, existing.id, existing);
-              } else {
-                const sem: SemanticMemory = {
-                  id: generateId("sem"),
-                  fact,
-                  confidence,
-                  sourceSessionIds: recentSummaries.map((s) => s.sessionId),
-                  sourceMemoryIds: [],
-                  accessCount: 1,
-                  lastAccessedAt: now,
-                  strength: confidence,
-                  createdAt: now,
-                  updatedAt: now,
-                };
-                await kv.set(KV.semantic, sem.id, sem);
-                newFacts++;
+                  const existing = existingSemantic.find(
+                    (s) => s.fact.toLowerCase() === fact.toLowerCase(),
+                  );
+                  if (data?.batchEffectKey) {
+                    const id = existing?.id ?? fingerprintId("sem", `${data.batchEffectKey}:${fact.toLowerCase()}`);
+                    await applyBatchEffect<SemanticMemory>(kv, KV.semantic, id, data.batchEffectKey, (current) => current ? {
+                      ...current, accessCount: current.accessCount + 1, lastAccessedAt: now, updatedAt: now,
+                      confidence: Math.max(current.confidence, confidence),
+                    } : {
+                      id, fact, confidence, sourceSessionIds: receipt?.semanticSourceIds ?? recentSummaries.map((s) => s.sessionId), sourceMemoryIds: [],
+                      accessCount: 1, lastAccessedAt: now, strength: confidence, createdAt: now, updatedAt: now,
+                    });
+                    continue;
+                  }
+                  if (existing) {
+                    existing.accessCount++;
+                    existing.lastAccessedAt = now;
+                    existing.updatedAt = now;
+                    existing.confidence = Math.max(existing.confidence, confidence);
+                    await kv.set(KV.semantic, existing.id, existing);
+                  } else {
+                    const sem: SemanticMemory = {
+                      id: generateId("sem"),
+                      fact,
+                      confidence,
+                      sourceSessionIds: recentSummaries.map((s) => s.sessionId),
+                      sourceMemoryIds: [],
+                      accessCount: 1,
+                      lastAccessedAt: now,
+                      strength: confidence,
+                      createdAt: now,
+                      updatedAt: now,
+                    };
+                    await kv.set(KV.semantic, sem.id, sem);
+                    newFacts++;
+                  }
+                }
+                results.semantic = { newFacts, totalSummaries: summaries.length };
+                if (semanticInput.checkpoint && (!checkpoint || semanticInput.checkpoint.processedThrough >= checkpoint.processedThrough)) {
+                  await kv.set(KV.state, SEMANTIC_CHECKPOINT_KEY, semanticInput.checkpoint);
+                }
               }
+            } catch (err) {
+              if (data?.batchEffectKey) throw err;
+              const msg = err instanceof Error ? err.message : String(err);
+              logger.error("Semantic consolidation failed", { error: msg });
+              results.semantic = { error: msg };
             }
-            results.semantic = { newFacts, totalSummaries: summaries.length };
-            if (semanticInput.checkpoint) {
-              await kv.set(KV.state, SEMANTIC_CHECKPOINT_KEY, semanticInput.checkpoint);
-            }
-            }
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            logger.error("Semantic consolidation failed", { error: msg });
-            results.semantic = { error: msg };
-          }
           }
         } else {
           results.semantic = {
@@ -260,16 +278,22 @@ export function registerConsolidationPipelineFunction(
 
       if (tier === "all" || tier === "reflect") {
         try {
-          const reflectResult = await sdk.trigger({ function_id: "mem::reflect", payload: {
-            maxClusters: 10,
-            project: data?.project,
-            deferred: data?.deferred,
-          } });
+          const reflectResult = await sdk.trigger({
+            function_id: "mem::reflect", payload: {
+              maxClusters: 10,
+              project: data?.project,
+              deferred: data?.deferred,
+              ...(data?.batchEffectKey ? { batchEffectKey: batchEffectKey(`${data.batchEffectKey}:reflect`) } : {}),
+            }
+          });
+          if (reflectResult && typeof reflectResult === "object" && "success" in reflectResult && reflectResult.success === false) {
+            throw new Error("Reflection tier reported failure");
+          }
           results.reflect = reflectResult;
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           logger.warn("Reflect tier failed", { error: msg });
-          results.reflect = { error: msg };
+          throw err;
         }
       }
 
@@ -283,11 +307,11 @@ export function registerConsolidationPipelineFunction(
           }))
           .filter((p) => p.frequency >= 2);
 
-        if (patterns.length >= 2) {
+        if (patterns.length >= 2 || (resuming && data?.batchResponse)) {
           const prompt = buildProceduralExtractionPrompt(patterns);
           const sourceFingerprint = fingerprintId("fwbconproc", JSON.stringify(patterns));
 
-          if (data?.batchResponse && data.batchSourceFingerprint !== sourceFingerprint) {
+          if (!resuming && data?.batchResponse && data.batchSourceFingerprint !== sourceFingerprint) {
             return { success: true, stale: true };
           }
 
@@ -299,11 +323,11 @@ export function registerConsolidationPipelineFunction(
             let queued = false;
             if (!data?.batchResponse && data?.deferred && batchQueue) {
               const enqueueResult = await batchQueue.enqueue({
-                correlationId: generateId("fwbcon-proc"),
+                correlationId: data.batchEffectKey ? fingerprintId("fwbcon-proc", data.batchEffectKey) : generateId("fwbcon-proc"),
                 task: "consolidation",
                 systemPrompt: PROCEDURAL_EXTRACTION_SYSTEM,
                 userPrompt: prompt,
-                metadata: { tier: "procedural", sourceFingerprint },
+                metadata: { tier: "procedural", sourceFingerprint, ...(data.batchEffectKey ? { batchEffectKey: data.batchEffectKey } : {}) },
               });
               if (enqueueResult.queued) {
                 queued = true;
@@ -311,68 +335,77 @@ export function registerConsolidationPipelineFunction(
               }
             }
             if (!queued) {
-            const response = data?.batchResponse ?? (llmRouter
-              ? await llmRouter.run(
-                complexity.complex ? "conflict_resolution" : "consolidation",
-                (selectedProvider) => selectedProvider.summarize(
-                  PROCEDURAL_EXTRACTION_SYSTEM,
-                  prompt,
-                ),
-                (candidate) => /<procedure\s+name="[^"]+"\s+trigger="[^"]+">[\s\S]*?<\/procedure>/.test(candidate),
-              )
-              : await provider.summarize(PROCEDURAL_EXTRACTION_SYSTEM, prompt));
+              const response = data?.batchResponse ?? (llmRouter
+                ? await llmRouter.run(
+                  complexity.complex ? "conflict_resolution" : "consolidation",
+                  (selectedProvider) => selectedProvider.summarize(
+                    PROCEDURAL_EXTRACTION_SYSTEM,
+                    prompt,
+                  ),
+                  (candidate) => /<procedure\s+name="[^"]+"\s+trigger="[^"]+">[\s\S]*?<\/procedure>/.test(candidate),
+                )
+                : await provider.summarize(PROCEDURAL_EXTRACTION_SYSTEM, prompt));
 
-            const procRegex =
-              /<procedure\s+name="([^"]+)"\s+trigger="([^"]+)">([\s\S]*?)<\/procedure>/g;
-            let match;
-            let newProcs = 0;
-            const now = new Date().toISOString();
-            const existingProcs = await kv.list<ProceduralMemory>(
-              KV.procedural,
-            );
-
-            while ((match = procRegex.exec(response)) !== null) {
-              const name = match[1];
-              const trigger = match[2];
-              const stepsBlock = match[3];
-              const steps: string[] = [];
-
-              const stepRegex = /<step>([^<]+)<\/step>/g;
-              let stepMatch;
-              while ((stepMatch = stepRegex.exec(stepsBlock)) !== null) {
-                steps.push(stepMatch[1].trim());
-              }
-
-              const existing = existingProcs.find(
-                (p) => p.name.toLowerCase() === name.toLowerCase(),
+              const procRegex =
+                /<procedure\s+name="([^"]+)"\s+trigger="([^"]+)">([\s\S]*?)<\/procedure>/g;
+              await admit();
+              let match;
+              let newProcs = 0;
+              const now = new Date().toISOString();
+              const existingProcs = await kv.list<ProceduralMemory>(
+                KV.procedural,
               );
-              if (existing) {
-                existing.frequency++;
-                existing.updatedAt = now;
-                existing.strength = Math.min(1, existing.strength + 0.1);
-                await kv.set(KV.procedural, existing.id, existing);
-              } else {
-                const proc: ProceduralMemory = {
-                  id: generateId("proc"),
-                  name,
-                  steps,
-                  triggerCondition: trigger,
-                  frequency: 1,
-                  sourceSessionIds: [],
-                  strength: 0.5,
-                  createdAt: now,
-                  updatedAt: now,
-                };
-                await kv.set(KV.procedural, proc.id, proc);
-                newProcs++;
+
+              while ((match = procRegex.exec(response)) !== null) {
+                const name = match[1];
+                const trigger = match[2];
+                const stepsBlock = match[3];
+                const steps: string[] = [];
+
+                const stepRegex = /<step>([^<]+)<\/step>/g;
+                let stepMatch;
+                while ((stepMatch = stepRegex.exec(stepsBlock)) !== null) {
+                  steps.push(stepMatch[1].trim());
+                }
+
+                const existing = existingProcs.find(
+                  (p) => p.name.toLowerCase() === name.toLowerCase(),
+                );
+                if (data?.batchEffectKey) {
+                  const id = existing?.id ?? fingerprintId("proc", `${data.batchEffectKey}:${name.toLowerCase()}`);
+                  await applyBatchEffect<ProceduralMemory>(kv, KV.procedural, id, data.batchEffectKey, (current) => current ? {
+                    ...current, frequency: current.frequency + 1, updatedAt: now, strength: Math.min(1, current.strength + 0.1),
+                  } : { id, name, steps, triggerCondition: trigger, frequency: 1, sourceSessionIds: [], strength: 0.5, createdAt: now, updatedAt: now });
+                  continue;
+                }
+                if (existing) {
+                  existing.frequency++;
+                  existing.updatedAt = now;
+                  existing.strength = Math.min(1, existing.strength + 0.1);
+                  await kv.set(KV.procedural, existing.id, existing);
+                } else {
+                  const proc: ProceduralMemory = {
+                    id: generateId("proc"),
+                    name,
+                    steps,
+                    triggerCondition: trigger,
+                    frequency: 1,
+                    sourceSessionIds: [],
+                    strength: 0.5,
+                    createdAt: now,
+                    updatedAt: now,
+                  };
+                  await kv.set(KV.procedural, proc.id, proc);
+                  newProcs++;
+                }
               }
-            }
-            results.procedural = {
-              newProcedures: newProcs,
-              patternsAnalyzed: patterns.length,
-            };
+              results.procedural = {
+                newProcedures: newProcs,
+                patternsAnalyzed: patterns.length,
+              };
             }
           } catch (err) {
+            if (data?.batchEffectKey) throw err;
             const msg = err instanceof Error ? err.message : String(err);
             logger.error("Procedural extraction failed", { error: msg });
             results.procedural = { error: msg };
@@ -386,16 +419,27 @@ export function registerConsolidationPipelineFunction(
       }
 
       if (tier === "all" || tier === "decay") {
+        const effectTimestamp = receipt?.effectTimestamp ?? new Date().toISOString();
+        if (data?.batchEffectKey) await admit({ effectTimestamp });
+        const decayKey = data?.batchEffectKey ? batchEffectKey(`${data.batchEffectKey}:decay`) : undefined;
         const semantic = await kv.list<SemanticMemory>(KV.semantic);
-        applyDecay(semantic, decayDays);
         for (const s of semantic) {
-          await kv.set(KV.semantic, s.id, s);
+          if (decayKey) await applyBatchEffect<SemanticMemory>(kv, KV.semantic, s.id, decayKey, (current) => {
+            if (!current) throw new Error("Semantic decay source disappeared during recovery");
+            applyDecay([current], decayDays, Date.parse(effectTimestamp));
+            return current;
+          });
+          else { applyDecay([s], decayDays); await kv.set(KV.semantic, s.id, s); }
         }
 
         const procedural = await kv.list<ProceduralMemory>(KV.procedural);
-        applyDecay(procedural, decayDays);
         for (const p of procedural) {
-          await kv.set(KV.procedural, p.id, p);
+          if (decayKey) await applyBatchEffect<ProceduralMemory>(kv, KV.procedural, p.id, decayKey, (current) => {
+            if (!current) throw new Error("Procedural decay source disappeared during recovery");
+            applyDecay([current], decayDays, Date.parse(effectTimestamp));
+            return current;
+          });
+          else { applyDecay([p], decayDays); await kv.set(KV.procedural, p.id, p); }
         }
 
         results.decay = {
@@ -406,7 +450,7 @@ export function registerConsolidationPipelineFunction(
 
       if (process.env["OBSIDIAN_AUTO_EXPORT"] === "true") {
         try {
-          await sdk.trigger({ function_id: "mem::obsidian-export", payload: {} });
+          await sdk.trigger({ function_id: "mem::obsidian-export", payload: { batchEffectKey: data?.batchEffectKey } });
           results.obsidianExport = { success: true };
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -415,13 +459,15 @@ export function registerConsolidationPipelineFunction(
         }
       }
 
-      await recordAudit(kv, "consolidate", "mem::consolidate-pipeline", [], {
+      const audit = recordAudit(kv, "consolidate", "mem::consolidate-pipeline", [], {
         tier,
         results,
-      });
+      }, undefined, undefined, data?.batchEffectKey);
+      if (data?.batchEffectKey) await audit.catch(() => { });
+      else await audit;
 
       logger.info("Consolidation pipeline complete", { tier, results });
       return { success: true, results };
-    },
+    }, () => recordAudit(kv, "consolidate", "mem::consolidate-pipeline", [], {}, undefined, undefined, data?.batchEffectKey)),
   );
 }

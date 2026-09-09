@@ -1,5 +1,6 @@
 import type { AuditEntry } from "../types.js";
 import { KV, generateId } from "../state/schema.js";
+import { batchEffectKey } from "../state/batch-effects.js";
 import type { StateKV } from "../state/kv.js";
 import { logger } from "../logger.js";
 
@@ -39,9 +40,15 @@ export async function recordAudit(
   details: Record<string, unknown> = {},
   qualityScore?: number,
   userId?: string,
+  effectKey?: string,
 ): Promise<AuditEntry> {
+  const id = effectKey ? `aud_${batchEffectKey(`${functionId}:${operation}:${effectKey}`)}` : generateId("aud");
+  if (effectKey) {
+    const existing = await kv.get<AuditEntry>(KV.audit, id);
+    if (existing) return existing;
+  }
   const entry: AuditEntry = {
-    id: generateId("aud"),
+    id,
     timestamp: new Date().toISOString(),
     operation,
     userId,

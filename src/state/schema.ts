@@ -75,6 +75,10 @@ export const KV = {
   fireworksBatchWorkItems: "mem:fireworks-batch:work-items",
   fireworksBatchJobs: "mem:fireworks-batch:jobs",
   fireworksBatchFingerprints: "mem:fireworks-batch:fingerprints",
+  fireworksBatchEnqueueIntents: "mem:fireworks-batch:enqueue-intents",
+  fireworksBatchActiveWork: "mem:fireworks-batch:active-work",
+  fireworksBatchActiveJobs: "mem:fireworks-batch:active-jobs",
+  batchCallbacks: "mem:batch-callbacks",
 } as const;
 
 export const STREAM = {

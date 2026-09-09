@@ -1,4 +1,4 @@
-import { registerWorker } from "iii-sdk";
+import { registerWorker, type ISdk } from "iii-sdk";
 import {
   loadConfig,
   getEnvVar,
@@ -23,6 +23,7 @@ import {
 } from "./providers/index.js";
 import { LlmTaskRouter } from "./providers/task-router.js";
 import { StateKV } from "./state/kv.js";
+import { batchEffectKey } from "./state/batch-effects.js";
 import { KV } from "./state/schema.js";
 import { VectorIndex } from "./state/vector-index.js";
 import { HybridSearch } from "./state/hybrid-search.js";
@@ -104,7 +105,7 @@ import { registerHealthMonitor } from "./health/monitor.js";
 import { initMetrics, OTEL_CONFIG } from "./telemetry/setup.js";
 import { VERSION } from "./version.js";
 import { bootLog } from "./logger.js";
-import type { AuxiliaryLlmConfig } from "./types.js";
+import type { AuxiliaryLlmConfig, FireworksBatchWorkItem } from "./types.js";
 import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -156,6 +157,160 @@ function isLocalOllamaAuxiliary(
   } catch {
     return false;
   }
+}
+
+type FireworksBatchCompletionResult =
+  | "stale"
+  | void
+  | { success: false; error: string };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function sanitizeBatchCallbackError(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  return value
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\bhttps?:\/\/[^\s<>"']+/gi, "[redacted-url]")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
+    .replace(
+      /(["']?)(authorization|api[-_ ]?key|access[-_ ]?token|token|secret|password)\1\s*[:=]\s*(?:"[^"]*"|'[^']*'|(?:bearer\s+)?[^,;\s}]+)/gi,
+      "$2=[redacted]",
+    )
+    .replace(
+      /(["']?)((?:user|system)?prompt|messages?|jsonl)\1\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^,;\s}]+)/gi,
+      "$2=[redacted]",
+    )
+    .slice(0, 512) || undefined;
+}
+
+function batchCallbackFailure(
+  value: unknown,
+  fallback: string,
+): { success: false; error: string } | undefined {
+  if (!isRecord(value) || value.success !== false) return undefined;
+  return {
+    success: false,
+    error: sanitizeBatchCallbackError(value.error) ?? fallback,
+  };
+}
+
+export function createFireworksBatchCompletionHandler(
+  sdk: ISdk,
+): (
+  item: FireworksBatchWorkItem,
+  content: string,
+) => Promise<FireworksBatchCompletionResult> {
+  return async (item, content) => {
+    const effectKey = batchEffectKey(item.id);
+    if (item.task === "graph_extraction") {
+      const rawObservations = item.metadata?.observations;
+      if (!rawObservations) throw new Error("batch graph result is missing observations");
+      const observations: unknown = JSON.parse(rawObservations);
+      if (!Array.isArray(observations)) throw new Error("batch graph observations are invalid");
+      const result = await sdk.trigger({
+        function_id: "mem::graph-extract",
+        payload: { observations, batchResponse: content, batchEffectKey: effectKey },
+      });
+      return batchCallbackFailure(result, "batch graph extraction failed");
+    }
+    if (item.task === "reflection") {
+      const cluster = item.metadata?.cluster;
+      if (!cluster) throw new Error("batch reflection result is missing its cluster");
+      const result = await sdk.trigger({
+        function_id: "mem::reflect",
+        payload: {
+          batchResponse: content,
+          batchCluster: cluster,
+          batchEffectKey: effectKey,
+          batchSourceFingerprint: item.metadata?.sourceFingerprint,
+          project: item.metadata?.project || undefined,
+        },
+      });
+      const failure = batchCallbackFailure(result, "batch reflection failed");
+      if (failure) return failure;
+      if (isRecord(result) && result.stale === true) {
+        const deferredResult = await sdk.trigger({
+          function_id: "mem::reflect",
+          payload: { deferred: true, project: item.metadata?.project || undefined, batchEffectKey: batchEffectKey(`${item.id}:fallback`) },
+        });
+        const deferredFailure = batchCallbackFailure(
+          deferredResult,
+          "deferred batch reflection failed",
+        );
+        if (deferredFailure) return deferredFailure;
+        return "stale";
+      }
+      return;
+    }
+    if (item.task === "crystallization") {
+      const rawActionIds = item.metadata?.actionIds;
+      if (!rawActionIds) throw new Error("batch crystallization result is missing action IDs");
+      const actionIds: unknown = JSON.parse(rawActionIds);
+      if (!Array.isArray(actionIds) || actionIds.some((id) => typeof id !== "string")) {
+        throw new Error("batch crystallization action IDs are invalid");
+      }
+      const result = await sdk.trigger({
+        function_id: "mem::crystallize",
+        payload: {
+          actionIds,
+          batchEffectKey: effectKey,
+          sessionId: item.metadata?.sessionId || undefined,
+          project: item.metadata?.project || undefined,
+          batchResponse: content,
+          batchSourceFingerprint: item.metadata?.sourceFingerprint,
+        },
+      });
+      const failure = batchCallbackFailure(result, "batch crystallization failed");
+      if (failure) return failure;
+      if (isRecord(result) && result.stale === true) {
+        const deferredResult = await sdk.trigger({
+          function_id: "mem::crystallize",
+          payload: {
+            actionIds,
+            batchEffectKey: batchEffectKey(`${item.id}:fallback`),
+            sessionId: item.metadata?.sessionId || undefined,
+            project: item.metadata?.project || undefined,
+            deferred: true,
+          },
+        });
+        const deferredFailure = batchCallbackFailure(
+          deferredResult,
+          "deferred batch crystallization failed",
+        );
+        if (deferredFailure) return deferredFailure;
+        return "stale";
+      }
+      return;
+    }
+    const result = await sdk.trigger({
+      function_id: "mem::consolidate-pipeline",
+      payload: {
+        tier: item.metadata?.tier,
+        batchEffectKey: effectKey,
+        force: true,
+        batchResponse: content,
+        batchSourceFingerprint: item.metadata?.sourceFingerprint,
+      },
+    });
+    const failure = batchCallbackFailure(result, "batch consolidation failed");
+    if (failure) return failure;
+    if (isRecord(result) && result.stale === true) {
+      const deferredResult = await sdk.trigger({
+        function_id: "mem::consolidate-pipeline",
+        payload: { tier: item.metadata?.tier, force: true, deferred: true, batchEffectKey: batchEffectKey(`${item.id}:fallback`) },
+      });
+      const deferredFailure = batchCallbackFailure(
+        deferredResult,
+        "deferred batch consolidation failed",
+      );
+      if (deferredFailure) return deferredFailure;
+      return "stale";
+    }
+  };
 }
 
 // Top-level safety net for iii-engine invocation timeouts (issue #204).
@@ -269,93 +424,14 @@ async function main() {
     kv,
     config.fireworksBatch,
     createFireworksBatchClient(config.fireworksBatch),
-    async (item, content) => {
-      if (item.task === "graph_extraction") {
-        const rawObservations = item.metadata?.observations;
-        if (!rawObservations) throw new Error("batch graph result is missing observations");
-        const observations: unknown = JSON.parse(rawObservations);
-        if (!Array.isArray(observations)) throw new Error("batch graph observations are invalid");
-        await sdk.trigger({
-          function_id: "mem::graph-extract",
-          payload: { observations, batchResponse: content },
-        });
-        return;
-      }
-      if (item.task === "reflection") {
-        const cluster = item.metadata?.cluster;
-        if (!cluster) throw new Error("batch reflection result is missing its cluster");
-        const result = await sdk.trigger({
-          function_id: "mem::reflect",
-          payload: {
-            batchResponse: content,
-            batchCluster: cluster,
-            batchSourceFingerprint: item.metadata?.sourceFingerprint,
-            project: item.metadata?.project || undefined,
-          },
-        });
-        if (typeof result === "object" && result !== null && (result as { stale?: unknown }).stale === true) {
-          await sdk.trigger({
-            function_id: "mem::reflect",
-            payload: { deferred: true, project: item.metadata?.project || undefined },
-          });
-          return "stale";
-        }
-        return;
-      }
-      if (item.task === "crystallization") {
-        const rawActionIds = item.metadata?.actionIds;
-        if (!rawActionIds) throw new Error("batch crystallization result is missing action IDs");
-        const actionIds: unknown = JSON.parse(rawActionIds);
-        if (!Array.isArray(actionIds) || actionIds.some((id) => typeof id !== "string")) {
-          throw new Error("batch crystallization action IDs are invalid");
-        }
-        const result = await sdk.trigger({
-          function_id: "mem::crystallize",
-          payload: {
-            actionIds,
-            sessionId: item.metadata?.sessionId || undefined,
-            project: item.metadata?.project || undefined,
-            batchResponse: content,
-            batchSourceFingerprint: item.metadata?.sourceFingerprint,
-          },
-        });
-        if (typeof result === "object" && result !== null && (result as { stale?: unknown }).stale === true) {
-          await sdk.trigger({
-            function_id: "mem::crystallize",
-            payload: {
-              actionIds,
-              sessionId: item.metadata?.sessionId || undefined,
-              project: item.metadata?.project || undefined,
-              deferred: true,
-            },
-          });
-          return "stale";
-        }
-        return;
-      }
-      const result = await sdk.trigger({
-        function_id: "mem::consolidate-pipeline",
-        payload: {
-          tier: item.metadata?.tier,
-          force: true,
-          batchResponse: content,
-          batchSourceFingerprint: item.metadata?.sourceFingerprint,
-        },
-      });
-      if (typeof result === "object" && result !== null && (result as { stale?: unknown }).stale === true) {
-        await sdk.trigger({
-          function_id: "mem::consolidate-pipeline",
-          payload: { tier: item.metadata?.tier, force: true, deferred: true },
-        });
-        return "stale";
-      }
-    },
+    createFireworksBatchCompletionHandler(sdk),
     async (item, usage) => {
       await metricsStore?.recordLlmUsage(
         batchTaskLlmTask(item.task),
         "fireworks-batch",
         item.model,
         usage,
+        batchEffectKey(item.id),
       );
     },
   );
@@ -791,7 +867,9 @@ async function main() {
   process.on("SIGTERM", shutdown);
 }
 
-main().catch((err) => {
-  console.error(`[agentmemory] Fatal:`, err);
-  process.exit(1);
-});
+if (process.env["VITEST"] !== "true") {
+  main().catch((err) => {
+    console.error(`[agentmemory] Fatal:`, err);
+    process.exit(1);
+  });
+}

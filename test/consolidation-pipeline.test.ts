@@ -263,6 +263,7 @@ describe("Consolidation Pipeline", () => {
   });
 
   it("pipeline proceeds with force=true even when consolidation is disabled", async () => {
+    sdk.registerFunction("mem::reflect", async () => ({ success: true }));
     vi.mocked(isConsolidationEnabled).mockReturnValue(false);
     const provider = {
       name: "test",

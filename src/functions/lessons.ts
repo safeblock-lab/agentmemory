@@ -3,6 +3,8 @@ import type { StateKV } from "../state/kv.js";
 import { KV, fingerprintId } from "../state/schema.js";
 import type { Lesson } from "../types.js";
 import { recordAudit } from "./audit.js";
+import { applyBatchEffect } from "../state/batch-effects.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 
 function reinforceLesson(lesson: Lesson): void {
   const now = new Date().toISOString();
@@ -25,12 +27,32 @@ export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
       tags?: string[];
       source?: "crystal" | "manual" | "consolidation";
       sourceIds?: string[];
-    }) => {
+      batchEffectKey?: string;
+    }) => withKeyedLock("batch-callback:lessons", async () => {
       if (!data.content?.trim()) {
         return { success: false, error: "content is required" };
       }
 
       const fp = fingerprintId("lsn", data.content.trim().toLowerCase());
+      if (data.batchEffectKey) {
+        if (!/^[a-f0-9]{64}$/.test(data.batchEffectKey)) return { success: false, error: "Invalid batch effect key" };
+        const lesson = await applyBatchEffect<Lesson>(kv, KV.lessons, fp, data.batchEffectKey, (current) => {
+          if (current && !current.deleted) {
+            reinforceLesson(current);
+            if (data.context && !current.context) current.context = data.context;
+            return current;
+          }
+          const now = new Date().toISOString();
+          return {
+            id: fp, content: data.content.trim(), context: data.context?.trim() || "",
+            confidence: typeof data.confidence === "number" && data.confidence >= 0 && data.confidence <= 1 ? data.confidence : 0.5,
+            reinforcements: 0, source: data.source || "manual", sourceIds: data.sourceIds || [],
+            project: data.project, tags: data.tags || [], createdAt: now, updatedAt: now, decayRate: 0.05,
+          };
+        });
+        await recordAudit(kv, "lesson_save", "mem::lesson-save", [fp], {}, undefined, undefined, data.batchEffectKey).catch(() => {});
+        return { success: true, action: "applied", lesson };
+      }
       const existing = await kv.get<Lesson>(KV.lessons, fp);
 
       if (existing && !existing.deleted) {
@@ -83,7 +105,7 @@ export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
       } catch {}
 
       return { success: true, action: "created", lesson };
-    },
+    }),
   );
 
   sdk.registerFunction("mem::lesson-recall", 
@@ -179,7 +201,7 @@ export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
   );
 
   sdk.registerFunction("mem::lesson-strengthen", 
-    async (data: { lessonId: string }) => {
+    async (data: { lessonId: string }) => withKeyedLock("batch-callback:lessons", async () => {
       if (!data.lessonId) {
         return { success: false, error: "lessonId is required" };
       }
@@ -200,11 +222,11 @@ export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
       } catch {}
 
       return { success: true, lesson };
-    },
+    }),
   );
 
   sdk.registerFunction("mem::lesson-decay-sweep", 
-    async () => {
+    async () => withKeyedLock("batch-callback:lessons", async () => {
       const lessons = await kv.list<Lesson>(KV.lessons);
       let decayed = 0;
       let softDeleted = 0;
@@ -278,6 +300,6 @@ export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
       );
 
       return { success: true, decayed, softDeleted, total: lessons.length };
-    },
+    }),
   );
 }

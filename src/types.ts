@@ -224,7 +224,21 @@ export interface FireworksBatchWorkResult {
   receivedAt: string;
 }
 
+export interface BatchEffectMetadata {
+  appliedBatchEffects?: string[];
+}
+
+export interface BatchCallbackReceipt {
+  state: "started" | "completed" | "stale";
+  activeKey?: string;
+  semanticSourceIds?: string[];
+  semanticCheckpoint?: { processedThrough: string; processedSessionIdsAtThrough: string[] };
+  resultHash?: string;
+  effectTimestamp?: string;
+}
+
 export interface FireworksBatchWorkItem {
+  callbackProtocolVersion?: 1;
   id: string;
   customId: string;
   correlationId: string;
@@ -243,11 +257,17 @@ export interface FireworksBatchWorkItem {
   result?: FireworksBatchWorkResult;
   lastError?: string;
   deadLetteredAt?: string;
+  completionIntent?: { key: string; resultHash: string };
 }
 
 export interface FireworksBatchJob {
+  requestedRemoteJobId?: string;
+  remoteReconciliationAttempts?: number;
+  callbackAttempts?: number;
+  reconciling?: boolean;
   id: string;
   remoteJobId?: string;
+  remoteJobName?: string;
   inputDatasetId: string;
   outputDatasetId: string;
   model: string;
@@ -256,10 +276,32 @@ export interface FireworksBatchJob {
   state: FireworksBatchJobState;
   attempts: number;
   nextAttemptAt: string;
+  submitAttemptedAt?: string;
   createdAt: string;
   updatedAt: string;
   completedAt?: string;
   lastError?: string;
+}
+
+export interface FireworksBatchActiveIndex {
+  version: 1;
+  ids: string[];
+  updatedAt: string;
+}
+
+export interface FireworksBatchEnqueueIntent {
+  version: 1;
+  id: string;
+  fingerprint: string;
+  item: FireworksBatchWorkItem;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface FireworksBatchEnqueueJournal {
+  version: 1;
+  intents: FireworksBatchEnqueueIntent[];
+  updatedAt: string;
 }
 
 export type LlmTask =
@@ -341,7 +383,7 @@ export interface EvalResult {
   functionId: string;
 }
 
-export interface FunctionMetrics {
+export interface FunctionMetrics extends BatchEffectMetadata {
   functionId: string;
   totalCalls: number;
   successCount: number;
@@ -463,7 +505,7 @@ export interface ExportPagination {
 }
 
 export interface ExportData {
-  version: "0.3.0" | "0.4.0" | "0.5.0" | "0.6.0" | "0.6.1" | "0.7.0" | "0.7.2" | "0.7.3" | "0.7.4" | "0.7.5" | "0.7.6" | "0.7.7" | "0.7.9" | "0.8.0" | "0.8.1" | "0.8.2" | "0.8.3" | "0.8.4" | "0.8.5" | "0.8.6" | "0.8.7" | "0.8.8" | "0.8.9" | "0.8.10" | "0.8.11" | "0.8.12" | "0.8.13" | "0.9.0" | "0.9.1" | "0.9.2" | "0.9.3" | "0.9.4" | "0.9.5" | "0.9.6" | "0.9.7" | "0.9.8" | "0.9.9" | "0.9.10" | "0.9.11" | "0.9.12" | "0.9.13" | "0.9.14" | "0.9.15" | "0.9.16" | "0.9.17" | "0.9.18" | "0.9.19" | "0.9.20" | "0.9.21" | "0.9.22" | "0.9.23" | "0.9.24" | "0.9.25" | "0.9.26" | "0.9.27" | "0.9.28" | "0.9.29" | "0.9.30" | "0.9.31" | "0.9.32" | "0.9.33" | "0.9.34" | "0.9.35" | "0.9.36" | "0.9.37" | "0.9.38" | "0.9.39" | "0.9.40" | "0.9.41" | "0.9.42";
+  version: "0.3.0" | "0.4.0" | "0.5.0" | "0.6.0" | "0.6.1" | "0.7.0" | "0.7.2" | "0.7.3" | "0.7.4" | "0.7.5" | "0.7.6" | "0.7.7" | "0.7.9" | "0.8.0" | "0.8.1" | "0.8.2" | "0.8.3" | "0.8.4" | "0.8.5" | "0.8.6" | "0.8.7" | "0.8.8" | "0.8.9" | "0.8.10" | "0.8.11" | "0.8.12" | "0.8.13" | "0.9.0" | "0.9.1" | "0.9.2" | "0.9.3" | "0.9.4" | "0.9.5" | "0.9.6" | "0.9.7" | "0.9.8" | "0.9.9" | "0.9.10" | "0.9.11" | "0.9.12" | "0.9.13" | "0.9.14" | "0.9.15" | "0.9.16" | "0.9.17" | "0.9.18" | "0.9.19" | "0.9.20" | "0.9.21" | "0.9.22" | "0.9.23" | "0.9.24" | "0.9.25" | "0.9.26" | "0.9.27" | "0.9.28" | "0.9.29" | "0.9.30" | "0.9.31" | "0.9.32" | "0.9.33" | "0.9.34" | "0.9.35" | "0.9.36" | "0.9.37" | "0.9.38" | "0.9.39" | "0.9.40" | "0.9.41" | "0.9.42" | "0.9.43";
   exportedAt: string;
   sessions: Session[];
   observations: Record<string, CompressedObservation[]>;
@@ -621,7 +663,8 @@ export interface GraphQueryResult {
 // KV.graphSnapshot with a single key "current". `dirty` is set true by
 // mem::graph-extract after writes and flipped false when the snapshot
 // rebuild completes.
-export interface GraphSnapshot {
+export interface GraphSnapshot extends BatchEffectMetadata {
+  batchInProgress?: string;
   version: 1;
   topNodes: GraphNode[];
   topEdges: GraphEdge[];
@@ -653,7 +696,7 @@ export type ConsolidationTier =
   | "semantic"
   | "procedural";
 
-export interface SemanticMemory {
+export interface SemanticMemory extends BatchEffectMetadata {
   id: string;
   fact: string;
   confidence: number;
@@ -666,7 +709,7 @@ export interface SemanticMemory {
   updatedAt: string;
 }
 
-export interface ProceduralMemory {
+export interface ProceduralMemory extends BatchEffectMetadata {
   id: string;
   name: string;
   steps: string[];
@@ -954,7 +997,7 @@ export interface Crystal {
   createdAt: string;
 }
 
-export interface Lesson {
+export interface Lesson extends BatchEffectMetadata {
   id: string;
   content: string;
   context: string;
@@ -972,7 +1015,7 @@ export interface Lesson {
   deleted?: boolean;
 }
 
-export interface Insight {
+export interface Insight extends BatchEffectMetadata {
   id: string;
   title: string;
   content: string;

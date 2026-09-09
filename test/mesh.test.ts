@@ -1,4 +1,17 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { request } from "node:https";
+vi.mock("node:dns/promises", () => ({ lookup: vi.fn(async () => [{ address: "93.184.216.34", family: 4 }]) }));
+vi.mock("node:https", async () => {
+  const { EventEmitter } = await import("node:events");
+  const { Readable } = await import("node:stream");
+  return { request: vi.fn((_url, _options, callback) => {
+    const req = new EventEmitter();
+    return Object.assign(req, { end: () => {
+      const response = Object.assign(Readable.from([Buffer.from('{"accepted":0}')]), { statusCode: 200 });
+      callback(response);
+    } });
+  }) };
+});
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -202,13 +215,6 @@ describe("Mesh Functions", () => {
       const authedKv = mockKV();
       registerMeshFunction(authedSdk as never, authedKv as never, "mesh-secret");
 
-      const fetchMock = vi.fn(async () =>
-        new Response(JSON.stringify({ accepted: 0 }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        }),
-      );
-      vi.stubGlobal("fetch", fetchMock);
 
       const regResult = (await authedSdk.trigger("mem::mesh-register", {
         url: "https://peer2.example.com",
@@ -222,13 +228,14 @@ describe("Mesh Functions", () => {
 
       expect(result.success).toBe(true);
       expect(result.results[0].errors).toEqual([]);
-      expect(fetchMock).toHaveBeenCalledWith(
-        "https://peer2.example.com/agentmemory/mesh/receive",
+      expect(request).toHaveBeenCalledWith(
+        new URL("https://peer2.example.com/agentmemory/mesh/receive"),
         expect.objectContaining({
           headers: expect.objectContaining({
             Authorization: "Bearer mesh-secret",
           }),
         }),
+        expect.any(Function),
       );
 
       vi.unstubAllGlobals();

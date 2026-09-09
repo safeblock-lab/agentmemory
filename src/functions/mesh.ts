@@ -2,6 +2,7 @@ import type { ISdk } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
 import { KV, generateId } from "../state/schema.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
+import { withBatchWriterLocks, withBatchRecordLocks, preserveBatchProvenance } from "../state/batch-effects.js";
 import { recordAudit } from "./audit.js";
 import type {
   MeshPeer,
@@ -14,44 +15,73 @@ import type {
   GraphEdge,
 } from "../types.js";
 import { lookup } from "node:dns/promises";
-import { isIP } from "node:net";
+import { BlockList, isIP } from "node:net";
+import { request } from "node:https";
+
+const forbidden = new BlockList();
+for (const [address, prefix] of [["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8], ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.0.2.0", 24], ["192.88.99.0", 24], ["192.168.0.0", 16], ["198.18.0.0", 15], ["198.51.100.0", 24], ["203.0.113.0", 24], ["224.0.0.0", 3]] as const) forbidden.addSubnet(address, prefix, "ipv4");
+for (const [address, prefix] of [["2001::", 23], ["2001:db8::", 32], ["2002::", 16], ["3fff::", 20]] as const) forbidden.addSubnet(address, prefix, "ipv6");
+const globalV6 = new BlockList();
+globalV6.addSubnet("2000::", 3, "ipv6");
 
 function isPrivateIP(ip: string): boolean {
-  if (ip === "127.0.0.1" || ip === "::1" || ip === "0.0.0.0") return true;
-  if (ip.startsWith("10.") || ip.startsWith("192.168.")) return true;
-  if (/^172\.(1[6-9]|2\d|3[01])\./.test(ip)) return true;
-  if (ip === "169.254.169.254") return true;
-  if (ip.startsWith("fe80:") || ip.startsWith("fc00:") || ip.startsWith("fd")) return true;
-  if (ip.startsWith("::ffff:")) {
-    const v4 = ip.slice(7);
-    return isPrivateIP(v4);
-  }
-  return false;
+  const family = isIP(ip);
+  if (family === 4) return forbidden.check(ip, "ipv4");
+  return family !== 6 || !globalV6.check(ip, "ipv6") || forbidden.check(ip, "ipv6");
+}
+
+async function resolveMeshUrl(urlStr: string): Promise<{ url: URL; address: string; family: number }> {
+  const url = new URL(urlStr);
+  const host = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (url.protocol !== "https:" || url.username || url.password || url.hash || host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) throw new Error("Mesh destination blocked");
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const resolved = isIP(host) ? [{ address: host, family: isIP(host) }] : await Promise.race([
+      lookup(host, { all: true, verbatim: true }),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("Mesh DNS timed out")), 5000); }),
+    ]);
+    if (!resolved.length || resolved.length > 16 || resolved.some(({ address }) => isPrivateIP(address))) throw new Error("Mesh destination blocked");
+    return { url, ...resolved[0] };
+  } finally { clearTimeout(timer); }
 }
 
 async function isAllowedUrl(urlStr: string): Promise<boolean> {
   try {
-    const parsed = new URL(urlStr);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
-    if (parsed.username || parsed.password) return false;
-    const host = parsed.hostname.toLowerCase();
-
-    if (host === "localhost") return false;
-    if (isIP(host) && isPrivateIP(host)) return false;
-
-    if (!isIP(host)) {
-      try {
-        const resolved = await lookup(host, { all: true });
-        if (resolved.some((r) => isPrivateIP(r.address))) return false;
-      } catch {
-        // DNS resolution failed — allow the URL (the actual fetch will fail if unreachable)
-      }
-    }
-
+    await resolveMeshUrl(urlStr);
     return true;
   } catch {
     return false;
   }
+}
+
+const MAX_MESH_BYTES = 8 * 1024 * 1024;
+async function meshRequest(urlStr: string, options: { method?: string; headers: Record<string, string>; body?: string }) {
+  if (options.body && Buffer.byteLength(options.body) > MAX_MESH_BYTES) throw new Error("Mesh request too large");
+  const resolved = await resolveMeshUrl(urlStr);
+  const identity = resolved.url.hostname.replace(/^\[|\]$/g, "");
+  return new Promise<{ ok: boolean; status: number; json: () => Promise<unknown> }>((resolve, reject) => {
+    // Pin the socket to the validated address; preserve Host and TLS identity.
+    const req = request(resolved.url, {
+      hostname: resolved.address, family: resolved.family,
+      servername: isIP(identity) ? undefined : identity,
+      method: options.method ?? "GET", headers: { ...options.headers, Host: resolved.url.host },
+      signal: AbortSignal.timeout(30000), agent: false,
+    }, (response) => {
+      const status = response.statusCode ?? 0;
+      if (status >= 300 && status < 400) { response.destroy(); reject(new Error("Mesh redirects blocked")); return; }
+      let bytes = 0;
+      const chunks: Buffer[] = [];
+      response.on("data", (chunk: Buffer) => {
+        bytes += chunk.length;
+        if (bytes > MAX_MESH_BYTES) { response.destroy(new Error("Mesh response too large")); return; }
+        chunks.push(chunk);
+      });
+      response.on("error", reject);
+      response.on("end", () => resolve({ ok: status >= 200 && status < 300, status, json: async () => JSON.parse(Buffer.concat(chunks).toString("utf8")) }));
+    });
+    req.on("error", () => reject(new Error("Mesh request failed")));
+    req.end(options.body);
+  });
 }
 
 const DEFAULT_SHARED_SCOPES = [
@@ -78,24 +108,24 @@ async function lwwMergeList<T extends { id: string }>(
   kv: StateKV,
   scope: string,
   items: T[] | undefined,
-  lockPrefix: string,
+  _lockPrefix: string,
   tsField: "updatedAt" | "createdAt",
 ): Promise<number> {
   if (!items || !Array.isArray(items)) return 0;
   let count = 0;
   for (const item of items) {
-    if (!item.id || typeof item.id !== "string") continue;
+    if (!item || !item.id || typeof item.id !== "string") continue;
     const ts = (item as Record<string, unknown>)[tsField];
     if (typeof ts !== "string" || Number.isNaN(new Date(ts).getTime())) continue;
-    const wrote = await withKeyedLock(`${lockPrefix}:${item.id}`, async () => {
+    const wrote = await withBatchRecordLocks([[scope, item.id]], async () => {
       const existing = await kv.get<T>(scope, item.id);
       if (!existing) {
-        await kv.set(scope, item.id, item);
+        await kv.set(scope, item.id, preserveBatchProvenance(existing, item));
         return true;
       }
       const existingTs = (existing as Record<string, unknown>)[tsField] as string;
       if (new Date(ts) > new Date(existingTs)) {
-        await kv.set(scope, item.id, item);
+        await kv.set(scope, item.id, preserveBatchProvenance(existing, item));
         return true;
       }
       return false;
@@ -116,17 +146,17 @@ async function lwwMergeGraphNodes(
   if (!items || !Array.isArray(items)) return 0;
   let count = 0;
   for (const item of items) {
-    if (!item.id || typeof item.id !== "string") continue;
+    if (!item || !item.id || typeof item.id !== "string") continue;
     const ts = graphNodeTs(item);
     if (!ts || Number.isNaN(new Date(ts).getTime())) continue;
-    const wrote = await withKeyedLock(`mem:gnode:${item.id}`, async () => {
+    const wrote = await withBatchRecordLocks([[KV.graphNodes, item.id]], async () => {
       const existing = await kv.get<GraphNode>(KV.graphNodes, item.id);
       if (!existing) {
-        await kv.set(KV.graphNodes, item.id, item);
+        await kv.set(KV.graphNodes, item.id, preserveBatchProvenance(existing, item));
         return true;
       }
       if (new Date(ts) > new Date(graphNodeTs(existing))) {
-        await kv.set(KV.graphNodes, item.id, item);
+        await kv.set(KV.graphNodes, item.id, preserveBatchProvenance(existing, item));
         return true;
       }
       return false;
@@ -186,7 +216,7 @@ export function registerMeshFunction(
     },
   );
 
-  sdk.registerFunction("mem::mesh-list", 
+  sdk.registerFunction("mem::mesh-list",
     async () => {
       const peers = await kv.list<MeshPeer>(KV.mesh);
       return { success: true, peers };
@@ -259,15 +289,13 @@ export function registerMeshFunction(
           if (direction === "push" || direction === "both") {
             const pushData = await collectSyncData(kv, scopes, peer.lastSyncAt, peer.syncFilter);
             try {
-              const response = await fetch(`${peer.url}/agentmemory/mesh/receive`, {
+              const response = await meshRequest(`${peer.url}/agentmemory/mesh/receive`, {
                 method: "POST",
                 headers: {
                   "Content-Type": "application/json",
                   Authorization: `Bearer ${meshAuthToken}`,
                 },
                 body: JSON.stringify(pushData),
-                signal: AbortSignal.timeout(30000),
-                redirect: "error",
               });
               if (response.ok) {
                 const body = (await response.json()) as { accepted: number };
@@ -282,14 +310,12 @@ export function registerMeshFunction(
 
           if (direction === "pull" || direction === "both") {
             try {
-              const response = await fetch(
+              const response = await meshRequest(
                 `${peer.url}/agentmemory/mesh/export?since=${peer.lastSyncAt || ""}`,
                 {
                   headers: {
                     Authorization: `Bearer ${meshAuthToken}`,
                   },
-                  signal: AbortSignal.timeout(30000),
-                  redirect: "error",
                 },
               );
               if (response.ok) {
@@ -337,37 +363,39 @@ export function registerMeshFunction(
       if (!data || typeof data !== "object") {
         return { success: false, error: "payload required" };
       }
-      let accepted = 0;
+      return withBatchWriterLocks(kv, ["graph", "consolidation", "crystallize"], async () => {
+        let accepted = 0;
 
-      accepted += await lwwMergeList(kv, KV.memories, data.memories, "mem:memory", "updatedAt");
-      accepted += await lwwMergeList(kv, KV.actions, data.actions, "mem:action", "updatedAt");
-      accepted += await lwwMergeList(kv, KV.semantic, data.semantic, "mem:semantic", "updatedAt");
-      accepted += await lwwMergeList(kv, KV.procedural, data.procedural, "mem:procedural", "updatedAt");
-      if (data.relations && Array.isArray(data.relations)) {
-        for (const rel of data.relations) {
-          if (!rel.sourceId || !rel.targetId || !rel.type) continue;
-          const relKey = `${rel.sourceId}:${rel.targetId}:${rel.type}`;
-          await withKeyedLock(`mem:relation:${relKey}`, async () => {
-            const existing = await kv.get<MemoryRelation>(KV.relations, relKey);
-            if (!existing) {
-              await kv.set(KV.relations, relKey, rel);
-              await recordAudit(kv, "mesh_sync", "mem::mesh-receive", [relKey], {
-                action: "mesh.receive.relation",
-                accepted: true,
-              });
-              accepted++;
-            }
-          });
+        accepted += await lwwMergeList(kv, KV.memories, data.memories, "mem:memory", "updatedAt");
+        accepted += await lwwMergeList(kv, KV.actions, data.actions, "mem:action", "updatedAt");
+        accepted += await lwwMergeList(kv, KV.semantic, data.semantic, "mem:semantic", "updatedAt");
+        accepted += await lwwMergeList(kv, KV.procedural, data.procedural, "mem:procedural", "updatedAt");
+        if (data.relations && Array.isArray(data.relations)) {
+          for (const rel of data.relations) {
+            if (!rel.sourceId || !rel.targetId || !rel.type) continue;
+            const relKey = `${rel.sourceId}:${rel.targetId}:${rel.type}`;
+            await withKeyedLock(`mem:relation:${relKey}`, async () => {
+              const existing = await kv.get<MemoryRelation>(KV.relations, relKey);
+              if (!existing) {
+                await kv.set(KV.relations, relKey, rel);
+                await recordAudit(kv, "mesh_sync", "mem::mesh-receive", [relKey], {
+                  action: "mesh.receive.relation",
+                  accepted: true,
+                });
+                accepted++;
+              }
+            });
+          }
         }
-      }
-      accepted += await lwwMergeGraphNodes(kv, data.graphNodes);
-      accepted += await lwwMergeList(kv, KV.graphEdges, data.graphEdges, "mem:gedge", "createdAt");
-      await recordAudit(kv, "mesh_sync", "mem::mesh-receive", [], {
-        action: "mesh.receive",
-        accepted,
-      });
+        accepted += await lwwMergeGraphNodes(kv, data.graphNodes);
+        accepted += await lwwMergeList(kv, KV.graphEdges, data.graphEdges, "mem:gedge", "createdAt");
+        await recordAudit(kv, "mesh_sync", "mem::mesh-receive", [], {
+          action: "mesh.receive",
+          accepted,
+        });
 
-      return { success: true, accepted };
+        return { success: true, accepted };
+      });
     },
   );
 
@@ -455,41 +483,43 @@ async function applySyncData(
   data: MeshSyncPayload,
   scopes: string[],
 ): Promise<number> {
-  let applied = 0;
+  return withBatchWriterLocks(kv, ["graph", "consolidation", "crystallize"], async () => {
+    let applied = 0;
 
-  if (scopes.includes("memories")) {
-    applied += await lwwMergeList(kv, KV.memories, data.memories, "mem:memory", "updatedAt");
-  }
-  if (scopes.includes("actions")) {
-    applied += await lwwMergeList(kv, KV.actions, data.actions, "mem:action", "updatedAt");
-  }
-  if (scopes.includes("semantic")) {
-    applied += await lwwMergeList(kv, KV.semantic, data.semantic, "mem:semantic", "updatedAt");
-  }
-  if (scopes.includes("procedural")) {
-    applied += await lwwMergeList(kv, KV.procedural, data.procedural, "mem:procedural", "updatedAt");
-  }
-  if (scopes.includes("relations") && data.relations) {
-    for (const rel of data.relations) {
-      if (!rel.sourceId || !rel.targetId || !rel.type) continue;
-      const relKey = `${rel.sourceId}:${rel.targetId}:${rel.type}`;
-      const wrote = await withKeyedLock(`mem:relation:${relKey}`, async () => {
-        const existing = await kv.get<MemoryRelation>(KV.relations, relKey);
-        if (!existing) {
-          await kv.set(KV.relations, relKey, rel);
-          return true;
-        }
-        return false;
-      });
-      if (wrote) applied++;
+    if (scopes.includes("memories")) {
+      applied += await lwwMergeList(kv, KV.memories, data.memories, "mem:memory", "updatedAt");
     }
-  }
-  if (scopes.includes("graph:nodes")) {
-    applied += await lwwMergeGraphNodes(kv, data.graphNodes);
-  }
-  if (scopes.includes("graph:edges")) {
-    applied += await lwwMergeList(kv, KV.graphEdges, data.graphEdges, "mem:gedge", "createdAt");
-  }
+    if (scopes.includes("actions")) {
+      applied += await lwwMergeList(kv, KV.actions, data.actions, "mem:action", "updatedAt");
+    }
+    if (scopes.includes("semantic")) {
+      applied += await lwwMergeList(kv, KV.semantic, data.semantic, "mem:semantic", "updatedAt");
+    }
+    if (scopes.includes("procedural")) {
+      applied += await lwwMergeList(kv, KV.procedural, data.procedural, "mem:procedural", "updatedAt");
+    }
+    if (scopes.includes("relations") && data.relations) {
+      for (const rel of data.relations) {
+        if (!rel.sourceId || !rel.targetId || !rel.type) continue;
+        const relKey = `${rel.sourceId}:${rel.targetId}:${rel.type}`;
+        const wrote = await withKeyedLock(`mem:relation:${relKey}`, async () => {
+          const existing = await kv.get<MemoryRelation>(KV.relations, relKey);
+          if (!existing) {
+            await kv.set(KV.relations, relKey, rel);
+            return true;
+          }
+          return false;
+        });
+        if (wrote) applied++;
+      }
+    }
+    if (scopes.includes("graph:nodes")) {
+      applied += await lwwMergeGraphNodes(kv, data.graphNodes);
+    }
+    if (scopes.includes("graph:edges")) {
+      applied += await lwwMergeList(kv, KV.graphEdges, data.graphEdges, "mem:gedge", "createdAt");
+    }
 
-  return applied;
+    return applied;
+  });
 }

@@ -238,6 +238,16 @@ describe("RetentionScoring", () => {
     expect(remaining.length).toBe(2);
   });
 
+  it("refuses eviction while a batch callback needs recovery", async () => {
+    const { registerRetentionFunctions } = await import("../src/functions/retention.js");
+    const sdk = mockSdk();
+    const kv = mockKV([makeMemory("keep", "fact", 500)]);
+    registerRetentionFunctions(sdk as never, kv as never);
+    await kv.set("mem:batch-callbacks", "active:consolidation", { state: "started", activeKey: "a".repeat(64) });
+    await expect(sdk.trigger({ function_id: "mem::retention-evict", payload: { threshold: 1 } })).rejects.toThrow("recovered");
+    expect(await kv.list("mem:memories")).toHaveLength(1);
+  });
+
   it("includes semantic memories in scoring", async () => {
     const { registerRetentionFunctions } = await import(
       "../src/functions/retention.js"

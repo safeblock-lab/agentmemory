@@ -4,6 +4,7 @@ import { KV, fingerprintId, generateId } from "../state/schema.js";
 import type { Action, ActionEdge, Crystal, MemoryProvider } from "../types.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
 import type { FireworksBatchQueue } from "./fireworks-batch.js";
+import { batchEffectKey, runBatchCallback, withBatchRecordLocks } from "../state/batch-effects.js";
 
 interface CrystalDigest {
   narrative: string;
@@ -47,7 +48,7 @@ export function registerCrystallizeFunction(
   llmRouter?: LlmTaskRouter,
   batchQueue?: FireworksBatchQueue,
 ): void {
-  sdk.registerFunction("mem::crystallize", 
+  sdk.registerFunction("mem::crystallize",
     async (data: {
       actionIds: string[];
       sessionId?: string;
@@ -55,7 +56,8 @@ export function registerCrystallizeFunction(
       deferred?: boolean;
       batchResponse?: string;
       batchSourceFingerprint?: string;
-    }) => {
+      batchEffectKey?: string;
+    }) => runBatchCallback(kv, "crystallize", data.batchEffectKey, async (resuming, admit) => {
       if (!data.actionIds || data.actionIds.length === 0) {
         return { success: false, error: "actionIds is required" };
       }
@@ -86,7 +88,7 @@ export function registerCrystallizeFunction(
 
       if (data.deferred && !data.batchResponse && batchQueue) {
         const enqueueResult = await batchQueue.enqueue({
-          correlationId: generateId("fwbcrys"),
+          correlationId: data.batchEffectKey ? fingerprintId("fwbcrys", data.batchEffectKey) : generateId("fwbcrys"),
           task: "crystallization",
           systemPrompt: CRYSTALLIZE_SYSTEM,
           userPrompt: prompt,
@@ -95,6 +97,7 @@ export function registerCrystallizeFunction(
             sessionId: data.sessionId || "",
             project: data.project || "",
             sourceFingerprint,
+            ...(data.batchEffectKey ? { batchEffectKey: data.batchEffectKey } : {}),
           },
         });
         if (enqueueResult.queued) {
@@ -102,7 +105,7 @@ export function registerCrystallizeFunction(
         }
       }
 
-      if (data.batchResponse && data.batchSourceFingerprint !== sourceFingerprint) {
+      if (!resuming && data.batchResponse && data.batchSourceFingerprint !== sourceFingerprint) {
         return { success: true, stale: true };
       }
 
@@ -127,20 +130,26 @@ export function registerCrystallizeFunction(
           )
           : await provider.summarize(CRYSTALLIZE_SYSTEM, prompt));
         const digest = parseDigest(response);
+        await admit();
 
-        const crystal: Crystal = {
-          id: generateId("crys"),
-          narrative: digest.narrative,
-          keyOutcomes: digest.keyOutcomes,
-          filesAffected: digest.filesAffected,
-          lessons: digest.lessons,
-          sourceActionIds: data.actionIds,
-          sessionId: data.sessionId,
-          project: data.project,
-          createdAt: new Date().toISOString(),
-        };
+        const crystalId = data.batchEffectKey ? fingerprintId("crys", data.batchEffectKey) : generateId("crys");
+        const crystal = await withBatchRecordLocks([[KV.crystals, crystalId]], async () => {
+          const storedCrystal = data.batchEffectKey ? await kv.get<Crystal>(KV.crystals, crystalId) : null;
+          const crystal: Crystal = storedCrystal ?? {
+            id: crystalId,
+            narrative: digest.narrative,
+            keyOutcomes: digest.keyOutcomes,
+            filesAffected: digest.filesAffected,
+            lessons: digest.lessons,
+            sourceActionIds: data.actionIds,
+            sessionId: data.sessionId,
+            project: data.project,
+            createdAt: new Date().toISOString(),
+          };
 
-        await kv.set(KV.crystals, crystal.id, crystal);
+          if (!storedCrystal) await kv.set(KV.crystals, crystal.id, crystal);
+          return crystal;
+        });
 
         await Promise.all(
           digest.lessons.map((lesson) =>
@@ -155,9 +164,15 @@ export function registerCrystallizeFunction(
                   tags: [],
                   source: "crystal",
                   sourceIds: [crystal.id],
+                  ...(data.batchEffectKey ? { batchEffectKey: batchEffectKey(`${data.batchEffectKey}:${lesson.trim().toLowerCase()}`) } : {}),
                 },
               })
-              .catch(() => {}),
+              .then((result) => {
+                if (data.batchEffectKey && result && typeof result === "object" && "success" in result && result.success === false) {
+                  throw new Error("Batch crystal lesson application failed");
+                }
+              })
+              .catch((error) => { if (data.batchEffectKey) throw error; }),
           ),
         );
 
@@ -173,10 +188,10 @@ export function registerCrystallizeFunction(
           error: `crystallization failed: ${String(err)}`,
         };
       }
-    },
+    }),
   );
 
-  sdk.registerFunction("mem::crystal-list", 
+  sdk.registerFunction("mem::crystal-list",
     async (data: {
       project?: string;
       sessionId?: string;
@@ -201,7 +216,7 @@ export function registerCrystallizeFunction(
     },
   );
 
-  sdk.registerFunction("mem::crystal-get", 
+  sdk.registerFunction("mem::crystal-get",
     async (data: { crystalId: string }) => {
       if (!data.crystalId) {
         return { success: false, error: "crystalId is required" };
@@ -216,7 +231,7 @@ export function registerCrystallizeFunction(
     },
   );
 
-  sdk.registerFunction("mem::auto-crystallize", 
+  sdk.registerFunction("mem::auto-crystallize",
     async (data: {
       olderThanDays?: number;
       project?: string;
@@ -278,11 +293,13 @@ export function registerCrystallizeFunction(
         const project = groupActions[0].project;
 
         try {
-          const result = (await sdk.trigger({ function_id: "mem::crystallize", payload: {
-            actionIds,
-            project,
-            deferred: data.deferred,
-          } })) as { success: boolean; crystal?: Crystal };
+          const result = (await sdk.trigger({
+            function_id: "mem::crystallize", payload: {
+              actionIds,
+              project,
+              deferred: data.deferred,
+            }
+          })) as { success: boolean; crystal?: Crystal };
 
           if (result.success && result.crystal) {
             crystalIds.push(result.crystal.id);

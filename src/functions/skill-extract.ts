@@ -1,4 +1,5 @@
 import type { ISdk } from "iii-sdk";
+import { withBatchWriterLocks, withBatchRecordLocks } from "../state/batch-effects.js";
 import type {
   CompressedObservation,
   SessionSummary,
@@ -107,7 +108,7 @@ export function registerSkillExtractFunctions(
   provider: MemoryProvider,
   llmRouter?: LlmTaskRouter,
 ): void {
-  sdk.registerFunction("mem::skill-extract", 
+  sdk.registerFunction("mem::skill-extract",
     async (data: { sessionId: string }) => {
       if (!data?.sessionId) {
         return { success: false, error: "sessionId is required" };
@@ -166,77 +167,77 @@ export function registerSkillExtractFunctions(
             steps: parsed.steps.map((s) => s.toLowerCase().trim()),
           }),
         );
-        const existing = await kv
-          .get<ProceduralMemory>(KV.procedural, fp)
-          .catch(() => null);
+        return await withBatchWriterLocks(kv, ["consolidation"], () => withBatchRecordLocks([[KV.procedural, fp]], async () => {
+          const existing = await kv.get<ProceduralMemory>(KV.procedural, fp);
 
-        if (existing) {
-          const alreadyReinforced = existing.sourceSessionIds.includes(data.sessionId);
-          if (!alreadyReinforced) {
-            existing.strength = Math.min(1.0, existing.strength + 0.15);
-            existing.frequency++;
-            existing.sourceSessionIds = [...existing.sourceSessionIds, data.sessionId];
+          if (existing) {
+            const alreadyReinforced = existing.sourceSessionIds.includes(data.sessionId);
+            if (!alreadyReinforced) {
+              existing.strength = Math.min(1.0, existing.strength + 0.15);
+              existing.frequency++;
+              existing.sourceSessionIds = [...existing.sourceSessionIds, data.sessionId];
+            }
+            existing.updatedAt = new Date().toISOString();
+            await kv.set(KV.procedural, existing.id, existing);
+
+            try {
+              await recordAudit(kv, "skill_extract", "mem::skill-extract", [], {
+                skillId: existing.id,
+                reinforced: true,
+                sessionId: data.sessionId,
+              });
+            } catch { }
+
+            logger.info("Skill reinforced", {
+              id: existing.id,
+              name: parsed.title,
+            });
+            return {
+              success: true,
+              extracted: true,
+              reinforced: true,
+              skill: existing,
+            };
           }
-          existing.updatedAt = new Date().toISOString();
-          await kv.set(KV.procedural, existing.id, existing);
+
+          const now = new Date().toISOString();
+          const skill: ProceduralMemory = {
+            id: fp,
+            name: parsed.title,
+            triggerCondition: parsed.trigger,
+            steps: parsed.steps,
+            expectedOutcome: parsed.expectedOutcome,
+            strength: 0.6,
+            frequency: 1,
+            tags: parsed.tags,
+            concepts: summary.concepts,
+            sourceSessionIds: [data.sessionId],
+            sourceObservationIds: observations
+              .slice(0, 10)
+              .map((o) => o.id),
+            createdAt: now,
+            updatedAt: now,
+          };
+
+          await kv.set(KV.procedural, skill.id, skill);
 
           try {
             await recordAudit(kv, "skill_extract", "mem::skill-extract", [], {
-              skillId: existing.id,
-              reinforced: true,
+              skillId: skill.id,
+              title: parsed.title,
+              steps: parsed.steps.length,
               sessionId: data.sessionId,
             });
-          } catch {}
+          } catch { }
 
-          logger.info("Skill reinforced", {
-            id: existing.id,
-            name: parsed.title,
-          });
-          return {
-            success: true,
-            extracted: true,
-            reinforced: true,
-            skill: existing,
-          };
-        }
-
-        const now = new Date().toISOString();
-        const skill: ProceduralMemory = {
-          id: fp,
-          name: parsed.title,
-          triggerCondition: parsed.trigger,
-          steps: parsed.steps,
-          expectedOutcome: parsed.expectedOutcome,
-          strength: 0.6,
-          frequency: 1,
-          tags: parsed.tags,
-          concepts: summary.concepts,
-          sourceSessionIds: [data.sessionId],
-          sourceObservationIds: observations
-            .slice(0, 10)
-            .map((o) => o.id),
-          createdAt: now,
-          updatedAt: now,
-        };
-
-        await kv.set(KV.procedural, skill.id, skill);
-
-        try {
-          await recordAudit(kv, "skill_extract", "mem::skill-extract", [], {
-            skillId: skill.id,
+          logger.info("Skill extracted", {
+            id: skill.id,
             title: parsed.title,
             steps: parsed.steps.length,
-            sessionId: data.sessionId,
           });
-        } catch {}
 
-        logger.info("Skill extracted", {
-          id: skill.id,
-          title: parsed.title,
-          steps: parsed.steps.length,
-        });
-
-        return { success: true, extracted: true, reinforced: false, skill };
+          return { success: true, extracted: true, reinforced: false, skill };
+        }));
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         logger.error("Skill extraction failed", { error: msg });
@@ -245,7 +246,7 @@ export function registerSkillExtractFunctions(
     },
   );
 
-  sdk.registerFunction("mem::skill-list", 
+  sdk.registerFunction("mem::skill-list",
     async (data: { limit?: number }) => {
       const limit = data?.limit ?? 50;
       const skills = await kv.list<ProceduralMemory>(KV.procedural);
@@ -258,7 +259,7 @@ export function registerSkillExtractFunctions(
     },
   );
 
-  sdk.registerFunction("mem::skill-match", 
+  sdk.registerFunction("mem::skill-match",
     async (data: { query: string; limit?: number }) => {
       if (!data?.query?.trim()) {
         return { success: false, error: "query is required" };
@@ -280,9 +281,9 @@ export function registerSkillExtractFunctions(
           return { skill, score: relevance * skill.strength };
         })
         .filter(Boolean) as Array<{
-        skill: ProceduralMemory;
-        score: number;
-      }>;
+          skill: ProceduralMemory;
+          score: number;
+        }>;
 
       scored.sort((a, b) => b.score - a.score);
 

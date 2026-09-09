@@ -21,7 +21,6 @@ import type {
   Facet,
   Lesson,
   Insight,
-  ExportPagination,
   AccessLogExport,
 } from "../types.js";
 import { normalizeAccessLog } from "./access-tracker.js";
@@ -30,6 +29,8 @@ import { StateKV } from "../state/kv.js";
 import { VERSION } from "../version.js";
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
+import { withBatchMutationLocks, preserveBatchProvenance, effectMetadata } from "../state/batch-effects.js";
+import type { BatchEffectMetadata } from "../types.js";
 
 export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction("mem::export", 
@@ -165,7 +166,7 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
     async (data: {
       exportData: ExportData;
       strategy?: "merge" | "replace" | "skip";
-    }) => {
+    }) => withBatchMutationLocks(kv, async () => {
       if (
         !data?.exportData ||
         typeof data.exportData !== "object" ||
@@ -174,9 +175,17 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         return { success: false, error: "exportData with string version is required" };
       }
       const strategy = data.strategy || "merge";
+      if (!["merge", "replace", "skip"].includes(strategy)) return { success: false, error: "Invalid import strategy" };
       const importData = data.exportData;
+      for (const records of [importData.lessons, importData.insights, importData.semanticMemories, importData.proceduralMemories]) {
+        if (!Array.isArray(records)) continue;
+        if (records.some((record) => !record || (record.appliedBatchEffects !== undefined && (
+          !Array.isArray(record.appliedBatchEffects) || record.appliedBatchEffects.length > 4096 ||
+          record.appliedBatchEffects.some((key) => typeof key !== "string" || !/^[a-f0-9]{64}$/.test(key))
+        )))) return { success: false, error: "Invalid batch effect metadata" };
+      }
 
-      const supportedVersions = new Set(["0.3.0", "0.4.0", "0.5.0", "0.6.0", "0.6.1", "0.7.0", "0.7.2", "0.7.3", "0.7.4", "0.7.5", "0.7.6", "0.7.7", "0.7.9", "0.8.0", "0.8.1", "0.8.2", "0.8.3", "0.8.4", "0.8.5", "0.8.6", "0.8.7", "0.8.8", "0.8.9", "0.8.10", "0.8.11", "0.8.12", "0.8.13", "0.9.0", "0.9.1", "0.9.2", "0.9.3", "0.9.4", "0.9.5", "0.9.6", "0.9.7", "0.9.8", "0.9.9", "0.9.10", "0.9.11", "0.9.12", "0.9.13", "0.9.14", "0.9.15", "0.9.16", "0.9.17", "0.9.18", "0.9.19", "0.9.20", "0.9.21", "0.9.22", "0.9.23", "0.9.24", "0.9.25", "0.9.26", "0.9.27", "0.9.28", "0.9.29", "0.9.30", "0.9.31", "0.9.32", "0.9.33", "0.9.34", "0.9.35", "0.9.36", "0.9.37", "0.9.38", "0.9.39", "0.9.40", "0.9.41", "0.9.42"]);
+      const supportedVersions = new Set(["0.3.0", "0.4.0", "0.5.0", "0.6.0", "0.6.1", "0.7.0", "0.7.2", "0.7.3", "0.7.4", "0.7.5", "0.7.6", "0.7.7", "0.7.9", "0.8.0", "0.8.1", "0.8.2", "0.8.3", "0.8.4", "0.8.5", "0.8.6", "0.8.7", "0.8.8", "0.8.9", "0.8.10", "0.8.11", "0.8.12", "0.8.13", "0.9.0", "0.9.1", "0.9.2", "0.9.3", "0.9.4", "0.9.5", "0.9.6", "0.9.7", "0.9.8", "0.9.9", "0.9.10", "0.9.11", "0.9.12", "0.9.13", "0.9.14", "0.9.15", "0.9.16", "0.9.17", "0.9.18", "0.9.19", "0.9.20", "0.9.21", "0.9.22", "0.9.23", "0.9.24", "0.9.25", "0.9.26", "0.9.27", "0.9.28", "0.9.29", "0.9.30", "0.9.31", "0.9.32", "0.9.33", "0.9.34", "0.9.35", "0.9.36", "0.9.37", "0.9.38", "0.9.39", "0.9.40", "0.9.41", "0.9.42", "0.9.43"]);
       if (!supportedVersions.has(importData.version)) {
         return {
           success: false,
@@ -253,6 +262,75 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
           success: false,
           error: `Too many total observations (max ${MAX_TOTAL_OBSERVATIONS})`,
         };
+      }
+
+      const sectionKeys = {
+        sessions: "id", memories: "id", summaries: "sessionId", profiles: "project",
+        graphNodes: "id", graphEdges: "id", semanticMemories: "id", proceduralMemories: "id",
+        actions: "id", actionEdges: "id", routines: "id", signals: "id", checkpoints: "id",
+        sentinels: "id", sketches: "id", crystals: "id", facets: "id", lessons: "id", insights: "id",
+        accessLogs: "memoryId",
+      } as const;
+      function validRecord(value: unknown, key: string): boolean {
+        if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+        const id = (value as Record<string, unknown>)[key];
+        return typeof id === "string" && id.trim().length > 0;
+      }
+      // Validate every collection consumed below before replace can delete
+      // anything. Legacy optional fields are normalized, not made mandatory.
+      for (const [section, key] of Object.entries(sectionKeys)) {
+        const records = importData[section as keyof typeof sectionKeys];
+        if (records === undefined) continue;
+        if (!Array.isArray(records)) return { success: false, error: `${section} must be an array` };
+        const limit = section === "accessLogs" ? MAX_ACCESS_LOGS : MAX_MEMORIES;
+        if (records.length > limit) return { success: false, error: `Too many ${section} (max ${limit})` };
+        if (records.some((record) => !validRecord(record, key))) return { success: false, error: `${section} contains an invalid record` };
+      }
+      for (const [sessionId, observations] of Object.entries(importData.observations)) {
+        if (!sessionId.trim() || observations.some((observation) => !validRecord(observation, "id"))) {
+          return { success: false, error: "observations contains an invalid record or session key" };
+        }
+      }
+      const normalizedAccessLogs = (importData.accessLogs ?? []).map(normalizeAccessLog);
+
+      const protectedScopes = [KV.graphNodes, KV.graphEdges, KV.semantic, KV.procedural, KV.lessons, KV.insights];
+      const prepared = new Map<string, Map<string, object>>();
+      async function prepareRecords<T extends { id: string }>(scope: string, records?: T[]): Promise<void> {
+        if (records === undefined) return;
+        if (!Array.isArray(records) || records.length > MAX_MEMORIES) throw new Error("Invalid protected import collection");
+        const merged = new Map<string, object>();
+        for (const record of records) {
+          if (!record || typeof record.id !== "string" || !record.id) throw new Error("Invalid protected import record");
+          const current = (merged.get(record.id) as T | undefined) ?? await kv.get<T>(scope, record.id);
+          if (strategy === "skip" && current) continue;
+          merged.set(record.id, preserveBatchProvenance(strategy === "replace" ? null : current, record));
+        }
+        prepared.set(scope, merged);
+      }
+      function preparedRecord<T extends { id: string }>(scope: string, record: T): T {
+        return (prepared.get(scope)?.get(record.id) as T | undefined) ?? record;
+      }
+      try {
+        if (strategy === "replace") {
+          // Callback receipts also protect deterministic graph/crystal effects
+          // whose identities do not carry a same-record receipt array.
+          if ((await kv.list(KV.batchCallbacks)).length) return { success: false, error: "Replace blocked: existing batch callback receipts must be preserved; use merge" };
+          for (const scope of [...protectedScopes, KV.graphSnapshot]) {
+            for (const record of await kv.list<BatchEffectMetadata>(scope)) {
+              if (effectMetadata(record).appliedBatchEffects?.length) return { success: false, error: "Replace blocked: existing batch effect metadata must be preserved; use merge" };
+            }
+          }
+        }
+        // This preflight runs under maintenance, before any delete/write. A
+        // union overflow must not leave an otherwise partially imported file.
+        await prepareRecords(KV.graphNodes, importData.graphNodes);
+        await prepareRecords(KV.graphEdges, importData.graphEdges);
+        await prepareRecords(KV.semantic, importData.semanticMemories);
+        await prepareRecords(KV.procedural, importData.proceduralMemories);
+        await prepareRecords(KV.lessons, importData.lessons);
+        await prepareRecords(KV.insights, importData.insights);
+      } catch {
+        return { success: false, error: "Import preflight failed: invalid or unavailable batch metadata, or receipt capacity exhausted" };
       }
 
       const stats = {
@@ -400,37 +478,37 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
       if (importData.graphNodes) {
         for (const node of importData.graphNodes) {
           if (strategy === "skip") {
-            const existing = await kv.get(KV.graphNodes, node.id).catch(() => null);
+            const existing = await kv.get(KV.graphNodes, node.id);
             if (existing) { stats.skipped++; continue; }
           }
-          await kv.set(KV.graphNodes, node.id, node);
+          await kv.set(KV.graphNodes, node.id, preparedRecord(KV.graphNodes, node));
         }
       }
       if (importData.graphEdges) {
         for (const edge of importData.graphEdges) {
           if (strategy === "skip") {
-            const existing = await kv.get(KV.graphEdges, edge.id).catch(() => null);
+            const existing = await kv.get(KV.graphEdges, edge.id);
             if (existing) { stats.skipped++; continue; }
           }
-          await kv.set(KV.graphEdges, edge.id, edge);
+          await kv.set(KV.graphEdges, edge.id, preparedRecord(KV.graphEdges, edge));
         }
       }
       if (importData.semanticMemories) {
         for (const sem of importData.semanticMemories) {
           if (strategy === "skip") {
-            const existing = await kv.get(KV.semantic, sem.id).catch(() => null);
+            const existing = await kv.get(KV.semantic, sem.id);
             if (existing) { stats.skipped++; continue; }
           }
-          await kv.set(KV.semantic, sem.id, sem);
+          await kv.set(KV.semantic, sem.id, preparedRecord(KV.semantic, sem));
         }
       }
       if (importData.proceduralMemories) {
         for (const proc of importData.proceduralMemories) {
           if (strategy === "skip") {
-            const existing = await kv.get(KV.procedural, proc.id).catch(() => null);
+            const existing = await kv.get(KV.procedural, proc.id);
             if (existing) { stats.skipped++; continue; }
           }
-          await kv.set(KV.procedural, proc.id, proc);
+          await kv.set(KV.procedural, proc.id, preparedRecord(KV.procedural, proc));
         }
       }
       if (importData.profiles) {
@@ -532,36 +610,26 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
       if (importData.lessons) {
         for (const lesson of importData.lessons) {
           if (strategy === "skip") {
-            const existing = await kv.get(KV.lessons, lesson.id).catch(() => null);
+            const existing = await kv.get(KV.lessons, lesson.id);
             if (existing) { stats.skipped++; continue; }
           }
-          await kv.set(KV.lessons, lesson.id, lesson);
+          await kv.set(KV.lessons, lesson.id, preparedRecord(KV.lessons, lesson));
         }
       }
       if (importData.insights) {
         for (const insight of importData.insights) {
           if (strategy === "skip") {
-            const existing = await kv.get(KV.insights, insight.id).catch(() => null);
+            const existing = await kv.get(KV.insights, insight.id);
             if (existing) { stats.skipped++; continue; }
           }
-          await kv.set(KV.insights, insight.id, insight);
+          await kv.set(KV.insights, insight.id, preparedRecord(KV.insights, insight));
         }
       }
-      if (importData.accessLogs) {
-        if (!Array.isArray(importData.accessLogs)) {
-          return { success: false, error: "accessLogs must be an array" };
-        }
-        if (importData.accessLogs.length > MAX_ACCESS_LOGS) {
-          return {
-            success: false,
-            error: `Too many access logs (max ${MAX_ACCESS_LOGS})`,
-          };
-        }
+      if (normalizedAccessLogs.length) {
         const memoryIds = new Set<string>(
           importData.memories.map((m) => m.id),
         );
-        for (const raw of importData.accessLogs) {
-          const log = normalizeAccessLog(raw);
+        for (const log of normalizedAccessLogs) {
           if (!log.memoryId || !memoryIds.has(log.memoryId)) continue;
           if (strategy === "skip") {
             const existing = await kv
@@ -582,6 +650,6 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         stats,
       });
       return { success: true, strategy, ...stats };
-    },
+    }),
   );
 }

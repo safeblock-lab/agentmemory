@@ -11,6 +11,8 @@ import type {
   MemoryProvider,
 } from "../types.js";
 import { recordAudit } from "./audit.js";
+import { applyBatchEffect, runBatchCallback } from "../state/batch-effects.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 import { REFLECT_SYSTEM, buildReflectPrompt } from "../prompts/reflect.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
 import type { FireworksBatchQueue } from "./fireworks-batch.js";
@@ -65,6 +67,7 @@ async function applyInsights(
   cluster: ConceptCluster,
   project: string | undefined,
   maxInsights: number,
+  effectKey?: string,
 ): Promise<{ newInsights: number; reinforced: number; count: number }> {
   const insightRegex =
     /<insight\s+confidence="([^"]+)"\s+title="([^"]+)">([\s\S]*?)<\/insight>/g;
@@ -83,6 +86,20 @@ async function applyInsights(
     if (!content) continue;
 
     const id = fingerprintId("ins", content.toLowerCase());
+    if (effectKey) {
+      await applyBatchEffect<Insight>(kv, KV.insights, id, effectKey, (existing) => {
+        if (existing && !existing.deleted) {
+          reinforceInsight(existing);
+          return existing;
+        }
+        const now = new Date().toISOString();
+        return { id, title, content, confidence, reinforcements: 0, sourceConceptCluster: cluster.concepts,
+          sourceMemoryIds: cluster.factIds, sourceLessonIds: cluster.lessonIds, sourceCrystalIds: cluster.crystalIds,
+          project, tags: cluster.concepts, createdAt: now, updatedAt: now, decayRate: 0.05 };
+      });
+      count++;
+      continue;
+    }
     const existing = await kv.get<Insight>(KV.insights, id);
     if (existing && !existing.deleted) {
       reinforceInsight(existing);
@@ -266,7 +283,8 @@ export function registerReflectFunctions(
       batchResponse?: string;
       batchCluster?: string;
       batchSourceFingerprint?: string;
-    }) => {
+      batchEffectKey?: string;
+    }) => runBatchCallback(kv, "reflect", data?.batchEffectKey, async (resuming, admit) => {
       const maxClusters = Math.min(data?.maxClusters ?? 10, 20);
       const maxInsightsPerCluster = 5;
       const maxTotal = 50;
@@ -308,20 +326,22 @@ export function registerReflectFunctions(
           return { success: false, error: "Invalid batch reflection cluster" };
         }
         const fingerprint = await currentReflectSourceFingerprint(kv, cluster);
-        if (!fingerprint || fingerprint !== data.batchSourceFingerprint) {
+        if (!resuming && (!fingerprint || fingerprint !== data.batchSourceFingerprint)) {
           return { success: true, stale: true };
         }
+        await admit();
         const applied = await applyInsights(
           kv,
           data.batchResponse,
           cluster,
           data.project,
           maxInsightsPerCluster,
+          data.batchEffectKey,
         );
         await recordAudit(kv, "reflect", "mem::reflect", [], {
           ...applied,
           source: "fireworks-batch",
-        });
+        }, undefined, undefined, data.batchEffectKey).catch(() => {});
         return { success: true, ...applied };
       }
 
@@ -389,7 +409,7 @@ export function registerReflectFunctions(
               clusterCrystals,
             );
             const enqueueResult = await batchQueue.enqueue({
-              correlationId: generateId("fwbreflect"),
+              correlationId: data.batchEffectKey ? fingerprintId("fwbreflect", `${data.batchEffectKey}:${sourceFingerprint}`) : generateId("fwbreflect"),
               task: "reflection",
               systemPrompt: REFLECT_SYSTEM,
               userPrompt: prompt,
@@ -397,6 +417,7 @@ export function registerReflectFunctions(
                 cluster: JSON.stringify(cluster),
                 project: data.project || "",
                 sourceFingerprint,
+                ...(data.batchEffectKey ? { batchEffectKey: data.batchEffectKey } : {}),
               },
             });
             if (enqueueResult.queued) {
@@ -447,7 +468,7 @@ export function registerReflectFunctions(
         usedFallback,
         queued,
       };
-    },
+    }, () => recordAudit(kv, "reflect", "mem::reflect", [], {}, undefined, undefined, data?.batchEffectKey)),
   );
 
   sdk.registerFunction("mem::insight-list", 
@@ -539,7 +560,7 @@ export function registerReflectFunctions(
   );
 
   sdk.registerFunction("mem::insight-decay-sweep", 
-    async () => {
+    async () => withKeyedLock("batch-callback:reflect", async () => {
       const items = await kv.list<Insight>(KV.insights);
       let decayed = 0;
       let softDeleted = 0;
@@ -588,6 +609,6 @@ export function registerReflectFunctions(
       });
 
       return { success: true, decayed, softDeleted, total: items.length };
-    },
+    }),
   );
 }

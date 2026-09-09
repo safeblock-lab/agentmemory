@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { readFileSync, writeFileSync } from "node:fs";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -162,5 +163,26 @@ describe("Snapshot Functions", () => {
 
     const audits = await kv.list("mem:audit");
     expect(audits.length).toBe(1);
+  });
+
+  it("refuses restore before touching the snapshot when a callback needs recovery", async () => {
+    await kv.set("mem:batch-callbacks", "active:graph", { state: "started", activeKey: "a".repeat(64) });
+    const result = await sdk.trigger("mem::snapshot-restore", { commitHash: "abc1234" });
+    expect(result).toMatchObject({ success: false, error: expect.stringContaining("recovered") });
+    expect(readFileSync).not.toHaveBeenCalled();
+  });
+
+  it("does not snapshot a partially applied callback", async () => {
+    await kv.set("mem:batch-callbacks", "active:graph", { state: "started", activeKey: "a".repeat(64) });
+    expect(await sdk.trigger("mem::snapshot-create", {})).toMatchObject({ success: false, error: expect.stringContaining("recovered") });
+    expect(writeFileSync).not.toHaveBeenCalled();
+  });
+
+  it("preserves graph provenance when restoring a legacy snapshot", async () => {
+    const key = "b".repeat(64);
+    await kv.set("mem:graph:nodes", "node", { id: "node", sourceObservationIds: ["current"], appliedBatchEffects: [key] });
+    vi.mocked(readFileSync).mockReturnValueOnce(JSON.stringify({ graphNodes: [{ id: "node", sourceObservationIds: ["snapshot"] }] }));
+    expect(await sdk.trigger("mem::snapshot-restore", { commitHash: "abc1234" })).toMatchObject({ success: true });
+    expect(await kv.get("mem:graph:nodes", "node")).toMatchObject({ sourceObservationIds: ["current", "snapshot"], appliedBatchEffects: [key] });
   });
 });

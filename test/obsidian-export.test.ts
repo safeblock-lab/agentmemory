@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { resolve } from "node:path";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -12,7 +13,7 @@ vi.mock("node:fs/promises", () => ({
     createdDirs.add(dir);
   }),
   writeFile: vi.fn(async (path: string, content: string) => {
-    writtenFiles.set(path, content);
+    writtenFiles.set(path.replace(/\\/g, "/"), content);
   }),
 }));
 
@@ -177,6 +178,7 @@ describe("Obsidian Export", () => {
 
   it("exports lessons with confidence and source", async () => {
     const lesson = makeLesson("lsn_001");
+    lesson.appliedBatchEffects = ["a".repeat(64)];
     await kv.set("mem:lessons", lesson.id, lesson);
 
     const result = (await sdk.trigger("mem::obsidian-export", {})) as {
@@ -193,6 +195,8 @@ describe("Obsidian Export", () => {
     expect(content).toContain("confidence: 0.8");
     expect(content).toContain("reinforcements: 2");
     expect(content).toContain('source: "manual"');
+    expect(content).not.toContain("appliedBatchEffects");
+    expect(content).not.toContain("a".repeat(64));
   });
 
   it("exports crystals with wikilinks to source actions", async () => {
@@ -227,7 +231,7 @@ describe("Obsidian Export", () => {
     });
 
     const hasCustomPath = [...createdDirs].some((d) =>
-      d.startsWith("/tmp/agentmemory-export-root/test-vault"),
+      d.startsWith(resolve("/tmp/agentmemory-export-root/test-vault")),
     );
     expect(hasCustomPath).toBe(true);
   });
@@ -238,7 +242,7 @@ describe("Obsidian Export", () => {
     })) as { success: boolean; error: string };
 
     expect(result.success).toBe(false);
-    expect(result.error).toContain(exportRoot);
+    expect(result.error).toContain(resolve(exportRoot));
   });
 
   it("skips deleted lessons", async () => {

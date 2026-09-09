@@ -6,8 +6,10 @@ import type {
   GraphSnapshot,
   CompressedObservation,
   MemoryProvider,
+  BatchEffectMetadata,
 } from "../types.js";
-import { KV, generateId } from "../state/schema.js";
+import { KV, generateId, fingerprintId } from "../state/schema.js";
+import { batchEffectKey, effectMetadata, runBatchCallback } from "../state/batch-effects.js";
 import type { StateKV } from "../state/kv.js";
 import {
   GRAPH_EXTRACTION_SYSTEM,
@@ -349,9 +351,10 @@ async function applyDegreeDelta(
   nodeId: string,
   delta: number,
 ): Promise<number> {
-  const prev = (await kv.get<number>(KV.graphNodeDegree, nodeId)) ?? 0;
+  const stored = await kv.get<number | BatchGraphDegree>(KV.graphNodeDegree, nodeId);
+  const prev = typeof stored === "number" ? stored : stored?.value ?? 0;
   const next = Math.max(0, prev + delta);
-  await kv.set(KV.graphNodeDegree, nodeId, next);
+  await kv.set(KV.graphNodeDegree, nodeId, typeof stored === "object" && stored ? { ...stored, value: next } : next);
 
   const inTop = snap.topNodes.findIndex((n) => n.id === nodeId);
   if (inTop !== -1) {
@@ -592,6 +595,91 @@ function parseGraphXml(
   return { nodes, edges };
 }
 
+interface BatchGraphDegree extends BatchEffectMetadata { value: number }
+
+async function applyBatchGraph(kv: StateKV, response: string, obsIds: string[], key: string): Promise<void> {
+  const snap = structuredClone((await kv.get<GraphSnapshot>(KV.graphSnapshot, SNAPSHOT_KEY)) ?? emptySnapshot());
+  if (snap.appliedBatchEffects?.includes(key)) return;
+  if (snap.batchInProgress && snap.batchInProgress !== key) throw new Error("A batch graph application must be recovered first");
+  if (!snap.batchInProgress) {
+    snap.batchInProgress = key;
+    await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, snap);
+  }
+  const metadata = effectMetadata(snap, key);
+  const { nodes, edges } = parseGraphXml(response, obsIds);
+  const remapped = new Map<string, string>();
+  const countedNodes = new Set<string>();
+  for (const node of nodes) {
+    const index = nameIndexKey(node.type, node.name);
+    const indexedId = await kv.get<string>(KV.graphNameIndex, index);
+    const candidateId = fingerprintId("gn", `${key}:${index}`);
+    let current = await kv.get<GraphNode>(KV.graphNodes, indexedId ?? candidateId);
+    if (current && snap.resetAt && current.createdAt < snap.resetAt) current = null;
+    const id = current?.id ?? candidateId;
+    remapped.set(node.id, id);
+    const next = current ? mergeNode(current, node, obsIds, current.updatedAt ?? current.createdAt) : { ...node, id };
+    await kv.set(KV.graphNodes, id, next);
+    await kv.set(KV.graphNameIndex, index, id);
+    // Deterministic IDs distinguish this callback's creations even if a
+    // preceding attempt died between the row, index, and snapshot writes.
+    if (id === candidateId && !countedNodes.has(id)) {
+      countedNodes.add(id);
+      snap.stats.totalNodes++;
+      snap.stats.nodesByType[node.type] = (snap.stats.nodesByType[node.type] ?? 0) + 1;
+      if (snap.topNodes.length < SNAPSHOT_TOP_NODES && !snap.topNodes.some((n) => n.id === id)) {
+        snap.topNodes.push(next);
+        snap.topDegrees[id] = 0;
+      }
+    } else {
+      const position = snap.topNodes.findIndex((n) => n.id === id);
+      if (position >= 0) snap.topNodes[position] = next;
+    }
+  }
+  const seenEdges = new Set<string>();
+  for (const edge of edges) {
+    edge.sourceNodeId = remapped.get(edge.sourceNodeId)!;
+    edge.targetNodeId = remapped.get(edge.targetNodeId)!;
+    const index = edgeIndexKey(edge.sourceNodeId, edge.targetNodeId, edge.type);
+    if (seenEdges.has(index)) continue;
+    seenEdges.add(index);
+    const indexedId = await kv.get<string>(KV.graphEdgeKey, index);
+    const candidateId = fingerprintId("ge", `${key}:${index}`);
+    let current = await kv.get<GraphEdge>(KV.graphEdges, indexedId ?? candidateId);
+    if (current && snap.resetAt && current.createdAt < snap.resetAt) current = null;
+    const id = current?.id ?? candidateId;
+    const next = current ? mergeEdge(current, obsIds) : { ...edge, id };
+    await kv.set(KV.graphEdges, id, next);
+    await kv.set(KV.graphEdgeKey, index, id);
+    if (id === candidateId) {
+      snap.stats.totalEdges++;
+      snap.stats.edgesByType[edge.type] = (snap.stats.edgesByType[edge.type] ?? 0) + 1;
+      for (const [endpoint, nodeId] of [edge.sourceNodeId, edge.targetNodeId].entries()) {
+        const degree = await kv.get<number | BatchGraphDegree>(KV.graphNodeDegree, nodeId);
+        const record: BatchGraphDegree = typeof degree === "number" ? { value: degree } : degree ?? { value: 0 };
+        const degreeKey = batchEffectKey(`${key}:${id}:${endpoint}`);
+        const value = record.value + (record.appliedBatchEffects?.includes(degreeKey) ? 0 : 1);
+        await kv.set(KV.graphNodeDegree, nodeId, { value, ...effectMetadata(record, degreeKey) });
+        const position = snap.topNodes.findIndex((n) => n.id === nodeId);
+        if (position >= 0) snap.topDegrees[nodeId] = value;
+        else if (snap.topNodes.length < SNAPSHOT_TOP_NODES || value > (snap.topDegrees[snap.topNodes.at(-1)!.id] ?? 0)) {
+          const node = await kv.get<GraphNode>(KV.graphNodes, nodeId);
+          if (node) {
+            if (snap.topNodes.length >= SNAPSHOT_TOP_NODES) delete snap.topDegrees[snap.topNodes.pop()!.id];
+            snap.topNodes.push(node);
+            snap.topDegrees[nodeId] = value;
+          }
+        }
+        snap.topNodes.sort((a, b) => (snap.topDegrees[b.id] ?? 0) - (snap.topDegrees[a.id] ?? 0));
+      }
+    }
+    snapshotPushEdgeIfBothInTop(snap, next);
+  }
+  const topIds = new Set(snap.topNodes.map((n) => n.id));
+  snap.topEdges = snap.topEdges.filter((e) => topIds.has(e.sourceNodeId) && topIds.has(e.targetNodeId));
+  const { batchInProgress: _pending, ...completedSnapshot } = snap;
+  await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, { ...completedSnapshot, ...metadata, dirty: false, updatedAt: new Date().toISOString() });
+}
+
 export function registerGraphFunction(
   sdk: ISdk,
   kv: StateKV,
@@ -601,9 +689,18 @@ export function registerGraphFunction(
   localCompactor?: LocalGraphCompactor,
 ): void {
   sdk.registerFunction("mem::graph-extract", 
-    async (data: { observations: CompressedObservation[]; batchResponse?: string; deferred?: boolean }) => {
+    async (data: { observations: CompressedObservation[]; batchResponse?: string; deferred?: boolean; batchEffectKey?: string }) => runBatchCallback(kv, "graph", data.batchEffectKey, async (_resuming, admit) => {
       if (!data.observations || data.observations.length === 0) {
         return { success: false, error: "No observations provided" };
+      }
+      if (data.batchResponse && data.batchEffectKey) {
+        await admit();
+        await applyBatchGraph(kv, data.batchResponse, data.observations.map((o) => o.id), data.batchEffectKey);
+        await recordAudit(kv, "observe", "mem::graph-extract", data.observations.map((o) => o.id), {}, undefined, undefined, data.batchEffectKey).catch(() => {});
+        return { success: true };
+      }
+      if ((await kv.get<GraphSnapshot>(KV.graphSnapshot, SNAPSHOT_KEY))?.batchInProgress) {
+        return { success: false, error: "A batch graph application must be recovered first" };
       }
 
       const inputUnits = data.batchResponse
@@ -822,7 +919,7 @@ export function registerGraphFunction(
         logger.error("Graph extraction failed", { error: msg });
         return { success: false, error: msg };
       }
-    },
+    }, () => recordAudit(kv, "observe", "mem::graph-extract", data.observations.map((o) => o.id), {}, undefined, undefined, data.batchEffectKey)),
   );
 
   // #753: every branch now applies a default cap and reports the
@@ -1025,7 +1122,10 @@ export function registerGraphFunction(
   // is mem::graph-reset followed by incremental re-extraction.
   sdk.registerFunction(
     "mem::graph-snapshot-rebuild",
-    async (data?: { force?: boolean }) => {
+    async (data?: { force?: boolean }) => runBatchCallback(kv, "graph", undefined, async () => {
+      if ((await kv.get<GraphSnapshot>(KV.graphSnapshot, SNAPSHOT_KEY))?.batchInProgress) {
+        return { success: false, error: "A batch graph application must be recovered first" };
+      }
       const started = Date.now();
       // #825: pre-flight refusal for legacy corpora. The old guard
       // checked node count AFTER kv.list, but the heartbeat dies at
@@ -1154,7 +1254,7 @@ export function registerGraphFunction(
       logger.error("Graph snapshot rebuild failed", { error: msg });
       return { success: false, error: msg };
     }
-  });
+  }));
 
   // #814 v2 + #825: clean-restart escape hatch for corpora of any
   // size, including the legacy 75K+ case that crashes kv.list.
@@ -1177,7 +1277,10 @@ export function registerGraphFunction(
   // read by any post-#816 code path. Cleanup is deferred to a future
   // chunked-vacuum job; #816's broken vacuum-via-list strategy is
   // what we are leaving behind here.
-  sdk.registerFunction("mem::graph-reset", async () => {
+  sdk.registerFunction("mem::graph-reset", async () => runBatchCallback(kv, "graph", undefined, async () => {
+    if ((await kv.get<GraphSnapshot>(KV.graphSnapshot, SNAPSHOT_KEY))?.batchInProgress) {
+      return { success: false, error: "A batch graph application must be recovered first" };
+    }
     const started = Date.now();
     // Stamp resetAt=now on the empty snapshot. Future
     // mem::graph-extract calls compare each name-index lookup's
@@ -1196,5 +1299,5 @@ export function registerGraphFunction(
     const tookMs = Date.now() - started;
     logger.info("Graph state reset", { counts, tookMs });
     return { success: true, cleared: counts, tookMs };
-  });
+  }));
 }

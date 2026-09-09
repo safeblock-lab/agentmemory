@@ -7,7 +7,8 @@ import type {
   TemporalState,
   MemoryProvider,
 } from "../types.js";
-import { KV, generateId } from "../state/schema.js";
+import { KV, generateId, fingerprintId } from "../state/schema.js";
+import { batchEffectKey, runBatchCallback, withBatchRecordLocks, preserveBatchProvenance } from "../state/batch-effects.js";
 import type { StateKV } from "../state/kv.js";
 import { logger } from "../logger.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
@@ -156,7 +157,7 @@ export function registerTemporalGraphFunctions(
   provider: MemoryProvider,
   llmRouter?: LlmTaskRouter,
 ): void {
-  sdk.registerFunction("mem::temporal-graph-extract", 
+  sdk.registerFunction("mem::temporal-graph-extract",
     async (data: {
       observations: Array<{
         id: string;
@@ -194,87 +195,87 @@ export function registerTemporalGraphFunctions(
 
         const obsIds = data.observations.map((o) => o.id);
         const { nodes, edges } = parseTemporalGraphXml(response, obsIds);
+        const effectKey = batchEffectKey(`temporal:${JSON.stringify(data.observations)}`);
+        return await runBatchCallback(kv, "graph", effectKey, async (_resuming, admit, receipt) => {
+          const resultHash = batchEffectKey(response);
+          if (receipt?.resultHash && receipt.resultHash !== resultHash) throw new Error("Temporal extraction result changed during recovery");
+          if ((await kv.get<{ batchInProgress?: string }>(KV.graphSnapshot, "current"))?.batchInProgress) throw new Error("A batch graph application must be recovered first");
+          const now = receipt?.effectTimestamp ?? new Date().toISOString();
+          await admit({ resultHash, effectTimestamp: now });
+          const existingNodes = await kv.list<GraphNode>(KV.graphNodes);
+          const existingEdges = await kv.list<GraphEdge>(KV.graphEdges);
+          const plannedEdgeIds = edges.map((_, index) => fingerprintId("ge", `${effectKey}:${index}`));
 
-        const existingNodes = await kv.list<GraphNode>(KV.graphNodes);
-        const existingEdges = await kv.list<GraphEdge>(KV.graphEdges);
-
-        const idRemap = new Map<string, string>();
-        for (const node of nodes) {
-          const existing = existingNodes.find(
-            (n) =>
-              n.name === node.name && n.type === node.type,
-          );
-          if (existing) {
+          const idRemap = new Map<string, string>();
+          for (const node of nodes) {
+            const existing = existingNodes.find(
+              (n) =>
+                n.name === node.name && n.type === node.type,
+            );
             const oldId = node.id;
-            const merged = {
-              ...existing,
-              sourceObservationIds: [
-                ...new Set([
-                  ...existing.sourceObservationIds,
-                  ...obsIds,
-                ]),
-              ],
-              properties: { ...existing.properties, ...node.properties },
-              updatedAt: new Date().toISOString(),
-              aliases: [
-                ...new Set([
-                  ...(existing.aliases || []),
-                  ...(node.aliases || []),
-                ]),
-              ],
-            };
-            if (merged.aliases.length === 0) delete (merged as any).aliases;
-            await kv.set(KV.graphNodes, existing.id, merged);
-            node.id = existing.id;
-            idRemap.set(oldId, existing.id);
-          } else {
-            await kv.set(KV.graphNodes, node.id, node);
-            existingNodes.push(node);
-          }
-        }
-
-        for (const edge of edges) {
-          if (idRemap.has(edge.sourceNodeId)) {
-            edge.sourceNodeId = idRemap.get(edge.sourceNodeId)!;
-          }
-          if (idRemap.has(edge.targetNodeId)) {
-            edge.targetNodeId = idRemap.get(edge.targetNodeId)!;
-          }
-          const existingKey = `${edge.sourceNodeId}|${edge.targetNodeId}|${edge.type}`;
-          const existingEdge = existingEdges.find(
-            (e) =>
-              `${e.sourceNodeId}|${e.targetNodeId}|${e.type}` ===
-              existingKey,
-          );
-
-          if (existingEdge) {
-            const updatedOld = {
-              ...existingEdge,
-              isLatest: false,
-              tvalidEnd:
-                existingEdge.tvalidEnd || new Date().toISOString(),
-              supersededBy: edge.id,
-            };
-            await kv.set(KV.graphEdges, existingEdge.id, updatedOld);
-
-            await kv.set(KV.graphEdgeHistory, existingEdge.id, updatedOld);
-
-            edge.version = (existingEdge.version || 1) + 1;
+            node.id = existing?.id ?? fingerprintId("gn", `temporal:${node.type}:${node.name}`);
+            node.createdAt = now;
+            await withBatchRecordLocks([[KV.graphNodes, node.id]], async () => {
+              const current = await kv.get<GraphNode>(KV.graphNodes, node.id);
+              const merged = preserveBatchProvenance(current, current ? { ...current, properties: { ...current.properties, ...node.properties }, sourceObservationIds: obsIds, aliases: node.aliases, updatedAt: now } : node);
+              await kv.set(KV.graphNodes, node.id, merged);
+            });
+            idRemap.set(oldId, node.id);
+            if (!existing) existingNodes.push(node);
           }
 
-          await kv.set(KV.graphEdges, edge.id, edge);
-          existingEdges.push(edge);
-        }
+          for (const [index, edge] of edges.entries()) {
+            edge.id = plannedEdgeIds[index];
+            edge.createdAt = now;
+            edge.tcommit = now;
+            if (idRemap.has(edge.sourceNodeId)) {
+              edge.sourceNodeId = idRemap.get(edge.sourceNodeId)!;
+            }
+            if (idRemap.has(edge.targetNodeId)) {
+              edge.targetNodeId = idRemap.get(edge.targetNodeId)!;
+            }
+            const existingKey = `${edge.sourceNodeId}|${edge.targetNodeId}|${edge.type}`;
+            const existingEdge = existingEdges.find((e) => e.supersededBy === edge.id) ?? existingEdges.filter(
+              (e) =>
+                plannedEdgeIds.indexOf(e.id) < index && e.isLatest !== false &&
+                `${e.sourceNodeId}|${e.targetNodeId}|${e.type}` ===
+                existingKey,
+            ).sort((a, b) => (b.version ?? 1) - (a.version ?? 1))[0];
+            const records: Array<[string, string]> = [[KV.graphEdges, edge.id]];
+            if (existingEdge) records.push([KV.graphEdges, existingEdge.id], [KV.graphEdgeHistory, existingEdge.id]);
+            await withBatchRecordLocks(records, async () => {
+              if (existingEdge) {
+                const current = await kv.get<GraphEdge>(KV.graphEdges, existingEdge.id);
+                if (!current) throw new Error("Temporal predecessor disappeared during recovery");
+                const updatedOld = {
+                  ...current,
+                  isLatest: false,
+                  tvalidEnd:
+                    current.tvalidEnd || now,
+                  supersededBy: edge.id,
+                };
+                await kv.set(KV.graphEdges, existingEdge.id, updatedOld);
 
-        logger.info("Temporal graph extraction complete", {
-          nodes: nodes.length,
-          edges: edges.length,
+                await kv.set(KV.graphEdgeHistory, existingEdge.id, updatedOld);
+
+                edge.version = (current.version || 1) + 1;
+              }
+              const current = await kv.get<GraphEdge>(KV.graphEdges, edge.id);
+              await kv.set(KV.graphEdges, edge.id, preserveBatchProvenance(current, edge));
+            });
+            existingEdges.push(edge);
+          }
+
+          logger.info("Temporal graph extraction complete", {
+            nodes: nodes.length,
+            edges: edges.length,
+          });
+          return {
+            success: true,
+            nodesAdded: nodes.length,
+            edgesAdded: edges.length,
+          };
         });
-        return {
-          success: true,
-          nodesAdded: nodes.length,
-          edgesAdded: edges.length,
-        };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         logger.error("Temporal graph extraction failed", { error: msg });
@@ -283,7 +284,7 @@ export function registerTemporalGraphFunctions(
     },
   );
 
-  sdk.registerFunction("mem::temporal-query", 
+  sdk.registerFunction("mem::temporal-query",
     async (data: {
       entityName: string;
       asOf?: string;
@@ -361,7 +362,7 @@ export function registerTemporalGraphFunctions(
     },
   );
 
-  sdk.registerFunction("mem::differential-state", 
+  sdk.registerFunction("mem::differential-state",
     async (data: {
       entityName: string;
       from?: string;
@@ -438,7 +439,7 @@ function getLatestByKey(edges: GraphEdge[]): GraphEdge[] {
     if (
       !existing ||
       new Date(e.tcommit || e.createdAt).getTime() >
-        new Date(existing.tcommit || existing.createdAt).getTime()
+      new Date(existing.tcommit || existing.createdAt).getTime()
     ) {
       byKey.set(key, e);
     }

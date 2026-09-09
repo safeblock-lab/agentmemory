@@ -1,6 +1,8 @@
 import type { FunctionMetrics, LlmTask, LlmUsage } from "../types.js";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
+import { effectMetadata } from "../state/batch-effects.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 
 export class MetricsStore {
   private cache = new Map<string, FunctionMetrics>();
@@ -14,7 +16,9 @@ export class MetricsStore {
     success: boolean,
     qualityScore?: number,
   ): Promise<void> {
-    let m = this.cache.get(functionId);
+    return withKeyedLock(`metrics:${functionId}`, async () => {
+    let m = await this.kv.get<FunctionMetrics>(KV.metrics, functionId);
+    if (m) m = structuredClone(m);
     if (!m) {
       m = (await this.kv.get<FunctionMetrics>(KV.metrics, functionId)) ?? {
         functionId,
@@ -27,6 +31,7 @@ export class MetricsStore {
     }
 
     const prev = m.totalCalls;
+    let nextQualityCalls: number | undefined;
     m.totalCalls += 1;
     m.avgLatencyMs = (m.avgLatencyMs * prev + latencyMs) / m.totalCalls;
     if (success) {
@@ -39,11 +44,17 @@ export class MetricsStore {
       m.avgQualityScore =
         (m.avgQualityScore * prevQualityCalls + qualityScore) /
         (prevQualityCalls + 1);
-      this.qualityCallCounts.set(functionId, prevQualityCalls + 1);
+      nextQualityCalls = prevQualityCalls + 1;
     }
 
-    this.cache.set(functionId, m);
-    await this.kv.set(KV.metrics, functionId, m).catch(() => {});
+    try {
+      await this.kv.set(KV.metrics, functionId, m);
+    } catch {
+      return;
+    }
+    if (nextQualityCalls !== undefined) this.qualityCallCounts.set(functionId, nextQualityCalls);
+    this.cache.set(functionId, structuredClone(m));
+    });
   }
 
   async get(functionId: string): Promise<FunctionMetrics | null> {
@@ -68,9 +79,17 @@ export class MetricsStore {
     provider: string,
     model: string,
     usage: LlmUsage,
+    effectKey?: string,
   ): Promise<void> {
     const functionId = `llm:${task}:${provider}:${model}`;
-    const existing = await this.get(functionId);
+    return withKeyedLock(`metrics:${functionId}`, async () => {
+    if (effectKey && !/^[a-f0-9]{64}$/.test(effectKey)) throw new Error("Invalid batch effect key");
+    const stored = await this.kv.get<FunctionMetrics>(KV.metrics, functionId);
+    if (effectKey && stored?.appliedBatchEffects?.includes(effectKey)) {
+      this.cache.set(functionId, structuredClone(stored));
+      return;
+    }
+    const existing = stored ? structuredClone(stored) : null;
     const metrics: FunctionMetrics = existing ?? {
       functionId,
       totalCalls: 0,
@@ -91,7 +110,9 @@ export class MetricsStore {
     if (usage.inputTokens === undefined && usage.outputTokens === undefined && usage.totalTokens === undefined) {
       metrics.unreportedUsageCalls = (metrics.unreportedUsageCalls ?? 0) + 1;
     }
-    this.cache.set(functionId, metrics);
+    Object.assign(metrics, effectMetadata(existing, effectKey));
     await this.kv.set(KV.metrics, functionId, metrics);
+    this.cache.set(functionId, structuredClone(metrics));
+    });
   }
 }

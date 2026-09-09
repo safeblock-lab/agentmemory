@@ -246,7 +246,7 @@ export function registerObsidianExportFunction(
   kv: StateKV,
 ): void {
   sdk.registerFunction("mem::obsidian-export",
-    async (data: { vaultDir?: string; types?: string[] } | undefined) => {
+    async (data: { vaultDir?: string; types?: string[]; batchEffectKey?: string } | undefined) => {
       if (!data || typeof data !== "object") {
         return { success: false, error: "payload is required" };
       }
@@ -412,7 +412,7 @@ export function registerObsidianExportFunction(
         await recordAudit(kv, "obsidian_export", "mem::obsidian-export", [], {
           vaultDir,
           stats,
-        });
+        }, undefined, undefined, data.batchEffectKey);
 
         return {
           success: true,
