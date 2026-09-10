@@ -144,6 +144,45 @@ describe("bounded callback recovery and job publication", () => {
     } finally { vi.unstubAllGlobals(); }
   });
 
+  it("resumes polling-exhausted reconciliation after a crash without resubmitting", async () => {
+    const h = effectHarness();
+    const now = new Date().toISOString();
+    const itemId = "fwbwork-legacy-recovery";
+    const jobId = "fwbjob-legacy-recovery";
+    await h.kv.set(KV.fireworksBatchWorkItems, itemId, {
+      id: itemId, customId: "legacy-recovery", correlationId: "legacy-recovery",
+      task: "reflection", model: "model", systemPrompt: "system", userPrompt: "user", maxTokens: 128,
+      state: "dead-letter", attempts: config.maxAttempts, nextAttemptAt: now,
+      createdAt: now, updatedAt: now, lastError: "batch polling attempts exhausted", deadLetteredAt: now,
+    });
+    await h.kv.set(KV.fireworksBatchJobs, jobId, {
+      id: jobId, remoteJobId: jobId, inputDatasetId: "input", outputDatasetId: "output",
+      model: "model", task: "reflection", workItemIds: [itemId], state: "dead-letter",
+      attempts: config.maxAttempts, nextAttemptAt: now, createdAt: now, updatedAt: now,
+      lastError: "batch polling attempts exhausted",
+    });
+    await h.kv.set(KV.fireworksBatchActiveWork, "current", { version: 1 as const, ids: [], updatedAt: now });
+    await h.kv.set(KV.fireworksBatchActiveJobs, "current", { version: 1 as const, ids: [], updatedAt: now });
+    const submitJob = vi.fn(async () => ({ remoteJobId: "must-not-submit" }));
+    const completed = vi.fn(async () => {});
+    const transport = {
+      async createDataset() {}, async uploadDataset() {}, submitJob,
+      async listRecentJobIds() { return [jobId]; },
+      async getJobStatus() { return { state: "COMPLETED", remoteJobId: jobId }; },
+      async downloadResults() { return JSON.stringify({ custom_id: "legacy-recovery", response: { body: { choices: [{ message: { content: "recovered" } }] } } }); },
+    };
+    const create = () => new FireworksBatchCoordinator(h.kv, config, transport, completed);
+
+    h.crash(KV.fireworksBatchWorkItems);
+    await expect(create().process()).rejects.toThrow("injected crash before write");
+    await create().process();
+
+    expect(submitJob).not.toHaveBeenCalled();
+    expect(completed).toHaveBeenCalledTimes(1);
+    await expect(h.kv.get<FireworksBatchJob>(KV.fireworksBatchJobs, jobId))
+      .resolves.toMatchObject({ state: "completed", legacyReconciliationAt: expect.any(String) });
+  });
+
   it("does not guess an ambiguous legacy remote identity", async () => {
     const h = effectHarness(), transport = makeTransport(), callback = vi.fn(async () => {});
     const coordinator = new FireworksBatchCoordinator(h.kv, config, transport, callback);

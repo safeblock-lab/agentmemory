@@ -595,9 +595,25 @@ function parseGraphXml(
   return { nodes, edges };
 }
 
+type ParsedGraphExtraction = {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+};
+
+const EMPTY_GRAPH_EXTRACTION_ERROR = "Graph extraction response contained no nodes or edges";
+
+function parseGraphExtractionResponse(
+  response: unknown,
+  observationIds: string[],
+): ParsedGraphExtraction | null {
+  if (typeof response !== "string") return null;
+  const parsed = parseGraphXml(response, observationIds);
+  return parsed.nodes.length === 0 && parsed.edges.length === 0 ? null : parsed;
+}
+
 interface BatchGraphDegree extends BatchEffectMetadata { value: number }
 
-async function applyBatchGraph(kv: StateKV, response: string, obsIds: string[], key: string): Promise<void> {
+async function applyBatchGraph(kv: StateKV, parsed: ParsedGraphExtraction, obsIds: string[], key: string): Promise<void> {
   const snap = structuredClone((await kv.get<GraphSnapshot>(KV.graphSnapshot, SNAPSHOT_KEY)) ?? emptySnapshot());
   if (snap.appliedBatchEffects?.includes(key)) return;
   if (snap.batchInProgress && snap.batchInProgress !== key) throw new Error("A batch graph application must be recovered first");
@@ -606,7 +622,7 @@ async function applyBatchGraph(kv: StateKV, response: string, obsIds: string[], 
     await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, snap);
   }
   const metadata = effectMetadata(snap, key);
-  const { nodes, edges } = parseGraphXml(response, obsIds);
+  const { nodes, edges } = parsed;
   const remapped = new Map<string, string>();
   const countedNodes = new Set<string>();
   for (const node of nodes) {
@@ -693,10 +709,15 @@ export function registerGraphFunction(
       if (!data.observations || data.observations.length === 0) {
         return { success: false, error: "No observations provided" };
       }
-      if (data.batchResponse && data.batchEffectKey) {
+      if (data.batchResponse !== undefined && data.batchEffectKey) {
+        const obsIds = data.observations.map((o) => o.id);
+        const parsed = parseGraphExtractionResponse(data.batchResponse, obsIds);
+        if (!parsed) {
+          return { success: false, error: EMPTY_GRAPH_EXTRACTION_ERROR };
+        }
         await admit();
-        await applyBatchGraph(kv, data.batchResponse, data.observations.map((o) => o.id), data.batchEffectKey);
-        await recordAudit(kv, "observe", "mem::graph-extract", data.observations.map((o) => o.id), {}, undefined, undefined, data.batchEffectKey).catch(() => {});
+        await applyBatchGraph(kv, parsed, obsIds, data.batchEffectKey);
+        await recordAudit(kv, "observe", "mem::graph-extract", obsIds, {}, undefined, undefined, data.batchEffectKey).catch(() => {});
         return { success: true };
       }
       if ((await kv.get<GraphSnapshot>(KV.graphSnapshot, SNAPSHOT_KEY))?.batchInProgress) {
@@ -768,14 +789,20 @@ export function registerGraphFunction(
                 prompt,
               ),
               (candidate) => {
-                const parsed = parseGraphXml(candidate, unit.sourceObservations.map((o) => o.id));
-                return parsed.nodes.length > 0 || parsed.edges.length > 0;
+                return parseGraphExtractionResponse(
+                  candidate,
+                  unit.sourceObservations.map((o) => o.id),
+                ) !== null;
               },
             )
             : await provider.compress(GRAPH_EXTRACTION_SYSTEM, prompt));
 
           const obsIds = unit.sourceObservations.map((o) => o.id);
-          const { nodes, edges } = parseGraphXml(response, obsIds);
+          const parsed = parseGraphExtractionResponse(response, obsIds);
+          if (!parsed) {
+            return { success: false, error: EMPTY_GRAPH_EXTRACTION_ERROR };
+          }
+          const { nodes, edges } = parsed;
 
         // #814 v2: targeted name-index lookups replace the O(n) scan
         // over `kv.list<GraphNode>(KV.graphNodes)`. At 75K nodes the

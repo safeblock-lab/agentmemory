@@ -60,6 +60,7 @@ const config: FireworksBatchConfig = {
   retryMaxMs: 10,
   pollIntervalMs: 0,
   pollMaxIntervalMs: 10,
+  pollDeadlineMs: 24 * 60 * 60_000,
   recoveryStaleMs: 1_000,
   maxQueuedItems: 10,
 };
@@ -250,6 +251,144 @@ describe("FireworksBatchCoordinator", () => {
       pendingJobIds: [],
       completedAt: expect.any(String),
     });
+  });
+
+  it("reindexes polling-exhausted jobs once without resubmitting them", async () => {
+    const kv = createKv();
+    const now = new Date().toISOString();
+    const itemId = "fwbwork-legacy-poll";
+    const jobId = "fwbjob-legacy-poll";
+    await kv.set(KV.fireworksBatchWorkItems, itemId, {
+      id: itemId,
+      customId: "legacy-poll",
+      correlationId: "legacy-poll",
+      task: "graph_extraction",
+      model: config.model!,
+      systemPrompt: "system",
+      userPrompt: "user",
+      maxTokens: 512,
+      state: "dead-letter",
+      attempts: config.maxAttempts,
+      nextAttemptAt: now,
+      createdAt: now,
+      updatedAt: now,
+      lastError: "batch polling attempts exhausted",
+      deadLetteredAt: now,
+    });
+    await kv.set(KV.fireworksBatchJobs, jobId, {
+      id: jobId,
+      remoteJobId: jobId,
+      inputDatasetId: `${jobId}-input`,
+      outputDatasetId: `${jobId}-output`,
+      model: config.model!,
+      task: "graph_extraction",
+      workItemIds: [itemId],
+      state: "dead-letter",
+      attempts: config.maxAttempts,
+      nextAttemptAt: now,
+      createdAt: now,
+      updatedAt: now,
+      lastError: "batch polling attempts exhausted",
+    });
+    await kv.set(KV.fireworksBatchActiveWork, "current", { version: 1 as const, ids: [], updatedAt: now });
+    await kv.set(KV.fireworksBatchActiveJobs, "current", { version: 1 as const, ids: [], updatedAt: now });
+    const completed = vi.fn(async () => {});
+    const listed = vi.fn(async () => [jobId]);
+    const submitted = vi.fn(async () => ({ remoteJobId: "must-not-submit" }));
+    const coordinator = new FireworksBatchCoordinator(
+      kv,
+      config,
+      {
+        async createDataset() {},
+        async uploadDataset() {},
+        submitJob: submitted,
+        listRecentJobIds: listed,
+        async getJobStatus() { return { state: "COMPLETED", remoteJobId: jobId }; },
+        async downloadResults() {
+          return JSON.stringify({
+            custom_id: "legacy-poll",
+            response: { body: { choices: [{ message: { content: "recovered" } }] } },
+          });
+        },
+      },
+      completed,
+    );
+
+    await coordinator.process();
+    await coordinator.process();
+
+    expect(submitted).not.toHaveBeenCalled();
+    expect(listed).toHaveBeenCalledTimes(1);
+    expect(completed).toHaveBeenCalledTimes(1);
+    await expect(kv.get<{ state: string; legacyReconciliationAt?: string }>(KV.fireworksBatchJobs, jobId))
+      .resolves.toMatchObject({ state: "completed", legacyReconciliationAt: expect.any(String) });
+    await expect(kv.get<{ state: string }>(KV.fireworksBatchWorkItems, itemId))
+      .resolves.toMatchObject({ state: "completed" });
+  });
+
+  it("quarantines completed jobs with ambiguous non-terminal legacy work", async () => {
+    const kv = createKv();
+    const now = new Date().toISOString();
+    const itemId = "fwbwork-legacy-completed";
+    const jobId = "fwbjob-legacy-completed";
+    await kv.set(KV.fireworksBatchWorkItems, itemId, {
+      callbackProtocolVersion: 1,
+      id: itemId,
+      customId: "legacy-completed",
+      correlationId: "legacy-completed",
+      task: "graph_extraction",
+      model: config.model!,
+      systemPrompt: "system",
+      userPrompt: "user",
+      maxTokens: 512,
+      state: "submitted",
+      attempts: 0,
+      nextAttemptAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await kv.set(KV.fireworksBatchJobs, jobId, {
+      id: jobId,
+      remoteJobId: jobId,
+      inputDatasetId: `${jobId}-input`,
+      outputDatasetId: `${jobId}-output`,
+      model: config.model!,
+      task: "graph_extraction",
+      workItemIds: [itemId],
+      state: "completed",
+      attempts: 1,
+      nextAttemptAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await kv.set(KV.fireworksBatchActiveWork, "current", { version: 1 as const, ids: [], updatedAt: now });
+    await kv.set(KV.fireworksBatchActiveJobs, "current", { version: 1 as const, ids: [], updatedAt: now });
+    const completed = vi.fn(async () => {});
+    const status = vi.fn(async () => ({ state: "COMPLETED" }));
+    const download = vi.fn(async () => "");
+    const coordinator = new FireworksBatchCoordinator(
+      kv,
+      config,
+      {
+        async createDataset() {},
+        async uploadDataset() {},
+        async submitJob() { return { remoteJobId: "must-not-submit" }; },
+        async listRecentJobIds() { return [jobId]; },
+        getJobStatus: status,
+        downloadResults: download,
+      },
+      completed,
+    );
+
+    await coordinator.process();
+
+    expect(status).not.toHaveBeenCalled();
+    expect(download).not.toHaveBeenCalled();
+    expect(completed).not.toHaveBeenCalled();
+    await expect(kv.get<{ state: string }>(KV.fireworksBatchJobs, jobId))
+      .resolves.toMatchObject({ state: "completed" });
+    await expect(kv.get<{ state: string; lastError?: string }>(KV.fireworksBatchWorkItems, itemId))
+      .resolves.toMatchObject({ state: "dead-letter", lastError: expect.stringContaining("ambiguous") });
   });
 
   it("processes work through bounded indexes when canonical listings are unavailable", async () => {
@@ -764,7 +903,7 @@ describe("FireworksBatchCoordinator", () => {
     ]);
   });
 
-  it("dead-letters a nonterminal poll exactly at maxAttempts", async () => {
+  it("keeps nonterminal polls alive beyond maxAttempts until the deadline", async () => {
     const kv = createKv();
     const now = new Date(0).toISOString();
     const itemId = "fwbwork-attempt-limit";
@@ -796,6 +935,7 @@ describe("FireworksBatchCoordinator", () => {
       state: "polling",
       attempts: 2,
       nextAttemptAt: now,
+      pollDeadlineAt: new Date(Date.now() + 60_000).toISOString(),
       createdAt: now,
       updatedAt: now,
     });
@@ -817,13 +957,179 @@ describe("FireworksBatchCoordinator", () => {
 
     await coordinator.process();
 
-    expect(statusCalls).toBe(1);
+    expect(statusCalls).toBeGreaterThanOrEqual(1);
     await expect(kv.get<{ state: string; attempts: number }>(KV.fireworksBatchJobs, jobId))
-      .resolves.toMatchObject({ state: "dead-letter", attempts: 3 });
+      .resolves.toMatchObject({ state: "polling", attempts: 2 });
     await expect(kv.get<{ state: string }>(KV.fireworksBatchWorkItems, itemId))
-      .resolves.toMatchObject({ state: "dead-letter" });
+      .resolves.toMatchObject({ state: "submitted" });
     await expect(kv.get<{ ids: string[] }>(KV.fireworksBatchActiveJobs, "current"))
-      .resolves.toMatchObject({ ids: [] });
+      .resolves.toMatchObject({ ids: [jobId] });
+  });
+
+  it("does not spend failure attempts on pending remote statuses", async () => {
+    const kv = createKv();
+    let statusCalls = 0;
+    const coordinator = new FireworksBatchCoordinator(
+      kv,
+      { ...config, maxAttempts: 1, pollDeadlineMs: 60_000 },
+      {
+        async createDataset() {},
+        async uploadDataset() {},
+        async submitJob() { return { remoteJobId: "remote-pending" }; },
+        async getJobStatus() { statusCalls++; return { state: "PENDING" }; },
+        async downloadResults() { return ""; },
+      },
+      async () => {},
+    );
+
+    await coordinator.enqueue({
+      correlationId: "pending-survives",
+      task: "graph_extraction",
+      systemPrompt: "system",
+      userPrompt: "user",
+    });
+    await coordinator.process();
+    await coordinator.process();
+
+    expect(statusCalls).toBeGreaterThanOrEqual(3);
+    await expect(kv.list<{ state: string; attempts: number; pollAttempts?: number }>(KV.fireworksBatchJobs)).resolves.toEqual([
+      expect.objectContaining({ state: "polling", attempts: 1, pollAttempts: expect.any(Number) }),
+    ]);
+    await expect(kv.list<{ state: string }>(KV.fireworksBatchWorkItems)).resolves.toEqual([
+      expect.objectContaining({ state: "submitted" }),
+    ]);
+  });
+
+  it("dead-letters a remote job when its polling deadline expires", async () => {
+    const kv = createKv();
+    const now = new Date(0).toISOString();
+    const itemId = "fwbwork-poll-deadline";
+    const jobId = "fwbjob-poll-deadline";
+    await kv.set(KV.fireworksBatchWorkItems, itemId, {
+      callbackProtocolVersion: 1,
+      id: itemId,
+      customId: "poll-deadline",
+      correlationId: "poll-deadline",
+      task: "graph_extraction",
+      model: config.model!,
+      systemPrompt: "system",
+      userPrompt: "user",
+      maxTokens: 512,
+      state: "submitted",
+      attempts: 0,
+      nextAttemptAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await kv.set(KV.fireworksBatchJobs, jobId, {
+      id: jobId,
+      remoteJobId: "remote-poll-deadline",
+      inputDatasetId: "input",
+      outputDatasetId: "output",
+      model: config.model!,
+      task: "graph_extraction",
+      workItemIds: [itemId],
+      state: "polling",
+      attempts: 1,
+      nextAttemptAt: now,
+      pollDeadlineAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await kv.set(KV.fireworksBatchActiveWork, "current", { version: 1 as const, ids: [itemId], updatedAt: now });
+    await kv.set(KV.fireworksBatchActiveJobs, "current", { version: 1 as const, ids: [jobId], updatedAt: now });
+    let statusCalls = 0;
+    const coordinator = new FireworksBatchCoordinator(
+      kv,
+      config,
+      {
+        async createDataset() {},
+        async uploadDataset() {},
+        async submitJob() { return { remoteJobId: "unused" }; },
+        async getJobStatus() { statusCalls++; return { state: "PENDING" }; },
+        async downloadResults() { return ""; },
+      },
+      async () => {},
+    );
+
+    await coordinator.process();
+
+    expect(statusCalls).toBe(0);
+    await expect(kv.get<{ state: string; lastError?: string }>(KV.fireworksBatchJobs, jobId))
+      .resolves.toMatchObject({ state: "dead-letter", lastError: "batch polling deadline exceeded" });
+    await expect(kv.get<{ state: string; lastError?: string }>(KV.fireworksBatchWorkItems, itemId))
+      .resolves.toMatchObject({ state: "dead-letter", lastError: "batch polling deadline exceeded" });
+  });
+
+  it("starts a fresh polling deadline for an active legacy job", async () => {
+    const kv = createKv();
+    const old = new Date(0).toISOString();
+    const itemId = "fwbwork-legacy-active-deadline";
+    const jobId = "fwbjob-legacy-active-deadline";
+    await kv.set(KV.fireworksBatchWorkItems, itemId, {
+      callbackProtocolVersion: 1,
+      id: itemId,
+      customId: "legacy-active-deadline",
+      correlationId: "legacy-active-deadline",
+      task: "graph_extraction",
+      model: config.model!,
+      systemPrompt: "system",
+      userPrompt: "user",
+      maxTokens: 512,
+      state: "submitted",
+      attempts: 0,
+      nextAttemptAt: old,
+      createdAt: old,
+      updatedAt: old,
+    });
+    await kv.set(KV.fireworksBatchJobs, jobId, {
+      id: jobId,
+      remoteJobId: "remote-legacy-active-deadline",
+      inputDatasetId: "input",
+      outputDatasetId: "output",
+      model: config.model!,
+      task: "graph_extraction",
+      workItemIds: [itemId],
+      state: "polling",
+      attempts: 1,
+      nextAttemptAt: old,
+      submitAttemptedAt: old,
+      createdAt: old,
+      updatedAt: old,
+    });
+    await kv.set(KV.fireworksBatchActiveWork, "current", {
+      version: 1 as const,
+      ids: [itemId],
+      updatedAt: old,
+    });
+    await kv.set(KV.fireworksBatchActiveJobs, "current", {
+      version: 1 as const,
+      ids: [jobId],
+      updatedAt: old,
+    });
+    let statusCalls = 0;
+    const coordinator = new FireworksBatchCoordinator(
+      kv,
+      { ...config, pollDeadlineMs: 60_000 },
+      {
+        async createDataset() {},
+        async uploadDataset() {},
+        async submitJob() { return { remoteJobId: "unused" }; },
+        async getJobStatus() {
+          statusCalls++;
+          return { state: "PENDING" };
+        },
+        async downloadResults() { return ""; },
+      },
+      async () => {},
+    );
+
+    await coordinator.process();
+
+    expect(statusCalls).toBeGreaterThan(0);
+    const job = await kv.get<{ state: string; pollDeadlineAt?: string }>(KV.fireworksBatchJobs, jobId);
+    expect(job).toMatchObject({ state: "polling", pollDeadlineAt: expect.any(String) });
+    expect(Date.parse(job!.pollDeadlineAt!)).toBeGreaterThan(Date.now());
   });
 
   it("sends fitting JSONL prefixes and does not starve later rows after an oversize row", async () => {
@@ -870,6 +1176,53 @@ describe("FireworksBatchCoordinator", () => {
       expect.objectContaining({ customId: "oversize", state: "dead-letter", lastError: expect.stringContaining("exceeded configured byte limit") }),
       expect.objectContaining({ customId: "small-1", state: "completed" }),
       expect.objectContaining({ customId: "small-2", state: "completed" }),
+    ]));
+  });
+
+  it("packs JSONL against the provider character limit as well as bytes", async () => {
+    const kv = createKv();
+    const smallLine = (customId: string, userPrompt: string) => JSON.stringify({
+      custom_id: customId,
+      body: {
+        messages: [{ role: "system", content: "system" }, { role: "user", content: userPrompt }],
+        max_tokens: 512,
+      },
+    });
+    const uploadedIds: string[] = [];
+    const transport: FireworksBatchTransport = {
+      async createDataset() {},
+      async uploadDataset(_id, jsonl) {
+        uploadedIds.push(...jsonl.split("\n").map((line) => (JSON.parse(line) as { custom_id: string }).custom_id));
+      },
+      async submitJob() { return { remoteJobId: `remote-${uploadedIds.at(-1)}` }; },
+      async getJobStatus() { return { state: "COMPLETED" }; },
+      async downloadResults() {
+        return uploadedIds.slice(-1).map((customId) => JSON.stringify({
+          custom_id: customId,
+          response: { body: { choices: [{ message: { content: customId } }] } },
+        })).join("\n");
+      },
+    };
+    const maxRequestChars = smallLine("small-char-1", "one").length + 1;
+    const coordinator = new FireworksBatchCoordinator(
+      kv,
+      { ...config, maxBatchItems: 3, maxRequestChars, maxRequestBytes: 20_000 },
+      transport,
+      async () => {},
+    );
+
+    await coordinator.enqueue({ correlationId: "small-char-1", task: "graph_extraction", systemPrompt: "system", userPrompt: "one" });
+    await coordinator.enqueue({ correlationId: "oversize-char", task: "graph_extraction", systemPrompt: "system", userPrompt: "x".repeat(maxRequestChars - "system".length) });
+    await coordinator.enqueue({ correlationId: "small-char-2", task: "graph_extraction", systemPrompt: "system", userPrompt: "two" });
+
+    await coordinator.process();
+    await coordinator.process();
+
+    expect(uploadedIds).toEqual(["small-char-1", "small-char-2"]);
+    await expect(kv.list<{ customId: string; state: string; lastError?: string }>(KV.fireworksBatchWorkItems)).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ customId: "oversize-char", state: "dead-letter", lastError: expect.stringContaining("character limit") }),
+      expect.objectContaining({ customId: "small-char-1", state: "completed" }),
+      expect.objectContaining({ customId: "small-char-2", state: "completed" }),
     ]));
   });
 

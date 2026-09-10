@@ -43,6 +43,48 @@ describe("batch destination crash recovery", () => {
     expect((await h.kv.get<GraphSnapshot>(KV.graphSnapshot, "current"))?.stats).toMatchObject({ totalNodes: 2, totalEdges: 1 });
   });
 
+  it.each(["", "<entities/><relationships/>"])(
+    "keeps empty graph callback %j retryable before applying a later valid result",
+    async (batchResponse) => {
+    const h = effectHarness();
+    const provider = { compress: vi.fn().mockResolvedValue(graphXml) };
+    registerGraphFunction(h.sdk as never, h.kv, provider as never);
+    const key = batchEffectKey("empty-then-valid-graph");
+    const payload = {
+      observations: [observation],
+      batchEffectKey: key,
+    };
+
+    const empty = await h.call("mem::graph-extract", {
+      ...payload,
+      batchResponse,
+    });
+    expect(empty).toMatchObject({
+      success: false,
+      error: "Graph extraction response contained no nodes or edges",
+    });
+    expect(await h.kv.list(KV.graphNodes)).toHaveLength(0);
+    expect(await h.kv.list(KV.graphEdges)).toHaveLength(0);
+    expect(await h.kv.get(KV.graphSnapshot, "current")).toBeNull();
+    expect(await h.kv.get(KV.batchCallbacks, `graph:${key}`)).toBeNull();
+    expect(await h.kv.get(KV.batchCallbacks, "active:graph")).toBeNull();
+    expect(await h.kv.list(KV.audit)).toHaveLength(0);
+    expect(provider.compress).not.toHaveBeenCalled();
+
+    const validPayload = { ...payload, batchResponse: graphXml };
+    expect(await h.call("mem::graph-extract", validPayload)).toMatchObject({ success: true });
+    const firstSnapshot = await h.kv.get<GraphSnapshot>(KV.graphSnapshot, "current");
+    expect(firstSnapshot?.stats).toMatchObject({ totalNodes: 2, totalEdges: 1 });
+
+    expect(await h.call("mem::graph-extract", validPayload)).toMatchObject({ success: true });
+    const secondSnapshot = await h.kv.get<GraphSnapshot>(KV.graphSnapshot, "current");
+    expect(secondSnapshot?.stats).toMatchObject({ totalNodes: 2, totalEdges: 1 });
+    expect(await h.kv.list(KV.graphNodes)).toHaveLength(2);
+    expect(await h.kv.list(KV.graphEdges)).toHaveLength(1);
+    expect(await h.kv.list(KV.audit)).toHaveLength(1);
+    },
+  );
+
   it.each([KV.insights, KV.batchCallbacks])("dedupes reflection after %s write loss", async (scope) => {
     const h = effectHarness();
     registerReflectFunctions(h.sdk as never, h.kv, {} as never);

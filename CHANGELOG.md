@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.44] — 2026-09-10
+
+### Fixed
+
+- Fireworks Batch polling now keeps accepted non-terminal jobs eligible until a persisted 24-hour deadline instead of exhausting the transport retry budget while Fireworks is still processing them.
+- Reconciled legacy polling-exhausted jobs are restored without resubmission when their remote identity proves they were never processed; completed jobs with ambiguous callback state are quarantined instead of replayed.
+- Graph batch responses containing no nodes or edges are rejected before they can replace or leave the graph in an invalid state.
+
+### Changed
+
+- Fireworks Batch dataset packing now enforces both UTF-8 byte and character limits, isolating oversized rows while allowing later work to proceed.
+
 ## [0.9.38] — 2026-08-24
 
 ### Changed

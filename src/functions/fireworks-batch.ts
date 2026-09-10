@@ -31,6 +31,10 @@ const MAX_ENQUEUE_INTENTS = 4_096;
 const MAX_ENQUEUE_JOURNAL_BYTES = 8 * 1024 * 1024;
 const MAX_REMOTE_RECONCILIATION_CANDIDATES = 32;
 const MAX_REMOTE_RECONCILIATION_ATTEMPTS = 3;
+const MAX_POLL_DEADLINE_MS = 24 * 60 * 60_000;
+const POLLING_EXHAUSTED_ERROR = "batch polling attempts exhausted";
+const POLLING_DEADLINE_ERROR = "batch polling deadline exceeded";
+const LEGACY_COMPLETED_AMBIGUOUS_ERROR = "Legacy completed batch contained non-terminal work; callback outcome is ambiguous; automatic replay blocked.";
 const ACTIVE_WORK_STATES = new Set(["queued", "submitted", "polling"]);
 const ACTIVE_JOB_STATES = new Set(["queued", "submitted", "polling"]);
 const TERMINAL_WORK_STATES = new Set(["completed", "stale", "failed", "dead-letter"]);
@@ -49,6 +53,7 @@ interface FireworksBatchRemoteRecovery {
   discoveredAt: string;
   updatedAt: string;
   completedAt?: string;
+  legacyReconciliationVersion?: 1;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -122,9 +127,33 @@ function retryAt(config: FireworksBatchConfig, attempts: number): string {
   return new Date(Date.now() + delay).toISOString();
 }
 
-function incrementAttempts(attempts: number, maxAttempts: number): { attempts: number; exhausted: boolean } {
+function boundedPollDeadlineMs(config: FireworksBatchConfig): number {
+  const configured = config.pollDeadlineMs;
+  if (!Number.isFinite(configured) || configured === undefined || configured < 1) return MAX_POLL_DEADLINE_MS;
+  return Math.min(MAX_POLL_DEADLINE_MS, Math.floor(configured));
+}
+
+function deadlineFrom(base: string | undefined, config: FireworksBatchConfig): string {
+  const baseMs = base ? Date.parse(base) : Number.NaN;
+  const start = Number.isFinite(baseMs) ? baseMs : Date.now();
+  return new Date(start + boundedPollDeadlineMs(config)).toISOString();
+}
+
+function pollRetryAt(config: FireworksBatchConfig, observations: number): string {
+  const base = Number.isFinite(config.pollIntervalMs) ? Math.max(0, Math.floor(config.pollIntervalMs)) : 0;
+  const max = Number.isFinite(config.pollMaxIntervalMs)
+    ? Math.max(base, Math.floor(config.pollMaxIntervalMs))
+    : base;
+  const delay = Math.min(max, base * 2 ** Math.max(0, observations - 1));
+  return new Date(Date.now() + delay).toISOString();
+}
+
+function incrementAttempts(attempts: number | undefined, maxAttempts: number): { attempts: number; exhausted: boolean } {
   const limit = Math.max(1, Math.floor(maxAttempts));
-  const next = Math.min(limit, Math.max(0, attempts) + 1);
+  const current = typeof attempts === "number" && Number.isFinite(attempts) && attempts >= 0
+    ? Math.floor(attempts)
+    : 0;
+  const next = Math.min(limit, current + 1);
   return { attempts: next, exhausted: next >= limit };
 }
 
@@ -350,15 +379,24 @@ function batchJsonlLine(item: FireworksBatchWorkItem): string {
   });
 }
 
-function fittingBatchPrefix(items: FireworksBatchWorkItem[], maxBytes: number): FireworksBatchWorkItem[] {
+function fittingBatchPrefix(
+  items: FireworksBatchWorkItem[],
+  maxBytes: number,
+  maxChars: number,
+): FireworksBatchWorkItem[] {
   const prefix: FireworksBatchWorkItem[] = [];
   let bytes = 0;
+  let chars = 0;
   for (const item of items) {
-    const lineBytes = Buffer.byteLength(batchJsonlLine(item), "utf8");
-    const nextBytes = bytes + (prefix.length === 0 ? 0 : 1) + lineBytes;
-    if (nextBytes > maxBytes) break;
+    const line = batchJsonlLine(item);
+    const separator = prefix.length === 0 ? 0 : 1;
+    const lineBytes = Buffer.byteLength(line, "utf8");
+    const nextBytes = bytes + separator + lineBytes;
+    const nextChars = chars + separator + line.length;
+    if (nextBytes > maxBytes || nextChars > maxChars) break;
     prefix.push(item);
     bytes = nextBytes;
+    chars = nextChars;
   }
   return prefix;
 }
@@ -568,13 +606,86 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
     return this.addActiveId(KV.fireworksBatchActiveJobs, job.id);
   }
 
+  private async quarantineCompletedLegacyJob(job: FireworksBatchJob): Promise<boolean> {
+    const items = await Promise.all(job.workItemIds.map((id) => this.kv.get<FireworksBatchWorkItem>(KV.fireworksBatchWorkItems, id)));
+    const ambiguous = items.filter((item): item is FireworksBatchWorkItem => item !== null && !TERMINAL_WORK_STATES.has(item.state));
+    if (ambiguous.length === 0) return true;
+    if (!job.legacyReconciliationAt) {
+      job.legacyReconciliationAt = new Date().toISOString();
+      job.updatedAt = job.legacyReconciliationAt;
+      await this.kv.set(KV.fireworksBatchJobs, job.id, job);
+    }
+    await this.markDeadLetter(ambiguous.map((item) => item.id), LEGACY_COMPLETED_AMBIGUOUS_ERROR);
+    return true;
+  }
+
+  private async reindexPollingExhaustedJob(job: FireworksBatchJob): Promise<boolean> {
+    const started = Boolean(job.legacyReconciliationAt);
+    if (job.state !== "dead-letter" || job.lastError !== POLLING_EXHAUSTED_ERROR) return false;
+    if (!isSafeRemoteJobId(job.remoteJobId) || !isSafeRemoteResource(job.outputDatasetId)) return false;
+
+    const items = await Promise.all(job.workItemIds.map((id) => this.kv.get<FireworksBatchWorkItem>(KV.fireworksBatchWorkItems, id)));
+    if (items.some((item) => !item)) return false;
+    const ownedItems = items.filter((item): item is FireworksBatchWorkItem => Boolean(item));
+    if (ownedItems.some((item) => item.completionIntent
+      || (TERMINAL_WORK_STATES.has(item.state)
+        && !(item.state === "dead-letter" && item.lastError === POLLING_EXHAUSTED_ERROR)))) {
+      return false;
+    }
+
+    const now = new Date().toISOString();
+    if (!started) {
+      job.legacyReconciliationAt = now;
+      job.updatedAt = now;
+      await this.kv.set(KV.fireworksBatchJobs, job.id, job);
+    }
+    for (const item of ownedItems) {
+      if (!TERMINAL_WORK_STATES.has(item.state)
+        || (item.state === "dead-letter" && item.lastError === POLLING_EXHAUSTED_ERROR)) {
+        item.callbackProtocolVersion = 1;
+        item.state = "polling";
+        item.nextAttemptAt = now;
+        delete item.lastError;
+        delete item.deadLetteredAt;
+        item.updatedAt = now;
+        await this.kv.set(KV.fireworksBatchWorkItems, item.id, item);
+      }
+      if (ACTIVE_WORK_STATES.has(item.state)) await this.addActiveId(KV.fireworksBatchActiveWork, item.id);
+    }
+
+    job.state = "polling";
+    job.attempts = 0;
+    job.nextAttemptAt = now;
+    job.pollAttempts = 0;
+    if (!job.pollDeadlineAt || !Number.isFinite(Date.parse(job.pollDeadlineAt)) || Date.parse(job.pollDeadlineAt) <= Date.now()) {
+      job.pollDeadlineAt = deadlineFrom(now, this.config);
+    }
+    delete job.lastError;
+    job.updatedAt = now;
+    await this.kv.set(KV.fireworksBatchJobs, job.id, job);
+    return true;
+  }
+
   private async repairRecentRemoteJobs(): Promise<void> {
     if (!this.transport?.listRecentJobIds) return;
     let recovery = await this.kv.get<FireworksBatchRemoteRecovery>(
       KV.fireworksBatchActiveJobs,
       REMOTE_RECOVERY_KEY,
     );
-    if (recovery?.completedAt) return;
+    if (recovery?.completedAt && recovery.legacyReconciliationVersion === 1) return;
+    if (recovery?.completedAt) {
+      try {
+        recovery.pendingJobIds = boundedActiveIds(await this.transport.listRecentJobIds(MAX_ACTIVE_INDEX_IDS));
+        delete recovery.completedAt;
+        recovery.updatedAt = new Date().toISOString();
+        await this.kv.set(KV.fireworksBatchActiveJobs, REMOTE_RECOVERY_KEY, recovery);
+      } catch (error) {
+        logger.warn("Fireworks Batch legacy recovery discovery failed", {
+          error: safeBatchErrorMessage(error, "remote job discovery failed"),
+        });
+        return;
+      }
+    }
     if (!recovery) {
       try {
         const now = new Date().toISOString();
@@ -598,12 +709,18 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
     const remaining: string[] = [];
     let repaired = 0;
     for (const jobId of recovery.pendingJobIds) {
+      const job = await this.kv.get<FireworksBatchJob>(KV.fireworksBatchJobs, jobId);
+      if (!job || job.id !== jobId) continue;
+      if (job.state === "completed") {
+        await this.quarantineCompletedLegacyJob(job);
+        continue;
+      }
+      if (job.state === "dead-letter") await this.reindexPollingExhaustedJob(job);
+      if (!ACTIVE_JOB_STATES.has(job.state)) continue;
       if (available === 0) {
         remaining.push(jobId);
         continue;
       }
-      const job = await this.kv.get<FireworksBatchJob>(KV.fireworksBatchJobs, jobId);
-      if (!job || job.id !== jobId || !ACTIVE_JOB_STATES.has(job.state)) continue;
       if (await this.addActiveId(KV.fireworksBatchActiveJobs, jobId)) {
         available--;
         repaired++;
@@ -614,7 +731,10 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
     const now = new Date().toISOString();
     recovery.pendingJobIds = remaining;
     recovery.updatedAt = now;
-    if (remaining.length === 0) recovery.completedAt = now;
+    if (remaining.length === 0) {
+      recovery.completedAt = now;
+      recovery.legacyReconciliationVersion = 1;
+    }
     await this.kv.set(KV.fireworksBatchActiveJobs, REMOTE_RECOVERY_KEY, recovery);
     if (repaired > 0) {
       logger.info("Fireworks Batch recovered remote jobs into the active index", { repaired });
@@ -852,13 +972,18 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
     for (const group of eligible) {
       let remaining = group;
       while (remaining.length > 0) {
-        const compatible = fittingBatchPrefix(remaining, this.config.maxRequestBytes);
+        const compatible = fittingBatchPrefix(remaining, this.config.maxRequestBytes, this.config.maxRequestChars);
         if (compatible.length === 0) {
           const oversized = remaining[0];
-          const rowBytes = Buffer.byteLength(batchJsonlLine(oversized), "utf8");
-          const error = `batch request row exceeded configured byte limit (${rowBytes} bytes)`;
+          const row = batchJsonlLine(oversized);
+          const rowBytes = Buffer.byteLength(row, "utf8");
+          const limits = [
+            rowBytes > this.config.maxRequestBytes ? "byte limit" : undefined,
+            row.length > this.config.maxRequestChars ? "character limit" : undefined,
+          ].filter((limit): limit is string => Boolean(limit));
+          const error = `batch request row exceeded configured ${limits.join(" and ") || "request limits"} (${row.length} chars, ${rowBytes} bytes)`;
           await this.markDeadLetter([oversized.id], error);
-          logger.warn("Fireworks Batch work item exceeded request byte limit", {
+          logger.warn("Fireworks Batch work item exceeded request limits", {
             task: oversized.task,
             workItemId: oversized.id,
             rowBytes,
@@ -882,7 +1007,9 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
           workItemIds: compatible.map((item) => item.id),
           state: "submitted",
           attempts: 1,
+          pollAttempts: 0,
           nextAttemptAt: new Date(Date.now() + this.config.pollIntervalMs).toISOString(),
+          pollDeadlineAt: deadlineFrom(now, this.config),
           createdAt: now,
           updatedAt: now,
         };
@@ -899,6 +1026,7 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
           await transport.createDataset(inputDatasetId, compatible.length);
           await transport.uploadDataset(inputDatasetId, jsonl);
           job.submitAttemptedAt = new Date().toISOString();
+          job.pollDeadlineAt = deadlineFrom(job.submitAttemptedAt, this.config);
           job.updatedAt = job.submitAttemptedAt;
           await this.kv.set(KV.fireworksBatchJobs, job.id, job);
           const submission = await transport.submitJob({ jobId, inputDatasetId, outputDatasetId, model: job.model, maxTokens: first.maxTokens });
@@ -926,6 +1054,15 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
     }
   }
 
+  private async ensurePollDeadline(job: FireworksBatchJob): Promise<string> {
+    const existing = typeof job.pollDeadlineAt === "string" ? Date.parse(job.pollDeadlineAt) : Number.NaN;
+    if (Number.isFinite(existing) && existing <= Date.now() + MAX_POLL_DEADLINE_MS) return job.pollDeadlineAt!;
+    job.pollDeadlineAt = deadlineFrom(undefined, this.config);
+    job.updatedAt = new Date().toISOString();
+    await this.kv.set(KV.fireworksBatchJobs, job.id, job);
+    return job.pollDeadlineAt;
+  }
+
   private async pollSubmitted(): Promise<void> {
     const now = new Date().toISOString();
     const jobs = await this.readActiveJobs();
@@ -935,9 +1072,9 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
         await this.exhaustCallbacks(job);
         continue;
       }
-      if (job.attempts >= maxAttempts && !job.reconciling) {
+      if (!job.reconciling && !job.remoteJobId && !job.submitAttemptedAt) {
         job.state = "dead-letter";
-        job.lastError = job.lastError || "batch polling attempts exhausted";
+        job.lastError = "batch submission has no proven remote identity; automatic recovery blocked";
         job.updatedAt = new Date().toISOString();
         await this.kv.set(KV.fireworksBatchJobs, job.id, job);
         await this.markDeadLetter(job.workItemIds, job.lastError);
@@ -959,6 +1096,18 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
         await this.markDeadLetter(job.workItemIds, job.lastError);
         await this.removeActiveId(KV.fireworksBatchActiveJobs, job.id);
         continue;
+      }
+      if (!job.reconciling) {
+        const pollDeadlineAt = await this.ensurePollDeadline(job);
+        if (Date.parse(pollDeadlineAt) <= Date.now()) {
+          job.state = "dead-letter";
+          job.lastError = POLLING_DEADLINE_ERROR;
+          job.updatedAt = new Date().toISOString();
+          await this.kv.set(KV.fireworksBatchJobs, job.id, job);
+          await this.markDeadLetter(job.workItemIds, job.lastError);
+          await this.removeActiveId(KV.fireworksBatchActiveJobs, job.id);
+          continue;
+        }
       }
       try {
         const status = reconciliation.status
@@ -991,19 +1140,16 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
           await this.markDeadLetter(job.workItemIds, job.lastError);
           await this.removeActiveId(KV.fireworksBatchActiveJobs, job.id);
         } else {
-          const attempt = incrementAttempts(job.attempts, this.config.maxAttempts);
-          job.attempts = attempt.attempts;
-          job.state = attempt.exhausted ? "dead-letter" : "polling";
-          job.lastError = attempt.exhausted ? "batch polling attempts exhausted" : job.lastError;
-          job.nextAttemptAt = attempt.exhausted
-            ? job.nextAttemptAt
-            : retryAt(this.config, job.attempts);
+          const previousPollAttempts = typeof job.pollAttempts === "number"
+            && Number.isFinite(job.pollAttempts) && job.pollAttempts >= 0
+            ? Math.floor(job.pollAttempts)
+            : 0;
+          job.pollAttempts = previousPollAttempts + 1;
+          job.state = "polling";
+          delete job.lastError;
+          job.nextAttemptAt = pollRetryAt(this.config, job.pollAttempts);
           job.updatedAt = new Date().toISOString();
           await this.kv.set(KV.fireworksBatchJobs, job.id, job);
-          if (attempt.exhausted) {
-            await this.markDeadLetter(job.workItemIds, job.lastError);
-            await this.removeActiveId(KV.fireworksBatchActiveJobs, job.id);
-          }
         }
       } catch (error) {
         const applying = job.reconciling && (error instanceof FireworksBatchCallbackError || (

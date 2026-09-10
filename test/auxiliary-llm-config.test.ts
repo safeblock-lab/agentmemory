@@ -42,6 +42,7 @@ const BATCH_KEYS = [
   "OPENAI_API_KEY",
   "OPENAI_BASE_URL",
   "OPENAI_MODEL",
+  "AGENTMEMORY_FIREWORKS_BATCH_POLL_DEADLINE_MS",
 ] as const;
 const original = new Map<string, string | undefined>();
 
@@ -151,8 +152,24 @@ describe("auxiliary LLM configuration", () => {
       enabled: true,
       accountId: "test-account",
       model: "accounts/test/models/test",
+      pollDeadlineMs: 24 * 60 * 60_000,
     });
     expect(config.auxiliaryProvider?.model).toBe("qwen3.5:4b");
+  });
+
+  it("bounds the Fireworks polling deadline to 24 hours", () => {
+    process.env["AGENTMEMORY_FIREWORKS_BATCH_ENABLED"] = "true";
+    process.env["FIREWORKS_ACCOUNT_ID"] = "test-account";
+    process.env["FIREWORKS_API_KEY"] = "test-key";
+    process.env["FIREWORKS_MODEL"] = "accounts/test/models/test";
+    process.env["AGENTMEMORY_FIREWORKS_BATCH_POLL_DEADLINE_MS"] = "999999999";
+
+    const config = loadConfig();
+
+    expect(config.fireworksBatch.pollDeadlineMs).toBe(24 * 60 * 60_000);
+    expect(config.llmRouting.warnings.join(" ")).toContain(
+      "AGENTMEMORY_FIREWORKS_BATCH_POLL_DEADLINE_MS must be between 1 and 86400000",
+    );
   });
 
   it("does not enable Batch from a non-Fireworks auxiliary key", () => {

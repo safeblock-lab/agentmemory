@@ -11,6 +11,7 @@ import type {
   GraphEdge,
   GraphQueryResult,
 } from "../src/types.js";
+import { KV } from "../src/state/schema.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -224,6 +225,47 @@ describe("Graph Functions", () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toContain("No observations");
+  });
+
+  it("graph-extract rejects empty parsed output before writing graph state", async () => {
+    mockProvider.compress.mockResolvedValueOnce("<entities/><relationships/>");
+
+    const result = (await sdk.trigger("mem::graph-extract", {
+      observations: [testObs],
+    })) as { success: boolean; error: string };
+
+    expect(result).toMatchObject({
+      success: false,
+      error: "Graph extraction response contained no nodes or edges",
+    });
+    expect(await kv.list(KV.graphNodes)).toHaveLength(0);
+    expect(await kv.list(KV.graphEdges)).toHaveLength(0);
+    expect(await kv.list(KV.graphNameIndex)).toHaveLength(0);
+    expect(await kv.list(KV.graphEdgeKey)).toHaveLength(0);
+    expect(await kv.list(KV.graphNodeDegree)).toHaveLength(0);
+    expect(await kv.list(KV.graphSnapshot)).toHaveLength(0);
+    expect(await kv.list(KV.audit)).toHaveLength(0);
+    expect(await kv.list(KV.batchCallbacks)).toHaveLength(0);
+  });
+
+  it("graph-extract accepts nodes without relationships", async () => {
+    mockProvider.compress.mockResolvedValueOnce(
+      '<entities><entity type="concept" name="standalone"/></entities>',
+    );
+
+    const result = (await sdk.trigger("mem::graph-extract", {
+      observations: [testObs],
+    })) as { success: boolean; nodesAdded: number; edgesAdded: number };
+
+    expect(result).toMatchObject({
+      success: true,
+      nodesAdded: 1,
+      edgesAdded: 0,
+    });
+    expect((await kv.get<{ stats: { totalNodes: number; totalEdges: number } }>(
+      KV.graphSnapshot,
+      "current",
+    ))?.stats).toMatchObject({ totalNodes: 1, totalEdges: 0 });
   });
 
   it("compacts an oversized routine locally and preserves complete source metadata", async () => {
