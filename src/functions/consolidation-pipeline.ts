@@ -5,6 +5,7 @@ import type {
   SessionSummary,
   Memory,
   MemoryProvider,
+  FireworksBatchWorkItem,
 } from "../types.js";
 import { KV, fingerprintId, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
@@ -25,10 +26,27 @@ import { assessConsolidationComplexity } from "./consolidation-complexity.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
 import type { FireworksBatchQueue } from "./fireworks-batch.js";
 import { applyBatchEffect, batchEffectKey, runBatchCallback } from "../state/batch-effects.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 
 const SEMANTIC_CHECKPOINT_KEY = "semantic-consolidation";
 const SEMANTIC_ANCHOR_SUMMARIES = 5;
 const SEMANTIC_NEW_SUMMARIES_PER_RUN = 15;
+
+function boundedPartitions<T>(items: T[], prompt: (items: T[]) => string): T[][] {
+  const groups: T[][] = [];
+  let group: T[] = [];
+  for (const item of items) {
+    if (prompt([item]).length > 10000) throw new Error("Consolidation source exceeds bounded batch input; source retained locally");
+    if (group.length && prompt([...group, item]).length > 10000) { groups.push(group); group = []; }
+    group.push(item);
+  }
+  if (group.length) groups.push(group);
+  return groups;
+}
+
+function semanticFingerprint(summaries: SessionSummary[]): string {
+  return fingerprintId("fwbconsem", JSON.stringify(summaries.map((s) => [s.sessionId, s.title, s.narrative, s.concepts, s.createdAt])));
+}
 
 interface SemanticCheckpoint {
   processedThrough: string;
@@ -38,6 +56,23 @@ interface SemanticCheckpoint {
 interface SemanticInput {
   summaries: SessionSummary[];
   checkpoint?: SemanticCheckpoint;
+}
+
+// Call only while holding the cohort lock, after any current effect was admitted.
+async function reconcileSemanticCohort(kv: StateKV, key: string, currentEffectKey?: string): Promise<void> {
+  const cohort = await kv.get<{ workItemIds: string[]; checkpoint?: SemanticCheckpoint }>(KV.state, key);
+  if (!cohort?.checkpoint || !cohort.workItemIds.length
+    || (currentEffectKey && !cohort.workItemIds.some((id) => batchEffectKey(id) === currentEffectKey))) return;
+  const members = await Promise.all(cohort.workItemIds.map((id) => kv.get<FireworksBatchWorkItem>(KV.fireworksBatchWorkItems, id)));
+  if (!members.every((work, index) => work?.id === cohort.workItemIds[index]
+    && (work.state === "completed" || batchEffectKey(work.id) === currentEffectKey))) return;
+  const current = await kv.get<SemanticCheckpoint>(KV.state, SEMANTIC_CHECKPOINT_KEY);
+  if (current && current.processedThrough > cohort.checkpoint.processedThrough) return;
+  const checkpoint = current?.processedThrough === cohort.checkpoint.processedThrough ? {
+    ...cohort.checkpoint,
+    processedSessionIdsAtThrough: [...new Set([...current.processedSessionIdsAtThrough, ...cohort.checkpoint.processedSessionIdsAtThrough])],
+  } : cohort.checkpoint;
+  await kv.set(KV.state, SEMANTIC_CHECKPOINT_KEY, checkpoint);
 }
 
 function isAfterCheckpoint(summary: SessionSummary, checkpoint: SemanticCheckpoint): boolean {
@@ -123,6 +158,9 @@ export function registerConsolidationPipelineFunction(
       batchSourceFingerprint?: string;
       deferred?: boolean;
       batchEffectKey?: string;
+      replacementOf?: string;
+      batchSourceIds?: string[];
+      batchCohort?: string;
     }) => runBatchCallback(kv, "consolidation", data?.batchEffectKey, async (resuming, admit, receipt) => {
       if (!data?.force && !isConsolidationEnabled()) {
         return { success: false, skipped: true, reason: "Consolidation disabled: set CONSOLIDATION_ENABLED=true or configure an LLM provider (ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY / MINIMAX_API_KEY / OPENAI_BASE_URL / AGENTMEMORY_PROVIDER=agent-sdk)" };
@@ -135,12 +173,12 @@ export function registerConsolidationPipelineFunction(
         const summaries = await kv.list<SessionSummary>(KV.summaries);
         const existingSemantic = await kv.list<SemanticMemory>(KV.semantic);
 
-        if (summaries.length >= 5 || (resuming && data?.batchResponse)) {
+        if (summaries.length >= 5 || data?.batchSourceIds?.length || (resuming && data?.batchResponse)) {
           const checkpoint = await kv.get<SemanticCheckpoint>(
             KV.state,
             SEMANTIC_CHECKPOINT_KEY,
           );
-          const semanticInput = receipt?.semanticSourceIds ? {
+          let semanticInput = receipt?.semanticSourceIds ? {
             summaries: summaries.filter((summary) => receipt.semanticSourceIds!.includes(summary.sessionId)),
             checkpoint: receipt.semanticCheckpoint,
           } : selectSemanticInput(
@@ -148,6 +186,21 @@ export function registerConsolidationPipelineFunction(
             resuming ? null : checkpoint,
             getConsolidationMinNewSummaries(),
           );
+          if (!resuming && (data?.deferred || data?.batchSourceIds)) {
+            const candidates = data.batchSourceIds
+              ? data.batchSourceIds.map((id) => summaries.find((summary) => summary.sessionId === id)).filter((summary): summary is SessionSummary => Boolean(summary))
+              : summaries.filter((summary) => data?.replacementOf || !checkpoint || isAfterCheckpoint(summary, checkpoint)).sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.sessionId.localeCompare(b.sessionId));
+            if (data.batchSourceIds && candidates.length !== data.batchSourceIds.length) return { success: true, stale: true };
+            const selected = candidates;
+            const last = selected[selected.length - 1];
+            semanticInput = { summaries: selected, checkpoint: last ? {
+              processedThrough: last.createdAt,
+              processedSessionIdsAtThrough: [...new Set([
+                ...(checkpoint?.processedThrough === last.createdAt ? checkpoint.processedSessionIdsAtThrough : []),
+                ...selected.filter((summary) => summary.createdAt === last.createdAt).map((summary) => summary.sessionId),
+              ])],
+            } : undefined };
+          }
           const recentSummaries = semanticInput.summaries;
           if (recentSummaries.length === 0 && !resuming) {
             results.semantic = {
@@ -184,17 +237,44 @@ export function registerConsolidationPipelineFunction(
               });
               let queued = false;
               if (!data?.batchResponse && data?.deferred && batchQueue) {
-                const enqueueResult = await batchQueue.enqueue({
-                  correlationId: data.batchEffectKey ? fingerprintId("fwbcon-sem", data.batchEffectKey) : generateId("fwbcon-sem"),
-                  task: "consolidation",
-                  systemPrompt: SEMANTIC_MERGE_SYSTEM,
-                  userPrompt: prompt,
-                  metadata: { tier: "semantic", sourceFingerprint, ...(data.batchEffectKey ? { batchEffectKey: data.batchEffectKey } : {}) },
+                const cohort = data.batchCohort ?? fingerprintId("fwbcohort", `${data.replacementOf ?? ""}:${sourceFingerprint}`);
+                const failure = await withKeyedLock(`semantic-cohort:${cohort}`, async () => {
+                  if (data.batchCohort && (!data.replacementOf || !/^fwbcohort_[a-f0-9]{16}$/.test(data.batchCohort)
+                    || !await kv.get(KV.state, data.batchCohort))) {
+                    return { success: false, error: "Replacement cohort is missing or invalid" };
+                  }
+                  const workItemIds: string[] = [];
+                  for (const group of boundedPartitions(recentSummaries, buildSemanticMergePrompt)) {
+                    const enqueueResult = await batchQueue.enqueue({
+                      replacementOf: data.replacementOf,
+                      correlationId: data.batchEffectKey ? fingerprintId("fwbcon-sem", data.batchEffectKey) : generateId("fwbcon-sem"),
+                      task: "consolidation",
+                      systemPrompt: SEMANTIC_MERGE_SYSTEM,
+                      userPrompt: buildSemanticMergePrompt(group),
+                      metadata: { tier: "semantic", sourceFingerprint: semanticFingerprint(group), sourceIds: JSON.stringify(group.map((summary) => summary.sessionId)), cohort, ...(data.batchEffectKey ? { batchEffectKey: data.batchEffectKey } : {}) },
+                    });
+                    if (!enqueueResult.queued || !enqueueResult.workItemId) {
+                      return { success: false, error: enqueueResult.reason ?? "Consolidation queue rejected bounded input" };
+                    }
+                    queued = true;
+                    workItemIds.push(enqueueResult.workItemId);
+                    results.semantic = { queued: true, workItemId: workItemIds[0], workItemIds, totalSummaries: summaries.length };
+                  }
+                  if (!data.batchCohort) {
+                    await kv.set(KV.state, cohort, { workItemIds, checkpoint: semanticInput.checkpoint });
+                  } else {
+                    const original = await kv.get<{ workItemIds: string[]; checkpoint?: SemanticCheckpoint }>(KV.state, cohort);
+                    if (!original || !Array.isArray(original.workItemIds)) throw new Error("Replacement cohort is invalid");
+                    if (original.workItemIds.includes(data.replacementOf!)) {
+                      const members = original.workItemIds.flatMap((id) => id === data.replacementOf ? workItemIds : [id]);
+                      await kv.set(KV.state, cohort, { ...original, workItemIds: [...new Set(members)] });
+                    } else if (!workItemIds.every((id) => original.workItemIds.includes(id))) {
+                      throw new Error("Old work is not a member of the replacement cohort");
+                    }
+                  }
+                  await reconcileSemanticCohort(kv, cohort);
                 });
-                if (enqueueResult.queued) {
-                  queued = true;
-                  results.semantic = { queued: true, workItemId: enqueueResult.workItemId, totalSummaries: summaries.length };
-                }
+                if (failure) return failure;
               }
               if (!queued) {
                 const response = data?.batchResponse ?? (llmRouter
@@ -257,7 +337,9 @@ export function registerConsolidationPipelineFunction(
                   }
                 }
                 results.semantic = { newFacts, totalSummaries: summaries.length };
-                if (semanticInput.checkpoint && (!checkpoint || semanticInput.checkpoint.processedThrough >= checkpoint.processedThrough)) {
+                if (data?.batchCohort) {
+                  await withKeyedLock(`semantic-cohort:${data.batchCohort}`, () => reconcileSemanticCohort(kv, data.batchCohort!, data.batchEffectKey));
+                } else if (semanticInput.checkpoint && (!checkpoint || semanticInput.checkpoint.processedThrough >= checkpoint.processedThrough)) {
                   await kv.set(KV.state, SEMANTIC_CHECKPOINT_KEY, semanticInput.checkpoint);
                 }
               }
@@ -299,15 +381,19 @@ export function registerConsolidationPipelineFunction(
 
       if (tier === "all" || tier === "procedural") {
         const memories = await kv.list<Memory>(KV.memories);
-        const patterns = memories
+        const patternSources = memories
           .filter((m) => m.isLatest && m.type === "pattern")
+          .filter((m) => !data?.batchSourceIds || data.batchSourceIds.includes(m.id))
           .map((m) => ({
+            id: m.id,
             content: m.content,
             frequency: m.sessionIds.length || 1,
           }))
           .filter((p) => p.frequency >= 2);
+        if (data?.batchSourceIds && patternSources.length !== data.batchSourceIds.length) return { success: true, stale: true };
+        const patterns = patternSources.map(({ content, frequency }) => ({ content, frequency }));
 
-        if (patterns.length >= 2 || (resuming && data?.batchResponse)) {
+        if (patterns.length >= 2 || data?.batchSourceIds?.length || (resuming && data?.batchResponse)) {
           const prompt = buildProceduralExtractionPrompt(patterns);
           const sourceFingerprint = fingerprintId("fwbconproc", JSON.stringify(patterns));
 
@@ -322,16 +408,22 @@ export function registerConsolidationPipelineFunction(
             });
             let queued = false;
             if (!data?.batchResponse && data?.deferred && batchQueue) {
+              const workItemIds: string[] = [];
+              for (const group of boundedPartitions(patternSources, buildProceduralExtractionPrompt)) {
+              const groupPatterns = group.map(({ content, frequency }) => ({ content, frequency }));
               const enqueueResult = await batchQueue.enqueue({
+                replacementOf: data.replacementOf,
                 correlationId: data.batchEffectKey ? fingerprintId("fwbcon-proc", data.batchEffectKey) : generateId("fwbcon-proc"),
                 task: "consolidation",
                 systemPrompt: PROCEDURAL_EXTRACTION_SYSTEM,
-                userPrompt: prompt,
-                metadata: { tier: "procedural", sourceFingerprint, ...(data.batchEffectKey ? { batchEffectKey: data.batchEffectKey } : {}) },
+                userPrompt: buildProceduralExtractionPrompt(groupPatterns),
+                metadata: { tier: "procedural", sourceFingerprint: fingerprintId("fwbconproc", JSON.stringify(groupPatterns)), sourceIds: JSON.stringify(group.map((item) => item.id)), ...(data.batchEffectKey ? { batchEffectKey: data.batchEffectKey } : {}) },
               });
               if (enqueueResult.queued) {
                 queued = true;
-                results.procedural = { queued: true, workItemId: enqueueResult.workItemId, patternsAnalyzed: patterns.length };
+                if (enqueueResult.workItemId) workItemIds.push(enqueueResult.workItemId);
+                results.procedural = { queued: true, workItemId: workItemIds[0], workItemIds, patternsAnalyzed: patterns.length };
+              } else return { success: false, error: enqueueResult.reason ?? "Consolidation queue rejected bounded input" };
               }
             }
             if (!queued) {

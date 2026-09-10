@@ -85,6 +85,65 @@ describe("parser failure recovery", () => {
     expect(await s.h.kv.get(KV.fireworksBatchActiveJobs, "remote-recovery-v1")).toMatchObject({ legacyReconciliationVersion: 3, completedAt: expect.any(String) });
   });
 
+  it.each([0, -1, 1.5, Infinity, 16385])("rejects an invalid batch output budget %s before enqueue", async (maxTokens) => {
+    const s = await seed();
+    const result = await s.create().enqueue({ correlationId: "bad", task: "graph_extraction", systemPrompt: "system", userPrompt: "current", maxTokens });
+    expect(result.queued).toBe(false);
+    expect(await s.h.kv.list(KV.fireworksBatchWorkItems)).toHaveLength(1);
+  });
+
+  it.each([undefined, KV.fireworksBatchWorkItems, KV.fireworksBatchFingerprints, KV.fireworksBatchActiveWork])("replaces with one durable fresh ID across restart at %s", async (crashScope) => {
+    const s = await seed();
+    const originalJob = await s.h.kv.get(KV.fireworksBatchJobs, s.job.id);
+    const originalWork = await s.h.kv.get(KV.fireworksBatchWorkItems, s.item.id);
+    const request = { replacementOf: s.item.id, correlationId: "fresh", task: "graph_extraction" as const,
+      systemPrompt: "current-system", userPrompt: "current-observations", metadata: { sourceFingerprint: "current-source" } };
+    if (crashScope) { s.h.crash(crashScope, true); await expect(s.create().enqueue(request)).rejects.toThrow(); }
+    const first = await s.create().enqueue(request);
+    const second = await s.create().enqueue(request);
+    expect(first.queued).toBe(true);
+    expect(first.workItemId).not.toBe(s.item.id);
+    expect(second.workItemId).toBe(first.workItemId);
+    const fresh = await s.h.kv.get<FireworksBatchWorkItem>(KV.fireworksBatchWorkItems, first.workItemId!);
+    expect(fresh).toMatchObject({ replacementOf: s.item.id, maxTokens: 8192, state: "queued" });
+    await s.h.kv.set(KV.fireworksBatchWorkItems, fresh!.id, { ...fresh, state: "completed" });
+    expect((await s.create().enqueue(request)).workItemId).toBe(first.workItemId);
+    expect(await s.h.kv.get(KV.fireworksBatchJobs, s.job.id)).toEqual(originalJob);
+    expect(await s.h.kv.get(KV.fireworksBatchWorkItems, s.item.id)).toEqual(originalWork);
+    expect(s.transport.submitJob).not.toHaveBeenCalled();
+    expect(s.transport.uploadDataset).not.toHaveBeenCalled();
+    expect(s.transport.createDataset).not.toHaveBeenCalled();
+  });
+
+  it("replaces a safe sibling while leaving a partial item blocked", async () => {
+    const s = await seed(2);
+    const lastError = "Batch callback attempts exhausted; reconcile partial downstream receipts before replacement work";
+    await s.h.kv.set(KV.fireworksBatchJobs, s.job.id, { ...s.job, lastError });
+    for (const work of s.items) await s.h.kv.set(KV.fireworksBatchWorkItems, work.id, { ...work, lastError });
+    await s.h.kv.set(KV.fireworksBatchWorkItems, s.item.id, { ...s.item, lastError, completionIntent: { key: "partial", resultHash: "hash" } });
+    expect(await s.create().canReplace(s.item.id)).toBe(false);
+    expect(await s.create().canReplace(s.items[1].id)).toBe(true);
+  });
+
+  it.each([false, true])("rejects truncated output before any usage or effect, body envelope=%s", async (bodyEnvelope) => {
+    const s = await seed();
+    const usage = vi.fn(async () => {});
+    const body = { choices: [{ finish_reason: "length", message: { content: '<entity type="concept" name="partial"/>' } }], usage: { total_tokens: 512 } };
+    s.transport.downloadResults.mockResolvedValue(JSON.stringify({ custom_id: s.item.customId, response: bodyEnvelope ? { body } : body }));
+    const coordinator = new FireworksBatchCoordinator(s.h.kv, config, s.transport, s.completed, usage);
+    await coordinator.process();
+    expect(usage).not.toHaveBeenCalled();
+    expect(s.completed).not.toHaveBeenCalled();
+    expect(await s.h.kv.list(KV.batchCallbacks)).toHaveLength(0);
+    expect(await s.h.kv.list(KV.graphNodes)).toHaveLength(0);
+    expect(await s.h.kv.list(KV.graphEdges)).toHaveLength(0);
+    expect(await s.h.kv.list(KV.audit)).toHaveLength(0);
+    const work = await s.h.kv.get<FireworksBatchWorkItem>(KV.fireworksBatchWorkItems, s.item.id);
+    expect(work?.completionIntent).toBeUndefined();
+    expect(work?.result).toBeUndefined();
+    expect(s.transport.submitJob).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])("revisits a completed version-2 checkpoint once, undefined misses=%s", async (missingAsUndefined) => {
     const s = await seed(1, missingAsUndefined);
     await s.h.kv.set(KV.fireworksBatchActiveJobs, "remote-recovery-v1", {

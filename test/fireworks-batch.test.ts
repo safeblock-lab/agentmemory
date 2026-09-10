@@ -636,7 +636,7 @@ describe("FireworksBatchCoordinator", () => {
         const row = JSON.parse(jsonl);
         expect(row).toMatchObject({
           custom_id: "graph-1",
-          body: { max_tokens: 512 },
+          body: { max_tokens: 8192 },
         });
         expect(row.body).not.toHaveProperty("model");
       },
@@ -1166,7 +1166,7 @@ describe("FireworksBatchCoordinator", () => {
       custom_id: customId,
       body: {
         messages: [{ role: "system", content: "system" }, { role: "user", content: userPrompt }],
-        max_tokens: 512,
+        max_tokens: 8192,
       },
     });
     const maxRequestBytes = Buffer.byteLength(smallLine("small-1", "one"), "utf8");
@@ -1213,7 +1213,7 @@ describe("FireworksBatchCoordinator", () => {
       custom_id: customId,
       body: {
         messages: [{ role: "system", content: "system" }, { role: "user", content: userPrompt }],
-        max_tokens: 512,
+        max_tokens: 8192,
       },
     });
     const uploadedIds: string[] = [];

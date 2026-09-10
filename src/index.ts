@@ -105,7 +105,7 @@ import { registerHealthMonitor } from "./health/monitor.js";
 import { initMetrics, OTEL_CONFIG } from "./telemetry/setup.js";
 import { VERSION } from "./version.js";
 import { bootLog } from "./logger.js";
-import type { AuxiliaryLlmConfig, FireworksBatchWorkItem } from "./types.js";
+import type { AuxiliaryLlmConfig, CompressedObservation, FireworksBatchWorkItem } from "./types.js";
 import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -196,6 +196,60 @@ function batchCallbackFailure(
     success: false,
     error: sanitizeBatchCallbackError(value.error) ?? fallback,
   };
+}
+
+export function registerFireworksBatchReplacement(sdk: ISdk, kv: StateKV, coordinator: FireworksBatchCoordinator): void {
+  sdk.registerFunction("mem::fireworks-batch-replace", async (data: unknown) => {
+    if (!isRecord(data) || !Array.isArray(data.workItemIds) || data.workItemIds.length < 1 || data.workItemIds.length > 72
+      || data.workItemIds.some((id) => typeof id !== "string" || !/^fwbwork[_a-z0-9-]+$/.test(id))
+      || new Set(data.workItemIds).size !== data.workItemIds.length) {
+      return { success: false, error: "Provide 1 to 72 unique work item IDs" };
+    }
+    const results: { workItemId: string; result: unknown }[] = [];
+    for (const id of data.workItemIds) {
+      if (!await coordinator.canReplace(id)) {
+        results.push({ workItemId: id, result: { success: false, error: "Old job has an ambiguous or ineligible effect state" } });
+        continue;
+      }
+      const old = await kv.get<FireworksBatchWorkItem>(KV.fireworksBatchWorkItems, id);
+      if (!old) throw new Error("Replacement source disappeared");
+      let result: unknown;
+      if (old.task === "graph_extraction") {
+        const refs: unknown = JSON.parse(old.metadata?.observations ?? "null");
+        if (!Array.isArray(refs) || !refs.length || refs.length > 4096
+          || refs.some((ref) => !isRecord(ref) || typeof ref.id !== "string" || typeof ref.sessionId !== "string")) {
+          results.push({ workItemId: id, result: { success: false, error: "Old graph provenance is invalid" } });
+          continue;
+        }
+        const current: CompressedObservation[] = [];
+        for (const ref of refs) {
+          const observation = await kv.get<CompressedObservation>(KV.observations(ref.sessionId), ref.id);
+          if (!observation || observation.id !== ref.id || observation.sessionId !== ref.sessionId) break;
+          current.push(observation);
+        }
+        if (current.length !== refs.length) {
+          results.push({ workItemId: id, result: { success: false, error: "Current graph sources are missing" } });
+          continue;
+        }
+        result = await sdk.trigger({ function_id: "mem::graph-extract", payload: { observations: current, deferred: true, replacementOf: id } });
+      } else if (old.task === "consolidation" && ["semantic", "procedural"].includes(old.metadata?.tier ?? "")) {
+        const sourceIds: unknown = old.metadata?.sourceIds ? JSON.parse(old.metadata.sourceIds) : undefined;
+        if (!Array.isArray(sourceIds) || sourceIds.length === 0 || sourceIds.some((sourceId) => typeof sourceId !== "string")) {
+          results.push({ workItemId: id, result: { success: false, error: "Current consolidation source identities cannot be proven" } });
+          continue;
+        }
+        const cohort = old.metadata?.cohort;
+        if (cohort !== undefined && (typeof cohort !== "string" || !/^fwbcohort_[a-f0-9]{16}$/.test(cohort))) {
+          results.push({ workItemId: id, result: { success: false, error: "Old consolidation cohort is invalid" } });
+          continue;
+        }
+        result = await sdk.trigger({ function_id: "mem::consolidate-pipeline", payload: { tier: old.metadata!.tier, force: true, deferred: true, replacementOf: id,
+          batchSourceIds: sourceIds, ...(cohort ? { batchCohort: cohort } : {}) } });
+      } else result = { success: false, error: "Replacement task is not supported" };
+      results.push({ workItemId: id, result });
+    }
+    return { success: true, results };
+  });
 }
 
 export function createFireworksBatchCompletionHandler(
@@ -294,6 +348,8 @@ export function createFireworksBatchCompletionHandler(
         force: true,
         batchResponse: content,
         batchSourceFingerprint: item.metadata?.sourceFingerprint,
+        ...(item.metadata?.sourceIds ? { batchSourceIds: JSON.parse(item.metadata.sourceIds) } : {}),
+        ...(item.metadata?.cohort ? { batchCohort: item.metadata.cohort } : {}),
       },
     });
     const failure = batchCallbackFailure(result, "batch consolidation failed");
@@ -435,6 +491,7 @@ async function main() {
       );
     },
   );
+  registerFireworksBatchReplacement(sdk, kv, fireworksBatch);
   const secret = getEnvVar("AGENTMEMORY_SECRET");
   const dedupMap = new DedupMap();
 

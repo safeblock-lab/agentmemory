@@ -99,6 +99,26 @@ describe("Graph Functions", () => {
     registerGraphFunction(sdk as never, kv as never, mockProvider as never);
   });
 
+  it("partitions replacement sources without dropping observations and rejects an oversized source", async () => {
+    const enqueue = vi.fn(async (_request: import("../src/types.js").FireworksBatchRequest) => ({ queued: true, workItemId: "fresh" }));
+    registerGraphFunction(sdk as never, kv as never, mockProvider as never, undefined, { enqueue });
+    const observations = Array.from({ length: 4 }, (_, i) => ({ ...testObs, id: `obs-${i}`, narrative: "x".repeat(5000) }));
+    const result = await sdk.trigger("mem::graph-extract", { observations, deferred: true, replacementOf: "old" });
+    expect(result.success).toBe(true);
+    expect(enqueue.mock.calls.length).toBeGreaterThan(1);
+    const requests = enqueue.mock.calls.map((call) => call[0] as unknown as import("../src/types.js").FireworksBatchRequest);
+    expect(requests.flatMap((request) => JSON.parse(request.metadata!.observations).map((o: CompressedObservation) => o.id))).toEqual(observations.map((o) => o.id));
+    for (const request of requests) {
+      expect(request.userPrompt.length).toBeLessThanOrEqual(10000);
+      expect(request.replacementOf).toBe("old");
+      expect(request.metadata?.sourceFingerprint).toBeTruthy();
+    }
+    enqueue.mockClear();
+    const oversized = await sdk.trigger("mem::graph-extract", { observations: [{ ...testObs, narrative: "x".repeat(20000) }], deferred: true, replacementOf: "old" });
+    expect(oversized.success).toBe(false);
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+
   it("graph-extract creates nodes and edges from XML response", async () => {
     const result = (await sdk.trigger("mem::graph-extract", {
       observations: [testObs],

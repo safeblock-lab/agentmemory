@@ -160,15 +160,16 @@ function incrementAttempts(attempts: number | undefined, maxAttempts: number): {
 function responseBody(value: unknown): Record<string, unknown> | undefined {
   if (!isRecord(value) || !isRecord(value.response)) return undefined;
   const response = value.response;
+  if (response.status_code !== undefined && response.status_code !== 200) return undefined;
   const body = Object.hasOwn(response, "body") ? response.body : response;
-  return isRecord(body) ? body : undefined;
+  return isRecord(body) && body.error == null ? body : undefined;
 }
 
 function resultContent(value: unknown): string | undefined {
   const choices = responseBody(value)?.choices;
-  if (!Array.isArray(choices) || !isRecord(choices[0]) || !isRecord(choices[0].message)) return undefined;
+  if (!Array.isArray(choices) || choices.length !== 1 || !isRecord(choices[0]) || !isRecord(choices[0].message)) return undefined;
   const content = choices[0].message.content;
-  return typeof content === "string" ? content : undefined;
+  return typeof content === "string" && content.trim().length > 0 ? content : undefined;
 }
 
 function resultUsage(value: unknown): LlmUsage | undefined {
@@ -249,6 +250,12 @@ function parseJsonlRows(text: string, label: "result" | "error"): ParsedBatchRow
     const content = resultContent(parsed);
     if (content === undefined) {
       throw new FireworksBatchReconciliationError(`batch ${label} row ${index + 1} had no valid response content`);
+    }
+    const choices = responseBody(parsed)?.choices;
+    const finishReason = Array.isArray(choices) && isRecord(choices[0]) ? choices[0].finish_reason : undefined;
+    if (finishReason !== undefined && finishReason !== "stop") {
+      const reason = finishReason === "length" ? "length" : "invalid";
+      throw new FireworksBatchReconciliationError(`batch ${label} row ${index + 1} had incomplete response (finish_reason=${reason})`);
     }
     rows.push({ customId: parsed.custom_id, kind: "result", content, usage: resultUsage(parsed) });
   }
@@ -422,6 +429,28 @@ function remoteStatusBelongsToJob(
 }
 
 export class FireworksBatchCoordinator implements FireworksBatchQueue {
+  async canReplace(workItemId: string): Promise<boolean> {
+    const old = await this.kv.get<FireworksBatchWorkItem>(KV.fireworksBatchWorkItems, workItemId);
+    if (!old || old.id !== workItemId || !old.batchJobId || old.state !== "dead-letter") return false;
+    const job = await this.kv.get<FireworksBatchJob>(KV.fireworksBatchJobs, old.batchJobId);
+    if (!job || job.id !== old.batchJobId || job.state !== "dead-letter"
+      || (!/^batch result row [1-9][0-9]* had (?:no valid response content|incomplete response \(finish_reason=(?:length|invalid)\))$/.test(job.lastError ?? "")
+        && job.lastError !== "Batch callback attempts exhausted; reconcile partial downstream receipts before replacement work")
+      || !/^fwbjob-[a-z0-9-]+$/.test(job.id) || job.remoteJobId !== job.id
+      || (job.requestedRemoteJobId !== undefined && job.requestedRemoteJobId !== job.id)
+      || (job.remoteJobName !== undefined && job.remoteJobName !== `accounts/${this.config.accountId}/batchInferenceJobs/${job.id}`)
+      || !job.workItemIds.includes(old.id) || new Set(job.workItemIds).size !== job.workItemIds.length
+      || ![`${job.id}-output`, `accounts/${this.config.accountId}/datasets/${job.id}-output`].includes(job.outputDatasetId)) return false;
+    if (old.task !== job.task || old.model !== job.model || old.lastError !== job.lastError
+      || old.callbackProtocolVersion !== 1 || old.result !== undefined || old.completionIntent !== undefined) return false;
+    for (const destination of ["graph", "consolidation", "crystallize", "lessons", "reflect"]) {
+      const key = batchEffectKey(old.id);
+      const receipt = await this.kv.get(KV.batchCallbacks, `${destination}:${key}`);
+      const active = await this.kv.get<{ activeKey?: string }>(KV.batchCallbacks, `active:${destination}`);
+      if (receipt != null || active?.activeKey === key) return false;
+    }
+    return true;
+  }
   private processInFlight: Promise<void> | undefined;
 
   constructor(
@@ -906,15 +935,32 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
     if (!request.systemPrompt || !request.userPrompt || remotePromptChars > this.config.maxRequestChars) {
       return { queued: false, reason: "Batch request exceeded configured limits" };
     }
+    const maxTokens = request.maxTokens ?? (request.task === "graph_extraction" || request.task === "consolidation"
+      ? 8192 : taskOutputTokens(batchTaskLlmTask(request.task), 1024));
+    if (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > 16384) {
+      return { queued: false, reason: "Batch output budget must be an integer between 1 and 16384" };
+    }
     if (metadataChars > MAX_PERSISTED_METADATA_CHARS) {
       return { queued: false, reason: "Batch provenance metadata exceeded local limits" };
     }
     return withKeyedLock(ENQUEUE_LOCK, async () => {
       await this.recoverEnqueueIntentsUnsafe();
-      const fingerprint = fingerprintId("fwb", `${request.task}\0${request.systemPrompt}\0${request.userPrompt}`);
+      if (request.replacementOf && (!request.metadata?.sourceFingerprint || !await this.canReplace(request.replacementOf))) {
+        return { queued: false, reason: "Replacement source is unsafe or missing its fingerprint" };
+      }
+      const fingerprint = request.replacementOf
+        ? fingerprintId("fwbrepl", `${request.replacementOf}\0${request.metadata!.sourceFingerprint}`)
+        : fingerprintId("fwb", `${request.task}\0${request.systemPrompt}\0${request.userPrompt}`);
       const existingId = await this.kv.get<string>(KV.fireworksBatchFingerprints, fingerprint);
       if (existingId) {
         const existing = await this.kv.get<FireworksBatchWorkItem>(KV.fireworksBatchWorkItems, existingId);
+        if (existing?.state === "completed" && request.metadata?.sourceFingerprint
+          && existing.metadata?.sourceFingerprint === request.metadata.sourceFingerprint) {
+          return { queued: true, workItemId: existing.id };
+        }
+        if (request.replacementOf && existing?.replacementOf === request.replacementOf && TERMINAL_WORK_STATES.has(existing.state)) {
+          return { queued: true, workItemId: existing.id };
+        }
         if (existing && existing.callbackProtocolVersion !== 1) {
           await this.quarantineLegacyWork(existing);
           // A new ID would silently replay an effect whose legacy outcome is unknown.
@@ -936,6 +982,7 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
       }
       const now = new Date().toISOString();
       const item: FireworksBatchWorkItem = {
+        ...(request.replacementOf ? { replacementOf: request.replacementOf } : {}),
         callbackProtocolVersion: 1,
         id: generateId("fwbwork"),
         customId: request.correlationId,
@@ -944,7 +991,7 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
         model: request.model || this.config.model!,
         systemPrompt: request.systemPrompt,
         userPrompt: request.userPrompt,
-        maxTokens: request.maxTokens ?? taskOutputTokens(batchTaskLlmTask(request.task), 1024),
+        maxTokens,
         metadata: request.metadata,
         state: "queued",
         attempts: 0,

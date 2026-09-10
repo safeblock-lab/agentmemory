@@ -705,7 +705,7 @@ export function registerGraphFunction(
   localCompactor?: LocalGraphCompactor,
 ): void {
   sdk.registerFunction("mem::graph-extract", 
-    async (data: { observations: CompressedObservation[]; batchResponse?: string; deferred?: boolean; batchEffectKey?: string }) => runBatchCallback(kv, "graph", data.batchEffectKey, async (_resuming, admit) => {
+    async (data: { observations: CompressedObservation[]; batchResponse?: string; deferred?: boolean; batchEffectKey?: string; replacementOf?: string }) => runBatchCallback(kv, "graph", data.batchEffectKey, async (_resuming, admit) => {
       if (!data.observations || data.observations.length === 0) {
         return { success: false, error: "No observations provided" };
       }
@@ -731,8 +731,8 @@ export function registerGraphFunction(
         } satisfies GraphExtractionUnit]
         : await prepareGraphExtractionInputs(
           data.observations,
-          getGraphExtractionInputTargetChars(),
-          localCompactor,
+          data.deferred ? Math.min(8000, getGraphExtractionInputTargetChars()) : getGraphExtractionInputTargetChars(),
+          data.replacementOf ? undefined : localCompactor,
         );
 
       try {
@@ -740,12 +740,14 @@ export function registerGraphFunction(
           const workItemIds: string[] = [];
           for (const unit of inputUnits) {
             const prompt = buildGraphExtractionPrompt(unit.promptObservations);
+            if (prompt.length > 10000) return { success: false, error: "Graph source exceeds the bounded batch input; source retained locally" };
             const queued = await batchQueue.enqueue({
+              replacementOf: data.replacementOf,
               correlationId: generateId("fwbgraph"),
               task: "graph_extraction",
               systemPrompt: GRAPH_EXTRACTION_SYSTEM,
               userPrompt: prompt,
-              metadata: { observations: JSON.stringify(unit.sourceObservations) },
+              metadata: { observations: JSON.stringify(unit.sourceObservations), sourceFingerprint: fingerprintId("fwbgraphsrc", JSON.stringify(unit.sourceObservations)) },
             });
             if (!queued.queued || !queued.workItemId) {
               logger.warn("Graph extraction batch unit was not queued; retaining source locally", {

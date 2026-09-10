@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.47] — 2026-09-11
+
+### Fixed
+
+- Fireworks Batch rejects explicit incomplete finish reasons before usage, completion intents, receipts, or callbacks. Graph and consolidation batches use a validated 8,192-token default output budget and bounded source partitions.
+- An explicit internal replacement operation reloads current sources and journals fresh work IDs by source fingerprint. Original jobs remain unchanged; ambiguous effects and consolidation records without source IDs stay blocked.
+- Semantic partitions carry source IDs and a durable cohort; checkpoints advance only after every cohort member completes.
+
 ## [0.9.46] — 2026-09-11
 
 ### Fixed

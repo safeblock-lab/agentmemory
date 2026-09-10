@@ -12,6 +12,8 @@ vi.mock("../src/config.js", () => ({
 
 import { registerConsolidationPipelineFunction } from "../src/functions/consolidation-pipeline.js";
 import { isConsolidationEnabled } from "../src/config.js";
+import { batchEffectKey } from "../src/state/batch-effects.js";
+import { KV } from "../src/state/schema.js";
 import type { SessionSummary, Memory, SemanticMemory, ProceduralMemory } from "../src/types.js";
 
 function mockKV() {
@@ -91,6 +93,115 @@ describe("Consolidation Pipeline", () => {
   beforeEach(() => {
     sdk = mockSdk();
     kv = mockKV();
+  });
+
+  it("queues all bounded semantic partitions with current source IDs and a durable cohort", async () => {
+    const requests: import("../src/types.js").FireworksBatchRequest[] = [];
+    const enqueue = vi.fn(async (request: import("../src/types.js").FireworksBatchRequest) => {
+      requests.push(request); return { queued: true, workItemId: `fresh-${requests.length}` };
+    });
+    const provider = { summarize: vi.fn(), compress: vi.fn() };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never, undefined, undefined, { enqueue });
+    for (let i = 0; i < 5; i++) await kv.set("mem:summaries", `ses_${i}`, { ...makeSummary(i), narrative: "x".repeat(5000) });
+    const result = await sdk.trigger("mem::consolidate-pipeline", { tier: "semantic", deferred: true, replacementOf: "old" });
+    expect(result.success).toBe(true);
+    expect(requests.length).toBeGreaterThan(1);
+    expect(requests.flatMap((r) => JSON.parse(r.metadata!.sourceIds)).sort()).toEqual(["ses_0", "ses_1", "ses_2", "ses_3", "ses_4"]);
+    for (const request of requests) {
+      expect(request.userPrompt.length).toBeLessThanOrEqual(10000);
+      expect(request.metadata?.sourceFingerprint).toBeTruthy();
+      expect(request.replacementOf).toBe("old");
+    }
+    expect(await kv.get("mem:state", requests[0].metadata!.cohort)).toMatchObject({ workItemIds: requests.map((_, i) => `fresh-${i + 1}`) });
+    expect(provider.summarize).not.toHaveBeenCalled();
+    for (let i = 0; i < requests.length; i++) await kv.set(KV.fireworksBatchWorkItems, `fresh-${i + 1}`, { id: `fresh-${i + 1}`, state: "polling" });
+    for (let i = requests.length - 1; i >= 0; i--) {
+      const metadata = requests[i].metadata!;
+      await sdk.trigger("mem::consolidate-pipeline", { tier: "semantic", force: true,
+        batchResponse: '<fact confidence="0.8">Bounded fact</fact>', batchEffectKey: batchEffectKey(`fresh-${i + 1}`),
+        batchSourceFingerprint: metadata.sourceFingerprint, batchSourceIds: JSON.parse(metadata.sourceIds), batchCohort: metadata.cohort });
+      if (i > 0) expect(await kv.get(KV.state, "semantic-consolidation")).toBeNull();
+      await kv.set(KV.fireworksBatchWorkItems, `fresh-${i + 1}`, { id: `fresh-${i + 1}`, state: "completed" });
+    }
+    expect(await kv.get(KV.state, "semantic-consolidation")).toMatchObject({ processedThrough: expect.any(String) });
+  });
+
+  it.each(["dead-letter", "completed"])("preserves the original replacement cohort and checkpoint with a %s sibling", async (siblingState) => {
+    const requests: import("../src/types.js").FireworksBatchRequest[] = [];
+    const enqueue = vi.fn(async (request: import("../src/types.js").FireworksBatchRequest) => {
+      requests.push(request); return { queued: true, workItemId: "fresh-replacement" };
+    });
+    const provider = { summarize: vi.fn(), compress: vi.fn() };
+    const register = () => registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never, undefined, undefined, { enqueue });
+    register();
+    const cohort = "fwbcohort_0123456789abcdef";
+    const checkpoint = { processedThrough: "2026-09-11T00:00:00.000Z", processedSessionIdsAtThrough: ["original-last"] };
+    await kv.set(KV.state, cohort, { workItemIds: ["old", "sibling"], checkpoint });
+    await kv.set(KV.fireworksBatchWorkItems, "sibling", { id: "sibling", state: siblingState });
+    await kv.set(KV.fireworksBatchWorkItems, "fresh-replacement", { id: "fresh-replacement", state: "polling" });
+    await kv.set(KV.summaries, "ses_0", makeSummary(0));
+    const request = { tier: "semantic", deferred: true, replacementOf: "old", batchSourceIds: ["ses_0"], batchCohort: cohort };
+    await sdk.trigger("mem::consolidate-pipeline", request);
+    expect(requests[0].metadata?.cohort).toBe(cohort);
+    expect(await kv.get(KV.state, cohort)).toEqual({ workItemIds: ["fresh-replacement", "sibling"], checkpoint });
+    register();
+    await sdk.trigger("mem::consolidate-pipeline", request);
+    expect(await kv.get(KV.state, cohort)).toEqual({ workItemIds: ["fresh-replacement", "sibling"], checkpoint });
+    const metadata = requests[0].metadata!;
+    await sdk.trigger("mem::consolidate-pipeline", { tier: "semantic", force: true, batchSourceIds: ["ses_0"],
+      batchResponse: '<fact confidence="0.8">Replacement fact</fact>', batchEffectKey: batchEffectKey("fresh-replacement"),
+      batchSourceFingerprint: metadata.sourceFingerprint, batchCohort: cohort });
+    expect(await kv.get(KV.state, "semantic-consolidation")).toEqual(siblingState === "completed" ? checkpoint : null);
+  });
+
+  it("reconciles a worker completing while replacement enqueue is suspended", async () => {
+    const cohort = "fwbcohort_0123456789abcdef";
+    const checkpoint = { processedThrough: "2026-09-11T00:00:00.000Z", processedSessionIdsAtThrough: ["original-last"] };
+    await kv.set(KV.state, cohort, { workItemIds: ["old"], checkpoint });
+    await kv.set(KV.summaries, "ses_0", makeSummary(0));
+    await kv.set(KV.fireworksBatchWorkItems, "fresh", { id: "fresh", state: "polling" });
+    let releaseEnqueue!: () => void;
+    const holdEnqueue = new Promise<void>((resolve) => { releaseEnqueue = resolve; });
+    let signalEnqueue!: (request: import("../src/types.js").FireworksBatchRequest) => void;
+    const enqueued = new Promise<import("../src/types.js").FireworksBatchRequest>((resolve) => { signalEnqueue = resolve; });
+    const enqueue = vi.fn(async (request: import("../src/types.js").FireworksBatchRequest) => {
+      signalEnqueue(request); await holdEnqueue; return { queued: true, workItemId: "fresh" };
+    });
+    registerConsolidationPipelineFunction(sdk as never, kv as never, {} as never, undefined, undefined, { enqueue });
+    const replacing = sdk.trigger("mem::consolidate-pipeline", { tier: "semantic", deferred: true, replacementOf: "old", batchSourceIds: ["ses_0"], batchCohort: cohort });
+    await enqueued;
+    await kv.set(KV.fireworksBatchWorkItems, "fresh", { id: "fresh", state: "completed" });
+    expect(await kv.get(KV.state, "semantic-consolidation")).toBeNull();
+    releaseEnqueue();
+    await replacing;
+    expect(await kv.get(KV.state, cohort)).toEqual({ workItemIds: ["fresh"], checkpoint });
+    expect(await kv.get(KV.state, "semantic-consolidation")).toEqual(checkpoint);
+  });
+
+  it("reconciles a completed replacement after restart between enqueue and cohort update", async () => {
+    const cohort = "fwbcohort_0123456789abcdef";
+    const checkpoint = { processedThrough: "2026-09-11T00:00:00.000Z", processedSessionIdsAtThrough: ["original-last"] };
+    await kv.set(KV.state, cohort, { workItemIds: ["old"], checkpoint });
+    await kv.set(KV.summaries, "ses_0", makeSummary(0));
+    const enqueue = vi.fn(async () => {
+      await kv.set(KV.fireworksBatchWorkItems, "fresh", { id: "fresh", state: "completed" });
+      return { queued: true, workItemId: "fresh" };
+    });
+    const originalSet = kv.set;
+    let crash = true;
+    vi.spyOn(kv, "set").mockImplementation(async (scope, key, value) => {
+      if (scope === KV.state && key === cohort && crash) { crash = false; throw new Error("crash before cohort write"); }
+      return originalSet(scope, key, value);
+    });
+    const register = () => registerConsolidationPipelineFunction(sdk as never, kv as never, {} as never, undefined, undefined, { enqueue });
+    register();
+    const request = { tier: "semantic", deferred: true, replacementOf: "old", batchSourceIds: ["ses_0"], batchCohort: cohort };
+    await sdk.trigger("mem::consolidate-pipeline", request);
+    expect(await kv.get(KV.state, cohort)).toMatchObject({ workItemIds: ["old"] });
+    register();
+    await sdk.trigger("mem::consolidate-pipeline", request);
+    expect(await kv.get(KV.state, cohort)).toEqual({ workItemIds: ["fresh"], checkpoint });
+    expect(await kv.get(KV.state, "semantic-consolidation")).toEqual(checkpoint);
   });
 
   it("pipeline skips semantic when fewer than 5 summaries", async () => {
