@@ -19,8 +19,15 @@ const config: FireworksBatchConfig = {
 };
 
 describe("parser failure recovery", () => {
-  async function seed(count = 1) {
+  async function seed(count = 1, missingAsUndefined = false) {
     const h = effectHarness(), now = new Date().toISOString(), jobId = "fwbjob-parser";
+    if (missingAsUndefined) {
+      const trigger = h.sdk.trigger.bind(h.sdk);
+      vi.spyOn(h.sdk, "trigger").mockImplementation(async (input) => {
+        const result = await trigger(input);
+        return input.function_id === "state::get" && result === null ? undefined : result;
+      });
+    }
     const lastError = "batch result row 1 had no valid response content";
     const item: FireworksBatchWorkItem = {
       id: "work-parser", customId: "row", correlationId: "row", batchJobId: jobId,
@@ -75,7 +82,42 @@ describe("parser failure recovery", () => {
     expect(await s.h.kv.get(KV.batchCallbacks, `graph:${batchEffectKey(s.item.id)}`)).toMatchObject({ state: "completed" });
     expect(await s.h.kv.get(KV.fireworksBatchJobs, s.job.id)).toMatchObject({ state: "completed", parserRecovery: { activatedAt: expect.any(String) } });
     for (const scope of [KV.fireworksBatchActiveWork, KV.fireworksBatchActiveJobs]) expect(await s.h.kv.get(scope, "current")).toMatchObject({ ids: [] });
-    expect(await s.h.kv.get(KV.fireworksBatchActiveJobs, "remote-recovery-v1")).toMatchObject({ legacyReconciliationVersion: 2, completedAt: expect.any(String) });
+    expect(await s.h.kv.get(KV.fireworksBatchActiveJobs, "remote-recovery-v1")).toMatchObject({ legacyReconciliationVersion: 3, completedAt: expect.any(String) });
+  });
+
+  it.each([false, true])("revisits a completed version-2 checkpoint once, undefined misses=%s", async (missingAsUndefined) => {
+    const s = await seed(1, missingAsUndefined);
+    await s.h.kv.set(KV.fireworksBatchActiveJobs, "remote-recovery-v1", {
+      version: 1, pendingJobIds: [], discoveredAt: s.job.createdAt, updatedAt: s.job.createdAt,
+      completedAt: s.job.createdAt, legacyReconciliationVersion: 2,
+    });
+    await s.create().process();
+    await s.create().process();
+    expect(s.transport.listRecentJobIds).toHaveBeenCalledTimes(1);
+    expect(s.transport.downloadResults).toHaveBeenCalledTimes(1);
+    expect(s.completed).toHaveBeenCalledTimes(1);
+    expect(s.transport.submitJob).not.toHaveBeenCalled();
+    expect(s.transport.createDataset).not.toHaveBeenCalled();
+    expect(s.transport.uploadDataset).not.toHaveBeenCalled();
+    expect(await s.h.kv.get(KV.fireworksBatchActiveJobs, "remote-recovery-v1")).toMatchObject({
+      pendingJobIds: [], completedAt: expect.any(String), legacyReconciliationVersion: 3,
+    });
+    expect(await s.h.kv.get(KV.fireworksBatchJobs, s.job.id)).toMatchObject({ state: "completed" });
+    expect(await s.h.kv.get(KV.batchCallbacks, `graph:${batchEffectKey(s.item.id)}`)).toMatchObject({ state: "completed" });
+    expect(await s.h.kv.list(KV.graphNodes)).toHaveLength(2);
+    expect(await s.h.kv.list(KV.graphEdges)).toHaveLength(1);
+    expect(await s.h.kv.list(KV.audit)).toHaveLength(1);
+  });
+
+  it.each([false, 0, "", {}, { state: "started" }, { state: "completed" }])("blocks present or ambiguous receipts: %j", async (receipt) => {
+    const s = await seed(1, true);
+    await s.h.kv.set(KV.batchCallbacks, `graph:${batchEffectKey(s.item.id)}`, receipt);
+    await s.create().process();
+    expect(s.transport.downloadResults).not.toHaveBeenCalled();
+    expect(s.transport.submitJob).not.toHaveBeenCalled();
+    expect(s.completed).not.toHaveBeenCalled();
+    expect(await s.h.kv.get(KV.fireworksBatchJobs, s.job.id)).toMatchObject({ state: "dead-letter" });
+    expect((await s.h.kv.get<FireworksBatchJob>(KV.fireworksBatchJobs, s.job.id))?.parserRecovery).toBeUndefined();
   });
 
   it.each(["receipt", "active", "intent", "result", "identity", "different-error", "legacy", "already-recovered", "missing-remote", "foreign-remote", "foreign-output", "foreign-account", "foreign-name", "foreign-request"])("blocks unsafe recovery: %s", async (reason) => {
@@ -102,8 +144,8 @@ describe("parser failure recovery", () => {
     expect((await s.h.kv.get<FireworksBatchJob>(KV.fireworksBatchJobs, s.job.id))?.parserRecovery).toEqual(s.job.parserRecovery);
   });
 
-  it("recovers seven owned rows after a partial reactivation crash with exact graph effects", async () => {
-    const s = await seed(7);
+  it.each([false, true])("recovers seven owned rows after a partial reactivation crash, undefined misses=%s", async (missingAsUndefined) => {
+    const s = await seed(7, missingAsUndefined);
     s.job.outputDatasetId = `accounts/test/datasets/${s.job.id}-output`;
     s.job.remoteJobName = `accounts/test/batchInferenceJobs/${s.job.id}`;
     await s.h.kv.set(KV.fireworksBatchJobs, s.job.id, s.job);

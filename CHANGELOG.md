@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.46] — 2026-09-11
+
+### Fixed
+
+- Fireworks Batch parser-failure recovery accepts both `null` and `undefined` for missing StateKV callback receipts while continuing to block present or ambiguous receipts.
+- Reconciliation version 3 durably revisits completed recovery checkpoints once so eligible jobs skipped by v0.9.45 can resume their existing results without resubmission or manual state edits.
+
 ## [0.9.45] — 2026-09-10
 
 ### Fixed

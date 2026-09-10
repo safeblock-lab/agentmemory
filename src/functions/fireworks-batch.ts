@@ -53,7 +53,7 @@ interface FireworksBatchRemoteRecovery {
   discoveredAt: string;
   updatedAt: string;
   completedAt?: string;
-  legacyReconciliationVersion?: 1 | 2;
+  legacyReconciliationVersion?: 1 | 2 | 3;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -687,7 +687,7 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
           this.kv.get(KV.batchCallbacks, `${destination}:${key}`),
           this.kv.get<{ activeKey?: string }>(KV.batchCallbacks, `active:${destination}`),
         ]);
-        if (receipt !== null || active?.activeKey === key) return false;
+        if ((receipt !== null && receipt !== undefined) || active?.activeKey === key) return false;
       }
       owned.push(item);
     }
@@ -724,7 +724,7 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
       KV.fireworksBatchActiveJobs,
       REMOTE_RECOVERY_KEY,
     );
-    if (recovery?.completedAt && recovery.legacyReconciliationVersion === 2) return;
+    if (recovery?.completedAt && recovery.legacyReconciliationVersion === 3) return;
     if (recovery?.completedAt) {
       try {
         recovery.pendingJobIds = boundedActiveIds(await this.transport.listRecentJobIds(MAX_ACTIVE_INDEX_IDS));
@@ -788,7 +788,7 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
     recovery.updatedAt = now;
     if (remaining.length === 0) {
       recovery.completedAt = now;
-      recovery.legacyReconciliationVersion = 2;
+      recovery.legacyReconciliationVersion = 3;
     }
     await this.kv.set(KV.fireworksBatchActiveJobs, REMOTE_RECOVERY_KEY, recovery);
     if (repaired > 0) {
