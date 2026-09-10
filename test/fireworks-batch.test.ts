@@ -102,6 +102,34 @@ describe("FireworksBatchClient", () => {
 });
 
 describe("FireworksBatchCoordinator", () => {
+  it.each(["direct", "body"])("accepts %s response content and usage", async (envelope) => {
+    const kv = createKv(), completed = vi.fn(async () => {}), usage = vi.fn(async () => {});
+    const body = { choices: [{ message: { content: "valid" } }], usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 } };
+    const coordinator = new FireworksBatchCoordinator(kv, config, {
+      async createDataset() {}, async uploadDataset() {}, async submitJob() { return { remoteJobId: "remote" }; },
+      async getJobStatus() { return { state: "COMPLETED" }; },
+      async downloadResults() { return JSON.stringify({ custom_id: "row", response: envelope === "body" ? { body } : body }); },
+    }, completed, usage);
+    await coordinator.enqueue({ correlationId: "row", task: "graph_extraction", systemPrompt: "system", userPrompt: "user" });
+    await coordinator.process(); await coordinator.process();
+    expect(completed).toHaveBeenCalledTimes(1);
+    expect(completed.mock.calls[0]).toEqual([expect.any(Object), "valid"]);
+    expect(usage).toHaveBeenCalledWith(expect.any(Object), { inputTokens: 5, outputTokens: 3, totalTokens: 8, responseChars: 0 });
+  });
+
+  it.each([null, [], "invalid", {}, { choices: [] }, { choices: [{ message: { content: 3 } }] }])("rejects invalid explicit body without direct fallback: %j", async (body) => {
+    const kv = createKv(), completed = vi.fn(async () => {}), usage = vi.fn(async () => {});
+    const coordinator = new FireworksBatchCoordinator(kv, { ...config, maxAttempts: 1 }, {
+      async createDataset() {}, async uploadDataset() {}, async submitJob() { return { remoteJobId: "remote" }; },
+      async getJobStatus() { return { state: "COMPLETED" }; },
+      async downloadResults() { return JSON.stringify({ custom_id: "row", response: { body, choices: [{ message: { content: "must not fall back" } }], usage: { total_tokens: 8 } } }); },
+    }, completed, usage);
+    await coordinator.enqueue({ correlationId: "row", task: "graph_extraction", systemPrompt: "system", userPrompt: "user" });
+    await coordinator.process();
+    expect(completed).not.toHaveBeenCalled(); expect(usage).not.toHaveBeenCalled();
+    expect(await kv.list(KV.fireworksBatchJobs)).toEqual([expect.objectContaining({ state: "dead-letter", lastError: "batch result row 1 had no valid response content" })]);
+  });
+
   it("publishes work after its record and journals job IDs before their records", async () => {
     const missingRecords: string[] = [];
     const kv = createKv({

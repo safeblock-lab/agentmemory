@@ -4,6 +4,7 @@ import { FireworksBatchCoordinator } from "../src/functions/fireworks-batch.js";
 import { batchEffectKey, runBatchCallback, applyBatchEffect, withBatchMutationLocks } from "../src/state/batch-effects.js";
 import { MetricsStore } from "../src/eval/metrics-store.js";
 import { FireworksBatchClient } from "../src/providers/fireworks-batch.js";
+import { registerGraphFunction } from "../src/functions/graph.js";
 import { KV } from "../src/state/schema.js";
 import type { BatchEffectMetadata, FireworksBatchConfig, FireworksBatchJob, FireworksBatchWorkItem } from "../src/types.js";
 
@@ -16,6 +17,123 @@ const config: FireworksBatchConfig = {
   maxConcurrency: 1, maxAttempts: 2, retryBaseMs: 1, retryMaxMs: 10,
   pollIntervalMs: 0, pollMaxIntervalMs: 10, recoveryStaleMs: 1000, maxQueuedItems: 10,
 };
+
+describe("parser failure recovery", () => {
+  async function seed(count = 1) {
+    const h = effectHarness(), now = new Date().toISOString(), jobId = "fwbjob-parser";
+    const lastError = "batch result row 1 had no valid response content";
+    const item: FireworksBatchWorkItem = {
+      id: "work-parser", customId: "row", correlationId: "row", batchJobId: jobId,
+      task: "graph_extraction", model: "model", systemPrompt: "system", userPrompt: "user", maxTokens: 128,
+      callbackProtocolVersion: 1, state: "dead-letter", attempts: 3, nextAttemptAt: now,
+      createdAt: now, updatedAt: now, deadLetteredAt: now, lastError,
+    };
+    const job: FireworksBatchJob = {
+      id: jobId, remoteJobId: jobId, inputDatasetId: `${jobId}-input`, outputDatasetId: `${jobId}-output`,
+      model: "model", task: "graph_extraction", workItemIds: [item.id], state: "dead-letter",
+      attempts: 3, callbackAttempts: 2, reconciling: true, nextAttemptAt: now, createdAt: now, updatedAt: now, lastError,
+    };
+    const items = Array.from({ length: count }, (_, index) => index === 0 ? item : {
+      ...item, id: `${item.id}-${index}`, customId: `row-${index}`, correlationId: `row-${index}`,
+    });
+    job.workItemIds = items.map((work) => work.id);
+    for (const work of items) await h.kv.set(KV.fireworksBatchWorkItems, work.id, work);
+    await h.kv.set(KV.fireworksBatchJobs, jobId, job);
+    for (const scope of [KV.fireworksBatchActiveWork, KV.fireworksBatchActiveJobs]) await h.kv.set(scope, "current", { version: 1, ids: [], updatedAt: now });
+    await h.kv.set(KV.fireworksBatchActiveJobs, "remote-recovery-v1", { version: 1, pendingJobIds: [], discoveredAt: now, updatedAt: now, completedAt: now, legacyReconciliationVersion: 1 });
+    const transport = {
+      createDataset: vi.fn(async () => {}), uploadDataset: vi.fn(async () => {}), submitJob: vi.fn(async () => ({ remoteJobId: "forbidden" })),
+      listRecentJobIds: vi.fn(async () => [jobId]), getJobStatus: vi.fn(async () => ({ state: "COMPLETED" })),
+      downloadResults: vi.fn(async () => items.map((work, index) => JSON.stringify({ custom_id: work.customId, response: { choices: [{ message: { content: `<entity type="concept" name="A${index}"/><entity type="concept" name="B${index}"/><relationship type="related_to" source="A${index}" target="B${index}" weight="1"/>` } }] } })).join("\n")),
+    };
+    registerGraphFunction(h.sdk as never, h.kv, {} as never);
+    const completed = vi.fn(async (work: FireworksBatchWorkItem, content: string) => {
+      const result = await h.call("mem::graph-extract", {
+        observations: [{ id: "obs", title: "title", narrative: "body", facts: [], concepts: [], files: [], type: "discovery" }],
+        batchResponse: content, batchEffectKey: batchEffectKey(work.id),
+      });
+      if (result.success !== true) throw new Error("Graph callback failed");
+    });
+    return { h, item, items, job, transport, completed, create: () => new FireworksBatchCoordinator(h.kv, config, transport, completed) };
+  }
+
+  it.each([undefined, KV.fireworksBatchWorkItems, KV.fireworksBatchJobs, KV.fireworksBatchActiveWork])("recovers once after restart at %s", async (scope) => {
+    const s = await seed();
+    if (scope) {
+      s.h.crash(scope, true);
+      await expect(s.create().process()).rejects.toThrow();
+    }
+    await s.create().process(); await s.create().process();
+    expect(s.transport.submitJob).not.toHaveBeenCalled();
+    expect(s.transport.createDataset).not.toHaveBeenCalled();
+    expect(s.transport.downloadResults).toHaveBeenCalledTimes(1);
+    expect(s.completed).toHaveBeenCalledTimes(1);
+    expect(await s.h.kv.list(KV.graphNodes)).toHaveLength(2);
+    expect(await s.h.kv.list(KV.graphEdges)).toHaveLength(1);
+    expect(await s.h.kv.get(KV.graphSnapshot, "current")).toMatchObject({ stats: { totalNodes: 2, totalEdges: 1 } });
+    expect(await s.h.kv.list(KV.audit)).toHaveLength(1);
+    expect(await s.h.kv.get(KV.batchCallbacks, `graph:${batchEffectKey(s.item.id)}`)).toMatchObject({ state: "completed" });
+    expect(await s.h.kv.get(KV.fireworksBatchJobs, s.job.id)).toMatchObject({ state: "completed", parserRecovery: { activatedAt: expect.any(String) } });
+    for (const scope of [KV.fireworksBatchActiveWork, KV.fireworksBatchActiveJobs]) expect(await s.h.kv.get(scope, "current")).toMatchObject({ ids: [] });
+    expect(await s.h.kv.get(KV.fireworksBatchActiveJobs, "remote-recovery-v1")).toMatchObject({ legacyReconciliationVersion: 2, completedAt: expect.any(String) });
+  });
+
+  it.each(["receipt", "active", "intent", "result", "identity", "different-error", "legacy", "already-recovered", "missing-remote", "foreign-remote", "foreign-output", "foreign-account", "foreign-name", "foreign-request"])("blocks unsafe recovery: %s", async (reason) => {
+    const s = await seed();
+    if (reason === "receipt") await s.h.kv.set(KV.batchCallbacks, `graph:${batchEffectKey(s.item.id)}`, { state: "started" });
+    if (reason === "active") await s.h.kv.set(KV.batchCallbacks, "active:graph", { activeKey: batchEffectKey(s.item.id) });
+    if (reason === "intent") s.item.completionIntent = { key: batchEffectKey(s.item.id), resultHash: "hash" };
+    if (reason === "result") s.item.result = { customId: "row", content: "prior", receivedAt: s.item.createdAt };
+    if (reason === "identity") s.item.batchJobId = "another-job";
+    if (reason === "different-error") s.item.lastError = "remote failed";
+    if (reason === "legacy") delete s.item.callbackProtocolVersion;
+    if (reason === "already-recovered") s.job.parserRecovery = { startedAt: s.job.createdAt, activatedAt: s.job.createdAt };
+    if (reason === "missing-remote") delete s.job.remoteJobId;
+    if (reason === "foreign-remote") s.job.remoteJobId = "fwbjob-foreign";
+    if (reason === "foreign-output") s.job.outputDatasetId = "fwbjob-foreign-output";
+    if (reason === "foreign-account") s.job.outputDatasetId = `accounts/foreign/datasets/${s.job.id}-output`;
+    if (reason === "foreign-name") s.job.remoteJobName = "accounts/test/batchInferenceJobs/fwbjob-foreign";
+    if (reason === "foreign-request") s.job.requestedRemoteJobId = "fwbjob-foreign";
+    await s.h.kv.set(KV.fireworksBatchWorkItems, s.item.id, s.item);
+    await s.h.kv.set(KV.fireworksBatchJobs, s.job.id, s.job);
+    await s.create().process(); await s.create().process();
+    expect(s.transport.downloadResults).not.toHaveBeenCalled(); expect(s.transport.submitJob).not.toHaveBeenCalled(); expect(s.completed).not.toHaveBeenCalled();
+    expect(await s.h.kv.get(KV.fireworksBatchJobs, s.job.id)).toMatchObject({ state: "dead-letter" });
+    expect((await s.h.kv.get<FireworksBatchJob>(KV.fireworksBatchJobs, s.job.id))?.parserRecovery).toEqual(s.job.parserRecovery);
+  });
+
+  it("recovers seven owned rows after a partial reactivation crash with exact graph effects", async () => {
+    const s = await seed(7);
+    s.job.outputDatasetId = `accounts/test/datasets/${s.job.id}-output`;
+    s.job.remoteJobName = `accounts/test/batchInferenceJobs/${s.job.id}`;
+    await s.h.kv.set(KV.fireworksBatchJobs, s.job.id, s.job);
+    s.h.crash(KV.fireworksBatchWorkItems, true, 4);
+    await expect(s.create().process()).rejects.toThrow();
+    expect(s.completed).not.toHaveBeenCalled();
+    const interrupted = await s.h.kv.list<FireworksBatchWorkItem>(KV.fireworksBatchWorkItems);
+    expect(interrupted.filter((work) => work.state === "polling")).toHaveLength(4);
+    expect(interrupted.filter((work) => work.state === "dead-letter")).toHaveLength(3);
+    await s.create().process();
+    const firstSnapshot = await s.h.kv.get(KV.graphSnapshot, "current");
+    expect(firstSnapshot).toMatchObject({ stats: { totalNodes: 14, totalEdges: 7 } });
+    await s.create().process();
+    expect(await s.h.kv.get(KV.graphSnapshot, "current")).toEqual(firstSnapshot);
+    expect(s.completed).toHaveBeenCalledTimes(7);
+    expect(s.transport.downloadResults).toHaveBeenCalledExactlyOnceWith(s.job.outputDatasetId);
+    expect(s.transport.submitJob).not.toHaveBeenCalled();
+    expect(s.transport.createDataset).not.toHaveBeenCalled();
+    expect(s.transport.uploadDataset).not.toHaveBeenCalled();
+    expect(await s.h.kv.list(KV.graphNodes)).toHaveLength(14);
+    expect(await s.h.kv.list(KV.graphEdges)).toHaveLength(7);
+    expect(await s.h.kv.list(KV.audit)).toHaveLength(7);
+    for (const work of s.items) {
+      expect(await s.h.kv.get(KV.batchCallbacks, `graph:${batchEffectKey(work.id)}`)).toMatchObject({ state: "completed" });
+      expect(await s.h.kv.get(KV.fireworksBatchWorkItems, work.id)).toMatchObject({ state: "completed" });
+    }
+    expect(await s.h.kv.get(KV.fireworksBatchJobs, s.job.id)).toMatchObject({ state: "completed" });
+    for (const scope of [KV.fireworksBatchActiveWork, KV.fireworksBatchActiveJobs]) expect(await s.h.kv.get(scope, "current")).toMatchObject({ ids: [] });
+  });
+});
 
 describe("coordinator durable completion intent", () => {
   it.each(["before-effect", "after-effect", "before-terminal"])("recovers %s without duplicated effects or usage", async (point) => {

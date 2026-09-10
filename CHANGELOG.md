@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.45] — 2026-09-10
+
+### Fixed
+
+- Fireworks Batch accepts both direct `response.choices`/`usage` and legacy `response.body.choices`/`usage`; an invalid explicit body is rejected without falling back to direct fields.
+- A bounded, durable recovery pass reactivates only matching response-parser dead letters with proven remote identity and no completion intent, result, or callback receipt. Existing datasets are reconciled through the normal idempotent callbacks without resubmission.
+
 ## [0.9.44] — 2026-09-10
 
 ### Fixed

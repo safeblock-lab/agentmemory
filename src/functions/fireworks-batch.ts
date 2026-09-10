@@ -53,7 +53,7 @@ interface FireworksBatchRemoteRecovery {
   discoveredAt: string;
   updatedAt: string;
   completedAt?: string;
-  legacyReconciliationVersion?: 1;
+  legacyReconciliationVersion?: 1 | 2;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -157,32 +157,23 @@ function incrementAttempts(attempts: number | undefined, maxAttempts: number): {
   return { attempts: next, exhausted: next >= limit };
 }
 
+function responseBody(value: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(value) || !isRecord(value.response)) return undefined;
+  const response = value.response;
+  const body = Object.hasOwn(response, "body") ? response.body : response;
+  return isRecord(body) ? body : undefined;
+}
+
 function resultContent(value: unknown): string | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const row = value as Record<string, unknown>;
-  const response = row.response;
-  if (!response || typeof response !== "object") return undefined;
-  const body = (response as Record<string, unknown>).body;
-  if (!body || typeof body !== "object") return undefined;
-  const choices = (body as Record<string, unknown>).choices;
-  if (!Array.isArray(choices) || choices.length === 0) return undefined;
-  const message = choices[0] && typeof choices[0] === "object"
-    ? (choices[0] as Record<string, unknown>).message
-    : undefined;
-  if (!message || typeof message !== "object") return undefined;
-  const content = (message as Record<string, unknown>).content;
+  const choices = responseBody(value)?.choices;
+  if (!Array.isArray(choices) || !isRecord(choices[0]) || !isRecord(choices[0].message)) return undefined;
+  const content = choices[0].message.content;
   return typeof content === "string" ? content : undefined;
 }
 
 function resultUsage(value: unknown): LlmUsage | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const response = (value as Record<string, unknown>).response;
-  if (!response || typeof response !== "object") return undefined;
-  const body = (response as Record<string, unknown>).body;
-  if (!body || typeof body !== "object") return undefined;
-  const usage = (body as Record<string, unknown>).usage;
-  if (!usage || typeof usage !== "object") return undefined;
-  const raw = usage as Record<string, unknown>;
+  const raw = responseBody(value)?.usage;
+  if (!isRecord(raw)) return undefined;
   const count = (value: unknown): number | undefined =>
     typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
   const inputTokens = count(raw.prompt_tokens ?? raw.input_tokens);
@@ -666,13 +657,74 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
     return true;
   }
 
+  private async reindexParserFailureJob(job: FireworksBatchJob): Promise<boolean> {
+    if (job.state !== "dead-letter" || job.parserRecovery?.activatedAt
+      || !/^batch result row [1-9][0-9]* had no valid response content$/.test(job.lastError ?? "")
+      || !job.reconciling || !isSafeRemoteJobId(job.remoteJobId)
+      || !isSafeRemoteResource(job.outputDatasetId) || job.workItemIds.length === 0
+      || new Set(job.workItemIds).size !== job.workItemIds.length) return false;
+    const expectedOutput = `${job.id}-output`;
+    const account = `accounts/${this.config.accountId}`;
+    if (!/^fwbjob-[a-z0-9-]+$/.test(job.id) || job.remoteJobId !== job.id
+      || (job.requestedRemoteJobId !== undefined && job.requestedRemoteJobId !== job.id)
+      || (job.remoteJobName !== undefined && job.remoteJobName !== `${account}/batchInferenceJobs/${job.id}`)
+      || (job.outputDatasetId !== expectedOutput && job.outputDatasetId !== `${account}/datasets/${expectedOutput}`)) return false;
+
+    const items = await Promise.all(job.workItemIds.map((id) => this.kv.get<FireworksBatchWorkItem>(KV.fireworksBatchWorkItems, id)));
+    const owned: FireworksBatchWorkItem[] = [];
+    const customIds = new Set<string>();
+    for (const [index, item] of items.entries()) {
+      if (!item || item.id !== job.workItemIds[index] || item.batchJobId !== job.id
+        || item.task !== job.task || item.model !== job.model || item.callbackProtocolVersion !== 1
+        || item.completionIntent !== undefined || item.result !== undefined
+        || typeof item.customId !== "string" || !item.customId || customIds.has(item.customId)
+        || !((item.state === "dead-letter" && item.lastError === job.lastError)
+          || (job.parserRecovery && item.state === "polling" && item.lastError === undefined))) return false;
+      customIds.add(item.customId);
+      const key = batchEffectKey(item.id);
+      for (const destination of ["consolidation", "crystallize", "graph", "lessons", "reflect"]) {
+        const [receipt, active] = await Promise.all([
+          this.kv.get(KV.batchCallbacks, `${destination}:${key}`),
+          this.kv.get<{ activeKey?: string }>(KV.batchCallbacks, `active:${destination}`),
+        ]);
+        if (receipt !== null || active?.activeKey === key) return false;
+      }
+      owned.push(item);
+    }
+
+    const now = new Date().toISOString();
+    if (!job.parserRecovery) {
+      job.parserRecovery = { startedAt: now };
+      job.updatedAt = now;
+      await this.kv.set(KV.fireworksBatchJobs, job.id, job);
+    }
+    for (const item of owned) {
+      item.state = "polling";
+      item.nextAttemptAt = now;
+      item.updatedAt = now;
+      delete item.lastError;
+      delete item.deadLetteredAt;
+      await this.kv.set(KV.fireworksBatchWorkItems, item.id, item);
+      await this.addActiveId(KV.fireworksBatchActiveWork, item.id);
+    }
+    job.state = "polling";
+    job.attempts = 0;
+    job.callbackAttempts = 0;
+    job.nextAttemptAt = now;
+    job.updatedAt = now;
+    job.parserRecovery.activatedAt = now;
+    delete job.lastError;
+    await this.kv.set(KV.fireworksBatchJobs, job.id, job);
+    return true;
+  }
+
   private async repairRecentRemoteJobs(): Promise<void> {
     if (!this.transport?.listRecentJobIds) return;
     let recovery = await this.kv.get<FireworksBatchRemoteRecovery>(
       KV.fireworksBatchActiveJobs,
       REMOTE_RECOVERY_KEY,
     );
-    if (recovery?.completedAt && recovery.legacyReconciliationVersion === 1) return;
+    if (recovery?.completedAt && recovery.legacyReconciliationVersion === 2) return;
     if (recovery?.completedAt) {
       try {
         recovery.pendingJobIds = boundedActiveIds(await this.transport.listRecentJobIds(MAX_ACTIVE_INDEX_IDS));
@@ -715,7 +767,10 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
         await this.quarantineCompletedLegacyJob(job);
         continue;
       }
-      if (job.state === "dead-letter") await this.reindexPollingExhaustedJob(job);
+      if (job.state === "dead-letter") {
+        await this.reindexParserFailureJob(job);
+        await this.reindexPollingExhaustedJob(job);
+      }
       if (!ACTIVE_JOB_STATES.has(job.state)) continue;
       if (available === 0) {
         remaining.push(jobId);
@@ -733,7 +788,7 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
     recovery.updatedAt = now;
     if (remaining.length === 0) {
       recovery.completedAt = now;
-      recovery.legacyReconciliationVersion = 1;
+      recovery.legacyReconciliationVersion = 2;
     }
     await this.kv.set(KV.fireworksBatchActiveJobs, REMOTE_RECOVERY_KEY, recovery);
     if (repaired > 0) {
