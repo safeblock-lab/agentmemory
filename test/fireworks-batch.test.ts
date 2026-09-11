@@ -52,8 +52,8 @@ const config: FireworksBatchConfig = {
   maxBatchItems: 10,
   maxRequestChars: 10_000,
   maxRequestBytes: 10_000,
-  maxResponseBytes: 10_000,
-  maxResultChars: 10_000,
+  maxResponseBytes: 16 * 1024 * 1024,
+  maxResultChars: 120_000,
   maxConcurrency: 1,
   maxAttempts: 3,
   retryBaseMs: 1,
@@ -665,6 +665,80 @@ describe("FireworksBatchCoordinator", () => {
     expect(uploads[0]).toContain('"custom_id":"replacement-one"');
     expect(uploads[0]).toContain('"custom_id":"replacement-two"');
     expect(uploads[0]).not.toContain('"custom_id":"normal"');
+  });
+
+  it("partitions compatible work before the aggregate result budget is exceeded", async () => {
+    const kv = createKv();
+    const uploads: string[] = [];
+    const transport: FireworksBatchTransport = {
+      async createDataset() {},
+      async uploadDataset(_id, jsonl) { uploads.push(jsonl); },
+      async submitJob() { return { remoteJobId: "result-budget" }; },
+      async getJobStatus() { return { state: "PENDING" }; },
+      async downloadResults() { return ""; },
+    };
+    const coordinator = new FireworksBatchCoordinator(
+      kv,
+      {
+        ...config,
+        minBatchItems: 2,
+        maxWaitMs: 0,
+        maxConcurrency: 2,
+        maxResultChars: 30_000,
+        maxResponseBytes: 100_000,
+      },
+      transport,
+      async () => {},
+    );
+
+    await coordinator.enqueue({ correlationId: "budget-one", task: "graph_extraction", systemPrompt: "system", userPrompt: "one", maxTokens: 4_096 });
+    await coordinator.enqueue({ correlationId: "budget-two", task: "graph_extraction", systemPrompt: "system", userPrompt: "two", maxTokens: 4_096 });
+    await coordinator.process();
+    await coordinator.process();
+
+    expect(uploads).toHaveLength(2);
+    expect(uploads.every((jsonl) => jsonl.split("\n").length === 1)).toBe(true);
+    expect(uploads.map((jsonl) => (JSON.parse(jsonl) as { custom_id: string }).custom_id).sort())
+      .toEqual(["budget-one", "budget-two"]);
+  });
+
+  it("dead-letters an individual row that cannot fit the result budget", async () => {
+    const kv = createKv();
+    const submitted = vi.fn(async () => ({ remoteJobId: "must-not-submit" }));
+    const coordinator = new FireworksBatchCoordinator(
+      kv,
+      {
+        ...config,
+        maxResultChars: 16_000,
+        maxResponseBytes: 64_000,
+      },
+      {
+        async createDataset() {},
+        async uploadDataset() {},
+        submitJob: submitted,
+        async getJobStatus() { return { state: "PENDING" }; },
+        async downloadResults() { return ""; },
+      },
+      async () => {},
+    );
+
+    await coordinator.enqueue({
+      correlationId: "oversized-result",
+      task: "graph_extraction",
+      systemPrompt: "system",
+      userPrompt: "one",
+      maxTokens: 4_096,
+    });
+    await coordinator.process();
+
+    expect(submitted).not.toHaveBeenCalled();
+    const items = await kv.list<FireworksBatchWorkItem>(KV.fireworksBatchWorkItems);
+    expect(items).toEqual([expect.objectContaining({
+      customId: "oversized-result",
+      state: "dead-letter",
+      lastError: expect.stringContaining("result row exceeded configured result character budget and result byte budget"),
+    })]);
+    await expect(kv.get(KV.fireworksBatchActiveWork, "current")).resolves.toMatchObject({ ids: [] });
   });
 
   it("flushes one compatible item once it reaches its maximum wait", async () => {

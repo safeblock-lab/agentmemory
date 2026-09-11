@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.49] — 2026-09-11
+
+### Fixed
+
+- Fireworks Batch now partitions compatible rows by the estimated aggregate result budget and dead-letters an individually oversized row before submission, allowing later graph work to continue.
+
 ## [0.9.48] — 2026-09-11
 
 ### Fixed

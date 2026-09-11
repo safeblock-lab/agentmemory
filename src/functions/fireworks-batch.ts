@@ -39,6 +39,10 @@ const ACTIVE_WORK_STATES = new Set(["queued", "submitted", "polling"]);
 const ACTIVE_JOB_STATES = new Set(["queued", "submitted", "polling"]);
 const TERMINAL_WORK_STATES = new Set(["completed", "stale", "failed", "dead-letter"]);
 const ENQUEUE_LOCK = "fireworks-batch:enqueue";
+const ESTIMATED_RESULT_CHARS_PER_TOKEN = 4;
+const ESTIMATED_RESULT_ROW_OVERHEAD_CHARS = 768;
+const MAX_RESULT_UTF8_BYTES_PER_CHAR = 4;
+const MAX_RESULT_AGGREGATE_BYTES = 64 * 1024 * 1024;
 
 class FireworksBatchReconciliationError extends Error {}
 class FireworksBatchCallbackError extends Error {}
@@ -378,24 +382,75 @@ function batchJsonlLine(item: FireworksBatchWorkItem): string {
   });
 }
 
+interface EstimatedResultSize {
+  chars: number;
+  bytes: number;
+}
+
+interface ResultBudget {
+  chars: number;
+  bytes: number;
+}
+
+function estimatedResultSize(item: FireworksBatchWorkItem): EstimatedResultSize {
+  const chars = item.maxTokens * ESTIMATED_RESULT_CHARS_PER_TOKEN
+    + ESTIMATED_RESULT_ROW_OVERHEAD_CHARS
+    + item.customId.length;
+  return { chars, bytes: chars * MAX_RESULT_UTF8_BYTES_PER_CHAR };
+}
+
+function resultBudget(config: FireworksBatchConfig): ResultBudget {
+  const chars = Number.isFinite(config.maxResultChars) && config.maxResultChars >= 0
+    ? Math.floor(config.maxResultChars)
+    : 0;
+  const responseBytes = Number.isFinite(config.maxResponseBytes) && config.maxResponseBytes >= 0
+    ? Math.floor(config.maxResponseBytes)
+    : 0;
+  return {
+    chars,
+    bytes: Math.min(
+      MAX_RESULT_AGGREGATE_BYTES,
+      responseBytes * 32,
+      chars * MAX_RESULT_UTF8_BYTES_PER_CHAR,
+    ),
+  };
+}
+
+function resultLimitNames(size: EstimatedResultSize, budget: ResultBudget): string[] {
+  return [
+    size.chars > budget.chars ? "result character budget" : undefined,
+    size.bytes > budget.bytes ? "result byte budget" : undefined,
+  ].filter((limit): limit is string => Boolean(limit));
+}
+
 function fittingBatchPrefix(
   items: FireworksBatchWorkItem[],
   maxBytes: number,
   maxChars: number,
+  maxResultChars: number,
+  maxResultBytes: number,
 ): FireworksBatchWorkItem[] {
   const prefix: FireworksBatchWorkItem[] = [];
   let bytes = 0;
   let chars = 0;
+  let resultChars = 0;
+  let resultBytes = 0;
   for (const item of items) {
     const line = batchJsonlLine(item);
     const separator = prefix.length === 0 ? 0 : 1;
     const lineBytes = Buffer.byteLength(line, "utf8");
     const nextBytes = bytes + separator + lineBytes;
     const nextChars = chars + separator + line.length;
-    if (nextBytes > maxBytes || nextChars > maxChars) break;
+    const estimated = estimatedResultSize(item);
+    const nextResultChars = resultChars + separator + estimated.chars;
+    const nextResultBytes = resultBytes + separator + estimated.bytes;
+    if (nextBytes > maxBytes || nextChars > maxChars
+      || nextResultChars > maxResultChars || nextResultBytes > maxResultBytes) break;
     prefix.push(item);
     bytes = nextBytes;
     chars = nextChars;
+    resultChars = nextResultChars;
+    resultBytes = nextResultBytes;
   }
   return prefix;
 }
@@ -1072,24 +1127,40 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
       .map((group) => group.sort((left, right) => left.createdAt.localeCompare(right.createdAt)).slice(0, this.config.maxBatchItems))
       .filter((group) => group.length >= this.config.minBatchItems || Date.now() - oldestCreatedAt(group) >= this.config.maxWaitMs)
       .sort((left, right) => oldestCreatedAt(left) - oldestCreatedAt(right));
+    const budget = resultBudget(this.config);
     for (const group of eligible) {
       let remaining = group;
       while (remaining.length > 0) {
-        const compatible = fittingBatchPrefix(remaining, this.config.maxRequestBytes, this.config.maxRequestChars);
+        const compatible = fittingBatchPrefix(
+          remaining,
+          this.config.maxRequestBytes,
+          this.config.maxRequestChars,
+          budget.chars,
+          budget.bytes,
+        );
         if (compatible.length === 0) {
           const oversized = remaining[0];
           const row = batchJsonlLine(oversized);
           const rowBytes = Buffer.byteLength(row, "utf8");
+          const estimated = estimatedResultSize(oversized);
           const limits = [
             rowBytes > this.config.maxRequestBytes ? "byte limit" : undefined,
             row.length > this.config.maxRequestChars ? "character limit" : undefined,
+            ...resultLimitNames(estimated, budget),
           ].filter((limit): limit is string => Boolean(limit));
-          const error = `batch request row exceeded configured ${limits.join(" and ") || "request limits"} (${row.length} chars, ${rowBytes} bytes)`;
+          const requestLimits = limits.filter((limit) => limit === "byte limit" || limit === "character limit");
+          const resultLimits = limits.filter((limit) => limit !== "byte limit" && limit !== "character limit");
+          const category = resultLimits.length > 0 && requestLimits.length === 0
+            ? "result row"
+            : "request row";
+          const error = `${category} exceeded configured ${limits.join(" and ") || "request limits"} (${row.length} chars, ${rowBytes} bytes; estimated result ${estimated.chars} chars, ${estimated.bytes} bytes)`;
           await this.markDeadLetter([oversized.id], error);
-          logger.warn("Fireworks Batch work item exceeded request limits", {
+          logger.warn("Fireworks Batch work item exceeded request or result limits", {
             task: oversized.task,
             workItemId: oversized.id,
             rowBytes,
+            estimatedResultChars: estimated.chars,
+            estimatedResultBytes: estimated.bytes,
           });
           remaining = remaining.slice(1);
           continue;
