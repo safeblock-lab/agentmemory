@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { FireworksBatchCoordinator } from "../src/functions/fireworks-batch.js";
 import { StateKV } from "../src/state/kv.js";
 import { KV } from "../src/state/schema.js";
-import type { FireworksBatchConfig } from "../src/types.js";
+import type { FireworksBatchConfig, FireworksBatchWorkItem } from "../src/types.js";
 import { FireworksBatchClient, FireworksBatchError, type FireworksBatchTransport } from "../src/providers/fireworks-batch.js";
 
 function createKv(options: {
@@ -602,6 +602,69 @@ describe("FireworksBatchCoordinator", () => {
     await coordinator.enqueue({ correlationId: "graph-2", task: "graph_extraction", systemPrompt: "system", userPrompt: "two" });
     await coordinator.process();
     expect(calls).toContain("submit");
+  });
+
+  it("keeps replacement work out of the normal compatible lane", async () => {
+    const kv = createKv();
+    const uploads: string[] = [];
+    const transport: FireworksBatchTransport = {
+      async createDataset() {},
+      async uploadDataset(_id, jsonl) { uploads.push(jsonl); },
+      async submitJob() { return { remoteJobId: "replacement-lane" }; },
+      async getJobStatus() { return { state: "PENDING" }; },
+      async downloadResults() { return ""; },
+    };
+    const now = new Date().toISOString();
+    const item = (id: string, replacementOf?: string): FireworksBatchWorkItem => ({
+      ...(replacementOf ? { replacementOf } : {}),
+      callbackProtocolVersion: 1,
+      id,
+      customId: id,
+      correlationId: id,
+      task: "graph_extraction",
+      model: config.model!,
+      systemPrompt: "same-system",
+      userPrompt: `prompt-${id}`,
+      maxTokens: 8192,
+      state: "queued",
+      attempts: 0,
+      nextAttemptAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const normal = item("normal");
+    const replacementOne = item("replacement-one", "old-one");
+    for (const work of [normal, replacementOne]) {
+      await kv.set(KV.fireworksBatchWorkItems, work.id, work);
+    }
+    await kv.set(KV.fireworksBatchActiveWork, "current", {
+      version: 1,
+      ids: [normal.id, replacementOne.id],
+      updatedAt: now,
+    });
+
+    const coordinator = new FireworksBatchCoordinator(
+      kv,
+      { ...config, minBatchItems: 2, maxWaitMs: 60_000 },
+      transport,
+      async () => {},
+    );
+    await coordinator.process();
+    expect(uploads).toEqual([]);
+
+    const replacementTwo = item("replacement-two", "old-two");
+    await kv.set(KV.fireworksBatchWorkItems, replacementTwo.id, replacementTwo);
+    await kv.set(KV.fireworksBatchActiveWork, "current", {
+      version: 1,
+      ids: [normal.id, replacementOne.id, replacementTwo.id],
+      updatedAt: now,
+    });
+    await coordinator.process();
+
+    expect(uploads).toHaveLength(1);
+    expect(uploads[0]).toContain('"custom_id":"replacement-one"');
+    expect(uploads[0]).toContain('"custom_id":"replacement-two"');
+    expect(uploads[0]).not.toContain('"custom_id":"normal"');
   });
 
   it("flushes one compatible item once it reaches its maximum wait", async () => {

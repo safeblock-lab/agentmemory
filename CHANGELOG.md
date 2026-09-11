@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.48] — 2026-09-11
+
+### Fixed
+
+- Replacement work now uses a separate scheduler lane from normal compatible work, preventing recovery batches from absorbing unrelated queued items with the same model and prompt configuration.
+
 ## [0.9.47] — 2026-09-11
 
 ### Fixed

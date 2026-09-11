@@ -272,7 +272,8 @@ function completionFailure(value: unknown): string | undefined {
 }
 
 function compatibilityKey(item: FireworksBatchWorkItem): string {
-  return `${item.task}\0${item.model}\0${item.maxTokens}\0${item.systemPrompt}`;
+  const lane = item.replacementOf ? "replacement" : "normal";
+  return `${lane}\0${item.task}\0${item.model}\0${item.maxTokens}\0${item.systemPrompt}`;
 }
 
 function oldestCreatedAt(items: FireworksBatchWorkItem[]): number {
