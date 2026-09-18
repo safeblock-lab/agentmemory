@@ -4,7 +4,8 @@ vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-vi.mock("../src/config.js", () => ({
+vi.mock("../src/config.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/config.js")>()),
   getConsolidationDecayDays: () => 30,
   getConsolidationMinNewSummaries: () => 5,
   isConsolidationEnabled: vi.fn(() => true),

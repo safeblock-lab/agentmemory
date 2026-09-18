@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.51] — 2026-09-18
+
+### Fixed
+
+- Config mocks now preserve newly added TypeSafe threshold exports, allowing the full release test suite to load graph and consolidation modules correctly.
+
 ## [0.9.50] — 2026-09-18
 
 ### Added

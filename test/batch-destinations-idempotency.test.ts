@@ -10,7 +10,13 @@ import { registerLessonsFunctions } from "../src/functions/lessons.js";
 import type { GraphSnapshot, Lesson, Insight, ProceduralMemory, FireworksBatchRequest } from "../src/types.js";
 
 vi.mock("../src/logger.js", () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
-vi.mock("../src/config.js", () => ({ getGraphExtractionInputTargetChars: () => 10000, isConsolidationEnabled: () => true, getConsolidationDecayDays: () => 30, getConsolidationMinNewSummaries: () => 1 }));
+vi.mock("../src/config.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/config.js")>()),
+  getGraphExtractionInputTargetChars: () => 10000,
+  isConsolidationEnabled: () => true,
+  getConsolidationDecayDays: () => 30,
+  getConsolidationMinNewSummaries: () => 1,
+}));
 
 const graphXml = '<entity type="concept" name="A"/><entity type="concept" name="B"/><relationship type="related_to" source="A" target="B" weight="1"/>';
 const observation = { id: "obs", title: "title", narrative: "body", facts: [], concepts: [], files: [], type: "discovery" };
