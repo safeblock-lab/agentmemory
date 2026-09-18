@@ -145,6 +145,7 @@ describe("End-to-End Multimodal Flow", () => {
       observationId: raw.id,
       sessionId: raw.sessionId,
       raw,
+      importanceOverride: 9,
     });
 
     expect(result.success).toBe(true);
@@ -156,6 +157,7 @@ describe("End-to-End Multimodal Flow", () => {
     expect(compressed.modality).toBe("mixed");
     expect(compressed.title).toBe("Screenshot of Red Dot");
     expect(compressed.narrative).toContain("red dot");
+    expect(compressed.importance).toBe(9);
 
     const stored = await kv.get("mem:obs:test-session", raw.id!) as CompressedObservation | null;
     expect(stored).not.toBeNull();

@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.52] — 2026-09-18
+
+### Fixed
+
+- TypeSafe admission and scoring now recognize qualified Codex and MCP read-tool names, so normal captured observations reach the configured decision provider.
+- TypeSafe preflight now runs before automatic LLM compression; confident rejection avoids the LLM call and an accepted importance score is preserved by `mem::compress`.
+
+### Added
+
+- Metadata-only TypeSafe runtime telemetry reports the feature, outcome, question count, and latency without logging decision state, answers, or credentials.
+
 ## [0.9.51] — 2026-09-18
 
 ### Fixed

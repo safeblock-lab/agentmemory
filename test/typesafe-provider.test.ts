@@ -14,7 +14,6 @@ const config: TypeSafeConfig = {
   features: {
     compaction: true,
     admission: true,
-    deduplication: true,
     pipelineGates: true,
     scoring: true,
   },
@@ -42,7 +41,8 @@ function makeFetch(body: unknown, status = 200): typeof fetch {
 describe("TypeSafeDecisionProvider", () => {
   it("sends a bounded typed Noul request to the fixed API endpoint", async () => {
     const fetcher = makeFetch(apiResponse({ result: { type: "noul", noul: 0.91 } }));
-    const provider = new TypeSafeDecisionProvider({ config, fetcher });
+    const onEvent = vi.fn();
+    const provider = new TypeSafeDecisionProvider({ config, fetcher, onEvent });
 
     await expect(provider.evaluateNoul("admission", { text: "keep this" }, "Should this observation be retained?")).resolves.toBe(0.91);
 
@@ -58,6 +58,11 @@ describe("TypeSafeDecisionProvider", () => {
         result: { type: "noul", instructions: "Should this observation be retained?" },
       },
     });
+    expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({
+      feature: "admission",
+      outcome: "success",
+      questionCount: 1,
+    }));
   });
 
   it("validates Choice and Score answers against their requested criteria", async () => {
@@ -185,12 +190,19 @@ describe("TypeSafeDecisionProvider", () => {
     const fetcher: typeof fetch = (_input, init) => new Promise((_resolve, reject) => {
       init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
     });
+    const onEvent = vi.fn();
     const provider = new TypeSafeDecisionProvider({
       config: { ...config, timeoutMs: 5 },
       fetcher,
+      onEvent,
     });
 
     await expect(provider.evaluateNoul("admission", "state", "Should it be kept?")).resolves.toBeUndefined();
+    expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({
+      feature: "admission",
+      outcome: "timeout",
+      questionCount: 1,
+    }));
   });
 
   it("truncates oversized state before sending it", async () => {

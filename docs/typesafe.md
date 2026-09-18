@@ -10,10 +10,10 @@ TypeSafe.ai supplies typed decisions, including choices, scores, and Noul decisi
 |---|---:|---|
 | `TYPESAFE_API_KEY` | unset | Enables authenticated TypeSafe.ai requests. |
 | `AGENTMEMORY_TYPESAFE_ENABLED` | `true` | Master switch for every TypeSafe feature. |
-| `AGENTMEMORY_TYPESAFE_COMPACTION_ENABLED` | `true` | Selects eligible, non-protected observations before graph extraction. |
-| `AGENTMEMORY_TYPESAFE_ADMISSION_ENABLED` | `true` | Controls admission decisions for eligible read-only tool observations. |
+| `AGENTMEMORY_TYPESAFE_COMPACTION_ENABLED` | `true` | Selects eligible, non-protected inputs before graph extraction and consolidation. |
+| `AGENTMEMORY_TYPESAFE_ADMISSION_ENABLED` | `true` | Controls automatic rejection for eligible non-mutating tool observations. |
 | `AGENTMEMORY_TYPESAFE_PIPELINE_GATES_ENABLED` | `true` | Gates eligible automatic graph, consolidation, reflection, and skill analysis. |
-| `AGENTMEMORY_TYPESAFE_SCORING_ENABLED` | `true` | Scores eligible read-only tool observations when automatic LLM compression is off. |
+| `AGENTMEMORY_TYPESAFE_SCORING_ENABLED` | `true` | Scores eligible non-mutating observations before synthetic or LLM compression. |
 | `AGENTMEMORY_TYPESAFE_TIMEOUT_MS` | `5000` | Request timeout, bounded to 30 seconds. |
 | `AGENTMEMORY_TYPESAFE_MAX_STATE_CHARS` | `16000` | Maximum decision-state size, bounded to 64,000 characters. |
 
@@ -21,9 +21,9 @@ The feature switches default to enabled. Actual requests require `TYPESAFE_API_K
 
 ## Current integrations
 
-Compaction runs before graph extraction. Decisions, errors, writes, recent observations, high-importance items, and image or mixed-modality observations are pinned deterministically. Only eligible ambiguous items go to TypeSafe in one bounded batch; state is privacy-filtered and reduced to a short preview. A deterministic empty-notification rule can drop obvious noise locally. TypeSafe drops an ambiguous item only at confidence `0.85` or higher; a keep answer, lower-confidence drop, missing answer, or error preserves the item.
+Compaction runs before graph extraction and consolidation. Decisions, errors, writes, recent observations, high-importance items, and image or mixed-modality observations are pinned deterministically. Only eligible ambiguous items go to TypeSafe in one bounded batch; state is privacy-filtered and reduced to a short preview. A deterministic empty-notification rule can drop obvious noise locally. TypeSafe drops an ambiguous item only at confidence `0.85` or higher; a keep answer, lower-confidence drop, missing answer, or error preserves the item.
 
-Admission and importance scoring share one request for eligible read-only tool observations. Protected signals bypass TypeSafe. Admission discards only on a `discard` answer with confidence at least `0.75`. Scoring updates importance only when confidence is at least `0.55`; it is disabled when `AGENTMEMORY_AUTO_COMPRESS=true` to avoid adding a second scoring route to the legacy compression path.
+Admission and importance scoring share one request for eligible non-mutating tool observations, including qualified Codex and MCP names such as `read_mcp_resource` and `mcp__...__search_graph`. Protected signals bypass TypeSafe. Admission discards only on a `discard` answer with confidence at least `0.75`. Scoring updates importance only when confidence is at least `0.55`. With `AGENTMEMORY_AUTO_COMPRESS=true`, this decision happens before the LLM call: a confident discard avoids compression spend, while an accepted score is forwarded into `mem::compress` as the authoritative importance.
 
 Pipeline gates run only on eligible automatic/deferred work: semantic and procedural consolidation, graph extraction, reflection clusters, and completed-session skill extraction. Explicit/manual or forced requests and batch replays bypass these gates. Calibrated skip thresholds are `0.60` for graph extraction, `0.60` for semantic consolidation, `0.65` for procedural consolidation, `0.80` for reflection, and `0.75` for low-signal skill extraction. Otherwise the existing pipeline runs.
 
@@ -40,15 +40,17 @@ Keep the API key in the local `.env` file or deployment secret store; do not com
 
 ## Graph input compaction
 
-Compaction makes keep/drop decisions about graph-extraction observations; it does not generate replacement summaries and it does not currently compact consolidation prompts. AgentMemory pins decisions, errors, writes, recent observations, high-importance entries, and image or mixed-modality observations locally. Empty, low-importance notifications can be dropped locally. Only the remaining ambiguous items are sent in one batch with a privacy-filtered preview, capped at 16 candidates and 16,000 serialized state characters by default.
+Compaction makes keep/drop decisions about graph-extraction observations and consolidation inputs; it does not generate replacement summaries. AgentMemory pins decisions, errors, writes, recent observations, high-importance entries, and image or mixed-modality observations locally. Empty, low-importance notifications can be dropped locally. Only the remaining ambiguous items are sent in one batch with a privacy-filtered preview, capped at 16 candidates and 16,000 serialized state characters by default.
 
 TypeSafe drops an ambiguous item only when it selects `drop` with confidence at least `0.85`. A keep answer, lower-confidence drop, missing answer, size-limit overflow, timeout, or provider error preserves the observation. The feature never asks TypeSafe to invent a summary.
 
 ## Observation admission and scoring
 
-Admission and importance scoring share one request for eligible read-only tool observations. Protected signals bypass TypeSafe. The decision state contains compact input/output previews rather than the full tool result. Admission discards only on a `discard` answer with confidence at least `0.75`. Scoring updates importance only when confidence is at least `0.55`; the score is bounded to the observation's supported importance range.
+Admission and importance scoring share one request for eligible non-mutating tool observations. Protected signals bypass TypeSafe. The decision state contains compact input/output previews rather than the full tool result. Admission discards only on a `discard` answer with confidence at least `0.75`. Scoring updates importance only when confidence is at least `0.55`; the score is bounded to the observation's supported importance range.
 
-Scoring is skipped when `AGENTMEMORY_AUTO_COMPRESS=true` so the legacy automatic compression route does not receive a second importance-scoring path. If admission or scoring is disabled, the existing deterministic observation path remains in effect.
+When `AGENTMEMORY_AUTO_COMPRESS=true`, the shared TypeSafe request runs before `mem::compress`. A confident rejection prevents the LLM call; otherwise the bounded TypeSafe importance is passed into the compressed observation. `mem::compress` does not make a duplicate TypeSafe request. If admission or scoring is disabled, the existing observation path remains in effect. `AGENTMEMORY_AUTO_REJECT` is not a configuration key; automatic rejection is controlled by `AGENTMEMORY_TYPESAFE_ADMISSION_ENABLED`.
+
+Successful, unavailable, timed-out, and rejected TypeSafe requests emit metadata-only runtime logs containing the feature, outcome, question count, and latency. State, answers, and credentials are never logged.
 
 ## Automatic pipeline gates
 

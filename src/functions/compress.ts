@@ -77,6 +77,7 @@ export function registerCompressFunction(
       observationId: string;
       sessionId: string;
       raw: RawObservation;
+      importanceOverride?: number;
     }) => {
       const startMs = Date.now();
 
@@ -166,12 +167,22 @@ export function registerCompressFunction(
         }
 
         const qualityScore = scoreCompression(parsed);
+        const importanceOverride =
+          typeof data.importanceOverride === "number" &&
+          Number.isFinite(data.importanceOverride) &&
+          data.importanceOverride >= 1 &&
+          data.importanceOverride <= 10
+            ? Math.round(data.importanceOverride)
+            : undefined;
 
         const compressed: CompressedObservation = {
           id: data.observationId,
           sessionId: data.sessionId,
           timestamp: data.raw.timestamp,
           ...parsed,
+          ...(importanceOverride !== undefined
+            ? { importance: importanceOverride }
+            : {}),
           confidence: qualityScore / 100,
           ...(hasImage ? { modality: data.raw.modality } : {}),
           ...(imageDescription ? { imageDescription } : {}),

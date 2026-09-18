@@ -18,7 +18,46 @@ import { logger } from "../logger.js";
 import { saveImageToDisk } from "../utils/image-store.js";
 import type { TypeSafeDecisionProvider, TypeSafeQuestion } from "../providers/typesafe.js";
 
-const READ_ONLY_TOOL = /^(?:read|grep|glob|ls|find|search)(?:[_:.-].*)?$/i;
+const READ_ONLY_TOOL_TOKENS = new Set([
+  "read",
+  "grep",
+  "glob",
+  "ls",
+  "find",
+  "search",
+  "query",
+  "get",
+  "list",
+  "view",
+  "open",
+  "inspect",
+  "fetch",
+]);
+const MUTATING_TOOL_TOKENS = new Set([
+  "write",
+  "edit",
+  "patch",
+  "delete",
+  "remove",
+  "move",
+  "rename",
+  "create",
+  "update",
+  "set",
+  "append",
+  "replace",
+  "install",
+  "deploy",
+  "commit",
+  "push",
+  "reset",
+  "exec",
+  "execute",
+  "command",
+  "shell",
+  "bash",
+  "powershell",
+]);
 const PROTECTED_OBSERVATION_SIGNAL = /\b(?:error|failed|failure|warning|decision|instruction|prompt|security|secret|token|password|credential|api[-_ ]?key|auth|permission|mutat(?:e|ion)|write|edit|patch|delete|remove|move|rename|deploy|install|commit|push|reset|sudo|shell|terminal|bash|powershell|environment|env|(?:AGENTS|CLAUDE|GEMINI|COPILOT)\.md)\b/i;
 const IMPORTANCE_LEVELS = [
   "Routine, reproducible detail with little future value",
@@ -49,11 +88,21 @@ function compactObservationText(value: unknown, limit: number): string {
   return text.replace(/\s+/g, " ").trim().slice(0, limit);
 }
 
+export function isTypeSafeObservationTool(toolName: string | undefined): boolean {
+  if (!toolName) return false;
+  const normalized = toolName
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase();
+  const tokens = normalized.split(/[^a-z0-9]+/).filter(Boolean);
+  if (tokens.some((token) => MUTATING_TOOL_TOKENS.has(token))) return false;
+  return tokens.some((token) => READ_ONLY_TOOL_TOKENS.has(token));
+}
+
 function shouldProtectObservation(raw: RawObservation, imageData?: string): boolean {
   if (raw.hookType !== "post_tool_use" || imageData || raw.modality === "image" || raw.modality === "mixed") {
     return true;
   }
-  if (!raw.toolName || !READ_ONLY_TOOL.test(raw.toolName)) return true;
+  if (!isTypeSafeObservationTool(raw.toolName)) return true;
   const preview = `${compactObservationText(raw.toolInput, 256)} ${compactObservationText(raw.toolOutput, 256)}`;
   return PROTECTED_OBSERVATION_SIGNAL.test(preview) || stripPrivateData(preview) !== preview;
 }
@@ -184,7 +233,7 @@ export function registerObserveFunction(
         }
 
         const admissionEnabled = isTypeSafeFeatureEnabled("admission");
-        const scoringEnabled = !isAutoCompressEnabled() && isTypeSafeFeatureEnabled("scoring");
+        const scoringEnabled = isTypeSafeFeatureEnabled("scoring");
         if (
           typeSafe &&
           !shouldProtectObservation(raw, pendingImageData) &&
@@ -200,7 +249,7 @@ export function registerObserveFunction(
           if (admissionEnabled) {
             questions.admission = {
               type: "choice",
-              instructions: "Should this read-only tool observation be retained for future agent work?",
+              instructions: "Should this non-mutating tool observation be retained for future agent work?",
               criteria: {
                 keep: "Retain this observation because it contains useful, durable project context.",
                 discard: "Discard only if this is clearly routine, reproducible, low-value output.",
@@ -210,7 +259,7 @@ export function registerObserveFunction(
           if (scoringEnabled) {
             questions.importance = {
               type: "score",
-              instructions: "Score this read-only observation's durable importance to future work.",
+              instructions: "Score this non-mutating observation's durable importance to future work.",
               criteria: IMPORTANCE_LEVELS,
             };
           }
@@ -407,6 +456,9 @@ export function registerObserveFunction(
               observationId: obsId,
               sessionId: payload.sessionId,
               raw,
+              ...(typeSafeImportance !== undefined
+                ? { importanceOverride: typeSafeImportance }
+                : {}),
             },
             action: TriggerAction.Void(),
           });

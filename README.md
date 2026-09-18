@@ -1219,7 +1219,7 @@ agentmemory auto-detects generation providers from your environment. By default,
 
 ### TypeSafe.ai decisions
 
-Set `TYPESAFE_API_KEY` to enable the TypeSafe.ai decision features. The master and per-feature switches default to `true`; set the master switch to `false` to disable all TypeSafe decisions, or disable one feature independently. A missing key, disabled feature, or TypeSafe request failure leaves that operation on its existing behavior. See [TypeSafe.ai decisions](docs/typesafe.md) for exact scope and the host-transcript limitation.
+Set `TYPESAFE_API_KEY` to enable the TypeSafe.ai decision features. The master and per-feature switches default to `true`; set the master switch to `false` to disable all TypeSafe decisions, or disable one feature independently. Eligible qualified read tools are evaluated before synthetic or LLM compression, and metadata-only runtime logs report each request outcome. A missing key, disabled feature, or TypeSafe request failure leaves that operation on its existing behavior. See [TypeSafe.ai decisions](docs/typesafe.md) for exact scope and the host-transcript limitation.
 
 ### Dual LLM routing
 

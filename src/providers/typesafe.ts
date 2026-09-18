@@ -54,9 +54,24 @@ export type TypeSafeAnswer =
   | TypeSafeChoiceAnswer
   | TypeSafeScoreAnswer;
 
+export type TypeSafeDecisionOutcome =
+  | "success"
+  | "timeout"
+  | "unavailable"
+  | "invalid-request"
+  | "error";
+
+export interface TypeSafeDecisionEvent {
+  feature: TypeSafeFeature;
+  outcome: TypeSafeDecisionOutcome;
+  questionCount: number;
+  latencyMs: number;
+}
+
 export interface TypeSafeDecisionProviderOptions {
   config?: TypeSafeConfig;
   fetcher?: typeof fetch;
+  onEvent?: (event: TypeSafeDecisionEvent) => void;
 }
 
 const MAX_QUESTIONS = 16;
@@ -262,10 +277,12 @@ function validateResponse(
 export class TypeSafeDecisionProvider {
   private readonly config: TypeSafeConfig;
   private readonly fetcher: typeof fetch | undefined;
+  private readonly onEvent: ((event: TypeSafeDecisionEvent) => void) | undefined;
 
   constructor(options: TypeSafeDecisionProviderOptions = {}) {
     this.config = options.config ?? getTypeSafeConfig();
     this.fetcher = options.fetcher ?? globalThis.fetch?.bind(globalThis);
+    this.onEvent = options.onEvent;
   }
 
   async evaluate(
@@ -273,25 +290,38 @@ export class TypeSafeDecisionProvider {
     state: unknown,
     questions: Readonly<Record<string, TypeSafeQuestion>>,
   ): Promise<Record<string, TypeSafeAnswer> | undefined> {
+    const startedAt = Date.now();
+    const ids = Object.keys(questions);
     try {
       if (!this.config.enabled || !this.config.features[feature] || !this.config.apiKey || !this.fetcher) {
         return undefined;
       }
-      const ids = Object.keys(questions);
       if (
         ids.length === 0 ||
         ids.length > MAX_QUESTIONS ||
         !ids.every((id) => /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(id)) ||
         !ids.every((id) => validateQuestion(questions[id]!))
-      ) return undefined;
+      ) {
+        this.emit({ feature, outcome: "invalid-request", questionCount: ids.length, latencyMs: Date.now() - startedAt });
+        return undefined;
+      }
 
-      if (JSON.stringify(questions).length > MAX_QUESTION_CHARS) return undefined;
+      if (JSON.stringify(questions).length > MAX_QUESTION_CHARS) {
+        this.emit({ feature, outcome: "invalid-request", questionCount: ids.length, latencyMs: Date.now() - startedAt });
+        return undefined;
+      }
       const stateLimit = Math.max(256, Math.min(64_000, this.config.maxStateChars));
       const boundedState = compactState(state, stateLimit);
-      if (boundedState === undefined) return undefined;
+      if (boundedState === undefined) {
+        this.emit({ feature, outcome: "invalid-request", questionCount: ids.length, latencyMs: Date.now() - startedAt });
+        return undefined;
+      }
 
       const body = JSON.stringify({ state: boundedState, model: "jev-latest", questions });
-      if (new TextEncoder().encode(body).byteLength > MAX_REQUEST_BYTES) return undefined;
+      if (new TextEncoder().encode(body).byteLength > MAX_REQUEST_BYTES) {
+        this.emit({ feature, outcome: "invalid-request", questionCount: ids.length, latencyMs: Date.now() - startedAt });
+        return undefined;
+      }
 
       const controller = new AbortController();
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -303,12 +333,28 @@ export class TypeSafeDecisionProvider {
       });
       const request = this.fetchAndValidate(body, questions, controller.signal);
       try {
-        return await Promise.race([request, timeout]);
+        const result = await Promise.race([request, timeout]);
+        this.emit({
+          feature,
+          outcome: result ? "success" : controller.signal.aborted ? "timeout" : "unavailable",
+          questionCount: ids.length,
+          latencyMs: Date.now() - startedAt,
+        });
+        return result;
       } finally {
         if (timer !== undefined) clearTimeout(timer);
       }
     } catch {
+      this.emit({ feature, outcome: "error", questionCount: ids.length, latencyMs: Date.now() - startedAt });
       return undefined;
+    }
+  }
+
+  private emit(event: TypeSafeDecisionEvent): void {
+    try {
+      this.onEvent?.(event);
+    } catch {
+      // Decision behavior must not depend on diagnostics consumers.
     }
   }
 

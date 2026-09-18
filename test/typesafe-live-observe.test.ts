@@ -46,6 +46,11 @@ async function runObservation(data: Record<string, unknown>) {
   const sdk = createSdk();
   const kv = mockKV();
   const { provider, answersByCall } = createRealProviderWithCapturedAnswers();
+  const compressionPayloads: unknown[] = [];
+  sdk.registerFunction("mem::compress", async (payload) => {
+    compressionPayloads.push(payload);
+    return { success: true };
+  });
   const sessionId = `typesafe-live-${randomUUID()}`;
   registerObserveFunction(sdk as never, kv as never, undefined, undefined, provider);
 
@@ -57,7 +62,7 @@ async function runObservation(data: Record<string, unknown>) {
   }) as { success?: boolean; skipped?: boolean; reason?: string; observationId?: string };
   const stored = await kv.list<CompressedObservation>(KV.observations(sessionId));
 
-  return { result, stored, answersByCall };
+  return { result, stored, answersByCall, compressionPayloads };
 }
 
 const runLiveTests = process.env["RUN_TYPESAFE_LIVE_TESTS"] === "true";
@@ -136,6 +141,31 @@ describe.skipIf(!runLiveTests)("TypeSafe live observation integration", () => {
     expect(Number.isInteger(importance)).toBe(true);
     if (score.confidence >= TYPESAFE_SCORING_CONFIDENCE_THRESHOLD) {
       expect(importance).toBe(Math.max(1, Math.min(10, Math.round(score.score) + 1)));
+    }
+  }, 30_000);
+
+  it("preflights a qualified Codex/MCP read before automatic LLM compression", async () => {
+    vi.stubEnv("AGENTMEMORY_AUTO_COMPRESS", "true");
+    const { result, answersByCall, compressionPayloads } = await runObservation({
+      tool_name: "mcp__codebase_memory_mcp__search_graph",
+      tool_input: { query: "registered compression pipeline" },
+      tool_output: [
+        "The observation pipeline registers a durable compression function.",
+        "Its output is stored with the source session identifier for later recall.",
+      ].join(" "),
+    });
+
+    expect(result.observationId).toBeTruthy();
+    expect(answersByCall).toHaveLength(1);
+    expect(compressionPayloads).toHaveLength(1);
+    const score = answersByCall[0]?.importance;
+    expect(score?.type).toBe("score");
+    if (score?.type !== "score") throw new Error("TypeSafe returned no valid importance score.");
+    const compressionPayload = compressionPayloads[0] as { importanceOverride?: number };
+    if (score.confidence >= TYPESAFE_SCORING_CONFIDENCE_THRESHOLD) {
+      expect(compressionPayload.importanceOverride).toBe(
+        Math.max(1, Math.min(10, Math.round(score.score) + 1)),
+      );
     }
   }, 30_000);
 });

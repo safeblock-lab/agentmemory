@@ -394,7 +394,15 @@ async function main() {
   const config = loadConfig();
   const typeSafeConfig = getTypeSafeConfig();
   const typeSafeDecisionProvider = typeSafeConfig.enabled && typeSafeConfig.apiKey
-    ? new TypeSafeDecisionProvider({ config: typeSafeConfig })
+    ? new TypeSafeDecisionProvider({
+        config: typeSafeConfig,
+        onEvent: (event) => {
+          bootLog(
+            `TypeSafe feature=${event.feature} outcome=${event.outcome} ` +
+            `questions=${event.questionCount} latency=${event.latencyMs}ms`,
+          );
+        },
+      })
     : undefined;
   const embeddingConfig = loadEmbeddingConfig();
   const fallbackConfig = loadFallbackConfig();
@@ -455,6 +463,15 @@ async function main() {
     `REST API: http://localhost:${config.restPort}/agentmemory/*`,
   );
   bootLog(`Streams: ws://localhost:${config.streamsPort}`);
+  const typeSafeFeatures = Object.entries(typeSafeConfig.features)
+    .filter(([, enabled]) => enabled)
+    .map(([feature]) => feature)
+    .join(",");
+  bootLog(
+    typeSafeDecisionProvider
+      ? `TypeSafe: enabled (${typeSafeFeatures || "no features"})`
+      : `TypeSafe: disabled (${typeSafeConfig.apiKey ? "master switch off" : "missing TYPESAFE_API_KEY"})`,
+  );
 
   const sdk = registerWorker(config.engineUrl, {
     workerName: "agentmemory",
