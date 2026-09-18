@@ -54,6 +54,35 @@ const FIREWORKS_BATCH_DEFAULT_RECOVERY_STALE_MS = 15 * 60_000;
 const FIREWORKS_BATCH_DEFAULT_MAX_QUEUED_ITEMS = 1_000;
 const GRAPH_EXTRACTION_DEFAULT_INPUT_TARGET_CHARS = 32_000;
 const CONSOLIDATION_DEFAULT_MIN_NEW_SUMMARIES = 5;
+const TYPESAFE_DEFAULT_TIMEOUT_MS = 5_000;
+const TYPESAFE_MAX_TIMEOUT_MS = 30_000;
+const TYPESAFE_DEFAULT_MAX_STATE_CHARS = 16_000;
+const TYPESAFE_MAX_STATE_CHARS = 64_000;
+export const TYPESAFE_ADMISSION_CONFIDENCE_THRESHOLD = 0.75;
+export const TYPESAFE_COMPACTION_CONFIDENCE_THRESHOLD = 0.85;
+export const TYPESAFE_GRAPH_GATE_CONFIDENCE_THRESHOLD = 0.60;
+export const TYPESAFE_SEMANTIC_GATE_CONFIDENCE_THRESHOLD = 0.60;
+export const TYPESAFE_PROCEDURAL_GATE_CONFIDENCE_THRESHOLD = 0.65;
+export const TYPESAFE_REFLECTION_GATE_CONFIDENCE_THRESHOLD = 0.80;
+export const TYPESAFE_SKILL_GATE_CONFIDENCE_THRESHOLD = 0.75;
+export const TYPESAFE_SCORING_CONFIDENCE_THRESHOLD = 0.55;
+
+const TYPESAFE_FEATURE_ENV = {
+  compaction: "AGENTMEMORY_TYPESAFE_COMPACTION_ENABLED",
+  admission: "AGENTMEMORY_TYPESAFE_ADMISSION_ENABLED",
+  pipelineGates: "AGENTMEMORY_TYPESAFE_PIPELINE_GATES_ENABLED",
+  scoring: "AGENTMEMORY_TYPESAFE_SCORING_ENABLED",
+} as const;
+
+export type TypeSafeFeature = keyof typeof TYPESAFE_FEATURE_ENV;
+
+export interface TypeSafeConfig {
+  enabled: boolean;
+  apiKey: string;
+  timeoutMs: number;
+  maxStateChars: number;
+  features: Record<TypeSafeFeature, boolean>;
+}
 
 const LLM_ROUTE_ENV = {
   graph_extraction: "AGENTMEMORY_GRAPH_LLM",
@@ -704,6 +733,56 @@ function getMergedEnv(
 
 export function getEnvVar(key: string): string | undefined {
   return getMergedEnv()[key];
+}
+
+function parseBooleanSetting(
+  env: EnvSource,
+  key: string,
+  fallback: boolean,
+): boolean {
+  const normalized = env[key]?.trim().toLowerCase();
+  if (normalized === "true" || normalized === "1") return true;
+  if (normalized === "false" || normalized === "0") return false;
+  return fallback;
+}
+
+export function getTypeSafeConfig(): TypeSafeConfig {
+  const env = getMergedEnv();
+  const configuredMaxStateChars = parseBoundedAuxInt(
+    env,
+    "AGENTMEMORY_TYPESAFE_MAX_STATE_CHARS",
+    TYPESAFE_DEFAULT_MAX_STATE_CHARS,
+    TYPESAFE_MAX_STATE_CHARS,
+    [],
+  );
+  const features: Record<TypeSafeFeature, boolean> = {
+    compaction: parseBooleanSetting(env, TYPESAFE_FEATURE_ENV.compaction, true),
+    admission: parseBooleanSetting(env, TYPESAFE_FEATURE_ENV.admission, true),
+    pipelineGates: parseBooleanSetting(env, TYPESAFE_FEATURE_ENV.pipelineGates, true),
+    scoring: parseBooleanSetting(env, TYPESAFE_FEATURE_ENV.scoring, true),
+  };
+  const apiKey = env["TYPESAFE_API_KEY"]?.trim() ?? "";
+
+  return {
+    enabled: parseBooleanSetting(env, "AGENTMEMORY_TYPESAFE_ENABLED", true),
+    apiKey: apiKey.length <= 4_096 ? apiKey : "",
+    timeoutMs: parseBoundedAuxInt(
+      env,
+      "AGENTMEMORY_TYPESAFE_TIMEOUT_MS",
+      TYPESAFE_DEFAULT_TIMEOUT_MS,
+      TYPESAFE_MAX_TIMEOUT_MS,
+      [],
+    ),
+    maxStateChars: configuredMaxStateChars >= 256
+      ? configuredMaxStateChars
+      : TYPESAFE_DEFAULT_MAX_STATE_CHARS,
+    features,
+  };
+}
+
+export function isTypeSafeFeatureEnabled(feature: TypeSafeFeature): boolean {
+  const config = getTypeSafeConfig();
+  return config.enabled && config.features[feature];
 }
 
 // DeepSeek thinking is intentionally controlled only by AgentMemory's env

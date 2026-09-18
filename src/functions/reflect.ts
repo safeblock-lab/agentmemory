@@ -11,11 +11,21 @@ import type {
   MemoryProvider,
 } from "../types.js";
 import { recordAudit } from "./audit.js";
+import { logger } from "../logger.js";
 import { applyBatchEffect, runBatchCallback } from "../state/batch-effects.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { REFLECT_SYSTEM, buildReflectPrompt } from "../prompts/reflect.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
+import type { TypeSafeDecisionProvider } from "../providers/typesafe.js";
 import type { FireworksBatchQueue } from "./fireworks-batch.js";
+import { stripPrivateData } from "./privacy.js";
+import { TYPESAFE_REFLECTION_GATE_CONFIDENCE_THRESHOLD } from "../config.js";
+
+const PROTECTED_REFLECT_SIGNAL = /\b(?:error|failed|failure|decision|instruction|prompt|security|secret|token|password|credential|api[-_ ]?key|auth|permission|mutation|write|edit|patch|delete|move|rename|commit|push|reset|deploy|install|shell|terminal|bash|powershell|environment|env|(?:AGENTS|CLAUDE|GEMINI|COPILOT)\.md)\b/i;
+
+function hasProtectedReflectSignal(text: string): boolean {
+  return PROTECTED_REFLECT_SIGNAL.test(text) || stripPrivateData(text) !== text;
+}
 
 interface ConceptCluster {
   concepts: string[];
@@ -274,6 +284,7 @@ export function registerReflectFunctions(
   provider: MemoryProvider,
   llmRouter?: LlmTaskRouter,
   batchQueue?: FireworksBatchQueue,
+  typeSafe?: TypeSafeDecisionProvider,
 ): void {
   sdk.registerFunction("mem::reflect", 
     async (data: {
@@ -284,6 +295,7 @@ export function registerReflectFunctions(
       batchCluster?: string;
       batchSourceFingerprint?: string;
       batchEffectKey?: string;
+      force?: boolean;
     }) => runBatchCallback(kv, "reflect", data?.batchEffectKey, async (resuming, admit) => {
       const maxClusters = Math.min(data?.maxClusters ?? 10, 20);
       const maxInsightsPerCluster = 5;
@@ -398,6 +410,74 @@ export function registerReflectFunctions(
           lessonIds: clusterLessons.map((l) => l.id),
           crystalIds: clusterCrystals.map((c) => c.id),
         };
+
+        const isRecent = (timestamp: string): boolean => {
+          const parsed = Date.parse(timestamp);
+          return !Number.isFinite(parsed) || Date.now() - parsed <= 7 * 24 * 60 * 60 * 1000;
+        };
+        const protectedCluster =
+          hasProtectedReflectSignal(cluster.concepts.join(" ")) ||
+          clusterFacts.some((fact) =>
+            fact.confidence >= 0.85 ||
+            isRecent(fact.updatedAt) ||
+            hasProtectedReflectSignal(fact.fact),
+          ) ||
+          clusterLessons.some((lesson) =>
+            lesson.confidence >= 0.85 ||
+            isRecent(lesson.updatedAt) ||
+            hasProtectedReflectSignal(lesson.content),
+          ) ||
+          clusterCrystals.some((crystal) =>
+            isRecent(crystal.createdAt) ||
+            crystal.filesAffected.length > 0 ||
+            hasProtectedReflectSignal([
+              crystal.narrative,
+              ...crystal.keyOutcomes,
+              ...crystal.filesAffected,
+              ...crystal.lessons,
+            ].join(" ")),
+          );
+        if (
+          typeSafe &&
+          data?.deferred &&
+          !data.force &&
+          !data.batchResponse &&
+          !data.batchEffectKey &&
+          !data.batchCluster &&
+          !data.batchSourceFingerprint &&
+          !protectedCluster
+        ) {
+          try {
+            const decision = await typeSafe.evaluateChoice(
+              "pipelineGates",
+              stripPrivateData(JSON.stringify({
+                workflow: "reflection",
+                concepts: cluster.concepts.slice(0, 5).map((concept) => concept.slice(0, 24)),
+                factCount: cluster.facts.length,
+                lessonCount: cluster.lessons.length,
+                crystalCount: cluster.crystalNarratives.length,
+                samples: [
+                  ...cluster.facts.slice(0, 2).map((fact) => fact.fact.slice(0, 48)),
+                  ...cluster.lessons.slice(0, 2).map((lesson) => lesson.content.slice(0, 48)),
+                  ...cluster.crystalNarratives.slice(0, 1).map((narrative) => narrative.slice(0, 48)),
+                ],
+              })).slice(0, 512),
+              "Should this scheduled reflection cluster be processed?",
+              {
+                run: "Run if combining these persisted facts and lessons may produce a new useful insight.",
+                skip: "Skip only when the cluster is clearly redundant or too weak to support a durable insight.",
+              },
+            );
+            if (decision?.choice === "skip" && decision.confidence >= TYPESAFE_REFLECTION_GATE_CONFIDENCE_THRESHOLD) {
+              clustersSkipped++;
+              continue;
+            }
+          } catch (error) {
+            logger.warn("TypeSafe reflection gate failed open", {
+              errorType: error instanceof Error ? error.name : "unknown",
+            });
+          }
+        }
 
         try {
           const prompt = buildReflectPrompt(cluster);

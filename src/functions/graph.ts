@@ -18,7 +18,16 @@ import {
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
+import type { TypeSafeDecisionProvider, TypeSafeQuestion } from "../providers/typesafe.js";
+import {
+  getGraphExtractionInputTargetChars,
+  getTypeSafeConfig,
+  isTypeSafeFeatureEnabled,
+  TYPESAFE_GRAPH_GATE_CONFIDENCE_THRESHOLD,
+} from "../config.js";
+import { stripPrivateData } from "./privacy.js";
 import type { FireworksBatchQueue } from "./fireworks-batch.js";
+import { selectCompactionCandidates } from "./typesafe-compaction.js";
 import {
   estimateGraphObservationChars,
   isProtectedGraphObservation,
@@ -26,8 +35,105 @@ import {
   toGraphPromptObservation,
   type GraphExtractionUnit,
 } from "./graph-input.js";
-import { getGraphExtractionInputTargetChars } from "../config.js";
 
+const PROTECTED_GRAPH_SIGNAL = /\b(?:error|failed|failure|decision|instruction|prompt|security|secret|token|password|credential|api[-_ ]?key|auth|permission|mutation|write|edit|patch|delete|move|rename|commit|push|reset|deploy|install|shell|terminal|bash|powershell|environment|env|(?:AGENTS|CLAUDE|GEMINI|COPILOT)\.md)\b/i;
+
+function hasProtectedGraphSignal(text: string): boolean {
+  return PROTECTED_GRAPH_SIGNAL.test(text) || stripPrivateData(text) !== text;
+}
+
+async function compactGraphObservations(
+  observations: CompressedObservation[],
+  typeSafe?: TypeSafeDecisionProvider,
+): Promise<CompressedObservation[]> {
+  if (!typeSafe || !isTypeSafeFeatureEnabled("compaction")) return observations;
+  const observationsByRecency = [...observations].sort((left, right) => {
+    const leftTimestamp = Date.parse(left.timestamp);
+    const rightTimestamp = Date.parse(right.timestamp);
+    if (!Number.isFinite(leftTimestamp)) return Number.isFinite(rightTimestamp) ? -1 : 0;
+    if (!Number.isFinite(rightTimestamp)) return 1;
+    return rightTimestamp - leftTimestamp;
+  });
+  const recentIds = new Set(observationsByRecency.slice(0, 6).map((observation) => observation.id));
+  const candidates = observations.map((observation) => {
+    const text = `${observation.title} ${observation.narrative} ${observation.facts.join(" ")} ${observation.concepts.join(" ")}`;
+    const protectedItem =
+      isProtectedGraphObservation(observation) ||
+      observation.type === "command_run" ||
+      recentIds.has(observation.id) ||
+      observation.importance >= 8 ||
+      observation.modality === "image" ||
+      observation.modality === "mixed" ||
+      hasProtectedGraphSignal(text);
+    const deterministicDrop =
+      observation.type === "notification" &&
+      observation.importance <= 2 &&
+      !observation.narrative.trim() &&
+      observation.facts.length === 0 &&
+      observation.concepts.length === 0 &&
+      observation.files.length === 0;
+    const state = stripPrivateData(JSON.stringify({
+      type: observation.type,
+      importance: observation.importance,
+      title: observation.title.slice(0, 64),
+      concepts: observation.concepts.slice(0, 3).map((concept) => concept.slice(0, 24)),
+      factCount: observation.facts.length,
+      preview: observation.narrative.slice(0, 96),
+      filesCount: observation.files.length,
+    })).slice(0, 512);
+    if (protectedItem) {
+      return { id: observation.id, value: observation, disposition: "protected" as const };
+    }
+    if (deterministicDrop) {
+      return { id: observation.id, value: observation, disposition: "deterministic-drop" as const };
+    }
+    return { id: observation.id, value: observation, disposition: "ambiguous" as const, state };
+  });
+
+  try {
+    const selected = await selectCompactionCandidates(
+      candidates,
+      typeSafe
+        ? async (batch) => {
+            const questions: Record<string, TypeSafeQuestion> = {};
+            for (const item of batch) {
+              questions[item.questionId] = {
+                type: "choice",
+                instructions: `Should graph-extraction candidate ${item.questionId} remain in the bounded input?`,
+                criteria: {
+                  keep: "Keep if this observation may contribute a useful entity, relationship, decision, or discovery.",
+                  drop: "Drop only if it is clearly routine, reproducible, and unlikely to affect durable graph knowledge.",
+                },
+              };
+            }
+            const answers = await typeSafe.evaluate("compaction", { candidates: batch }, questions);
+            if (!answers) return undefined;
+            const decisions: Record<string, { choice: "keep" | "drop"; confidence: number }> = {};
+            for (const item of batch) {
+              const answer = answers?.[item.questionId];
+              if (answer?.type === "choice" && (answer.choice === "keep" || answer.choice === "drop")) {
+                decisions[item.questionId] = { choice: answer.choice, confidence: answer.confidence };
+              }
+            }
+            return decisions;
+          }
+        : undefined,
+      { maxStateChars: getTypeSafeConfig().maxStateChars },
+    );
+    const decisionFailures = selected.fallbackReasons.filter((reason) =>
+      reason === "decision-error" || reason === "decision-unavailable" || reason === "invalid-answer",
+    );
+    if (decisionFailures.length > 0) {
+      logger.warn("TypeSafe graph compaction failed open", { reasons: decisionFailures });
+    }
+    return selected.kept.map((candidate) => candidate.value);
+  } catch (error) {
+    logger.warn("TypeSafe graph compaction failed open", {
+      errorType: error instanceof Error ? error.name : "unknown",
+    });
+    return observations;
+  }
+}
 const GRAPH_INPUT_COMPACTION_SYSTEM = `You compact coding-session observations before knowledge-graph extraction.
 Return one concise factual digest. Preserve every decision, error, file write/edit, named entity, file path, command result, and causal relationship present in the input. Do not invent facts, merge unrelated names, or use vague summaries. Keep exact identifiers and paths. The digest is an intermediate representation, not XML.`;
 
@@ -703,9 +809,10 @@ export function registerGraphFunction(
   llmRouter?: LlmTaskRouter,
   batchQueue?: FireworksBatchQueue,
   localCompactor?: LocalGraphCompactor,
+  typeSafe?: TypeSafeDecisionProvider,
 ): void {
   sdk.registerFunction("mem::graph-extract", 
-    async (data: { observations: CompressedObservation[]; batchResponse?: string; deferred?: boolean; batchEffectKey?: string; replacementOf?: string }) => runBatchCallback(kv, "graph", data.batchEffectKey, async (_resuming, admit) => {
+    async (data: { observations: CompressedObservation[]; batchResponse?: string; deferred?: boolean; force?: boolean; batchEffectKey?: string; replacementOf?: string }) => runBatchCallback(kv, "graph", data.batchEffectKey, async (_resuming, admit) => {
       if (!data.observations || data.observations.length === 0) {
         return { success: false, error: "No observations provided" };
       }
@@ -724,13 +831,77 @@ export function registerGraphFunction(
         return { success: false, error: "A batch graph application must be recovered first" };
       }
 
+      let observationsForGraph = data.observations;
+      if (!data.force && data.batchResponse === undefined && !data.batchEffectKey && !data.replacementOf) {
+        observationsForGraph = await compactGraphObservations(observationsForGraph, typeSafe);
+        if (observationsForGraph.length === 0) {
+          return {
+            success: true,
+            skipped: true,
+            reason: "TypeSafe compaction removed only empty routine notifications",
+            observationsRetained: true,
+          };
+        }
+      }
+
+      if (
+        typeSafe &&
+        data.deferred &&
+        !data.force &&
+        data.batchResponse === undefined &&
+        !data.batchEffectKey &&
+        !data.replacementOf &&
+        !observationsForGraph.some((observation) =>
+          isProtectedGraphObservation(observation) ||
+          observation.type === "command_run" ||
+          observation.importance >= 8 ||
+          observation.modality === "image" ||
+          observation.modality === "mixed" ||
+          hasProtectedGraphSignal(`${observation.title} ${observation.narrative} ${observation.facts.join(" ")}`),
+        )
+      ) {
+        try {
+          const decision = await typeSafe.evaluateChoice(
+            "pipelineGates",
+            stripPrivateData(JSON.stringify({
+              workflow: "graph-extraction",
+              observationCount: observationsForGraph.length,
+              observationTypes: [...new Set(observationsForGraph.map((observation) => observation.type))],
+              samples: observationsForGraph.slice(0, 3).map((observation) => ({
+                title: observation.title.slice(0, 32),
+                concepts: observation.concepts.slice(0, 3).map((concept) => concept.slice(0, 16)),
+                facts: observation.facts.length,
+                preview: observation.narrative.slice(0, 20),
+              })),
+            })).slice(0, 512),
+            "Should this scheduled graph extraction run?",
+            {
+              run: "Run if the observations may add useful entities or relationships to the graph.",
+              skip: "Skip only when the batch is clearly routine and unlikely to add any durable graph information.",
+            },
+          );
+          if (decision?.choice === "skip" && decision.confidence >= TYPESAFE_GRAPH_GATE_CONFIDENCE_THRESHOLD) {
+            return {
+              success: true,
+              skipped: true,
+              reason: "TypeSafe pipeline gate",
+              observationsRetained: true,
+            };
+          }
+        } catch (error) {
+          logger.warn("TypeSafe graph pipeline gate failed open", {
+            errorType: error instanceof Error ? error.name : "unknown",
+          });
+        }
+      }
+
       const inputUnits = data.batchResponse
         ? [{
-          sourceObservations: data.observations,
-          promptObservations: data.observations.map(toGraphPromptObservation),
+          sourceObservations: observationsForGraph,
+          promptObservations: observationsForGraph.map(toGraphPromptObservation),
         } satisfies GraphExtractionUnit]
         : await prepareGraphExtractionInputs(
-          data.observations,
+          observationsForGraph,
           data.deferred ? Math.min(8000, getGraphExtractionInputTargetChars()) : getGraphExtractionInputTargetChars(),
           data.replacementOf ? undefined : localCompactor,
         );

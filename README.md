@@ -1202,7 +1202,7 @@ Full registry: [workers.iii.dev](https://workers.iii.dev). Every worker there co
 
 ### LLM Providers
 
-agentmemory auto-detects from your environment. By default, no LLM calls are made unless you configure a provider or explicitly opt in to the Claude subscription fallback.
+agentmemory auto-detects generation providers from your environment. By default, no generative LLM calls are made unless you configure a provider or explicitly opt in to the Claude subscription fallback. TypeSafe.ai typed decisions use a separate key and do not generate summaries or prose.
 
 | Provider | Config | Notes |
 |----------|--------|-------|
@@ -1213,8 +1213,13 @@ agentmemory auto-detects from your environment. By default, no LLM calls are mad
 | OpenRouter | `OPENROUTER_API_KEY` | Any model |
 | OpenAI API | `OPENAI_API_KEY` | Default `gpt-4o-mini`, override with `OPENAI_MODEL` |
 | Fireworks.ai | `OPENAI_API_KEY` + `OPENAI_BASE_URL` | OpenAI-compatible chat API; set `OPENAI_MODEL` and optionally `OPENAI_REASONING_EFFORT`. See [Fireworks.ai (OpenAI-compatible)](#fireworksai-openai-compatible). |
+| TypeSafe.ai decisions | `TYPESAFE_API_KEY` | Typed decisions for eligible observations and automatic analysis, independent of the generation provider. Switches default to enabled. See [TypeSafe.ai decisions](docs/typesafe.md). |
 | **Local (Ollama / LM Studio / vLLM / llama.cpp)** | `OPENAI_API_KEY=local` + `OPENAI_BASE_URL=http://localhost:11434/v1` (Ollama) or `http://localhost:1234/v1` (LM Studio) + `OPENAI_MODEL=<your model>` | Anything OpenAI-API-compatible. Zero cost, runs on your hardware. See [Local models](#local-models-ollama-lm-studio-vllm) below. |
 | Claude subscription fallback | `AGENTMEMORY_ALLOW_AGENT_SDK=true` | Opt-in only. Spawns `@anthropic-ai/claude-agent-sdk` sessions — used to cause unbounded Stop-hook recursion so it is no longer the default. |
+
+### TypeSafe.ai decisions
+
+Set `TYPESAFE_API_KEY` to enable the TypeSafe.ai decision features. The master and per-feature switches default to `true`; set the master switch to `false` to disable all TypeSafe decisions, or disable one feature independently. A missing key, disabled feature, or TypeSafe request failure leaves that operation on its existing behavior. See [TypeSafe.ai decisions](docs/typesafe.md) for exact scope and the host-transcript limitation.
 
 ### Dual LLM routing
 

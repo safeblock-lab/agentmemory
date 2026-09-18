@@ -7,6 +7,7 @@ import {
   loadClaudeBridgeConfig,
   loadTeamConfig,
   loadSnapshotConfig,
+  getTypeSafeConfig,
   isGraphExtractionEnabled,
   isAutoCompressEnabled,
   isConsolidationEnabled,
@@ -21,6 +22,7 @@ import {
   createEmbeddingProvider,
   createImageEmbeddingProvider,
 } from "./providers/index.js";
+import { TypeSafeDecisionProvider } from "./providers/typesafe.js";
 import { LlmTaskRouter } from "./providers/task-router.js";
 import { StateKV } from "./state/kv.js";
 import { batchEffectKey } from "./state/batch-effects.js";
@@ -390,6 +392,10 @@ process.on("unhandledRejection", (reason) => {
 
 async function main() {
   const config = loadConfig();
+  const typeSafeConfig = getTypeSafeConfig();
+  const typeSafeDecisionProvider = typeSafeConfig.enabled && typeSafeConfig.apiKey
+    ? new TypeSafeDecisionProvider({ config: typeSafeConfig })
+    : undefined;
   const embeddingConfig = loadEmbeddingConfig();
   const fallbackConfig = loadFallbackConfig();
 
@@ -507,7 +513,7 @@ async function main() {
   initMetrics(meterAccessor as ((name: string) => import("@opentelemetry/api").Meter) | undefined);
 
   registerPrivacyFunction(sdk);
-  registerObserveFunction(sdk, kv, dedupMap, config.maxObservationsPerSession);
+  registerObserveFunction(sdk, kv, dedupMap, config.maxObservationsPerSession, typeSafeDecisionProvider);
   registerImageQuotaCleanup(sdk, kv);
   registerVisionSearchFunctions(sdk, kv, imageEmbeddingProvider);
   if (isSlotsEnabled()) {
@@ -551,6 +557,7 @@ async function main() {
       taskRouter,
       config.fireworksBatch.enabled ? fireworksBatch : undefined,
       localGraphCompactor,
+      typeSafeDecisionProvider,
     );
     bootLog(`Knowledge graph: extraction enabled`);
   }
@@ -562,6 +569,7 @@ async function main() {
     taskRouter,
     config.auxiliaryProvider?.maxInputChars,
     config.fireworksBatch.enabled ? fireworksBatch : undefined,
+    typeSafeDecisionProvider,
   );
   bootLog(`Consolidation pipeline: registered (CONSOLIDATION_ENABLED=${isConsolidationEnabled() ? "true" : "false"})`);
 
@@ -624,9 +632,10 @@ async function main() {
     provider,
     taskRouter,
     config.fireworksBatch.enabled ? fireworksBatch : undefined,
+    typeSafeDecisionProvider,
   );
   registerWorkingMemoryFunctions(sdk, kv, config.tokenBudget);
-  registerSkillExtractFunctions(sdk, kv, provider, taskRouter);
+  registerSkillExtractFunctions(sdk, kv, provider, taskRouter, typeSafeDecisionProvider);
   registerCascadeFunction(sdk, kv);
 
   registerSlidingWindowFunction(sdk, kv, provider, taskRouter);

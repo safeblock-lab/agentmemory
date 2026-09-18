@@ -19,7 +19,11 @@ import { recordAudit } from "./audit.js";
 import {
   getConsolidationDecayDays,
   getConsolidationMinNewSummaries,
+  getTypeSafeConfig,
   isConsolidationEnabled,
+  isTypeSafeFeatureEnabled,
+  TYPESAFE_PROCEDURAL_GATE_CONFIDENCE_THRESHOLD,
+  TYPESAFE_SEMANTIC_GATE_CONFIDENCE_THRESHOLD,
 } from "../config.js";
 import { logger } from "../logger.js";
 import { assessConsolidationComplexity } from "./consolidation-complexity.js";
@@ -27,6 +31,71 @@ import type { LlmTaskRouter } from "../providers/task-router.js";
 import type { FireworksBatchQueue } from "./fireworks-batch.js";
 import { applyBatchEffect, batchEffectKey, runBatchCallback } from "../state/batch-effects.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
+import type { CompactionCandidate } from "./typesafe-compaction.js";
+import { selectCompactionCandidates } from "./typesafe-compaction.js";
+import { stripPrivateData } from "./privacy.js";
+import type { TypeSafeDecisionProvider, TypeSafeQuestion } from "../providers/typesafe.js";
+
+const PROTECTED_PIPELINE_SIGNAL = /\b(?:error|failed|failure|decision|instruction|prompt|security|secret|token|password|credential|api[-_ ]?key|auth|permission|mutat(?:e|ion)|write|edit|patch|delete|remove|deploy|install|bug|fix|shell|terminal|bash|powershell|environment|env|(?:AGENTS|CLAUDE|GEMINI|COPILOT)\.md)\b/i;
+
+function hasProtectedPipelineSignal(text: string): boolean {
+  return PROTECTED_PIPELINE_SIGNAL.test(text) || stripPrivateData(text) !== text;
+}
+
+async function compactConsolidationInputs<T>(
+  workflow: string,
+  candidates: readonly CompactionCandidate<T>[],
+  typeSafe?: TypeSafeDecisionProvider,
+): Promise<{ kept: readonly CompactionCandidate<T>[]; dropped: readonly CompactionCandidate<T>[] }> {
+  if (!typeSafe || !isTypeSafeFeatureEnabled("compaction")) {
+    return { kept: candidates, dropped: [] };
+  }
+  try {
+    const selection = await selectCompactionCandidates(
+      candidates,
+      async (batch) => {
+        const questions: Record<string, TypeSafeQuestion> = {};
+        for (const item of batch) {
+          questions[item.questionId] = {
+            type: "choice",
+            instructions: `Should consolidation input ${item.questionId} remain in ${workflow}?`,
+            criteria: {
+              keep: "Keep if this input may add a durable fact or reusable procedure.",
+              drop: "Drop only if this input is clearly routine, redundant, and low-value.",
+            },
+          };
+        }
+        const answers = await typeSafe.evaluate("compaction", { candidates: batch }, questions);
+        if (!answers) return undefined;
+        const decisions: Record<string, { choice: "keep" | "drop"; confidence: number }> = {};
+        for (const item of batch) {
+          const answer = answers?.[item.questionId];
+          if (answer?.type === "choice" && (answer.choice === "keep" || answer.choice === "drop")) {
+            decisions[item.questionId] = { choice: answer.choice, confidence: answer.confidence };
+          }
+        }
+        return decisions;
+      },
+      { maxStateChars: getTypeSafeConfig().maxStateChars },
+    );
+    const decisionFailures = selection.fallbackReasons.filter((reason) =>
+      reason === "decision-error" || reason === "decision-unavailable" || reason === "invalid-answer",
+    );
+    if (decisionFailures.length > 0) {
+      logger.warn("TypeSafe consolidation compaction failed open", {
+        workflow,
+        reasons: decisionFailures,
+      });
+    }
+    return { kept: selection.kept, dropped: selection.dropped };
+  } catch (error) {
+    logger.warn("TypeSafe consolidation compaction failed open", {
+      workflow,
+      errorType: error instanceof Error ? error.name : "unknown",
+    });
+    return { kept: candidates, dropped: [] };
+  }
+}
 
 const SEMANTIC_CHECKPOINT_KEY = "semantic-consolidation";
 const SEMANTIC_ANCHOR_SUMMARIES = 5;
@@ -148,6 +217,7 @@ export function registerConsolidationPipelineFunction(
   llmRouter?: LlmTaskRouter,
   auxiliaryMaxInputChars?: number,
   batchQueue?: FireworksBatchQueue,
+  typeSafe?: TypeSafeDecisionProvider,
 ): void {
   sdk.registerFunction("mem::consolidate-pipeline",
     async (data?: {
@@ -166,6 +236,15 @@ export function registerConsolidationPipelineFunction(
         return { success: false, skipped: true, reason: "Consolidation disabled: set CONSOLIDATION_ENABLED=true or configure an LLM provider (ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY / MINIMAX_API_KEY / OPENAI_BASE_URL / AGENTMEMORY_PROVIDER=agent-sdk)" };
       }
       const tier = data?.tier || "all";
+      const canGatePipeline = Boolean(
+        typeSafe && data?.deferred && !data.force && !data.batchResponse &&
+        !data.batchEffectKey && !data.batchSourceIds?.length && !data.replacementOf,
+      );
+      const compactionProvider =
+        !data?.force && !data?.batchResponse && !data?.batchEffectKey &&
+        !data?.batchSourceIds?.length && !data?.replacementOf && !data?.batchCohort
+          ? typeSafe
+          : undefined;
       const decayDays = getConsolidationDecayDays();
       const results: Record<string, unknown> = {};
 
@@ -201,11 +280,102 @@ export function registerConsolidationPipelineFunction(
               ])],
             } : undefined };
           }
-          const recentSummaries = semanticInput.summaries;
+          const sourceSummaries = semanticInput.summaries;
+          const summariesByRecency = [...sourceSummaries].sort((left, right) => {
+            const leftTimestamp = Date.parse(left.createdAt);
+            const rightTimestamp = Date.parse(right.createdAt);
+            if (!Number.isFinite(leftTimestamp)) return Number.isFinite(rightTimestamp) ? -1 : 0;
+            if (!Number.isFinite(rightTimestamp)) return 1;
+            return rightTimestamp - leftTimestamp;
+          });
+          const recentSummaryIds = new Set(summariesByRecency.slice(0, 6).map((summary) => summary.sessionId));
+          const summaryCandidates: CompactionCandidate<SessionSummary>[] = sourceSummaries.map((summary) => {
+            const signal = `${summary.title} ${summary.narrative} ${(summary.keyDecisions ?? []).join(" ")}`;
+            const protectedItem =
+              recentSummaryIds.has(summary.sessionId) ||
+              (summary.keyDecisions?.length ?? 0) > 0 ||
+              (summary.filesModified?.length ?? 0) > 0 ||
+              hasProtectedPipelineSignal(signal);
+            const deterministicDrop =
+              summary.observationCount === 0 &&
+              !summary.title.trim() &&
+              !summary.narrative.trim() &&
+              (summary.concepts?.length ?? 0) === 0 &&
+              (summary.keyDecisions?.length ?? 0) === 0 &&
+              (summary.filesModified?.length ?? 0) === 0;
+            if (protectedItem) {
+              return { id: summary.sessionId, value: summary, disposition: "protected" };
+            }
+            if (deterministicDrop) {
+              return { id: summary.sessionId, value: summary, disposition: "deterministic-drop" };
+            }
+            return {
+              id: summary.sessionId,
+              value: summary,
+              disposition: "ambiguous",
+              state: stripPrivateData(JSON.stringify({
+                title: summary.title.slice(0, 56),
+                narrative: summary.narrative.slice(0, 96),
+                concepts: (summary.concepts ?? []).slice(0, 3).map((concept) => concept.slice(0, 24)),
+                observationCount: summary.observationCount,
+                createdAt: summary.createdAt,
+              })).slice(0, 512),
+            };
+          });
+          const compactedSummaries = await compactConsolidationInputs(
+            "semantic consolidation",
+            summaryCandidates,
+            compactionProvider,
+          );
+          const recentSummaries = compactedSummaries.kept.map((candidate) => candidate.value);
+          const compactedSummaryCount = compactedSummaries.dropped.length;
+          let skipSemantic = false;
+          if (
+            canGatePipeline &&
+            recentSummaries.length > 0 &&
+            !recentSummaries.some((summary) =>
+              summary.keyDecisions?.length > 0 ||
+              summary.filesModified?.length > 0 ||
+              hasProtectedPipelineSignal(`${summary.title} ${summary.narrative}`),
+            )
+          ) {
+            try {
+              const decision = await typeSafe!.evaluateChoice(
+                "pipelineGates",
+                stripPrivateData(JSON.stringify({
+                  workflow: "semantic-consolidation",
+                  summaryCount: recentSummaries.length,
+                  existingFactCount: existingSemantic.length,
+                  summaries: recentSummaries.slice(0, 3).map((summary) => ({
+                    title: summary.title.slice(0, 36),
+                    conceptCount: summary.concepts?.length ?? 0,
+                    concepts: (summary.concepts ?? []).slice(0, 2).map((concept) => concept.slice(0, 16)),
+                    preview: summary.narrative.slice(0, 20),
+                  })),
+                })).slice(0, 512),
+                "Should this scheduled semantic consolidation run?",
+                {
+                  run: "Run when these new summaries may contribute useful, distinct durable facts.",
+                  skip: "Skip only when this batch is clearly routine or redundant and contains no important decision or change.",
+                },
+              );
+              skipSemantic = decision?.choice === "skip" && decision.confidence >= TYPESAFE_SEMANTIC_GATE_CONFIDENCE_THRESHOLD;
+            } catch (error) {
+              logger.warn("TypeSafe semantic consolidation gate failed open", {
+                errorType: error instanceof Error ? error.name : "unknown",
+              });
+            }
+          }
           if (recentSummaries.length === 0 && !resuming) {
             results.semantic = {
               skipped: true,
               reason: `fewer than ${getConsolidationMinNewSummaries()} new summaries`,
+            };
+          } else if (skipSemantic) {
+            results.semantic = {
+              skipped: true,
+              reason: "TypeSafe pipeline gate",
+              compactedSummaries: compactedSummaryCount,
             };
           } else {
 
@@ -258,7 +428,7 @@ export function registerConsolidationPipelineFunction(
                     }
                     queued = true;
                     workItemIds.push(enqueueResult.workItemId);
-                    results.semantic = { queued: true, workItemId: workItemIds[0], workItemIds, totalSummaries: summaries.length };
+                    results.semantic = { queued: true, workItemId: workItemIds[0], workItemIds, totalSummaries: summaries.length, compactedSummaries: compactedSummaryCount };
                   }
                   if (!data.batchCohort) {
                     await kv.set(KV.state, cohort, { workItemIds, checkpoint: semanticInput.checkpoint });
@@ -336,7 +506,7 @@ export function registerConsolidationPipelineFunction(
                     newFacts++;
                   }
                 }
-                results.semantic = { newFacts, totalSummaries: summaries.length };
+                results.semantic = { newFacts, totalSummaries: summaries.length, compactedSummaries: compactedSummaryCount };
                 if (data?.batchCohort) {
                   await withKeyedLock(`semantic-cohort:${data.batchCohort}`, () => reconcileSemanticCohort(kv, data.batchCohort!, data.batchEffectKey));
                 } else if (semanticInput.checkpoint && (!checkpoint || semanticInput.checkpoint.processedThrough >= checkpoint.processedThrough)) {
@@ -381,19 +551,86 @@ export function registerConsolidationPipelineFunction(
 
       if (tier === "all" || tier === "procedural") {
         const memories = await kv.list<Memory>(KV.memories);
-        const patternSources = memories
+        let patternSources = memories
           .filter((m) => m.isLatest && m.type === "pattern")
           .filter((m) => !data?.batchSourceIds || data.batchSourceIds.includes(m.id))
           .map((m) => ({
             id: m.id,
             content: m.content,
             frequency: m.sessionIds.length || 1,
+            updatedAt: m.updatedAt,
           }))
           .filter((p) => p.frequency >= 2);
         if (data?.batchSourceIds && patternSources.length !== data.batchSourceIds.length) return { success: true, stale: true };
+        const patternCandidates: CompactionCandidate<(typeof patternSources)[number]>[] = patternSources.map((pattern) => {
+          const updatedAt = Date.parse(pattern.updatedAt);
+          const protectedItem =
+            pattern.frequency >= 3 ||
+            !Number.isFinite(updatedAt) ||
+            Date.now() - updatedAt <= 7 * 24 * 60 * 60 * 1000 ||
+            hasProtectedPipelineSignal(pattern.content);
+          const deterministicDrop = pattern.frequency < 2 || !pattern.content.trim();
+          if (protectedItem) {
+            return { id: pattern.id, value: pattern, disposition: "protected" };
+          }
+          if (deterministicDrop) {
+            return { id: pattern.id, value: pattern, disposition: "deterministic-drop" };
+          }
+          return {
+            id: pattern.id,
+            value: pattern,
+            disposition: "ambiguous",
+            state: stripPrivateData(JSON.stringify({
+              frequency: pattern.frequency,
+              preview: pattern.content.slice(0, 192),
+              ageDays: Number.isFinite(Date.parse(pattern.updatedAt))
+                ? Math.max(0, Math.floor((Date.now() - Date.parse(pattern.updatedAt)) / (24 * 60 * 60 * 1000)))
+                : undefined,
+            })).slice(0, 512),
+          };
+        });
+        const compactedPatterns = await compactConsolidationInputs(
+          "procedural consolidation",
+          patternCandidates,
+          compactionProvider,
+        );
+        patternSources = compactedPatterns.kept.map((candidate) => candidate.value);
         const patterns = patternSources.map(({ content, frequency }) => ({ content, frequency }));
 
-        if (patterns.length >= 2 || data?.batchSourceIds?.length || (resuming && data?.batchResponse)) {
+        let skipProcedural = false;
+        if (
+          canGatePipeline &&
+          patterns.length >= 2 &&
+          !patternSources.some((pattern) =>
+            pattern.frequency >= 3 || hasProtectedPipelineSignal(pattern.content),
+          )
+        ) {
+          try {
+            const decision = await typeSafe!.evaluateChoice(
+              "pipelineGates",
+              stripPrivateData(JSON.stringify({
+                workflow: "procedural-consolidation",
+                patternCount: patterns.length,
+                patterns: patternSources.slice(0, 3).map((pattern) => ({
+                  frequency: pattern.frequency,
+                  preview: pattern.content.slice(0, 72),
+                })),
+              })).slice(0, 512),
+              "Should this scheduled recurring-pattern extraction run?",
+              {
+                run: "Run when repeated patterns are likely to form a useful reusable procedure.",
+                skip: "Skip only when these are clearly weak or routine patterns with no durable procedure.",
+              },
+            );
+            skipProcedural = decision?.choice === "skip" && decision.confidence >= TYPESAFE_PROCEDURAL_GATE_CONFIDENCE_THRESHOLD;
+          } catch (error) {
+            logger.warn("TypeSafe procedural consolidation gate failed open", {
+              errorType: error instanceof Error ? error.name : "unknown",
+            });
+          }
+        }
+
+        if ((patterns.length >= 2 || data?.batchSourceIds?.length || (resuming && data?.batchResponse)) && !skipProcedural) {
           const prompt = buildProceduralExtractionPrompt(patterns);
           const sourceFingerprint = fingerprintId("fwbconproc", JSON.stringify(patterns));
 
@@ -494,6 +731,7 @@ export function registerConsolidationPipelineFunction(
               results.procedural = {
                 newProcedures: newProcs,
                 patternsAnalyzed: patterns.length,
+                compactedPatterns: compactedPatterns.dropped.length,
               };
             }
           } catch (err) {
@@ -505,7 +743,11 @@ export function registerConsolidationPipelineFunction(
         } else {
           results.procedural = {
             skipped: true,
-            reason: "fewer than 2 recurring patterns",
+            reason: skipProcedural
+              ? "TypeSafe pipeline gate"
+              : compactedPatterns.dropped.length > 0
+                ? "TypeSafe compaction removed only low-value patterns"
+                : "fewer than 2 recurring patterns",
           };
         }
       }

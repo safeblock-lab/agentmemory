@@ -12,6 +12,15 @@ import { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
+import type { TypeSafeDecisionProvider } from "../providers/typesafe.js";
+import { stripPrivateData } from "./privacy.js";
+import { TYPESAFE_SKILL_GATE_CONFIDENCE_THRESHOLD } from "../config.js";
+
+const PROTECTED_SKILL_SIGNAL = /\b(?:error|failed|failure|decision|instruction|prompt|security|secret|token|password|credential|api[-_ ]?key|auth|permission|mutation|write|edit|patch|delete|move|rename|commit|push|reset|deploy|install|shell|terminal|bash|powershell|environment|env|(?:AGENTS|CLAUDE|GEMINI|COPILOT)\.md)\b/i;
+
+function hasProtectedSkillSignal(text: string): boolean {
+  return PROTECTED_SKILL_SIGNAL.test(text) || stripPrivateData(text) !== text;
+}
 
 const SKILL_EXTRACT_SYSTEM = `You are a skill extraction engine. Given a completed multi-step task session, extract a reusable procedural skill document.
 
@@ -107,9 +116,10 @@ export function registerSkillExtractFunctions(
   kv: StateKV,
   provider: MemoryProvider,
   llmRouter?: LlmTaskRouter,
+  typeSafe?: TypeSafeDecisionProvider,
 ): void {
   sdk.registerFunction("mem::skill-extract",
-    async (data: { sessionId: string }) => {
+    async (data: { sessionId: string; force?: boolean }) => {
       if (!data?.sessionId) {
         return { success: false, error: "sessionId is required" };
       }
@@ -139,6 +149,64 @@ export function registerSkillExtractFunctions(
       }
       if (observations.length < 3) {
         return { success: false, error: "too few observations for skill extraction" };
+      }
+
+      const protectedSession =
+        (summary.keyDecisions?.length ?? 0) > 0 ||
+        (summary.filesModified?.length ?? 0) > 0 ||
+        hasProtectedSkillSignal(`${summary.title} ${summary.narrative} ${(summary.concepts ?? []).join(" ")}`) ||
+        observations.some((observation) =>
+          observation.importance >= 8 ||
+          observation.type === "error" ||
+          observation.type === "decision" ||
+          observation.type === "file_write" ||
+          observation.type === "file_edit" ||
+          observation.type === "command_run" ||
+          observation.modality === "image" ||
+          observation.modality === "mixed" ||
+          hasProtectedSkillSignal(
+            `${observation.title} ${observation.narrative} ${(observation.facts ?? []).join(" ")} ${(observation.concepts ?? []).join(" ")}`,
+          ),
+        );
+      if (typeSafe && !data.force && !protectedSession) {
+        try {
+          const typeCounts = observations.reduce<Record<string, number>>((counts, observation) => {
+            counts[observation.type] = (counts[observation.type] ?? 0) + 1;
+            return counts;
+          }, {});
+          const decision = await typeSafe.evaluateChoice(
+            "pipelineGates",
+            stripPrivateData(JSON.stringify({
+              workflow: "skill-extraction",
+              summaryTitle: summary.title.slice(0, 48),
+              concepts: (summary.concepts ?? []).slice(0, 5).map((concept) => concept.slice(0, 20)),
+              observationCount: observations.length,
+              observationTypes: typeCounts,
+              averageImportance: observations.reduce((sum, observation) => sum + observation.importance, 0) / observations.length,
+              sampleTitles: observations.slice(0, 3).map((observation) => observation.title.slice(0, 24)),
+            })).slice(0, 512),
+            "Should this completed session be analyzed for a reusable skill?",
+            {
+              run: "Run when the session appears to contain a repeatable procedure that would help future tasks.",
+              skip: "Skip only when the session is clearly exploratory, routine, or unlikely to contain a reusable procedure.",
+            },
+          );
+          if (decision?.choice === "skip" && decision.confidence >= TYPESAFE_SKILL_GATE_CONFIDENCE_THRESHOLD) {
+            logger.info("Skill extraction skipped by TypeSafe gate", {
+              sessionId: data.sessionId,
+            });
+            return {
+              success: true,
+              extracted: false,
+              skipped: true,
+              reason: "TypeSafe pipeline gate",
+            };
+          }
+        } catch (error) {
+          logger.warn("TypeSafe skill extraction gate failed open", {
+            errorType: error instanceof Error ? error.name : "unknown",
+          });
+        }
       }
 
       try {

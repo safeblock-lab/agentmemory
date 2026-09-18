@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.50] — 2026-09-18
+
+### Added
+
+- Optional TypeSafe/Jev decisions for bounded internal compaction, read-only observation admission and scoring, and deferred graph, consolidation, reflection, and skill-extraction gates.
+- Paid opt-in integration and calibration suites covering the real TypeSafe API and registered AgentMemory functions without touching persistent user state.
+
+### Changed
+
+- TypeSafe is enabled by default when `TYPESAFE_API_KEY` is configured, with independent environment switches for each feature and calibrated per-workflow confidence thresholds.
+- Protected, sensitive, forced, manual, batch-replay, and uncertain inputs continue through the existing fail-open paths.
+
 ## [0.9.49] — 2026-09-11
 
 ### Fixed

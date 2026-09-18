@@ -5,12 +5,58 @@ import { StateKV } from "../state/kv.js";
 import { stripPrivateData } from "./privacy.js";
 import { DedupMap } from "./dedup.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
-import { isAutoCompressEnabled } from "../config.js";
+import {
+  getAgentId,
+  isAutoCompressEnabled,
+  isTypeSafeFeatureEnabled,
+  TYPESAFE_ADMISSION_CONFIDENCE_THRESHOLD,
+  TYPESAFE_SCORING_CONFIDENCE_THRESHOLD,
+} from "../config.js";
 import { buildSyntheticCompression } from "./compress-synthetic.js";
 import { getSearchIndex, vectorIndexAddGuarded } from "./search.js";
-import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
 import { saveImageToDisk } from "../utils/image-store.js";
+import type { TypeSafeDecisionProvider, TypeSafeQuestion } from "../providers/typesafe.js";
+
+const READ_ONLY_TOOL = /^(?:read|grep|glob|ls|find|search)(?:[_:.-].*)?$/i;
+const PROTECTED_OBSERVATION_SIGNAL = /\b(?:error|failed|failure|warning|decision|instruction|prompt|security|secret|token|password|credential|api[-_ ]?key|auth|permission|mutat(?:e|ion)|write|edit|patch|delete|remove|move|rename|deploy|install|commit|push|reset|sudo|shell|terminal|bash|powershell|environment|env|(?:AGENTS|CLAUDE|GEMINI|COPILOT)\.md)\b/i;
+const IMPORTANCE_LEVELS = [
+  "Routine, reproducible detail with little future value",
+  "Low-value detail useful only as immediate context",
+  "Minor project context or ordinary lookup result",
+  "Some reusable detail, but limited durability",
+  "Moderately useful project information",
+  "Useful detail likely to help a later task",
+  "Important project context or a recurring pattern",
+  "High-value decision, fix, or technical discovery",
+  "Very important durable project knowledge",
+  "Critical instruction, security, or project constraint",
+];
+
+function compactObservationText(value: unknown, limit: number): string {
+  let text: string;
+  if (typeof value === "string") {
+    text = value;
+  } else if (value === undefined || value === null) {
+    return "";
+  } else {
+    try {
+      text = JSON.stringify(value) ?? "";
+    } catch {
+      return "";
+    }
+  }
+  return text.replace(/\s+/g, " ").trim().slice(0, limit);
+}
+
+function shouldProtectObservation(raw: RawObservation, imageData?: string): boolean {
+  if (raw.hookType !== "post_tool_use" || imageData || raw.modality === "image" || raw.modality === "mixed") {
+    return true;
+  }
+  if (!raw.toolName || !READ_ONLY_TOOL.test(raw.toolName)) return true;
+  const preview = `${compactObservationText(raw.toolInput, 256)} ${compactObservationText(raw.toolOutput, 256)}`;
+  return PROTECTED_OBSERVATION_SIGNAL.test(preview) || stripPrivateData(preview) !== preview;
+}
 
 export function extractImage(d: unknown): string | undefined {
   if (!d) return undefined;
@@ -40,6 +86,7 @@ export function registerObserveFunction(
   kv: StateKV,
   dedupMap?: DedupMap,
   maxObservationsPerSession?: number,
+  typeSafe?: TypeSafeDecisionProvider,
 ): void {
   sdk.registerFunction("mem::observe", 
     async (payload: HookPayload) => {
@@ -60,6 +107,7 @@ export function registerObserveFunction(
       }
 
       const obsId = generateId("obs");
+      let typeSafeImportance: number | undefined;
 
       let dedupHash: string | undefined;
       if (dedupMap) {
@@ -132,6 +180,74 @@ export function registerObserveFunction(
               success: false,
               error: `Session observation limit reached (${maxObservationsPerSession})`,
             };
+          }
+        }
+
+        const admissionEnabled = isTypeSafeFeatureEnabled("admission");
+        const scoringEnabled = !isAutoCompressEnabled() && isTypeSafeFeatureEnabled("scoring");
+        if (
+          typeSafe &&
+          !shouldProtectObservation(raw, pendingImageData) &&
+          (admissionEnabled || scoringEnabled)
+        ) {
+          const inputPreview = compactObservationText(raw.toolInput, 192);
+          const outputPreview = compactObservationText(raw.toolOutput, 320);
+          const preview = stripPrivateData(
+            `${inputPreview}${inputPreview && outputPreview ? " | " : ""}${outputPreview}`,
+          ).slice(0, 448);
+          const state = { preview };
+          const questions: Record<string, TypeSafeQuestion> = {};
+          if (admissionEnabled) {
+            questions.admission = {
+              type: "choice",
+              instructions: "Should this read-only tool observation be retained for future agent work?",
+              criteria: {
+                keep: "Retain this observation because it contains useful, durable project context.",
+                discard: "Discard only if this is clearly routine, reproducible, low-value output.",
+              },
+            };
+          }
+          if (scoringEnabled) {
+            questions.importance = {
+              type: "score",
+              instructions: "Score this read-only observation's durable importance to future work.",
+              criteria: IMPORTANCE_LEVELS,
+            };
+          }
+          try {
+            const answers = await typeSafe.evaluate(
+              admissionEnabled ? "admission" : "scoring",
+              state,
+              questions,
+            );
+            const admission = answers?.admission;
+            if (
+              admissionEnabled &&
+              admission?.type === "choice" &&
+              admission.choice === "discard" &&
+              admission.confidence >= TYPESAFE_ADMISSION_CONFIDENCE_THRESHOLD
+            ) {
+              if (dedupMap && dedupHash) dedupMap.record(dedupHash);
+              return {
+                success: true,
+                skipped: true,
+                reason: "TypeSafe admission",
+                sessionId: payload.sessionId,
+              };
+            }
+            const importance = answers?.importance;
+            if (
+              scoringEnabled &&
+              importance?.type === "score" &&
+              importance.confidence >= TYPESAFE_SCORING_CONFIDENCE_THRESHOLD &&
+              Number.isFinite(importance.score)
+            ) {
+              typeSafeImportance = Math.max(1, Math.min(10, Math.round(importance.score) + 1));
+            }
+          } catch (error) {
+            logger.warn("TypeSafe observation admission failed open", {
+              errorType: error instanceof Error ? error.name : "unknown",
+            });
           }
         }
 
@@ -296,6 +412,9 @@ export function registerObserveFunction(
           });
         } else {
           const synthetic = buildSyntheticCompression(raw);
+          if (typeSafeImportance !== undefined) {
+            synthetic.importance = typeSafeImportance;
+          }
           await kv.set(
             KV.observations(payload.sessionId),
             obsId,
