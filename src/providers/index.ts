@@ -14,6 +14,10 @@ import { OllamaProvider } from "./ollama.js";
 import { OpenRouterProvider } from "./openrouter.js";
 import { ResilientProvider } from "./resilient.js";
 import { FallbackChainProvider } from "./fallback-chain.js";
+import {
+  GeminiAccountPoolProvider,
+  loadGeminiAccounts,
+} from "./gemini-account-pool.js";
 import { getEnvVar } from "../config.js";
 import {
   FireworksBatchClient,
@@ -47,6 +51,56 @@ function requireEnvVar(key: string): string {
   return value;
 }
 
+const GEMINI_CHAT_COMPLETIONS_URL =
+  "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
+const FIREWORKS_BASE_URL = "https://api.fireworks.ai/inference/v1";
+
+function createGeminiAccountPool(config: ProviderConfig): MemoryProvider {
+  const directory = config.geminiAccountsDir;
+  if (!directory) {
+    throw new Error("Gemini account directory is required.");
+  }
+
+  const accounts = loadGeminiAccounts(directory, config.model).map(
+    (account) => new OpenRouterProvider(
+      account.apiKey,
+      account.model,
+      config.maxTokens,
+      GEMINI_CHAT_COMPLETIONS_URL,
+    ),
+  );
+
+  const configuredOpenAiBaseUrl = getEnvVar("OPENAI_BASE_URL");
+  let openAiIsFireworks = false;
+  if (configuredOpenAiBaseUrl) {
+    try {
+      openAiIsFireworks = new URL(configuredOpenAiBaseUrl).hostname === "api.fireworks.ai";
+    } catch {
+      openAiIsFireworks = false;
+    }
+  }
+  const fireworksApiKey =
+    getEnvVar("FIREWORKS_API_KEY") ||
+    (openAiIsFireworks ? getEnvVar("OPENAI_API_KEY") : undefined);
+  const fireworksModel =
+    getEnvVar("FIREWORKS_MODEL") ||
+    (openAiIsFireworks ? getEnvVar("OPENAI_MODEL") : undefined);
+  if (!fireworksApiKey || !fireworksModel) {
+    throw new Error(
+      "Gemini account pooling requires FIREWORKS_API_KEY and FIREWORKS_MODEL " +
+        "(or Fireworks OPENAI_API_KEY, OPENAI_BASE_URL, and OPENAI_MODEL).",
+    );
+  }
+
+  const terminalFallback = new OpenAIProvider(
+    fireworksApiKey,
+    fireworksModel,
+    config.maxTokens,
+    FIREWORKS_BASE_URL,
+  );
+  return new GeminiAccountPoolProvider(accounts, terminalFallback);
+}
+
 // #778: fallback providers used to inherit the primary provider's
 // model name (e.g. fallback Gemini was called with `gpt-4o-mini`),
 // 404'd every call, and tripped the circuit breaker — making
@@ -61,7 +115,7 @@ function defaultModelFor(providerType: ProviderConfig["provider"]): string {
     case "anthropic":
       return getEnvVar("ANTHROPIC_MODEL") || "claude-sonnet-4-20250514";
     case "gemini":
-      return getEnvVar("GEMINI_MODEL") || "gemini-2.5-flash";
+      return getEnvVar("GEMINI_MODEL") || "gemini-flash-latest";
     case "openrouter":
       return (
         getEnvVar("OPENROUTER_MODEL") || "anthropic/claude-sonnet-4-20250514"
@@ -150,6 +204,9 @@ function createBaseProvider(config: ProviderConfig): MemoryProvider {
         config.baseURL,
       );
     case "gemini": {
+      if (config.geminiAccountsDir) {
+        return createGeminiAccountPool(config);
+      }
       const geminiKey =
         getEnvVar("GEMINI_API_KEY") || getEnvVar("GOOGLE_API_KEY");
       if (!geminiKey) {
@@ -161,7 +218,7 @@ function createBaseProvider(config: ProviderConfig): MemoryProvider {
         geminiKey,
         config.model,
         config.maxTokens,
-        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        GEMINI_CHAT_COMPLETIONS_URL,
       );
     }
     case "openrouter":

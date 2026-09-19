@@ -1210,6 +1210,7 @@ agentmemory auto-detects generation providers from your environment. By default,
 | Anthropic API | `ANTHROPIC_API_KEY` | Per-token billing |
 | MiniMax | `MINIMAX_API_KEY` | Anthropic-compatible |
 | Gemini | `GEMINI_API_KEY` | Also enables embeddings |
+| Gemini account pool | `AGENTMEMORY_GEMINI_ACCOUNTS_DIR` | Tries one project/account JSON at a time on HTTP 429, then permanently uses Fireworks until restart. |
 | OpenRouter | `OPENROUTER_API_KEY` | Any model |
 | OpenAI API | `OPENAI_API_KEY` | Default `gpt-4o-mini`, override with `OPENAI_MODEL` |
 | Fireworks.ai | `OPENAI_API_KEY` + `OPENAI_BASE_URL` | OpenAI-compatible chat API; set `OPENAI_MODEL` and optionally `OPENAI_REASONING_EFFORT`. See [Fireworks.ai (OpenAI-compatible)](#fireworksai-openai-compatible). |
@@ -1217,9 +1218,32 @@ agentmemory auto-detects generation providers from your environment. By default,
 | **Local (Ollama / LM Studio / vLLM / llama.cpp)** | `OPENAI_API_KEY=local` + `OPENAI_BASE_URL=http://localhost:11434/v1` (Ollama) or `http://localhost:1234/v1` (LM Studio) + `OPENAI_MODEL=<your model>` | Anything OpenAI-API-compatible. Zero cost, runs on your hardware. See [Local models](#local-models-ollama-lm-studio-vllm) below. |
 | Claude subscription fallback | `AGENTMEMORY_ALLOW_AGENT_SDK=true` | Opt-in only. Spawns `@anthropic-ai/claude-agent-sdk` sessions — used to cause unbounded Stop-hook recursion so it is no longer the default. |
 
+### Gemini account pool with Fireworks fallback
+
+Set `AGENTMEMORY_GEMINI_ACCOUNTS_DIR` to a directory outside the repository. Put one `*.json` file per Google project in it. Accounts are shuffled once when the provider starts, then tried in that order. Google applies Gemini quotas per project, so multiple keys from the same project do not provide independent quota.
+
+```json
+{
+  "name": "personal-01",
+  "project": "projects/1234567890",
+  "apiKey": "your-gemini-api-key"
+}
+```
+
+`apiKey` is required. `name`, `project`, and `model` are optional; `GEMINI_MODEL` or Google's rolling `gemini-flash-latest` alias supplies the default model. Keep the directory private and never commit these files.
+
+```env
+AGENTMEMORY_GEMINI_ACCOUNTS_DIR=C:\Users\you\.agentmemory\gemini-accounts
+GEMINI_MODEL=gemini-flash-latest
+FIREWORKS_API_KEY=your-fireworks-key
+FIREWORKS_MODEL=accounts/your-account/models/your-model
+```
+
+An HTTP 429 marks the current Gemini account exhausted for the process lifetime and advances to the next JSON. After every account returns 429, Fireworks becomes the sticky provider for all later generation requests until agentmemory restarts. Authentication, malformed-response, and network errors do not rotate accounts or silently incur Fireworks cost. Existing Fireworks OpenAI-compatible settings also work when `OPENAI_BASE_URL` targets `api.fireworks.ai` and `OPENAI_API_KEY` plus `OPENAI_MODEL` are set.
+
 ### TypeSafe.ai decisions
 
-Set `TYPESAFE_API_KEY` to enable the TypeSafe.ai decision features. The master and per-feature switches default to `true`; set the master switch to `false` to disable all TypeSafe decisions, or disable one feature independently. Eligible qualified read tools are evaluated before synthetic or LLM compression, and metadata-only runtime logs report each request outcome. A missing key, disabled feature, or TypeSafe request failure leaves that operation on its existing behavior. See [TypeSafe.ai decisions](docs/typesafe.md) for exact scope and the host-transcript limitation.
+TypeSafe AI is disabled by default to prevent unintended paid requests. To opt in, configure `TYPESAFE_API_KEY` and set `AGENTMEMORY_TYPESAFE_ENABLED=true`; paid Jev compaction also requires `AGENTMEMORY_TYPESAFE_COMPACTION_ENABLED=true`. Enabled qualified read tools can be evaluated before synthetic or LLM compression, and metadata-only runtime logs report each request outcome. A missing key, disabled feature, or TypeSafe request failure leaves that operation on its existing behavior. See [TypeSafe.ai decisions](docs/typesafe.md) for exact scope and the host-transcript limitation.
 
 ### Dual LLM routing
 

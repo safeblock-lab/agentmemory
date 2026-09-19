@@ -30,40 +30,41 @@ afterEach(() => {
 });
 
 describe("TypeSafe configuration", () => {
-  it("defaults the master and every feature on but stays unconfigured without a key", () => {
+  it("defaults the master off and stays unconfigured without a key", () => {
     const config = getTypeSafeConfig();
 
     expect(config).toEqual({
-      enabled: true,
+      enabled: false,
       apiKey: "",
       timeoutMs: 5_000,
       maxStateChars: 16_000,
       features: {
-        compaction: true,
+        compaction: false,
         admission: true,
         pipelineGates: true,
         scoring: true,
       },
     });
-    expect(isTypeSafeFeatureEnabled("admission")).toBe(true);
+    expect(isTypeSafeFeatureEnabled("admission")).toBe(false);
   });
 
   it("accepts the documented boolean forms and lets the master flag disable all calls", () => {
     process.env["TYPESAFE_API_KEY"] = " test-key ";
     process.env["AGENTMEMORY_TYPESAFE_ENABLED"] = "0";
-    process.env["AGENTMEMORY_TYPESAFE_COMPACTION_ENABLED"] = "false";
+    process.env["AGENTMEMORY_TYPESAFE_COMPACTION_ENABLED"] = "true";
     process.env["AGENTMEMORY_TYPESAFE_ADMISSION_ENABLED"] = "1";
 
     const config = getTypeSafeConfig();
 
     expect(config.apiKey).toBe("test-key");
     expect(config.enabled).toBe(false);
-    expect(config.features).toMatchObject({ compaction: false, admission: true });
+    expect(config.features).toMatchObject({ compaction: true, admission: true });
     expect(isTypeSafeFeatureEnabled("admission")).toBe(false);
     expect(isTypeSafeFeatureEnabled("compaction")).toBe(false);
   });
 
   it("can independently disable each feature", () => {
+    process.env["AGENTMEMORY_TYPESAFE_ENABLED"] = "true";
     process.env["AGENTMEMORY_TYPESAFE_COMPACTION_ENABLED"] = "0";
     process.env["AGENTMEMORY_TYPESAFE_ADMISSION_ENABLED"] = "false";
     process.env["AGENTMEMORY_TYPESAFE_PIPELINE_GATES_ENABLED"] = "false";
@@ -93,12 +94,12 @@ describe("TypeSafe configuration", () => {
     expect(getTypeSafeConfig().maxStateChars).toBe(64_000);
   });
 
-  it("falls back to enabled defaults for unrecognized boolean values", () => {
+  it("falls back to the disabled master default for unrecognized boolean values", () => {
     process.env["AGENTMEMORY_TYPESAFE_ENABLED"] = "sometimes";
     process.env["AGENTMEMORY_TYPESAFE_SCORING_ENABLED"] = "sometimes";
 
     expect(getTypeSafeConfig()).toMatchObject({
-      enabled: true,
+      enabled: false,
       features: { scoring: true },
     });
   });

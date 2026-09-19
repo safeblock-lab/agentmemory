@@ -2,6 +2,17 @@ import type { MemoryProvider } from "../types.js";
 import { fetchWithTimeout } from "./_fetch.js";
 import { extractLlmTokenUsage, startLlmCallTelemetry } from "./_llm-logging.js";
 
+export class OpenRouterProviderError extends Error {
+  constructor(
+    readonly provider: string,
+    readonly status: number,
+    detail: string,
+  ) {
+    super(`${provider} API error (${status}): ${detail.slice(0, 1_000)}`);
+    this.name = "OpenRouterProviderError";
+  }
+}
+
 export class OpenRouterProvider implements MemoryProvider {
   name: string;
   private apiKey: string;
@@ -64,7 +75,7 @@ export class OpenRouterProvider implements MemoryProvider {
     if (!response.ok) {
       telemetry.failure({ httpStatus: response.status, errorKind: "provider_response" });
       const text = await response.text();
-      throw new Error(`${this.name} API error (${response.status}): ${text}`);
+      throw new OpenRouterProviderError(this.name, response.status, text);
     }
 
     let data: Record<string, unknown>;

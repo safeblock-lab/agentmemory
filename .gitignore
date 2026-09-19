@@ -30,3 +30,5 @@ eval/reports/
 # LongMemEval download is 278MB; fetched on demand
 eval/data/longmemeval/
 .fireworks*
+.release*
+.batch*

@@ -112,6 +112,22 @@ describe("doctor v2 diagnostic catalog", () => {
     expect(status.ok).toBe(true);
   });
 
+  it("no-llm-provider-key passes for a Gemini account directory", async () => {
+    const diagnostics = buildDiagnostics(
+      stubEffects({
+        readEnvFile: () => ({
+          AGENTMEMORY_GEMINI_ACCOUNTS_DIR: "C:\\gemini-accounts",
+        }),
+      }),
+    );
+    const check = diagnostics.find((d) => d.id === "no-llm-provider-key")!;
+    const status = await check.check(stubCtx());
+    expect(status).toEqual({
+      ok: true,
+      detail: "found: AGENTMEMORY_GEMINI_ACCOUNTS_DIR",
+    });
+  });
+
   it("engine-version-mismatch fails when iii reports the wrong version", async () => {
     const diagnostics = buildDiagnostics(
       stubEffects({ iiiBinaryVersion: () => "0.99.99" }),

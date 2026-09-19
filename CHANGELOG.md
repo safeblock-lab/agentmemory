@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.53] — 2026-09-19
+
+### Added
+
+- Gemini generation can load one API key per project from a private JSON directory, rotate accounts on quota exhaustion, and fall back permanently to Fireworks for the rest of the process.
+
+### Changed
+
+- Gemini accounts are shuffled once at provider startup and use Google's rolling `gemini-flash-latest` alias unless a model is configured explicitly.
+- TypeSafe AI is now opt-in at the master switch, preventing paid decisions during compression and other flows unless explicitly enabled; Jev graph and consolidation input compaction remains separately opt-in.
+
 ## [0.9.52] — 2026-09-18
 
 ### Fixed

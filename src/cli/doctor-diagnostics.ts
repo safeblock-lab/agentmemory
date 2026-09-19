@@ -198,7 +198,7 @@ export function buildDiagnostics(effects: DoctorEffects): Diagnostic[] {
       fixPreview: "Open ~/.agentmemory/.env in $EDITOR and paste your key, then re-check.",
       moreInfo:
         "Set at least one of: ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, " +
-        "OPENROUTER_API_KEY, MINIMAX_API_KEY. The daemon picks the first that resolves " +
+        "OPENROUTER_API_KEY, MINIMAX_API_KEY, or AGENTMEMORY_GEMINI_ACCOUNTS_DIR. The daemon picks the first that resolves " +
         "to a real (non-placeholder) value at startup.",
       check: async () => {
         if (!effects.envFileExists()) {
@@ -206,9 +206,14 @@ export function buildDiagnostics(effects: DoctorEffects): Diagnostic[] {
         }
         const env = effects.readEnvFile();
         const real = realProviderKeys(env);
+        const accountDirectory = env["AGENTMEMORY_GEMINI_ACCOUNTS_DIR"]?.trim();
         return {
-          ok: real.length > 0,
-          detail: real.length > 0 ? `found: ${real.join(", ")}` : "no provider key set",
+          ok: real.length > 0 || Boolean(accountDirectory),
+          detail: real.length > 0
+            ? `found: ${real.join(", ")}`
+            : accountDirectory
+              ? "found: AGENTMEMORY_GEMINI_ACCOUNTS_DIR"
+              : "no provider key set",
         };
       },
       fix: (ctx) => effects.openEditor(ctx.envPath),

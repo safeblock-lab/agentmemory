@@ -9,15 +9,15 @@ TypeSafe.ai supplies typed decisions, including choices, scores, and Noul decisi
 | Variable | Default | Purpose |
 |---|---:|---|
 | `TYPESAFE_API_KEY` | unset | Enables authenticated TypeSafe.ai requests. |
-| `AGENTMEMORY_TYPESAFE_ENABLED` | `true` | Master switch for every TypeSafe feature. |
-| `AGENTMEMORY_TYPESAFE_COMPACTION_ENABLED` | `true` | Selects eligible, non-protected inputs before graph extraction and consolidation. |
+| `AGENTMEMORY_TYPESAFE_ENABLED` | `false` | Master switch; set to `true` to opt into TypeSafe AI requests. |
+| `AGENTMEMORY_TYPESAFE_COMPACTION_ENABLED` | `false` | Opts into paid Jev selection of eligible, non-protected inputs before graph extraction and consolidation. |
 | `AGENTMEMORY_TYPESAFE_ADMISSION_ENABLED` | `true` | Controls automatic rejection for eligible non-mutating tool observations. |
 | `AGENTMEMORY_TYPESAFE_PIPELINE_GATES_ENABLED` | `true` | Gates eligible automatic graph, consolidation, reflection, and skill analysis. |
 | `AGENTMEMORY_TYPESAFE_SCORING_ENABLED` | `true` | Scores eligible non-mutating observations before synthetic or LLM compression. |
 | `AGENTMEMORY_TYPESAFE_TIMEOUT_MS` | `5000` | Request timeout, bounded to 30 seconds. |
 | `AGENTMEMORY_TYPESAFE_MAX_STATE_CHARS` | `16000` | Maximum decision-state size, bounded to 64,000 characters. |
 
-The feature switches default to enabled. Actual requests require `TYPESAFE_API_KEY`. Set the master switch to `false` to disable every TypeSafe feature, or set an individual feature switch to `false` to disable only that feature. A missing key, disabled switch, TypeSafe error, or unusable response falls back to the operation's existing behavior.
+TypeSafe AI is disabled by default so no paid request occurs without explicit opt-in. Actual requests require both `TYPESAFE_API_KEY` and `AGENTMEMORY_TYPESAFE_ENABLED=true`. Compaction remains independently disabled by default; enable only the features you intend to use. A missing key, disabled switch, TypeSafe error, or unusable response falls back to the operation's existing behavior.
 
 ## Current integrations
 
@@ -29,8 +29,8 @@ Pipeline gates run only on eligible automatic/deferred work: semantic and proced
 
 ```env
 TYPESAFE_API_KEY=your-typesafe-api-key
-AGENTMEMORY_TYPESAFE_ENABLED=true
-AGENTMEMORY_TYPESAFE_COMPACTION_ENABLED=true
+AGENTMEMORY_TYPESAFE_ENABLED=false
+AGENTMEMORY_TYPESAFE_COMPACTION_ENABLED=false
 AGENTMEMORY_TYPESAFE_ADMISSION_ENABLED=true
 AGENTMEMORY_TYPESAFE_PIPELINE_GATES_ENABLED=true
 AGENTMEMORY_TYPESAFE_SCORING_ENABLED=true
@@ -40,7 +40,7 @@ Keep the API key in the local `.env` file or deployment secret store; do not com
 
 ## Graph input compaction
 
-Compaction makes keep/drop decisions about graph-extraction observations and consolidation inputs; it does not generate replacement summaries. AgentMemory pins decisions, errors, writes, recent observations, high-importance entries, and image or mixed-modality observations locally. Empty, low-importance notifications can be dropped locally. Only the remaining ambiguous items are sent in one batch with a privacy-filtered preview, capped at 16 candidates and 16,000 serialized state characters by default.
+Compaction is opt-in and makes keep/drop decisions about graph-extraction observations and consolidation inputs; it does not generate replacement summaries. AgentMemory pins decisions, errors, writes, recent observations, high-importance entries, and image or mixed-modality observations locally. Empty, low-importance notifications can be dropped locally. Only the remaining ambiguous items are sent in one batch with a privacy-filtered preview, capped at 16 candidates and 16,000 serialized state characters by default.
 
 TypeSafe drops an ambiguous item only when it selects `drop` with confidence at least `0.85`. A keep answer, lower-confidence drop, missing answer, size-limit overflow, timeout, or provider error preserves the observation. The feature never asks TypeSafe to invent a summary.
 

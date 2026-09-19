@@ -583,6 +583,15 @@ function parseLlmRoutingConfig(
 function detectProvider(env: Record<string, string>): ProviderConfig {
   const maxTokens = parseInt(env["MAX_TOKENS"] || "4096", 10);
 
+  if (hasRealValue(env["AGENTMEMORY_GEMINI_ACCOUNTS_DIR"])) {
+    return {
+      provider: "gemini",
+      model: env["GEMINI_MODEL"] || "gemini-flash-latest",
+      maxTokens,
+      geminiAccountsDir: env["AGENTMEMORY_GEMINI_ACCOUNTS_DIR"].trim(),
+    };
+  }
+
   // OpenAI-compatible: supports OpenAI, DeepSeek, SiliconFlow, Azure, vLLM, LM Studio
   if (hasRealValue(env["OPENAI_API_KEY"]) && env["OPENAI_API_KEY_FOR_LLM"] !== "false") {
     return {
@@ -619,7 +628,7 @@ function detectProvider(env: Record<string, string>): ProviderConfig {
     }
     return {
       provider: "gemini",
-      model: env["GEMINI_MODEL"] || "gemini-2.5-flash",
+      model: env["GEMINI_MODEL"] || "gemini-flash-latest",
       maxTokens,
     };
   }
@@ -659,7 +668,7 @@ function detectProvider(env: Record<string, string>): ProviderConfig {
     process.stderr.write(
       pc.dim(
         "[agentmemory] No LLM provider key set — running zero-LLM (BM25 + on-device embeddings). " +
-          "Set ANTHROPIC_API_KEY (or GEMINI/OPENAI/OPENROUTER/MINIMAX) in ~/.agentmemory/.env for LLM compression and summaries. " +
+          "Set ANTHROPIC_API_KEY (or GEMINI/OPENAI/OPENROUTER/MINIMAX), or AGENTMEMORY_GEMINI_ACCOUNTS_DIR, in ~/.agentmemory/.env for LLM compression and summaries. " +
           "Agent-SDK fallback stays off by default to avoid a Stop-hook recursion loop; opt in with AGENTMEMORY_AUTO_COMPRESS=true + AGENTMEMORY_ALLOW_AGENT_SDK=true.\n",
       ),
     );
@@ -756,7 +765,7 @@ export function getTypeSafeConfig(): TypeSafeConfig {
     [],
   );
   const features: Record<TypeSafeFeature, boolean> = {
-    compaction: parseBooleanSetting(env, TYPESAFE_FEATURE_ENV.compaction, true),
+    compaction: parseBooleanSetting(env, TYPESAFE_FEATURE_ENV.compaction, false),
     admission: parseBooleanSetting(env, TYPESAFE_FEATURE_ENV.admission, true),
     pipelineGates: parseBooleanSetting(env, TYPESAFE_FEATURE_ENV.pipelineGates, true),
     scoring: parseBooleanSetting(env, TYPESAFE_FEATURE_ENV.scoring, true),
@@ -764,7 +773,7 @@ export function getTypeSafeConfig(): TypeSafeConfig {
   const apiKey = env["TYPESAFE_API_KEY"]?.trim() ?? "";
 
   return {
-    enabled: parseBooleanSetting(env, "AGENTMEMORY_TYPESAFE_ENABLED", true),
+    enabled: parseBooleanSetting(env, "AGENTMEMORY_TYPESAFE_ENABLED", false),
     apiKey: apiKey.length <= 4_096 ? apiKey : "",
     timeoutMs: parseBoundedAuxInt(
       env,
@@ -802,6 +811,7 @@ export function isDropStaleIndexEnabled(): boolean {
 export function detectLlmProviderKind(): "llm" | "noop" {
   const env = getMergedEnv();
   if (
+    hasRealValue(env["AGENTMEMORY_GEMINI_ACCOUNTS_DIR"]) ||
     hasRealValue(env["ANTHROPIC_API_KEY"]) ||
     hasRealValue(env["GEMINI_API_KEY"]) ||
     hasRealValue(env["GOOGLE_API_KEY"]) ||
@@ -978,7 +988,8 @@ function hasLLMProviderConfigured(env: Record<string, string | undefined>): bool
     env["OPENAI_API_KEY"] &&
     (env["OPENAI_API_KEY_FOR_LLM"] || "").toLowerCase() !== "false";
   return Boolean(
-    env["ANTHROPIC_API_KEY"] ||
+    env["AGENTMEMORY_GEMINI_ACCOUNTS_DIR"] ||
+      env["ANTHROPIC_API_KEY"] ||
       openaiKeyForLlm ||
       env["OPENROUTER_API_KEY"] ||
       env["GEMINI_API_KEY"] ||
