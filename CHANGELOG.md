@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.54] — 2026-09-19
+
+### Fixed
+
+- Gemini account-pool calls are serialized at one request per second. Transient HTTP 503 responses receive four bounded retries after 2, 4, 8, and 16 seconds, then the request goes directly to the terminal fallback without trying another Gemini account.
+
+### Added
+
+- An optional `~/.agentmemory/openrouter-keys.json` pool samples two distinct accounts per request with `nvidia/nemotron-3.5-lightning:free` before using the paid Fireworks fallback.
+
 ## [0.9.53] — 2026-09-19
 
 ### Added

@@ -12,6 +12,10 @@ import { NoopProvider } from "./noop.js";
 import { OpenAIProvider } from "./openai.js";
 import { OllamaProvider } from "./ollama.js";
 import { OpenRouterProvider } from "./openrouter.js";
+import {
+  loadOpenRouterKeys,
+  OpenRouterKeyPoolProvider,
+} from "./openrouter-key-pool.js";
 import { ResilientProvider } from "./resilient.js";
 import { FallbackChainProvider } from "./fallback-chain.js";
 import {
@@ -54,6 +58,8 @@ function requireEnvVar(key: string): string {
 const GEMINI_CHAT_COMPLETIONS_URL =
   "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
 const FIREWORKS_BASE_URL = "https://api.fireworks.ai/inference/v1";
+const OPENROUTER_CHAT_COMPLETIONS_URL = "https://openrouter.ai/api/v1/chat/completions";
+const OPENROUTER_FREE_MODEL = "nvidia/nemotron-3.5-lightning:free";
 
 function createGeminiAccountPool(config: ProviderConfig): MemoryProvider {
   const directory = config.geminiAccountsDir;
@@ -92,12 +98,25 @@ function createGeminiAccountPool(config: ProviderConfig): MemoryProvider {
     );
   }
 
-  const terminalFallback = new OpenAIProvider(
+  const fireworksFallback = new OpenAIProvider(
     fireworksApiKey,
     fireworksModel,
     config.maxTokens,
     FIREWORKS_BASE_URL,
   );
+  const terminalFallback = config.openRouterKeysFile
+    ? new OpenRouterKeyPoolProvider(
+      loadOpenRouterKeys(config.openRouterKeysFile).map(
+        (apiKey) => new OpenRouterProvider(
+          apiKey,
+          OPENROUTER_FREE_MODEL,
+          config.maxTokens,
+          OPENROUTER_CHAT_COMPLETIONS_URL,
+        ),
+      ),
+      fireworksFallback,
+    )
+    : fireworksFallback;
   return new GeminiAccountPoolProvider(accounts, terminalFallback);
 }
 

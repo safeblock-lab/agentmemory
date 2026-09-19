@@ -1210,7 +1210,7 @@ agentmemory auto-detects generation providers from your environment. By default,
 | Anthropic API | `ANTHROPIC_API_KEY` | Per-token billing |
 | MiniMax | `MINIMAX_API_KEY` | Anthropic-compatible |
 | Gemini | `GEMINI_API_KEY` | Also enables embeddings |
-| Gemini account pool | `AGENTMEMORY_GEMINI_ACCOUNTS_DIR` | Tries one project/account JSON at a time on HTTP 429, then permanently uses Fireworks until restart. |
+| Gemini account pool | `AGENTMEMORY_GEMINI_ACCOUNTS_DIR` | Serializes Google calls at one request per second, tries one project/account JSON at a time on HTTP 429, then samples two free OpenRouter accounts before Fireworks. |
 | OpenRouter | `OPENROUTER_API_KEY` | Any model |
 | OpenAI API | `OPENAI_API_KEY` | Default `gpt-4o-mini`, override with `OPENAI_MODEL` |
 | Fireworks.ai | `OPENAI_API_KEY` + `OPENAI_BASE_URL` | OpenAI-compatible chat API; set `OPENAI_MODEL` and optionally `OPENAI_REASONING_EFFORT`. See [Fireworks.ai (OpenAI-compatible)](#fireworksai-openai-compatible). |
@@ -1239,7 +1239,9 @@ FIREWORKS_API_KEY=your-fireworks-key
 FIREWORKS_MODEL=accounts/your-account/models/your-model
 ```
 
-An HTTP 429 marks the current Gemini account exhausted for the process lifetime and advances to the next JSON. After every account returns 429, Fireworks becomes the sticky provider for all later generation requests until agentmemory restarts. Authentication, malformed-response, and network errors do not rotate accounts or silently incur Fireworks cost. Existing Fireworks OpenAI-compatible settings also work when `OPENAI_BASE_URL` targets `api.fireworks.ai` and `OPENAI_API_KEY` plus `OPENAI_MODEL` are set.
+Optionally create `~/.agentmemory/openrouter-keys.json` as a JSON array with one quoted OpenRouter key per line. The file is validated at startup, capped at 128 unique keys, and never logged. After Google quota is exhausted, every request selects two distinct keys at random and tries `nvidia/nemotron-3.5-lightning:free` with each before using Fireworks. A later request samples again, so the free pool remains ahead of the paid fallback.
+
+Google requests are serialized and start at least one second apart across compression and summarization. A temporary HTTP 503 is retried four times on the same account, after 2, 4, 8, and 16 seconds. If the fifth attempt still returns 503, that request goes directly to the OpenRouter sampler without trying another Gemini account; a later request may try Gemini again. An HTTP 429 marks the current Gemini account exhausted for the process lifetime and advances to the next JSON. After every account returns 429, the OpenRouter sampler becomes the process-lifetime fallback; Fireworks is used only for a request whose two sampled free accounts both fail. Authentication, malformed-response, and network errors from Google do not rotate accounts or silently incur Fireworks cost. Existing Fireworks OpenAI-compatible settings also work when `OPENAI_BASE_URL` targets `api.fireworks.ai` and `OPENAI_API_KEY` plus `OPENAI_MODEL` are set.
 
 ### TypeSafe.ai decisions
 

@@ -25,6 +25,7 @@ function safeParseInt(value: string | undefined, fallback: number): number {
 
 const DATA_DIR = join(homedir(), ".agentmemory");
 const ENV_FILE = join(DATA_DIR, ".env");
+const OPENROUTER_KEYS_FILE = join(DATA_DIR, "openrouter-keys.json");
 
 let warnPremiumModelShown = false;
 
@@ -589,6 +590,9 @@ function detectProvider(env: Record<string, string>): ProviderConfig {
       model: env["GEMINI_MODEL"] || "gemini-flash-latest",
       maxTokens,
       geminiAccountsDir: env["AGENTMEMORY_GEMINI_ACCOUNTS_DIR"].trim(),
+      openRouterKeysFile: existsSync(OPENROUTER_KEYS_FILE)
+        ? OPENROUTER_KEYS_FILE
+        : undefined,
     };
   }
 

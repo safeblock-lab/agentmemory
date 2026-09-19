@@ -12,12 +12,19 @@ import { OpenRouterProviderError } from "./openrouter.js";
 const MAX_ACCOUNT_FILES = 64;
 const MAX_ACCOUNT_FILE_BYTES = 64 * 1024;
 const MAX_FIELD_LENGTH = 512;
+const DEFAULT_MINIMUM_REQUEST_INTERVAL_MS = 1_000;
+const DEFAULT_UNAVAILABLE_RETRY_DELAYS_MS = [2_000, 4_000, 8_000, 16_000] as const;
 
 export interface GeminiAccountConfig {
   apiKey: string;
   name?: string;
   project?: string;
   model: string;
+}
+
+export interface GeminiAccountPoolOptions {
+  minimumRequestIntervalMs?: number;
+  unavailableRetryDelaysMs?: readonly number[];
 }
 
 type RandomIndex = (exclusiveMaximum: number) => number;
@@ -119,15 +126,26 @@ export class GeminiAccountPoolProvider implements MemoryProvider {
   readonly name: string;
   private activeAccountIndex = 0;
   private fallbackOnly = false;
+  private operationTail: Promise<void> = Promise.resolve();
+  private nextGeminiRequestAt = 0;
+  private readonly minimumRequestIntervalMs: number;
+  private readonly unavailableRetryDelaysMs: readonly number[];
 
   constructor(
     private readonly accounts: readonly MemoryProvider[],
     private readonly terminalFallback: MemoryProvider,
+    options: GeminiAccountPoolOptions = {},
   ) {
     if (accounts.length === 0) {
       throw new Error("At least one Gemini account provider is required.");
     }
     this.name = `gemini-pool(${accounts.length}) -> ${terminalFallback.name}`;
+    this.minimumRequestIntervalMs = normalizeDelay(
+      options.minimumRequestIntervalMs ?? DEFAULT_MINIMUM_REQUEST_INTERVAL_MS,
+    );
+    this.unavailableRetryDelaysMs = (
+      options.unavailableRetryDelaysMs ?? DEFAULT_UNAVAILABLE_RETRY_DELAYS_MS
+    ).map(normalizeDelay);
   }
 
   compress(
@@ -135,7 +153,7 @@ export class GeminiAccountPoolProvider implements MemoryProvider {
     userPrompt: string,
     options?: LlmCallOptions,
   ): Promise<string> {
-    return this.run((provider) => provider.compress(systemPrompt, userPrompt, options));
+    return this.enqueue((provider) => provider.compress(systemPrompt, userPrompt, options));
   }
 
   summarize(
@@ -143,34 +161,88 @@ export class GeminiAccountPoolProvider implements MemoryProvider {
     userPrompt: string,
     options?: LlmCallOptions,
   ): Promise<string> {
-    return this.run((provider) => provider.summarize(systemPrompt, userPrompt, options));
+    return this.enqueue((provider) => provider.summarize(systemPrompt, userPrompt, options));
+  }
+
+  private enqueue(operation: (provider: MemoryProvider) => Promise<string>): Promise<string> {
+    const result = this.operationTail.then(() => this.run(operation));
+    this.operationTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
   }
 
   private async run(operation: (provider: MemoryProvider) => Promise<string>): Promise<string> {
     while (!this.fallbackOnly && this.activeAccountIndex < this.accounts.length) {
       const accountIndex = this.activeAccountIndex;
-      try {
-        return await operation(this.accounts[accountIndex]);
-      } catch (error) {
-        if (!(error instanceof OpenRouterProviderError) || error.status !== 429) {
-          throw error;
-        }
-        if (this.activeAccountIndex === accountIndex) {
-          this.activeAccountIndex += 1;
-          logger.warn("Gemini account quota exhausted; advancing account pool", {
-            accountIndex: accountIndex + 1,
-            accountCount: this.accounts.length,
-          });
+      let unavailableRetryIndex = 0;
+
+      while (true) {
+        await this.waitForGeminiSlot();
+        try {
+          return await operation(this.accounts[accountIndex]);
+        } catch (error) {
+          if (
+            error instanceof OpenRouterProviderError
+            && error.status === 503
+          ) {
+            if (unavailableRetryIndex < this.unavailableRetryDelaysMs.length) {
+              const retryDelayMs = this.unavailableRetryDelaysMs[unavailableRetryIndex]!;
+              unavailableRetryIndex += 1;
+              logger.warn("Gemini temporarily unavailable; retrying current account", {
+                accountIndex: accountIndex + 1,
+                accountCount: this.accounts.length,
+                retryAttempt: unavailableRetryIndex,
+                retryDelayMs,
+              });
+              await delay(retryDelayMs);
+              continue;
+            }
+            logger.warn("Gemini remains unavailable; using terminal fallback for this request", {
+              accountIndex: accountIndex + 1,
+              accountCount: this.accounts.length,
+              attempts: unavailableRetryIndex + 1,
+            });
+            return operation(this.terminalFallback);
+          }
+          if (!(error instanceof OpenRouterProviderError) || error.status !== 429) {
+            throw error;
+          }
+          if (this.activeAccountIndex === accountIndex) {
+            this.activeAccountIndex += 1;
+            logger.warn("Gemini account quota exhausted; advancing account pool", {
+              accountIndex: accountIndex + 1,
+              accountCount: this.accounts.length,
+            });
+          }
+          break;
         }
       }
     }
 
     if (!this.fallbackOnly) {
-      logger.warn("Gemini account pool exhausted; switching permanently to Fireworks", {
+      logger.warn("Gemini account pool exhausted; switching permanently to terminal fallback", {
         accountCount: this.accounts.length,
       });
     }
     this.fallbackOnly = true;
     return operation(this.terminalFallback);
   }
+
+  private async waitForGeminiSlot(): Promise<void> {
+    const waitMs = Math.max(0, this.nextGeminiRequestAt - Date.now());
+    await delay(waitMs);
+    this.nextGeminiRequestAt = Date.now() + this.minimumRequestIntervalMs;
+  }
+}
+
+function normalizeDelay(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.floor(value));
+}
+
+function delay(milliseconds: number): Promise<void> {
+  if (milliseconds === 0) return Promise.resolve();
+  return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
 }
