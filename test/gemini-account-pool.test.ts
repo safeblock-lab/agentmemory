@@ -123,7 +123,7 @@ describe("GeminiAccountPoolProvider", () => {
     expect(fallback).not.toHaveBeenCalled();
   });
 
-  it("uses Fireworks for all later calls after every account is exhausted", async () => {
+  it("uses the fallback while every account is cooling down", async () => {
     const exhausted = () => Promise.reject(
       new OpenRouterProviderError("gemini", 429, "quota exhausted"),
     );
@@ -141,6 +141,102 @@ describe("GeminiAccountPoolProvider", () => {
     expect(first).toHaveBeenCalledTimes(1);
     expect(second).toHaveBeenCalledTimes(1);
     expect(fallback).toHaveBeenCalledTimes(2);
+  });
+
+  it("re-enables a rate-limited account after five minutes", async () => {
+    vi.useFakeTimers();
+    const gemini = vi.fn()
+      .mockRejectedValueOnce(new OpenRouterProviderError("gemini", 429, "rate limited"))
+      .mockResolvedValue("google-response");
+    const fallback = vi.fn().mockResolvedValue("openrouter");
+    const pool = new GeminiAccountPoolProvider(
+      [provider("gemini", gemini)],
+      provider("openrouter", fallback),
+      {
+        minimumRequestIntervalMs: 0,
+        unavailableRetryDelaysMs: [],
+        quotaCooldownMs: 5 * 60_000,
+      },
+    );
+
+    await expect(pool.compress("system", "first")).resolves.toBe("openrouter");
+    await expect(pool.compress("system", "second")).resolves.toBe("openrouter");
+    expect(gemini).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+
+    await expect(pool.compress("system", "third")).resolves.toBe("google-response");
+    expect(gemini).toHaveBeenCalledTimes(2);
+    expect(fallback).toHaveBeenCalledTimes(2);
+  });
+
+  it("honors Retry-After seconds instead of the default cooldown", async () => {
+    vi.useFakeTimers();
+    const gemini = vi.fn()
+      .mockRejectedValueOnce(new OpenRouterProviderError("gemini", 429, "rate limited", "30"))
+      .mockResolvedValue("google-response");
+    const fallback = vi.fn().mockResolvedValue("openrouter");
+    const pool = new GeminiAccountPoolProvider(
+      [provider("gemini", gemini)],
+      provider("openrouter", fallback),
+      immediatePoolOptions,
+    );
+
+    await expect(pool.compress("system", "first")).resolves.toBe("openrouter");
+    await vi.advanceTimersByTimeAsync(29_999);
+    await expect(pool.compress("system", "second")).resolves.toBe("openrouter");
+    expect(gemini).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(pool.compress("system", "third")).resolves.toBe("google-response");
+    expect(gemini).toHaveBeenCalledTimes(2);
+  });
+
+  it("honors an HTTP-date Retry-After value", async () => {
+    vi.useFakeTimers();
+    const now = new Date("2026-09-19T12:00:00.000Z");
+    vi.setSystemTime(now);
+    const retryAt = new Date(now.getTime() + 90_000).toUTCString();
+    const gemini = vi.fn()
+      .mockRejectedValueOnce(new OpenRouterProviderError("gemini", 429, "rate limited", retryAt))
+      .mockResolvedValue("google-response");
+    const fallback = vi.fn().mockResolvedValue("openrouter");
+    const pool = new GeminiAccountPoolProvider(
+      [provider("gemini", gemini)],
+      provider("openrouter", fallback),
+      immediatePoolOptions,
+    );
+
+    await expect(pool.compress("system", "first")).resolves.toBe("openrouter");
+    await vi.advanceTimersByTimeAsync(89_999);
+    await expect(pool.compress("system", "second")).resolves.toBe("openrouter");
+    expect(gemini).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(pool.compress("system", "third")).resolves.toBe("google-response");
+    expect(gemini).toHaveBeenCalledTimes(2);
+  });
+
+  it("falls back to five minutes for an invalid Retry-After value", async () => {
+    vi.useFakeTimers();
+    const gemini = vi.fn()
+      .mockRejectedValueOnce(new OpenRouterProviderError("gemini", 429, "rate limited", "later"))
+      .mockResolvedValue("google-response");
+    const fallback = vi.fn().mockResolvedValue("openrouter");
+    const pool = new GeminiAccountPoolProvider(
+      [provider("gemini", gemini)],
+      provider("openrouter", fallback),
+      immediatePoolOptions,
+    );
+
+    await expect(pool.compress("system", "first")).resolves.toBe("openrouter");
+    await vi.advanceTimersByTimeAsync(5 * 60_000 - 1);
+    await expect(pool.compress("system", "second")).resolves.toBe("openrouter");
+    expect(gemini).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(pool.compress("system", "third")).resolves.toBe("google-response");
+    expect(gemini).toHaveBeenCalledTimes(2);
   });
 
   it("does not hide non-quota Gemini failures behind another account", async () => {

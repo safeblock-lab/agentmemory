@@ -14,6 +14,8 @@ const MAX_ACCOUNT_FILE_BYTES = 64 * 1024;
 const MAX_FIELD_LENGTH = 512;
 const DEFAULT_MINIMUM_REQUEST_INTERVAL_MS = 1_000;
 const DEFAULT_UNAVAILABLE_RETRY_DELAYS_MS = [2_000, 4_000, 8_000, 16_000] as const;
+const DEFAULT_QUOTA_COOLDOWN_MS = 5 * 60_000;
+const MAX_RETRY_AFTER_LENGTH = 128;
 
 export interface GeminiAccountConfig {
   apiKey: string;
@@ -25,6 +27,7 @@ export interface GeminiAccountConfig {
 export interface GeminiAccountPoolOptions {
   minimumRequestIntervalMs?: number;
   unavailableRetryDelaysMs?: readonly number[];
+  quotaCooldownMs?: number;
 }
 
 type RandomIndex = (exclusiveMaximum: number) => number;
@@ -124,12 +127,13 @@ export function loadGeminiAccounts(
 
 export class GeminiAccountPoolProvider implements MemoryProvider {
   readonly name: string;
-  private activeAccountIndex = 0;
-  private fallbackOnly = false;
+  private nextAccountIndex = 0;
   private operationTail: Promise<void> = Promise.resolve();
   private nextGeminiRequestAt = 0;
+  private readonly quotaCooldownUntil: number[];
   private readonly minimumRequestIntervalMs: number;
   private readonly unavailableRetryDelaysMs: readonly number[];
+  private readonly quotaCooldownMs: number;
 
   constructor(
     private readonly accounts: readonly MemoryProvider[],
@@ -146,6 +150,10 @@ export class GeminiAccountPoolProvider implements MemoryProvider {
     this.unavailableRetryDelaysMs = (
       options.unavailableRetryDelaysMs ?? DEFAULT_UNAVAILABLE_RETRY_DELAYS_MS
     ).map(normalizeDelay);
+    this.quotaCooldownMs = normalizeDelay(
+      options.quotaCooldownMs ?? DEFAULT_QUOTA_COOLDOWN_MS,
+    );
+    this.quotaCooldownUntil = accounts.map(() => 0);
   }
 
   compress(
@@ -174,8 +182,12 @@ export class GeminiAccountPoolProvider implements MemoryProvider {
   }
 
   private async run(operation: (provider: MemoryProvider) => Promise<string>): Promise<string> {
-    while (!this.fallbackOnly && this.activeAccountIndex < this.accounts.length) {
-      const accountIndex = this.activeAccountIndex;
+    const attemptedAccounts = new Set<number>();
+    while (attemptedAccounts.size < this.accounts.length) {
+      const accountIndex = this.findAvailableAccount(attemptedAccounts);
+      if (accountIndex === undefined) break;
+      attemptedAccounts.add(accountIndex);
+      this.nextAccountIndex = accountIndex;
       let unavailableRetryIndex = 0;
 
       while (true) {
@@ -209,25 +221,47 @@ export class GeminiAccountPoolProvider implements MemoryProvider {
           if (!(error instanceof OpenRouterProviderError) || error.status !== 429) {
             throw error;
           }
-          if (this.activeAccountIndex === accountIndex) {
-            this.activeAccountIndex += 1;
-            logger.warn("Gemini account quota exhausted; advancing account pool", {
-              accountIndex: accountIndex + 1,
-              accountCount: this.accounts.length,
-            });
-          }
+          const now = Date.now();
+          const retryAfterMs = parseRetryAfterMs(error.retryAfter, now);
+          const cooldownMs = retryAfterMs ?? this.quotaCooldownMs;
+          this.quotaCooldownUntil[accountIndex] = now + cooldownMs;
+          this.nextAccountIndex = (accountIndex + 1) % this.accounts.length;
+          logger.warn("Gemini account rate limited; applying cooldown", {
+            accountIndex: accountIndex + 1,
+            accountCount: this.accounts.length,
+            cooldownMs,
+            cooldownSource: retryAfterMs === undefined ? "default" : "retry-after",
+          });
           break;
         }
       }
     }
 
-    if (!this.fallbackOnly) {
-      logger.warn("Gemini account pool exhausted; switching permanently to terminal fallback", {
-        accountCount: this.accounts.length,
-      });
-    }
-    this.fallbackOnly = true;
+    const now = Date.now();
+    const futureCooldowns = this.quotaCooldownUntil.filter((until) => until > now);
+    const nextAvailableInMs = futureCooldowns.length > 0
+      ? Math.max(0, Math.min(...futureCooldowns) - now)
+      : 0;
+    logger.warn("No Gemini accounts currently available; using terminal fallback for this request", {
+      accountCount: this.accounts.length,
+      coolingAccountCount: futureCooldowns.length,
+      nextAvailableInMs,
+    });
     return operation(this.terminalFallback);
+  }
+
+  private findAvailableAccount(attemptedAccounts: ReadonlySet<number>): number | undefined {
+    const now = Date.now();
+    for (let offset = 0; offset < this.accounts.length; offset += 1) {
+      const accountIndex = (this.nextAccountIndex + offset) % this.accounts.length;
+      if (
+        !attemptedAccounts.has(accountIndex)
+        && this.quotaCooldownUntil[accountIndex]! <= now
+      ) {
+        return accountIndex;
+      }
+    }
+    return undefined;
   }
 
   private async waitForGeminiSlot(): Promise<void> {
@@ -240,6 +274,24 @@ export class GeminiAccountPoolProvider implements MemoryProvider {
 function normalizeDelay(value: number): number {
   if (!Number.isFinite(value)) return 0;
   return Math.max(0, Math.floor(value));
+}
+
+function parseRetryAfterMs(value: string | undefined, now: number): number | undefined {
+  if (value === undefined) return undefined;
+  const normalized = value.trim();
+  if (normalized.length === 0 || normalized.length > MAX_RETRY_AFTER_LENGTH) return undefined;
+
+  if (/^\d+$/.test(normalized)) {
+    const seconds = Number(normalized);
+    if (!Number.isSafeInteger(seconds) || seconds > Number.MAX_SAFE_INTEGER / 1_000) {
+      return undefined;
+    }
+    return seconds * 1_000;
+  }
+
+  const retryAt = Date.parse(normalized);
+  if (!Number.isFinite(retryAt)) return undefined;
+  return Math.max(0, retryAt - now);
 }
 
 function delay(milliseconds: number): Promise<void> {

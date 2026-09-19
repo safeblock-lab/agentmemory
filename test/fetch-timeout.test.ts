@@ -1,7 +1,10 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { fetchWithTimeout } from "../src/providers/_fetch.js";
 import { MinimaxProvider } from "../src/providers/minimax.js";
-import { OpenRouterProvider } from "../src/providers/openrouter.js";
+import {
+  OpenRouterProvider,
+  OpenRouterProviderError,
+} from "../src/providers/openrouter.js";
 import { OpenAIProvider } from "../src/providers/openai.js";
 import { GeminiEmbeddingProvider } from "../src/providers/embedding/gemini.js";
 import { OpenAIEmbeddingProvider } from "../src/providers/embedding/openai.js";
@@ -114,6 +117,27 @@ describe("Provider hang regression — OpenRouterProvider (covers Gemini LLM pat
       "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
     );
     await expect(provider.compress("system", "user")).rejects.toThrow();
+  });
+
+  it("preserves Retry-After from provider error responses", async () => {
+    vi.restoreAllMocks();
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("rate limited", {
+        status: 429,
+        headers: { "Retry-After": "45" },
+      }),
+    );
+    const provider = new OpenRouterProvider(
+      "test-key",
+      "gemini-2.5-flash",
+      1024,
+      "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    );
+
+    await expect(provider.compress("system", "user")).rejects.toMatchObject({
+      status: 429,
+      retryAfter: "45",
+    } satisfies Partial<OpenRouterProviderError>);
   });
 });
 

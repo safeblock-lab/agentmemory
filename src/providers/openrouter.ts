@@ -7,6 +7,7 @@ export class OpenRouterProviderError extends Error {
     readonly provider: string,
     readonly status: number,
     detail: string,
+    readonly retryAfter?: string,
   ) {
     super(`${provider} API error (${status}): ${detail.slice(0, 1_000)}`);
     this.name = "OpenRouterProviderError";
@@ -75,7 +76,12 @@ export class OpenRouterProvider implements MemoryProvider {
     if (!response.ok) {
       telemetry.failure({ httpStatus: response.status, errorKind: "provider_response" });
       const text = await response.text();
-      throw new OpenRouterProviderError(this.name, response.status, text);
+      throw new OpenRouterProviderError(
+        this.name,
+        response.status,
+        text,
+        response.headers.get("retry-after") ?? undefined,
+      );
     }
 
     let data: Record<string, unknown>;

@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.55] — 2026-09-19
+
+### Fixed
+
+- Gemini HTTP 429 responses now place only the affected account in cooldown, honoring Google's `Retry-After` header or defaulting to five minutes; accounts automatically re-enter the pool instead of disabling Gemini until restart.
+
 ## [0.9.54] — 2026-09-19
 
 ### Fixed
