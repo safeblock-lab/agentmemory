@@ -28,12 +28,16 @@ agentmemory is a persistent memory system for AI coding agents, built on iii-eng
 
 **When bumping version, you MUST update ALL of the following:**
 1. `package.json` — version field
-2. `src/version.ts` — VERSION constant and type union
-3. `src/types.ts` — ExportData version union
-4. `src/functions/export-import.ts` — supportedVersions set
-5. `test/export-import.test.ts` — version assertion
-6. `plugin/.claude-plugin/plugin.json` — version field
-7. `plugin/plugin.json` (when present) — version field
+2. `package-lock.json` — root package version fields
+3. `src/version.ts` — VERSION constant
+4. `src/types.ts` — ExportData version union
+5. `src/functions/export-import.ts` — supportedVersions set
+6. `test/export-import.test.ts` — version assertion
+7. `plugin/.claude-plugin/plugin.json` — version field
+8. `plugin/plugin.json` (when present) — version field
+9. `plugin/.codex-plugin/plugin.json` (when present) — version field
+10. `.cursor-plugin/plugin.json` (when present) — version field
+11. `packages/mcp/package.json` (when present) — package version and agentmemory dependency range
 
 **When adding new KV scopes:**
 1. `src/state/schema.ts` — add to the KV object
@@ -116,7 +120,7 @@ Hook scripts in `src/hooks/` are standalone Node.js scripts (no iii-sdk import).
 - Test files go in `test/` with `.test.ts` extension
 - Follow existing patterns in `test/crystallize.test.ts` for function tests
 
-## Current Stats (v0.9.57)
+## Current Stats (v0.9.58)
 
 - 54 MCP tools (8 visible by default, `AGENTMEMORY_TOOLS=all` for all)
 - 132 REST endpoints
