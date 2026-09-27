@@ -38,7 +38,7 @@ jobs:
           fs.appendFileSync(process.env.GITHUB_ENV, `VERSION=${version}\n`);
           NODE
 
-      - run: npm install --legacy-peer-deps --no-audit --no-fund
+      - run: npm ci --legacy-peer-deps --no-audit --no-fund
       - run: npm run build
       - run: npm run skills:check
       - run: npm test

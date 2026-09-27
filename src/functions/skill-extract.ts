@@ -1,4 +1,4 @@
-import type { ISdk } from "iii-sdk";
+import type { IIIClient } from "iii-sdk";
 import { withBatchWriterLocks, withBatchRecordLocks } from "../state/batch-effects.js";
 import type {
   CompressedObservation,
@@ -112,7 +112,7 @@ function parseSkillXml(
 }
 
 export function registerSkillExtractFunctions(
-  sdk: ISdk,
+  sdk: IIIClient,
   kv: StateKV,
   provider: MemoryProvider,
   llmRouter?: LlmTaskRouter,

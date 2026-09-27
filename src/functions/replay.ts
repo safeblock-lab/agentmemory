@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { lstat, readFile, readdir } from "node:fs/promises";
 import { resolve, join } from "node:path";
-import type { ISdk } from "iii-sdk";
+import type { IIIClient } from "iii-sdk";
 import { withBatchWriterLocks, withBatchRecordLocks, preserveBatchProvenance } from "../state/batch-effects.js";
 import type {
   CompressedObservation,
@@ -10,13 +10,15 @@ import type {
   RawObservation,
   Session,
 } from "../types.js";
+import { importOrigin } from "../types.js";
 import type { StateKV } from "../state/kv.js";
 import { KV, generateId, fingerprintId } from "../state/schema.js";
 import { parseJsonlText } from "../replay/jsonl-parser.js";
+import { resetLessonIndex } from "./lessons.js";
 import { projectTimeline, type Timeline } from "../replay/timeline.js";
 import { safeAudit } from "./audit.js";
 import { buildSyntheticCompression } from "./compress-synthetic.js";
-import { getSearchIndex } from "./search.js";
+import { indexRecords } from "./search.js";
 import { logger } from "../logger.js";
 
 export const MAX_FILES_DEFAULT = 200;
@@ -158,6 +160,7 @@ async function deriveCrystalAndLessons(
       lessonIds.push(lessonId);
     } catch { }
   }
+  if (lessonIds.length > 0) resetLessonIndex();
 
   // Content-addressed on sessionId so re-importing the same session
   // upserts the crystal in place instead of creating a new one.
@@ -261,7 +264,7 @@ async function findJsonlFiles(
   };
 }
 
-export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
+export function registerReplayFunctions(sdk: IIIClient, kv: StateKV): void {
   sdk.registerFunction(
     "mem::replay::load",
     async (data: { sessionId: string }): Promise<
@@ -435,16 +438,28 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
           await kv.set(KV.sessions, session.id, session);
         }
 
-        const searchIndex = getSearchIndex();
         const compressed: CompressedObservation[] = [];
         await Promise.all(
           parsed.observations.map(async (obs) => {
             const synthetic = buildSyntheticCompression(obs);
+            synthetic.origin = importOrigin(
+              synthetic.origin,
+              synthetic.timestamp,
+              "jsonl",
+            );
             compressed.push(synthetic);
             await kv.set(KV.observations(parsed.sessionId), obs.id, synthetic);
-            searchIndex.add(synthetic);
           }),
         );
+        // BM25 + vector in one path so jsonl-imported observations are
+        // reachable by semantic search, not just keyword.
+        try {
+          await indexRecords(compressed, []);
+        } catch (err) {
+          logger.warn("Import indexing failed; restart rebuild will recover", {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
         observationCount += parsed.observations.length;
         sessionIds.push(parsed.sessionId);
 

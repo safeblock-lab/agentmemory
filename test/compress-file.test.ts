@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { resolve } from "node:path";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -107,9 +108,9 @@ describe("mem::compress-file", () => {
   });
 
   it("rejects symlinks", async () => {
-    symlinkPaths.add("/tmp/notes.md");
+    symlinkPaths.add(resolve("/tmp/notes.md"));
     const result = (await sdk.trigger("mem::compress-file", {
-      filePath: "/tmp/notes.md",
+      filePath: resolve("/tmp/notes.md"),
     })) as { success: boolean; error: string };
     expect(result.success).toBe(false);
     expect(result.error).toContain("symlink");
@@ -118,7 +119,7 @@ describe("mem::compress-file", () => {
   });
 
   it("rejects TOCTOU symlink swap at write time via O_NOFOLLOW", async () => {
-    const path = "/tmp/notes.md";
+    const path = resolve("/tmp/notes.md");
     fileStore.set(
       path,
       "# Title\n\nVisit https://example.com\n\n```ts\nconst x = 1;\n```\n\nContent.",
@@ -137,7 +138,7 @@ describe("mem::compress-file", () => {
 
   it("rejects non-markdown paths", async () => {
     const result = (await sdk.trigger("mem::compress-file", {
-      filePath: "/tmp/readme.txt",
+      filePath: resolve("/tmp/readme.txt"),
     })) as { success: boolean; error: string };
     expect(result.success).toBe(false);
     expect(result.error).toContain(".md");
@@ -145,14 +146,14 @@ describe("mem::compress-file", () => {
 
   it("returns file not found for missing paths", async () => {
     const result = (await sdk.trigger("mem::compress-file", {
-      filePath: "/tmp/nonexistent.md",
+      filePath: resolve("/tmp/nonexistent.md"),
     })) as { success: boolean; error: string };
     expect(result.success).toBe(false);
     expect(result.error).toContain("not found");
   });
 
   it("compresses markdown and writes .original.md backup", async () => {
-    const path = "/tmp/notes.md";
+    const path = resolve("/tmp/notes.md");
     fileStore.set(
       path,
       "# Title\n\nVisit https://example.com\n\n```ts\nconst x = 1;\n```\n\nSome long explanation.",
@@ -172,14 +173,14 @@ describe("mem::compress-file", () => {
     };
 
     expect(result.success).toBe(true);
-    expect(result.backupPath).toBe("/tmp/notes.original.md");
-    expect(fileStore.get("/tmp/notes.original.md")).toContain("Some long explanation.");
+    expect(result.backupPath).toBe(resolve("/tmp/notes.original.md"));
+    expect(fileStore.get(resolve("/tmp/notes.original.md"))).toContain("Some long explanation.");
     expect(fileStore.get(path)).toContain("Short explanation.");
     expect(result.compressedChars).toBeLessThan(result.originalChars);
   });
 
   it("fails validation when URLs change", async () => {
-    const path = "/tmp/guide.md";
+    const path = resolve("/tmp/guide.md");
     fileStore.set(path, "# Guide\n\nhttps://example.com\n");
     summarize.mockResolvedValue("# Guide\n\nhttps://different.example.com\n");
 
@@ -190,11 +191,11 @@ describe("mem::compress-file", () => {
     expect(result.success).toBe(false);
     expect(result.error).toContain("validation");
     expect(result.details.some((d) => d.includes("url"))).toBe(true);
-    expect(fileStore.get("/tmp/guide.original.md")).toBeUndefined();
+    expect(fileStore.get(resolve("/tmp/guide.original.md"))).toBeUndefined();
   });
 
   it("uses a distinct backup path for *.original.md inputs", async () => {
-    const path = "/tmp/notes.original.md";
+    const path = resolve("/tmp/notes.original.md");
     fileStore.set(path, "# Title\n\nLong original body.");
     summarize.mockResolvedValue("# Title\n\nShort body.");
 
@@ -203,8 +204,8 @@ describe("mem::compress-file", () => {
     })) as { success: boolean; backupPath: string };
 
     expect(result.success).toBe(true);
-    expect(result.backupPath).toBe("/tmp/notes.original.backup.md");
-    expect(fileStore.get("/tmp/notes.original.backup.md")).toBe(
+    expect(result.backupPath).toBe(resolve("/tmp/notes.original.backup.md"));
+    expect(fileStore.get(resolve("/tmp/notes.original.backup.md"))).toBe(
       "# Title\n\nLong original body.",
     );
     expect(fileStore.get(path)).toBe("# Title\n\nShort body.");

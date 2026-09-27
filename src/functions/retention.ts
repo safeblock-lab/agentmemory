@@ -1,4 +1,4 @@
-import type { ISdk } from "iii-sdk";
+import type { IIIClient } from "iii-sdk";
 import { withBatchMutationLocks } from "../state/batch-effects.js";
 import type {
   Memory,
@@ -79,22 +79,6 @@ function computeReinforcementBoost(
   return boost * sigma;
 }
 
-function computeRetention(
-  salience: number,
-  createdAt: string,
-  accessTimestamps: number[],
-  config: DecayConfig,
-): number {
-  const deltaT =
-    (Date.now() - new Date(createdAt).getTime()) / (1000 * 60 * 60 * 24);
-  const temporalDecay = Math.exp(-config.lambda * deltaT);
-  const reinforcementBoost = computeReinforcementBoost(
-    accessTimestamps,
-    config.sigma,
-  );
-  return Math.min(1, salience * temporalDecay + reinforcementBoost);
-}
-
 function computeSalience(
   memory: Memory | SemanticMemory,
   accessCount: number,
@@ -122,7 +106,7 @@ function computeSalience(
 }
 
 export function registerRetentionFunctions(
-  sdk: ISdk,
+  sdk: IIIClient,
   kv: StateKV,
 ): void {
   sdk.registerFunction("mem::retention-score",

@@ -1,4 +1,4 @@
-import type { ISdk } from "iii-sdk";
+import type { IIIClient } from "iii-sdk";
 import type { MemoryProvider, QueryExpansion } from "../types.js";
 import { logger } from "../logger.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
@@ -68,7 +68,7 @@ function parseExpansionXml(xml: string): QueryExpansion | null {
 }
 
 export function registerQueryExpansionFunction(
-  sdk: ISdk,
+  sdk: IIIClient,
   provider: MemoryProvider,
   llmRouter?: LlmTaskRouter,
 ): void {

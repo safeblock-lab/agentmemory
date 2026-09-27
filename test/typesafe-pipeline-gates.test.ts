@@ -86,6 +86,7 @@ beforeEach(() => {
   vi.stubEnv("AGENTMEMORY_TYPESAFE_SCORING_ENABLED", "true");
   vi.stubEnv("AGENTMEMORY_AUTO_COMPRESS", "false");
   vi.stubEnv("CONSOLIDATION_ENABLED", "true");
+  vi.stubEnv("GRAPH_EXTRACTION_ENABLED", "true");
 });
 
 afterEach(() => vi.unstubAllEnvs());
@@ -172,6 +173,7 @@ describe("TypeSafe pipeline decisions", () => {
         : undefined,
     });
     const provider = {
+      name: "test",
       compress: vi.fn(async (_system: string, prompt: string) => {
         expect(prompt).not.toContain("compacted-out-observation");
         return '<entity type="concept" name="graph-gate-test"/>';
@@ -197,7 +199,7 @@ describe("TypeSafe pipeline decisions", () => {
   it("gates scheduled graph extraction with bounded state and retains its input", async () => {
     const { sdk, kv } = harness();
     const typeSafe = decisionProvider({ evaluateChoice: async () => choice("skip") });
-    const provider = { compress: vi.fn() };
+    const provider = { name: "test", compress: vi.fn() };
     registerGraphFunction(sdk as never, kv as never, provider as never, undefined, undefined, undefined, typeSafe as never);
     const observations = Array.from({ length: 7 }, (_, index) => compressedObservation(
       `graph-gate-${index}`,

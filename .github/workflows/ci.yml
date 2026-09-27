@@ -52,7 +52,7 @@ jobs:
         # src/functions/obsidian-export.ts needs os.tmpdir() + path.join
         # rework before Windows can be added back. Tracked as follow-up.
         os: [ubuntu-latest, macos-latest]
-        node-version: [20, 22]
+        node-version: [20, 22, 24, 26]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -60,10 +60,6 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ matrix.node-version }}
-      # Two-step install: generate a lockfile in-runner with
-      # --package-lock-only, then install from it with `npm ci`.
-      # Lockfiles are gitignored at the repo level.
-      - run: npm install --package-lock-only --legacy-peer-deps --no-audit --no-fund
       - run: npm ci --legacy-peer-deps --no-audit --no-fund
       - run: npm run build
       - run: npm run skills:check

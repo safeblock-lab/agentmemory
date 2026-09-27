@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -64,6 +64,9 @@ const mockProvider = {
   summarize: vi.fn(),
 };
 
+// Structured fields stay empty so the deterministic heuristic pass
+// contributes nothing and these tests keep exercising the LLM XML
+// parse + persist path in isolation.
 const testObs: CompressedObservation = {
   id: "obs_1",
   sessionId: "ses_1",
@@ -72,8 +75,8 @@ const testObs: CompressedObservation = {
   title: "Edit index file",
   facts: ["Modified main function"],
   narrative: "Updated index.ts with main function",
-  concepts: ["typescript", "entry-point"],
-  files: ["src/index.ts"],
+  concepts: [],
+  files: [],
   importance: 7,
 };
 
@@ -91,11 +94,13 @@ async function withGraphInputTarget<T>(work: () => Promise<T>): Promise<T> {
 describe("Graph Functions", () => {
   let sdk: ReturnType<typeof mockSdk>;
   let kv: ReturnType<typeof mockKV>;
+  const ORIG_GRAPH_FLAG = process.env["GRAPH_EXTRACTION_ENABLED"];
 
   beforeEach(() => {
     sdk = mockSdk();
     kv = mockKV();
     vi.clearAllMocks();
+    process.env["GRAPH_EXTRACTION_ENABLED"] = "true";
     registerGraphFunction(sdk as never, kv as never, mockProvider as never);
   });
 
@@ -117,6 +122,30 @@ describe("Graph Functions", () => {
     const oversized = await sdk.trigger("mem::graph-extract", { observations: [{ ...testObs, narrative: "x".repeat(20000) }], deferred: true, replacementOf: "old" });
     expect(oversized.success).toBe(false);
     expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  afterEach(() => {
+    if (ORIG_GRAPH_FLAG === undefined) delete process.env["GRAPH_EXTRACTION_ENABLED"];
+    else process.env["GRAPH_EXTRACTION_ENABLED"] = ORIG_GRAPH_FLAG;
+  });
+
+  it("persists structural graph data keyless without calling an LLM", async () => {
+    process.env["GRAPH_EXTRACTION_ENABLED"] = "false";
+    const compress = vi.fn();
+    registerGraphFunction(sdk as never, kv as never, { name: "noop", compress, summarize: vi.fn() });
+    const result = await sdk.trigger("mem::graph-extract", { observations: [{ ...testObs, files: ["src/index.ts"], concepts: ["startup"] }] });
+    expect(result).toMatchObject({ success: true, nodesAdded: 2, edgesAdded: 1 });
+    expect(compress).not.toHaveBeenCalled();
+    expect(await kv.list(KV.graphNodes)).toHaveLength(2);
+  });
+
+  it("retains structural graph data when routed LLM extraction fails", async () => {
+    const provider = { name: "test", compress: vi.fn().mockRejectedValue(new Error("temporary failure")), summarize: vi.fn() };
+    registerGraphFunction(sdk as never, kv as never, provider);
+    const result = await sdk.trigger("mem::graph-extract", { observations: [{ ...testObs, files: ["src/index.ts"], concepts: ["startup"] }] });
+    expect(result).toMatchObject({ success: true, nodesAdded: 2, edgesAdded: 1, llmError: "temporary failure" });
+    expect(await kv.list(KV.graphNodes)).toHaveLength(2);
+    expect(await kv.list(KV.graphEdges)).toHaveLength(1);
   });
 
   it("graph-extract creates nodes and edges from XML response", async () => {

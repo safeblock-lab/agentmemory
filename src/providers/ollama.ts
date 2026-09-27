@@ -1,4 +1,4 @@
-import type { AuxiliaryLlmConfig, LlmCallOptions, LlmTask, MemoryProvider } from "../types.js";
+import type { AuxiliaryLlmConfig, LlmCallOptions, MemoryProvider } from "../types.js";
 import { jsonrepair } from "jsonrepair";
 import { fetchWithTimeout } from "./_fetch.js";
 import { startLlmCallTelemetry } from "./_llm-logging.js";

@@ -16,10 +16,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 let sandbox: string;
+const engineBinaryName = process.platform === "win32" ? "iii.exe" : "iii";
 
 function ctx(overrides: Partial<RemoveContext> = {}): RemoveContext {
   return {
     home: sandbox,
+    runtimeDir: join(sandbox, ".agentmemory"),
+    dataDir: join(sandbox, ".agentmemory", "data"),
     pinnedVersion: "0.11.2",
     localBinIiiVersion: null,
     connectManifest: null,
@@ -110,7 +113,7 @@ describe("buildRemovePlan", () => {
   });
 
   it("local-bin/iii is alwaysAsk when version does not match", () => {
-    touch(".local/bin/iii", "fakebin");
+    touch(`.local/bin/${engineBinaryName}`, "fakebin");
     const plan = buildRemovePlan(
       ctx({ localBinIiiVersion: "9.9.9" }),
       { force: false, keepData: false },
@@ -121,7 +124,7 @@ describe("buildRemovePlan", () => {
   });
 
   it("local-bin/iii is auto-fixable when version matches pinned", () => {
-    touch(".local/bin/iii", "fakebin");
+    touch(`.local/bin/${engineBinaryName}`, "fakebin");
     const plan = buildRemovePlan(
       ctx({ localBinIiiVersion: "0.11.2" }),
       { force: false, keepData: false },
@@ -139,13 +142,58 @@ describe("buildRemovePlan", () => {
   });
 
   it("private ~/.agentmemory/bin/iii is removed without prompt", () => {
-    touch(".agentmemory/bin/iii", "fakebin");
+    touch(`.agentmemory/bin/${engineBinaryName}`, "fakebin");
     const plan = buildRemovePlan(ctx(), { force: false, keepData: false });
     const item = plan.find((p) => p.id === "private-bin-iii")!;
     expect(item).toBeDefined();
     expect(item.applicable).toBe(true);
     expect(item.alwaysAsk).toBe(false);
     expect(item.description).toContain("private install");
+  });
+
+  it.each([
+    {
+      label: "instance",
+      runtimeDir: "instance-2",
+      selectedDataDir: "instance-2",
+    },
+    {
+      label: "custom data",
+      runtimeDir: ".agentmemory",
+      selectedDataDir: "custom-data",
+    },
+  ])("targets the resolved $label runtime and data roots", ({ runtimeDir, selectedDataDir }) => {
+    const resolvedRuntimeDir = join(sandbox, runtimeDir);
+    const resolvedDataDir = join(sandbox, selectedDataDir);
+    mkdirSync(resolvedRuntimeDir, { recursive: true });
+    mkdirSync(resolvedDataDir, { recursive: true });
+    writeFileSync(join(resolvedRuntimeDir, "iii.pid"), "101\n");
+    writeFileSync(join(resolvedRuntimeDir, "worker.pid"), "102\n");
+    writeFileSync(join(resolvedRuntimeDir, "engine-state.json"), "{}");
+    writeFileSync(join(resolvedDataDir, "iii-config.runtime.yaml"), "# generated");
+
+    const context = {
+      ...ctx(),
+      runtimeDir: resolvedRuntimeDir,
+      dataDir: resolvedDataDir,
+    } as RemoveContext & { runtimeDir: string; dataDir: string };
+    const plan = buildRemovePlan(context, { force: false, keepData: false });
+
+    expect(plan.find((item) => item.id === "pidfile")?.path).toBe(
+      join(resolvedRuntimeDir, "iii.pid"),
+    );
+    expect(plan.find((item) => item.id === "worker-pidfile")?.path).toBe(
+      join(resolvedRuntimeDir, "worker.pid"),
+    );
+    expect(plan.find((item) => item.id === "engine-state")?.path).toBe(
+      join(resolvedRuntimeDir, "engine-state.json"),
+    );
+    expect(plan.find((item) => item.id === "runtime-config")?.path).toBe(
+      join(resolvedDataDir, "iii-config.runtime.yaml"),
+    );
+    expect(plan.find((item) => item.id === "data-dir")?.path).toBe(
+      resolvedDataDir,
+    );
   });
 });
 

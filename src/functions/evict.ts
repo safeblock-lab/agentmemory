@@ -1,4 +1,4 @@
-import type { ISdk } from "iii-sdk";
+import type { IIIClient } from "iii-sdk";
 import type {
   Session,
   CompressedObservation,
@@ -8,6 +8,7 @@ import type {
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
+import { isConsolidationEnabled } from "../config.js";
 import { recordAudit } from "./audit.js";
 import { deleteAccessLog } from "./access-tracker.js";
 import { logger } from "../logger.js";
@@ -54,13 +55,15 @@ function isCompressedObservation(
 }
 
 async function recoverStaleSession(
-  sdk: ISdk,
+  sdk: IIIClient,
   sessionId: string,
 ): Promise<boolean> {
   try {
     const result = await sdk.trigger({
       function_id: "event::session::stopped",
-      payload: { sessionId },
+      // Suppress the per-session consolidation fan-out: eviction runs a
+      // single corpus-wide consolidation pass after all recoveries instead.
+      payload: { sessionId, skipConsolidation: true },
     });
     if (!isValidRecoveryResult(result)) {
       logger.warn("Stale session recovery failed", {
@@ -79,11 +82,21 @@ async function recoverStaleSession(
   }
 }
 
-async function runRecoveredSessionConsolidation(sdk: ISdk): Promise<void> {
+async function runRecoveredSessionConsolidation(sdk: IIIClient): Promise<void> {
+  // Same gate as the session-stop path: keyless installs must not fire
+  // no-op LLM consolidation from an eviction sweep either.
+  if (!isConsolidationEnabled()) return;
   try {
     await sdk.trigger({
       function_id: "mem::consolidate-pipeline",
-      payload: { tier: "all", deferred: true },
+      payload: { tier: "all", force: true, deferred: true },
+    });
+    // One crystallization pass for the batch (the per-session fan-out was
+    // suppressed with skipConsolidation), keeping recovered sessions
+    // consistent with normally-stopped ones without the N-fold amplification.
+    await sdk.trigger({
+      function_id: "mem::auto-crystallize",
+      payload: { olderThanDays: 0, deferred: true },
     });
   } catch (err) {
     logger.warn("Recovered session consolidation failed", {
@@ -92,7 +105,7 @@ async function runRecoveredSessionConsolidation(sdk: ISdk): Promise<void> {
   }
 }
 
-export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
+export function registerEvictFunction(sdk: IIIClient, kv: StateKV): void {
   sdk.registerFunction("mem::evict", 
     async (data: { dryRun?: boolean }): Promise<EvictionStats> => {
       const dryRun = data?.dryRun ?? false;

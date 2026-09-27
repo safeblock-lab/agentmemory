@@ -1,7 +1,11 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { registerWorker } from "iii-sdk";
+import { StateKV } from "../src/state/kv.js";
 import { HybridSearch } from "../src/state/hybrid-search.js";
 import { SearchIndex } from "../src/state/search-index.js";
 import type { CompressedObservation, EmbeddingProvider } from "../src/types.js";
+
+vi.mock("iii-sdk", () => ({ registerWorker: vi.fn(() => ({ trigger: vi.fn() })) }));
 
 function makeObs(
   overrides: Partial<CompressedObservation> = {},
@@ -132,6 +136,26 @@ describe("HybridSearch", () => {
     const hybrid = new HybridSearch(bm25, null, null, kv as never);
     const results = await hybrid.search("auth", 3);
     expect(results.length).toBe(3);
+  });
+
+  it("sorts equal expanded-query scores by observation id", async () => {
+    for (const [id, term] of [["obs_z", "alpha"], ["obs_a", "beta"]]) {
+      const obs = makeObs({ id, title: term, narrative: term, concepts: [], facts: [], files: [] });
+      bm25.add(obs);
+      await kv.set("mem:obs:ses_1", id, obs);
+    }
+    const stateKv = new StateKV(registerWorker("ws://unused.test"));
+    vi.spyOn(stateKv, "get").mockImplementation(kv.get);
+    vi.spyOn(stateKv, "list").mockImplementation(kv.list);
+    const hybrid = new HybridSearch(bm25, null, null, stateKv);
+    const results = await hybrid.searchWithExpansion("alpha", 20, {
+      reformulations: ["beta"],
+      temporalConcretizations: [],
+      entityExtractions: [],
+    });
+
+    expect(results[0].combinedScore).toBe(results[1].combinedScore);
+    expect(results.map((result) => result.observation.id)).toEqual(["obs_a", "obs_z"]);
   });
 
   it("skips observations not found in KV", async () => {

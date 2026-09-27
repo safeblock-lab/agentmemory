@@ -101,6 +101,10 @@ describe("mem::search", () => {
 
     // Module-level SearchIndex singleton would leak across tests; reset.
     getSearchIndex().clear();
+    // mem::search awaits a shared rebuild on a cold index; the explicit call
+    // here pre-populates the index deterministically so the query assertions
+    // below never depend on that cold-start path.
+    await rebuildIndex(kv as never);
   });
 
   it("returns full format by default", async () => {
@@ -204,5 +208,22 @@ describe("mem::search", () => {
     // Cleanup
     setVectorIndex(null);
     setEmbeddingProvider(null);
+  });
+
+  it("a cold-start search rebuilds BM25 without touching the persisted vector index", async () => {
+    const vector = new VectorIndex();
+    vector.add("obs_persisted", "ses_1", new Float32Array([0.1, 0.2, 0.3]));
+    setVectorIndex(vector);
+    getSearchIndex().clear();
+
+    const result = (await sdk.trigger("mem::search", {
+      query: "auth middleware",
+    })) as { results: Array<{ observation: CompressedObservation }> };
+
+    expect(result.results[0]?.observation.id).toBe("obs_a");
+    expect(getVectorIndex()?.has("obs_persisted")).toBe(true);
+    expect(getVectorIndex()?.size).toBe(1);
+
+    setVectorIndex(null);
   });
 });

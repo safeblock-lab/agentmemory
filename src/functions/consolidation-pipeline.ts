@@ -1,4 +1,4 @@
-import type { ISdk } from "iii-sdk";
+import type { IIIClient } from "iii-sdk";
 import type {
   SemanticMemory,
   ProceduralMemory,
@@ -25,6 +25,7 @@ import {
   TYPESAFE_PROCEDURAL_GATE_CONFIDENCE_THRESHOLD,
   TYPESAFE_SEMANTIC_GATE_CONFIDENCE_THRESHOLD,
 } from "../config.js";
+import { CONSOLIDATION_LAST_RUN_KEY } from "./consolidation-status.js";
 import { logger } from "../logger.js";
 import { assessConsolidationComplexity } from "./consolidation-complexity.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
@@ -211,7 +212,7 @@ function applyDecay(
 }
 
 export function registerConsolidationPipelineFunction(
-  sdk: ISdk,
+  sdk: IIIClient,
   kv: StateKV,
   provider: MemoryProvider,
   llmRouter?: LlmTaskRouter,
@@ -799,6 +800,10 @@ export function registerConsolidationPipelineFunction(
       }, undefined, undefined, data?.batchEffectKey);
       if (data?.batchEffectKey) await audit.catch(() => { });
       else await audit;
+
+      await kv
+        .set(KV.config, CONSOLIDATION_LAST_RUN_KEY, { at: new Date().toISOString(), tier, results })
+        .catch(() => {});
 
       logger.info("Consolidation pipeline complete", { tier, results });
       return { success: true, results };

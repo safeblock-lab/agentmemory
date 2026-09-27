@@ -200,9 +200,10 @@ else:
     raise AssertionError("expected RuntimeError")
 assert calls == [], calls
 `;
-    const result = spawnSync("python3", ["-c", script], {
+    const python = process.env["PYTHON"] || (process.platform === "win32" ? "python" : "python3");
+    const result = spawnSync(python, ["-c", script], {
       cwd: process.cwd(),
-      env: { ...process.env, HOME: home },
+      env: { ...process.env, HOME: home, USERPROFILE: home },
       encoding: "utf8",
     });
     expect(result.status, result.stderr || result.stdout).toBe(0);

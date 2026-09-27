@@ -1,5 +1,5 @@
-import type { ISdk } from "iii-sdk";
-import type { Memory, CompressedObservation, ContextBlock } from "../types.js";
+import type { IIIClient } from "iii-sdk";
+import type { Memory } from "../types.js";
 import { KV, generateId } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
@@ -32,7 +32,7 @@ function scoreEntry(entry: CoreMemoryEntry, now: number): number {
 }
 
 export function registerWorkingMemoryFunctions(
-  sdk: ISdk,
+  sdk: IIIClient,
   kv: StateKV,
   tokenBudget: number,
 ): void {

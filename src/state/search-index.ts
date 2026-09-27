@@ -20,6 +20,7 @@ export class SearchIndex {
   private readonly b = 0.75;
 
   add(obs: CompressedObservation): void {
+    if (this.entries.has(obs.id)) this.remove(obs.id);
     const terms = this.extractTerms(obs);
     const termFreq = new Map<string, number>();
     let termCount = 0;
@@ -49,6 +50,15 @@ export class SearchIndex {
 
   has(id: string): boolean {
     return this.entries.has(id);
+  }
+
+  observationCountsBySession(): Map<string, number> {
+    const counts = new Map<string, number>();
+    for (const entry of this.entries.values()) {
+      if (entry.obsId.startsWith("mem_")) continue;
+      counts.set(entry.sessionId, (counts.get(entry.sessionId) ?? 0) + 1);
+    }
+    return counts;
   }
 
   remove(id: string): void {

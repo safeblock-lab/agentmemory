@@ -1,4 +1,5 @@
-import type { ISdk, ApiRequest } from "iii-sdk";
+import type { IIIClient } from "iii-sdk";
+import type { HttpRequest } from "@iii-dev/helpers/http";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
 import type {
@@ -41,12 +42,12 @@ function parseCsvList(value: unknown): string[] {
 }
 
 export function registerMcpEndpoints(
-  sdk: ISdk,
+  sdk: IIIClient,
   kv: StateKV,
   secret?: string,
 ): void {
   function checkAuth(
-    req: ApiRequest,
+    req: HttpRequest,
     sec: string | undefined,
   ): McpResponse | null {
     if (!sec) return null;
@@ -59,7 +60,7 @@ export function registerMcpEndpoints(
   }
 
   sdk.registerFunction("mcp::tools::list", 
-    async (req: ApiRequest): Promise<McpResponse> => {
+    async (req: HttpRequest): Promise<McpResponse> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
       return { status_code: 200, body: { tools: getVisibleTools() } };
@@ -73,7 +74,7 @@ export function registerMcpEndpoints(
 
   sdk.registerFunction("mcp::tools::call", 
     async (
-      req: ApiRequest<{ name: string; arguments: Record<string, unknown> }>,
+      req: HttpRequest<{ name: string; arguments: Record<string, unknown> }>,
     ): Promise<McpResponse> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
@@ -186,6 +187,10 @@ export function registerMcpEndpoints(
               typeof args.project === "string" && args.project.trim().length > 0
                 ? args.project.trim()
                 : undefined;
+            const saveAgentId =
+              typeof args.agentId === "string" && args.agentId.trim().length > 0
+                ? (args.agentId as string).trim()
+                : undefined;
 
             const result = await sdk.trigger({ function_id: "mem::remember", payload: {
               content: args.content,
@@ -193,6 +198,7 @@ export function registerMcpEndpoints(
               concepts,
               files,
               ...(project !== undefined && { project }),
+              ...(saveAgentId !== undefined && { agentId: saveAgentId }),
             } });
             return {
               status_code: 200,
@@ -1122,6 +1128,16 @@ export function registerMcpEndpoints(
             return { status_code: 200, body: { content: [{ type: "text", text: JSON.stringify(lessonRecallResult, null, 2) }] } };
           }
 
+          case "memory_lesson_delete": {
+            if (typeof args.lessonId !== "string" || !args.lessonId.trim()) {
+              return { status_code: 400, body: { error: "lessonId is required" } };
+            }
+            const lessonDeleteResult = await sdk.trigger({ function_id: "mem::lesson-delete", payload: {
+              lessonId: args.lessonId.trim(),
+            } });
+            return { status_code: 200, body: { content: [{ type: "text", text: JSON.stringify(lessonDeleteResult, null, 2) }] } };
+          }
+
           case "memory_reflect": {
             const reflectResult = await sdk.trigger({ function_id: "mem::reflect", payload: {
               project: args.project,
@@ -1320,7 +1336,7 @@ export function registerMcpEndpoints(
   ];
 
   sdk.registerFunction("mcp::resources::list", 
-    async (req: ApiRequest): Promise<McpResponse> => {
+    async (req: HttpRequest): Promise<McpResponse> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
       return { status_code: 200, body: { resources: MCP_RESOURCES } };
@@ -1333,7 +1349,7 @@ export function registerMcpEndpoints(
   });
 
   sdk.registerFunction("mcp::resources::read", 
-    async (req: ApiRequest<{ uri: string }>): Promise<McpResponse> => {
+    async (req: HttpRequest<{ uri: string }>): Promise<McpResponse> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
 
@@ -1606,7 +1622,7 @@ export function registerMcpEndpoints(
   ];
 
   sdk.registerFunction("mcp::prompts::list", 
-    async (req: ApiRequest): Promise<McpResponse> => {
+    async (req: HttpRequest): Promise<McpResponse> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
       return { status_code: 200, body: { prompts: MCP_PROMPTS } };
@@ -1620,7 +1636,7 @@ export function registerMcpEndpoints(
 
   sdk.registerFunction("mcp::prompts::get", 
     async (
-      req: ApiRequest<{ name: string; arguments?: Record<string, string> }>,
+      req: HttpRequest<{ name: string; arguments?: Record<string, string> }>,
     ): Promise<McpResponse> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;

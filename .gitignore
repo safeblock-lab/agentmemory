@@ -19,8 +19,7 @@ data-*/
 agentmemory-debug/
 .gstack/
 
-# Lock files — never commit (see feedback_no_lockfiles memory)
-package-lock.json
+# Alternative package-manager locks; npm's release lock is committed.
 pnpm-lock.yaml
 yarn.lock
 integrations/hermes/__pycache__/

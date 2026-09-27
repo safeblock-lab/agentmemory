@@ -4,7 +4,7 @@
 
 agentmemory is a persistent memory system for AI coding agents, built on iii-engine's three primitives (Worker/Function/Trigger). Everything goes through `registerFunction`/`registerTrigger`/`sdk.trigger()` — never bypass iii-engine with standalone SQLite or in-process alternatives.
 
-- **Engine**: iii-sdk (WebSocket to iii-engine on port 49134)
+- **Engine**: iii-sdk 0.22.1 with @iii-dev/helpers 0.22.1 (WebSocket to iii-engine 0.22.1 on port 49134; the client type is `IIIClient`, HTTP requests are `HttpRequest` from `@iii-dev/helpers/http`)
 - **State**: File-based SQLite via iii-engine's StateModule (`./data/state_store.db`)
 - **Build**: TypeScript → ESM via tsdown, output to `dist/`
 - **Test**: vitest (`npm test` excludes integration tests)
@@ -59,7 +59,9 @@ sdk.registerFunction(
 
 ### REST Endpoint Registration
 ```typescript
-sdk.registerFunction("api::your-endpoint", async (req: ApiRequest) => {
+import type { HttpRequest } from "@iii-dev/helpers/http";
+
+sdk.registerFunction("api::your-endpoint", async (req: HttpRequest) => {
   const denied = checkAuth(req, secret);
   if (denied) return denied;
   const body = req.body as Record<string, unknown>;
@@ -109,16 +111,16 @@ Hook scripts in `src/hooks/` are standalone Node.js scripts (no iii-sdk import).
 
 ## Testing
 
-- All tests must pass before PR: `npm test` (1,428+ tests)
+- All tests must pass before PR: `npm test` (1,596+ tests)
 - Mock pattern: `vi.mock("iii-sdk")` with mock `sdk.trigger`, `kv.get/set/list`
 - Test files go in `test/` with `.test.ts` extension
 - Follow existing patterns in `test/crystallize.test.ts` for function tests
 
-## Current Stats (v0.9.28)
+## Current Stats (v0.9.56)
 
-- 53 MCP tools (8 visible by default, `AGENTMEMORY_TOOLS=all` for all)
-- 128 REST endpoints
+- 54 MCP tools (8 visible by default, `AGENTMEMORY_TOOLS=all` for all)
+- 132 REST endpoints
 - 6 MCP resources, 3 MCP prompts
-- 12 hooks, 15 skills
+- 12 hooks, 17 skills
 - 260+ iii functions
-- 1,428+ tests
+- 1,596+ tests

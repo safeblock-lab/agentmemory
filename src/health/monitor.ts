@@ -1,22 +1,16 @@
-import type { ISdk } from "iii-sdk";
+import { getHeapStatistics } from "node:v8";
+import type { IIIClient } from "iii-sdk";
 import type { HealthSnapshot } from "../types.js";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
 import { evaluateHealth } from "./thresholds.js";
 
 export function registerHealthMonitor(
-  sdk: ISdk,
+  sdk: IIIClient,
   kv: StateKV,
 ): { stop: () => void } {
-  let connectionState = "connected";
   let prevCpuUsage = process.cpuUsage();
   let prevCpuTime = Date.now();
-
-  if (typeof sdk.on === "function") {
-    sdk.on("connection_state", (state?: unknown) => {
-      connectionState = state as string;
-    });
-  }
 
   async function collectHealth(): Promise<HealthSnapshot> {
     const mem = process.memoryUsage();
@@ -37,11 +31,13 @@ export function registerHealthMonitor(
     const eventLoopLagMs = performance.now() - startMark;
 
     let workers: HealthSnapshot["workers"] = [];
+    let connectionState = "disconnected";
     try {
       const result = await sdk.trigger<
         unknown,
         { workers?: HealthSnapshot["workers"] }
-      >({ function_id: "engine::workers::list", payload: {} });
+      >({ function_id: "engine::workers::list", payload: {}, timeoutMs: 5000 });
+      connectionState = "connected";
       if (result?.workers) workers = result.workers;
     } catch {}
 
@@ -69,6 +65,7 @@ export function registerHealthMonitor(
       memory: {
         heapUsed: mem.heapUsed,
         heapTotal: mem.heapTotal,
+        heapLimit: getHeapStatistics().heap_size_limit,
         rss: mem.rss,
         external: mem.external,
       },

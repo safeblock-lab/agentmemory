@@ -4,71 +4,112 @@ You are a coding agent. Follow this runbook top to bottom to install agentmemory
 
 ## What you are installing
 
-agentmemory is a local memory server for coding agents. It runs on your machine, exposes a REST API on port 3111 and an MCP server, and stores memories on disk under `~/.agentmemory`. It is built on the iii engine, which agentmemory downloads and manages for you as a pinned binary under `~/.agentmemory/bin`. You do not install iii separately.
+agentmemory is a local memory server for coding agents. It exposes a REST API and MCP HTTP routes on port 3111, streams on 3112, a viewer on 3113, and connects its worker to iii-engine on 49134. It is built on the iii engine, which agentmemory manages as a pinned v0.22.1 binary under `~/.agentmemory/bin` on macOS/Linux or `%USERPROFILE%\.agentmemory\bin` on Windows.
 
-Default mode needs no API key and no cloud account. Out of the box it runs hybrid retrieval (BM25 keyword search plus local on-device embeddings), so a full install proves real semantic recall with zero credentials. An LLM provider key is optional and only unlocks richer summaries and auto-injection (see "Optional: richer features").
+Configuration and the managed iii binary live under `~/.agentmemory`. Persistent iii state uses the platform data directory: `~/Library/Application Support/agentmemory` on macOS, `$XDG_DATA_HOME/agentmemory` or `~/.local/share/agentmemory` on Linux, and `%APPDATA%\agentmemory` on Windows. Override it with `--data-dir <path>` or `AGENTMEMORY_DATA_DIR`; use the same override on every restart. For instance 0, an existing `./data/state_store.db` or `./data/iii-config.yaml` takes precedence over the platform default, while an explicit flag or environment override still wins. Native and Docker starts use the same resolved host data directory.
+
+Default keyless mode needs no API key or cloud account and disables vector embeddings. `memory_recall` (`mem::search`) uses BM25, while `memory_smart_search` can also fuse structural graph matches when graph data exists. Semantic vector recall is an explicit opt-in: set `EMBEDDING_PROVIDER=local` for on-device `Xenova/all-MiniLM-L6-v2`, or configure a supported remote embedding provider. Local inference is free, but the first embedding request downloads the model and therefore needs network access and extra startup time. An LLM provider is separate; LLM-written observation compression requires both a provider and `AGENTMEMORY_AUTO_COMPRESS=true`.
 
 ## Prerequisites
 
-- Node.js >= 20 and npm. Check with `node -v`.
-- macOS or Linux for the one-command path. On Windows, use WSL2; native Windows engine setup is manual and `agentmemory connect` is not supported there.
+- Node.js >= 20 with npm and npx. Check with `node -v`, `npm -v`, and `npx -v`.
+- macOS/Linux automatic iii installation also requires `curl`, a POSIX `sh`, and `tar`. Check with `command -v curl sh tar`. Minimal images such as `node:20-slim` may not include them.
+- Windows: WSL2 follows the Linux path above. Native Windows requires a manually downloaded, pinned iii-engine v0.22.1 `iii.exe`, or Docker Desktop; the CLI does not auto-extract the Windows ZIP. Native automated `connect` supports only `copilot-cli`. Other Windows agents need manual MCP configuration; WSL `connect` applies only to agents installed in that same WSL environment.
 - Ports 3111 (REST), 3112 (streams), 3113 (viewer), and 49134 (engine) free. If any are taken, stop whatever is using them before starting (see Troubleshooting).
 
 ## Running non-interactively
 
-Several commands prompt on a TTY (for example the first-run "install globally?" question). As an agent you usually want no prompts. Either set `CI=1` in the environment for the commands below, or rely on the fact that agentmemory skips all prompts automatically when stdin/stdout are not a TTY. Prompts are also never-nag: once answered they persist and are not asked again. Re-run onboarding any time with `agentmemory --reset`.
+Install this fork from its matching GitHub Release using `Install-AgentMemory.ps1` and the release checksums, then use `agentmemory` as the canonical command. Several agentmemory onboarding choices can still prompt on a TTY; set `CI=1` for unattended runs or use non-TTY stdin. Re-run onboarding any time with `agentmemory --reset`.
 
-## 1. Install globally
+## 1. Verify the runtime prerequisites
+
+```bash
+node -v
+npm -v
+npx -v
+
+# macOS/Linux only
+command -v curl sh tar
+```
+
+Expect: Node prints v20 or newer, npm succeeds, and macOS/Linux prints a path for each automatic-installer dependency.
+
+For native Windows, install the engine before continuing:
 
 For this fork on Windows, download `Install-AgentMemory.ps1` from the matching GitHub Release, then run:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-AgentMemory.ps1 -Version v0.9.32
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-AgentMemory.ps1 -Version v0.9.56
 ```
 
 The installer downloads the tarball from this fork's GitHub Release, verifies its SHA-256 checksum, then installs it globally. It does not use npm publishing.
 
-Expect: the install completes without errors.
-
-## 2. Verify the install
-
-```bash
-agentmemory --version
+```powershell
+# Download the archive that matches your CPU from the pinned release:
+# https://github.com/iii-hq/iii/releases/tag/iii%2Fv0.22.1
+# Extract iii.exe to $HOME\.agentmemory\bin\iii.exe, then verify the pin:
+& "$HOME\.agentmemory\bin\iii.exe" --version
 ```
 
-Expect: a version string is printed. If `command not found`, close and reopen PowerShell so the global npm bin directory is on `PATH`.
+Expect: exactly `0.22.1`. Do not install the latest unpinned iii release. Alternatively, use WSL2 or start Docker Desktop and choose the Docker path when agentmemory starts.
 
-## 3. Start the server
+## 2. Start the server
 
-The server listens on port 3111 and auto-starts its pinned iii engine on first run (this can take a few seconds the first time while the engine binary is fetched into `~/.agentmemory/bin`). Run it in the background or in a separate terminal so the rest of the runbook can talk to it.
+The installed command starts this fork and, on macOS/Linux, auto-installs its pinned iii-engine into the private agentmemory bin directory. Run it in a dedicated terminal:
 
 ```bash
-agentmemory &
+agentmemory
 ```
 
-Or run `agentmemory` in the foreground in a dedicated terminal.
+To prefer Docker even when a compatible native binary is present, set `AGENTMEMORY_USE_DOCKER=1` for the same command. To choose persistent storage, pass an absolute path and reuse it on every start:
 
-Wait until it is reachable, then continue:
+```bash
+agentmemory --data-dir /absolute/path/to/agentmemory-data
+```
+
+Docker bind-mounts that same resolved host directory at `/data`. For a second isolated daemon, add `--instance 1`; it stores data and lifecycle metadata under `instance-1` and defaults to ports 3211, 3212, 3213, and 49234. Do not use `--port` alone for concurrent daemons: it changes the ports but keeps instance 0's canonical lifecycle ownership. Use `--instance` for isolation.
+
+Expect: iii-engine v0.22.1 starts, the agentmemory worker registers with iii, and the ready panel lists REST, viewer, streams, and engine addresses. First boot can take longer while the engine binary is downloaded.
+
+## 3. Validate the server and all four ports
+
+| Port | Owner | Validation |
+|---|---|---|
+| 3111 | agentmemory REST/MCP | `/agentmemory/livez` and `/agentmemory/health` return 200 |
+| 3112 | iii streams | listed in the ready panel; must be free at startup |
+| 3113 | agentmemory viewer | opening the URL returns the viewer |
+| 49134 | iii engine WebSocket | listed in the ready panel and worker registration succeeds |
+
+From a second terminal, run:
 
 ```bash
 curl -fsS http://localhost:3111/agentmemory/livez
+curl -fsS http://localhost:3111/agentmemory/health
+curl -fsS -o /dev/null http://localhost:3113/
+agentmemory status
 ```
 
-Expect: a `200` response. Retry for up to ~15 seconds on first run while the engine warms up.
+Expect: both REST checks return JSON, the viewer request succeeds, the startup ready panel has listed all four addresses, and `status` reports healthy agentmemory state. In keyless mode, status should report vectors disabled or `bm25-only`; `mem::search` uses BM25, while smart search may also include existing graph matches. Native PowerShell users can use `Invoke-RestMethod` instead of `curl`.
 
-## 4. Prove recall in one command
+## 4. Exercise default recall and optional local semantics
 
 ```bash
-agentmemory demo --serve
+agentmemory demo
 ```
 
-`--serve` boots the server, seeds three realistic sessions (JWT auth, an N+1 query fix, rate limiting), runs semantic searches against them, prints the results, and tears everything down. No second terminal needed.
+The demo seeds three realistic sessions and searches them. In default keyless mode, vectors are disabled and the `mem::search` keyword queries such as `jwt auth middleware` and `rate limiting` should return BM25 hits. The deliberately semantic query `database performance optimization` can return zero because no embedding provider is active. Smart search can still add structural graph matches if graph data already exists.
 
-Expect: the demo finds the "N+1 query fix" memory when it searches for "database performance optimization", which keyword matching alone cannot do. Open `http://localhost:3113` while it runs to watch the memory build live.
+To opt into on-device semantic recall, add this line to `~/.agentmemory/.env`, restart the server, and rerun the demo:
+
+```env
+EMBEDDING_PROVIDER=local
+```
+
+The first embedding request downloads `Xenova/all-MiniLM-L6-v2`; wait for that download to finish. Afterward, inference runs locally and the semantic query should find the N+1 memory. Open `http://localhost:3113` to watch the memory build live.
 
 ## 5. Wire MCP into the calling agent
 
-Detect which agent is running this runbook, then wire its MCP config:
+Detect which agent is running this runbook, then wire its MCP config. On native Windows, run this automated step only for `copilot-cli`:
 
 ```bash
 agentmemory connect <agent>
@@ -78,9 +119,9 @@ agentmemory connect <agent>
 
 `claude-code`, `copilot-cli`, `codex`, `cursor`, `gemini-cli`, `opencode`, `cline`, `continue`, `droid`, `hermes`, `openclaw`, `openhuman`, `pi`, `qwen`, `warp`, `zed`, `antigravity`, `kiro`.
 
-If you cannot tell which agent you are, default to `claude-code`. After wiring, restart the agent or run its MCP reload command (for example `/mcp` in Claude Code) so it picks up the server.
+If you cannot tell which agent you are, default to `claude-code` on macOS/Linux. On native Windows, `copilot-cli` is the only automated adapter; configure all other agents with the manual MCP block in the README. Run `connect` inside WSL only when the target agent is installed inside the same WSL environment. After wiring, restart the agent or run its MCP reload command (for example `/mcp` in Claude Code) so it picks up the server.
 
-Expect: the agent now lists agentmemory's tools. With the server running you should see the full set of 53 tools (for example `memory_save`, `memory_smart_search`, `memory_sessions`). If you see only 7 tools, the MCP shim could not reach a server, see Troubleshooting.
+Expect: the agent now lists agentmemory's tools. With the server running you should see the full set of 54 tools (for example `memory_save`, `memory_smart_search`, `memory_sessions`). If you see only 7 tools, the MCP shim could not reach the server; see Troubleshooting.
 
 ## 6. Install native skills
 
@@ -95,7 +136,7 @@ This installs the bundled skills and lifecycle hooks from this fork. The plugin 
 
 Expect: the skills are installed for the detected agent.
 
-## 7. Verify a save and recall round-trip
+## 7. Verify save, recall, and restart persistence
 
 Confirm health first:
 
@@ -121,23 +162,43 @@ Expect: the first call returns `201`, the second returns `200` with results that
 
 If `AGENTMEMORY_SECRET` is set in the environment, the REST API requires it. Add `-H "Authorization: Bearer $AGENTMEMORY_SECRET"` to both calls. By default no secret is set and localhost is open.
 
+Now stop and restart the processes, using the same `--data-dir` value if you set one:
+
+```bash
+agentmemory stop
+agentmemory
+```
+
+After `/agentmemory/livez` returns 200 again, repeat the `smart-search` request above. Expect: the saved probe is still returned. This restart check proves the selected platform data directory is persistent rather than only proving the in-memory index.
+
+## Optional: install a global command
+
+The npx form above is the canonical fresh-install path. If you want the shorter `agentmemory` command afterward:
+
+```bash
+npm install -g @agentmemory/agentmemory@latest
+agentmemory --version
+```
+
+If a system Node install returns `EACCES` on macOS/Linux, use a user-owned npm prefix rather than changing repository permissions. The npx form remains available without a global install.
+
 ## Optional: richer features
 
 These are off by default because they spend tokens. Enable them only if the user wants them. Put configuration in `~/.agentmemory/.env` (no `export` prefix), then restart the server.
 
 - `AGENTMEMORY_INJECT_CONTEXT=true` makes the SessionStart and PreToolUse hooks inject past memory into the agent's context automatically. Cost: spends session tokens proportional to tool-call frequency.
-- `AGENTMEMORY_AUTO_COMPRESS=true` sends each observation to your LLM provider for a richer summary. Cost: spends API tokens proportional to tool-use frequency. Requires a provider key.
-- Provider key: set one of `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, and similar, in the same file. Without a key, agentmemory stays in zero-LLM mode and still indexes and recalls via BM25 plus local embeddings.
+- LLM-written observation compression requires both `AGENTMEMORY_AUTO_COMPRESS=true` and a configured provider. A provider alone leaves synthetic compression active. When both are set, each observation is sent to the provider for a richer summary, spending API tokens proportional to tool-use frequency.
+- Provider key: set one of `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, and similar, in the same file. Without a key, agentmemory stays in zero-LLM mode and recalls via BM25. Local embeddings remain available as the separate `EMBEDDING_PROVIDER=local` opt-in above.
 
 ## Tool surface
 
-The MCP server exposes 53 tools by default (`--tools all`). Use `--tools core` (or `AGENTMEMORY_TOOLS=core`) for a lean 8-tool set on hosts with tight tool limits. The 8 core tools cover save, recall, consolidate, smart search, sessions, diagnose, lesson save, and reflect.
+The MCP server exposes 54 tools by default (`--tools all`). Use `--tools core` (or `AGENTMEMORY_TOOLS=core`) for a lean 8-tool set on hosts with tight tool limits. The 8 core tools cover save, recall, consolidate, smart search, sessions, diagnose, lesson save, and reflect.
 
 ## Lifecycle commands
 
-- `agentmemory status` shows server and engine state.
+- `agentmemory status` shows server health, viewer, provider, and embedding state.
 - `agentmemory doctor` runs diagnostics and reports what is misconfigured.
-- `agentmemory stop` stops the engine this CLI started (`stop --force` bypasses the Docker guard).
+- `agentmemory stop` stops the engine this CLI started. Docker mode validates and preserves the exact container and `/data` mount for the next restart; `stop --force` applies only to native ownership checks.
 - `agentmemory upgrade` upgrades agentmemory and the iii runtime, best effort.
 - `agentmemory --reset` wipes onboarding preferences and re-runs the wizard.
 - `agentmemory import-jsonl <file>` imports prior Claude Code session logs as memories.
@@ -147,20 +208,24 @@ The MCP server exposes 53 tools by default (`--tools all`). Use `--tools core` (
 - `command not found: agentmemory`: close and reopen PowerShell so its global npm bin directory is on `PATH`, then rerun the release installer if needed.
 - Installation failed: download `Install-AgentMemory.ps1` and `SHA256SUMS.txt` again from the same GitHub Release. The installer intentionally refuses a checksum mismatch.
 - Port already in use: another process holds 3111, 3112, 3113, or 49134. Stop that process, then re-run.
+- Custom REST port: `--port <N>` derives streams as `N+1`, viewer as `N+2`, and the iii worker WebSocket as `N+46023` only when their explicit port/URL variables are unset (`III_STREAM_PORT` or legacy `III_STREAMS_PORT`, `III_VIEWER_PORT` or `AGENTMEMORY_VIEWER_URL`, and `III_ENGINE_PORT` or `III_ENGINE_URL`).
 - Server starts but `livez` never returns 200: re-run with `agentmemory --verbose` to see engine stderr.
+- `The engine process started but the REST API never responded.`: inspect all four derived ports, confirm the pinned iii process stayed alive, and use `--verbose` for captured engine stderr.
 - Engine version warning on start: harmless. agentmemory uses its own pinned engine in `~/.agentmemory/bin` regardless of any `iii` on `PATH`. Set `AGENTMEMORY_III_VERSION` only to override deliberately.
-- "engine conflict" / another iii engine already running: if a different iii version is already serving the port (common if you run your own iii), agentmemory will not adopt it and stops with an "engine conflict" note. Stop that engine (`agentmemory stop --force`, or however you started it), then re-run `agentmemory` — it installs and runs the pinned engine in `~/.agentmemory/bin`, leaving your own iii untouched.
-- Only 7 tools visible in the agent: start `agentmemory`, ensure `AGENTMEMORY_URL` points at it (default `http://localhost:3111`), then reload MCP.
-- Windows: use WSL2 for the path above. Native Windows runs the server but `connect` and the automated engine install are not supported.
+- "engine conflict" / another iii engine already running: if a different iii version is already serving the port, agentmemory will not adopt it. Stop that engine (`agentmemory stop --force`, or however you started it), then rerun the canonical command. Its private v0.22.1 binary does not replace a user-managed `iii` on `PATH`.
+- Only 7 tools visible in the agent: the MCP shim is in local fallback because it could not reach a server. Start `agentmemory`, ensure `AGENTMEMORY_URL` points at it (default `http://localhost:3111`), then reload MCP.
+- Native Windows: the CLI does not auto-extract the ZIP. Install the pinned v0.22.1 `iii.exe` manually, use WSL2, or run with Docker Desktop and `AGENTMEMORY_USE_DOCKER=1`. Automated `connect` supports only `copilot-cli`; configure other native agents manually.
+- Semantic demo query returns zero hits: this is expected with vectors disabled in default keyless mode. Set `EMBEDDING_PROVIDER=local`, restart, allow the first model download to complete, and rerun the demo.
 
 ## Report success
 
 Report back to the user:
 
 - agentmemory installed, version, and the server running on port 3111
+- iii-engine v0.22.1 running, the selected platform data directory, and all four ports accounted for
 - which agent was wired via `agentmemory connect`, and the tool count the agent now sees
-- the save and recall round-trip returned the probe memory
+- the save and recall round-trip returned the probe memory after a full stop/start
 - the viewer is available at `http://localhost:3113`
-- whether any optional features were enabled
+- whether vectors were disabled (`mem::search` BM25, with optional graph matches in smart search) or an embedding provider was enabled
 
 If any step failed, report which step, the exact command, and the error output.
