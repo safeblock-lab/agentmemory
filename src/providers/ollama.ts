@@ -2,7 +2,7 @@ import type { AuxiliaryLlmConfig, LlmCallOptions, MemoryProvider } from "../type
 import { jsonrepair } from "jsonrepair";
 import { fetchWithTimeout } from "./_fetch.js";
 import { startLlmCallTelemetry } from "./_llm-logging.js";
-import { taskOutputTokens } from "./task-output-limits.js";
+import { summaryOutputTokens, taskOutputTokens } from "./task-output-limits.js";
 
 const NO_THINK_OUTPUT_FORMAT = {
   type: "object",
@@ -47,9 +47,9 @@ export class OllamaProvider implements MemoryProvider {
     const noThink = options?.thinking === undefined
       ? this.noThink
       : !options.thinking;
-    const outputTokens = noThink
+    const outputTokens = summaryOutputTokens(options, noThink
       ? taskOutputTokens(task, this.maxTokens)
-      : this.maxTokens;
+      : this.maxTokens);
     const telemetry = startLlmCallTelemetry({
       provider: "ollama",
       model: this.model,

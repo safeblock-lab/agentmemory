@@ -1,4 +1,4 @@
-import type { FireworksBatchTask, LlmTask } from "../types.js";
+import type { FireworksBatchTask, LlmTask, LlmCallOptions } from "../types.js";
 
 const TASK_OUTPUT_TOKENS: Record<LlmTask, number> = {
   graph_extraction: 512,
@@ -15,7 +15,18 @@ const TASK_OUTPUT_TOKENS: Record<LlmTask, number> = {
   flow_compression: 768,
 };
 
-export function taskOutputTokens(task: LlmTask | undefined, configuredMaximum: number): number {
+export function summaryOutputTokens(options: LlmCallOptions | undefined, fallback: number): number {
+  if (options?.task !== "summary" || options.outputTokens === undefined) return fallback;
+  if (!Number.isSafeInteger(options.outputTokens) || options.outputTokens <= 0) {
+    throw new Error("invalid_summary_budget: outputTokens must be a positive finite integer");
+  }
+  return options.outputTokens;
+}
+
+export function taskOutputTokens(task: LlmTask | undefined, configuredMaximum: number, outputTokens?: number): number {
+  if (task === "summary" && outputTokens !== undefined) {
+    return summaryOutputTokens({ task, outputTokens }, configuredMaximum);
+  }
   return task ? Math.min(configuredMaximum, TASK_OUTPUT_TOKENS[task]) : configuredMaximum;
 }
 

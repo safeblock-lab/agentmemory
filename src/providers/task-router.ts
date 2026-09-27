@@ -166,8 +166,8 @@ export class LlmTaskRouter {
     const provider = target.provider;
     return {
       name: provider.name,
-      compress: (systemPrompt, userPrompt) => provider.compress(systemPrompt, userPrompt, options),
-      summarize: (systemPrompt, userPrompt) => provider.summarize(systemPrompt, userPrompt, options),
+      compress: (systemPrompt, userPrompt, callOptions) => provider.compress(systemPrompt, userPrompt, { ...callOptions, ...options }),
+      summarize: (systemPrompt, userPrompt, callOptions) => provider.summarize(systemPrompt, userPrompt, { ...callOptions, ...options }),
       ...(provider.describeImage
         ? { describeImage: provider.describeImage.bind(provider) }
         : {}),

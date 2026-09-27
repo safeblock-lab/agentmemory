@@ -154,6 +154,49 @@ describe("mem::summarize chunking", () => {
     delete process.env.SUMMARIZE_CHUNK_CONCURRENCY;
   });
 
+  it("keeps original observationCount after splitting one giant Unicode observation", async () => {
+    process.env.AGENTMEMORY_SUMMARY_CONTEXT_TOKENS = "4096";
+    process.env.AGENTMEMORY_SUMMARY_OUTPUT_TOKENS = "512";
+    process.env.AGENTMEMORY_SUMMARY_SAFETY_MARGIN_TOKENS = "256";
+    const provider = makeProvider([summaryXml({ title: "giant" })]);
+    const { handler, kv } = await setupHandler({ sessionId: "giant", obsCount: 1, provider });
+    await kv.set("obs:giant", "obs_0", { ...makeObs(0, "giant"), narrative: "🧠漢字".repeat(2000) });
+    const result = await handler({ sessionId: "giant" });
+    expect(result.success).toBe(true);
+    expect(provider.calls.length).toBeGreaterThan(2);
+    expect(await kv.get("summaries", "giant")).toMatchObject({ observationCount: 1 });
+  });
+
+  it("does not persist a summary when the reserve leaves no prompt capacity", async () => {
+    process.env.AGENTMEMORY_SUMMARY_CONTEXT_TOKENS = "13000";
+    const provider = makeProvider([summaryXml({ title: "invalid budget" })]);
+    const { handler, kv } = await setupHandler({ sessionId: "invalid-budget", obsCount: 1, provider });
+    const result = await handler({ sessionId: "invalid-budget" });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("invalid_summary_budget");
+    expect(provider.calls).toHaveLength(0);
+    expect(await kv.get("summaries", "invalid-budget")).toBeNull();
+  });
+
+  it("empty sessions make no provider calls", async () => {
+    const provider = makeProvider([summaryXml({ title: "empty" })]);
+    const { handler, kv } = await setupHandler({ sessionId: "empty", obsCount: 0, provider });
+    expect(await handler({ sessionId: "empty" })).toMatchObject({ success: false, error: "no_observations" });
+    expect(provider.calls).toHaveLength(0);
+    expect(await kv.get("summaries", "empty")).toBeNull();
+  });
+
+  it("does not persist a reducer result when reduction makes no progress", async () => {
+    process.env.AGENTMEMORY_SUMMARY_CONTEXT_TOKENS = "4096";
+    process.env.AGENTMEMORY_SUMMARY_OUTPUT_TOKENS = "512";
+    process.env.AGENTMEMORY_SUMMARY_SAFETY_MARGIN_TOKENS = "256";
+    process.env.SUMMARIZE_CHUNK_SIZE = "1";
+    const provider = makeProvider([summaryXml({ title: "no progress", narrative: "x".repeat(1400) })]);
+    const { handler, kv } = await setupHandler({ sessionId: "no-progress", obsCount: 4, provider });
+    expect(await handler({ sessionId: "no-progress" })).toMatchObject({ success: false, error: "summary_reduce_no_progress" });
+    expect(await kv.get("summaries", "no-progress")).toBeNull();
+  });
+
   afterEach(() => {
     process.env = { ...ORIGINAL_ENV };
   });

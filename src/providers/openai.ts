@@ -118,7 +118,7 @@ export class OpenAIProvider implements MemoryProvider {
     });
     const body: Record<string, unknown> = {
       model: this.model,
-      max_tokens: taskOutputTokens(options?.task, this.maxTokens),
+      max_tokens: taskOutputTokens(options?.task, this.maxTokens, options?.outputTokens),
       // OpenAI API spec defines `stream` as defaulting to false, so omitting
       // it should yield a JSON response. Some OpenAI-compatible proxies
       // (notably 9Router < 0.4.56 — see decolua/9router#1260) default to
@@ -272,5 +272,4 @@ function parsePositiveInt(raw: string | null | undefined): number | undefined {
   const n = Number(trimmed);
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
-
 

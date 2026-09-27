@@ -1,0 +1,82 @@
+# Session summary budgets
+
+`mem::summarize` budgets each complete map and reduce prompt against the context
+window configured for the models that can serve the summary route. Settings use
+the normal merged configuration: `~/.agentmemory/.env`, then process environment
+overrides. File settings are cached until the worker restarts.
+
+## Settings
+
+```dotenv
+AGENTMEMORY_SUMMARY_CONTEXT_TOKENS=131072
+AGENTMEMORY_SUMMARY_OUTPUT_TOKENS=8192
+AGENTMEMORY_SUMMARY_SAFETY_MARGIN_TOKENS=4096
+SUMMARIZE_CHUNK_SIZE=400
+SUMMARIZE_CHUNK_CONCURRENCY=6
+```
+
+The default reserves 8192 output tokens and 4096 margin tokens, leaving **118784
+estimated input tokens before fixed system, prompt formatting and envelope
+overhead**. Every request includes those costs in its fit check. Choose a context
+window supported by every primary, auxiliary and fallback model reachable by the
+summary route. Smaller windows can be configured independently of output size.
+
+All settings must be positive finite safe integers. Concurrency cannot exceed
+32. Invalid reserves, or a context too small for the fixed prompts and a fragment,
+fail before a summary is persisted. `SUMMARIZE_CHUNK_SIZE` remains an optional
+additional observation cap (default 400); it is no longer a token estimate.
+
+## Input estimation and splitting
+
+The dependency-free estimate counts UTF-8 bytes of the JSON-escaped system and
+user strings, plus 512 for message framing and the supported Ollama structured
+output instruction and schema. This deliberately conservative estimate targets
+byte and subword tokenizers; it is **not a universal proof for arbitrary model
+tokenizers**, provider-added instructions or undisclosed provider context costs.
+Keep the margin and use the actual supported context window for your route.
+
+Observations are packed in their existing source order. Oversized observations
+are split at Unicode code point boundaries, including titles, narratives, facts,
+files and concepts. Their fragments retain the original observation number.
+Reducer inputs use the same fitting checks and can split oversized partials;
+fragments retain their source observation ranges and order. Fragmentation never
+truncates input text or increases the persisted `observationCount`.
+
+Map calls use the configured concurrency. Reduce calls run in bounded rounds:
+each completed nonfinal round must strictly decrease the total serialized partial
+size plus per-partial framing cost. Outputs that do not shrink cause
+`summary_reduce_no_progress`. Work is limited to 4096 packed items per packing
+operation, 4096 selected-provider calls across a summarize invocation (including
+its final parse retry), and 12 adaptive/reduction levels. Provider wrappers and
+transports retain their existing bounded internal fallback/retry policies; those
+internal attempts are additional to the selected-provider call limit. These
+limits bound work, not elapsed completion time or the iii invocation deadline.
+
+Explicit context or token-limit errors trigger bounded subdivision with a
+smaller input budget while retaining the configured output reserve. Ambiguous
+errors such as `invalid_content: empty or too large` do not prove a size failure
+and retain the existing retry-once behavior. Unusable map chunks can still be
+skipped; more than half failing aborts the summary. Intermediate reduce failures,
+budget exhaustion and lack of progress abort without persisting a final summary.
+
+## Output reserve and providers
+
+Summary requests send the configured output cap as an explicit per-call option.
+The task router preserves it through auxiliary selection and primary fallback.
+OpenAI-compatible (including Fireworks, DeepSeek and Azure), OpenRouter/Gemini
+compatibility, Anthropic, MiniMax and native Ollama requests receive the cap in
+their request bodies. Existing resilience, account-pool and fallback-chain
+wrappers forward it. The default 8192 overrides the old summary task cap of 768
+and constructor cap of 4096 **only for session summary calls**. `MAX_TOKENS`,
+`AGENTMEMORY_AUX_LLM_MAX_TOKENS`, other tasks, Fireworks Batch and TypeSafe keep
+their existing behavior.
+
+Claude Agent SDK does not expose an equivalent per-call output cap in this
+adapter. Input packing still applies, but its actual output limit cannot be
+enforced by these settings. Use a supported REST provider when the reserved
+output cap must match the transmitted request. Thinking models may consume part
+of their requested output allowance on reasoning according to provider behavior.
+
+Diagnostics record counts and failure categories without prompt or provider
+payloads. Existing XML parsing, summary validation, audit persistence, routing
+usage telemetry and circuit-breaker behavior remain in place.

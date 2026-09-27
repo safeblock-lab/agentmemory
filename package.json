@@ -1,6 +1,6 @@
 {
   "name": "@agentmemory/agentmemory",
-  "version": "0.9.56",
+  "version": "0.9.57",
   "description": "Persistent memory for AI coding agents, powered by iii-engine's three primitives",
   "type": "module",
   "main": "dist/index.mjs",
@@ -56,6 +56,7 @@
     "docs/fork-local-usage.md",
     "docs/fireworks-batch.md",
     "docs/typesafe.md",
+    "docs/summary-budget.md",
     "AGENTS.md"
   ],
   "author": "Rohit Ghumare <ghumare64@gmail.com>",

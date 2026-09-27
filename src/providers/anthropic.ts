@@ -1,6 +1,8 @@
 import Anthropic from '@anthropic-ai/sdk'
-import type { MemoryProvider } from '../types.js'
+import type { LlmCallOptions, MemoryProvider } from '../types.js'
 import { extractLlmTokenUsage, startLlmCallTelemetry } from './_llm-logging.js'
+
+import { summaryOutputTokens } from './task-output-limits.js';
 
 export class AnthropicProvider implements MemoryProvider {
   name = 'anthropic'
@@ -14,12 +16,12 @@ export class AnthropicProvider implements MemoryProvider {
     this.maxTokens = maxTokens
   }
 
-  async compress(systemPrompt: string, userPrompt: string): Promise<string> {
-    return this.call(systemPrompt, userPrompt, 'compress')
+  async compress(systemPrompt: string, userPrompt: string, options?: LlmCallOptions): Promise<string> {
+    return this.call(systemPrompt, userPrompt, 'compress', options)
   }
 
-  async summarize(systemPrompt: string, userPrompt: string): Promise<string> {
-    return this.call(systemPrompt, userPrompt, 'summarize')
+  async summarize(systemPrompt: string, userPrompt: string, options?: LlmCallOptions): Promise<string> {
+    return this.call(systemPrompt, userPrompt, 'summarize', options)
   }
 
   async describeImage(imageData: string, mimeType: string, prompt: string): Promise<string> {
@@ -49,12 +51,12 @@ export class AnthropicProvider implements MemoryProvider {
     }
   }
 
-  private async call(systemPrompt: string, userPrompt: string, operation: 'compress' | 'summarize'): Promise<string> {
+  private async call(systemPrompt: string, userPrompt: string, operation: 'compress' | 'summarize', options?: LlmCallOptions): Promise<string> {
     const telemetry = startLlmCallTelemetry({ provider: this.name, model: this.model, operation })
     try {
       const response = await this.client.messages.create({
       model: this.model,
-      max_tokens: this.maxTokens,
+      max_tokens: summaryOutputTokens(options, this.maxTokens),
       system: systemPrompt,
       messages: [{ role: 'user', content: userPrompt }],
       })

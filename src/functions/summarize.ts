@@ -7,13 +7,6 @@ import type {
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
-import {
-  SUMMARY_SYSTEM,
-  buildSummaryPrompt,
-  REDUCE_SYSTEM,
-  buildReducePrompt,
-} from "../prompts/summary.js";
-import { getXmlTag, getXmlChildren } from "../prompts/xml.js";
 import { SummaryOutputSchema } from "../eval/schemas.js";
 import { validateOutput } from "../eval/validator.js";
 import { scoreSummary } from "../eval/quality.js";
@@ -21,226 +14,9 @@ import type { MetricsStore } from "../eval/metrics-store.js";
 import { safeAudit } from "./audit.js";
 import { logger } from "../logger.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
-
-// Per-chunk observation budget when a session is too large to fit in one
-// LLM call. Default ≈ 50k input tokens per chunk at ~110 tok/obs — fits
-// comfortably in 128k-window models. Override via SUMMARIZE_CHUNK_SIZE.
-const CHUNK_SIZE_DEFAULT = 400;
-// Concurrent in-flight chunk calls. 6 keeps a 100-chunk session under
-// iii's 180s function-invocation timeout at ~8s/call while staying
-// inside generous-but-not-unlimited provider rate limits (well below
-// OpenAI free tier's 500 RPM). High-throughput providers
-// (Novita / DeepInfra / DeepSeek) typically allow 100+ concurrent — set
-// SUMMARIZE_CHUNK_CONCURRENCY higher to cover ~1000+ chunk sessions.
-const CHUNK_CONCURRENCY_DEFAULT = 6;
-// Bail on the merged summary if more than this fraction of chunks fail
-// to parse — a half-blind narrative is worse than a clean error.
-const MAX_SKIP_RATIO = 0.5;
-
-function getChunkSize(): number {
-  const raw = process.env.SUMMARIZE_CHUNK_SIZE;
-  if (!raw) return CHUNK_SIZE_DEFAULT;
-  const n = parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : CHUNK_SIZE_DEFAULT;
-}
-
-function getChunkConcurrency(): number {
-  const raw = process.env.SUMMARIZE_CHUNK_CONCURRENCY;
-  if (!raw) return CHUNK_CONCURRENCY_DEFAULT;
-  const n = parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : CHUNK_CONCURRENCY_DEFAULT;
-}
-
-// One chunk call with retry-once. Returns null when both attempts fail —
-// whether by parse failure, provider 4xx (content rejected by upstream
-// filters), or transient network/5xx errors that didn't recover on retry.
-// All failure modes are equivalent at this layer: the chunk is unusable,
-// skip it and let the caller decide via the skip-ratio bailout whether
-// the overall summary is still trustworthy. Errors that affect every
-// chunk (auth, model down) will trip the bailout naturally.
-async function summarizeChunkWithRetry(
-  provider: MemoryProvider,
-  llmRouter: LlmTaskRouter | undefined,
-  chunk: CompressedObservation[],
-  sessionId: string,
-  project: string,
-  idx: number,
-  total: number,
-): Promise<SessionSummary | null> {
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      const prompt = buildSummaryPrompt(chunk);
-      const xml = llmRouter
-        ? await llmRouter.run(
-          "summary",
-          (selectedProvider) => selectedProvider.summarize(SUMMARY_SYSTEM, prompt),
-          (candidate) => parseSummaryXml(candidate, sessionId, project, chunk.length) !== null,
-        )
-        : await provider.summarize(SUMMARY_SYSTEM, prompt);
-      const parsed = parseSummaryXml(xml, sessionId, project, chunk.length);
-      if (parsed) return parsed;
-      logger.warn("Summarize chunk parse failed", {
-        sessionId,
-        chunk: `${idx + 1}/${total}`,
-        attempt,
-      });
-    } catch (err) {
-      logger.warn("Summarize chunk LLM call failed", {
-        sessionId,
-        chunk: `${idx + 1}/${total}`,
-        attempt,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-  return null;
-}
-
-// Returns the final summary XML string. For sessions ≤ chunk size, this is
-// a single LLM call (legacy behavior). For larger sessions, observations
-// are split into chunks processed in parallel batches, each chunk retried
-// once on parse failure, persistently-bad chunks skipped, and remaining
-// partials merged via a reduce call.
-async function produceSummaryXml(
-  provider: MemoryProvider,
-  llmRouter: LlmTaskRouter | undefined,
-  compressed: CompressedObservation[],
-  sessionId: string,
-  project: string,
-): Promise<{
-  response: string;
-  mode: "single" | "chunked";
-  chunks: number;
-  skipped?: number;
-}> {
-  const chunkSize = getChunkSize();
-  if (compressed.length <= chunkSize) {
-    const prompt = buildSummaryPrompt(compressed);
-    const response = llmRouter
-      ? await llmRouter.run(
-        "summary",
-        (selectedProvider) => selectedProvider.summarize(SUMMARY_SYSTEM, prompt),
-        (candidate) => parseSummaryXml(candidate, sessionId, project, compressed.length) !== null,
-      )
-      : await provider.summarize(SUMMARY_SYSTEM, prompt);
-    return { response, mode: "single", chunks: 1 };
-  }
-
-  const chunks: CompressedObservation[][] = [];
-  for (let i = 0; i < compressed.length; i += chunkSize) {
-    chunks.push(compressed.slice(i, i + chunkSize));
-  }
-  const concurrency = getChunkConcurrency();
-  logger.info("Summarize chunking session", {
-    sessionId,
-    chunks: chunks.length,
-    chunkSize,
-    concurrency,
-    totalObservations: compressed.length,
-  });
-
-  // Sparse array preserves chunk → index mapping after parallel resolution,
-  // so the reduce step sees partials in chronological order even when some
-  // were skipped.
-  const partialByIdx: Array<SessionSummary | null> = new Array(chunks.length).fill(null);
-  for (let batchStart = 0; batchStart < chunks.length; batchStart += concurrency) {
-    const batch = chunks.slice(batchStart, batchStart + concurrency);
-    await Promise.all(
-      batch.map(async (chunk, j) => {
-        const idx = batchStart + j;
-        partialByIdx[idx] = await summarizeChunkWithRetry(
-          provider,
-          llmRouter,
-          chunk,
-          sessionId,
-          project,
-          idx,
-          chunks.length,
-        );
-      }),
-    );
-  }
-
-  const skipped = partialByIdx.filter((p) => p === null).length;
-  const partials = partialByIdx.filter((p): p is SessionSummary => p !== null);
-
-  if (skipped > Math.floor(chunks.length * MAX_SKIP_RATIO)) {
-    throw new Error(
-      `too_many_chunks_skipped: ${skipped}/${chunks.length} chunks failed to parse after retry`,
-    );
-  }
-  if (skipped > 0) {
-    logger.warn("Summarize chunks partially skipped", {
-      sessionId,
-      skipped,
-      total: chunks.length,
-    });
-  }
-
-  const reduceInput = partials.map((p) => {
-    const originalIdx = partialByIdx.indexOf(p);
-    return {
-      title: p.title,
-      narrative: p.narrative,
-      keyDecisions: p.keyDecisions,
-      filesModified: p.filesModified,
-      concepts: p.concepts,
-      obsRangeStart: originalIdx * chunkSize + 1,
-      obsRangeEnd: Math.min((originalIdx + 1) * chunkSize, compressed.length),
-    };
-  });
-  const reducePrompt = buildReducePrompt(reduceInput);
-  const response = llmRouter
-    ? await llmRouter.run(
-      "summary",
-      (selectedProvider) => selectedProvider.summarize(REDUCE_SYSTEM, reducePrompt),
-      (candidate) => parseSummaryXml(candidate, sessionId, project, compressed.length) !== null,
-    )
-    : await provider.summarize(REDUCE_SYSTEM, reducePrompt);
-  return { response, mode: "chunked", chunks: chunks.length, skipped };
-}
-
-// #783: many LLMs (DeepSeek, GPT variants, some Anthropic responses)
-// wrap structured XML in markdown code fences or add conversational
-// text before/after. Strip those wrappers before the tag regex so a
-// well-formed summary doesn't get silently dropped as parse_failed.
-function stripXmlWrappers(raw: string): string {
-  if (!raw) return "";
-  let cleaned = raw.trim();
-  // ```xml ... ``` or ``` ... ``` fences (anywhere in the payload).
-  cleaned = cleaned.replace(/```\s*xml\s*\n?/gi, "");
-  cleaned = cleaned.replace(/```/g, "");
-  cleaned = cleaned.trim();
-  // If preamble / postamble surrounds the XML root, peel it off.
-  const rootMatch = cleaned.match(
-    /(<[a-zA-Z_][a-zA-Z0-9_-]*>[\s\S]*<\/[a-zA-Z_][a-zA-Z0-9_-]*>)/,
-  );
-  if (rootMatch && rootMatch[1]) return rootMatch[1].trim();
-  return cleaned;
-}
-
-function parseSummaryXml(
-  xml: string,
-  sessionId: string,
-  project: string,
-  obsCount: number,
-): SessionSummary | null {
-  const cleaned = stripXmlWrappers(xml);
-  const title = getXmlTag(cleaned, "title");
-  if (!title) return null;
-
-  return {
-    sessionId,
-    project,
-    createdAt: new Date().toISOString(),
-    title,
-    narrative: getXmlTag(cleaned, "narrative"),
-    keyDecisions: getXmlChildren(cleaned, "decisions", "decision"),
-    filesModified: getXmlChildren(cleaned, "files", "file"),
-    concepts: getXmlChildren(cleaned, "concepts", "concept"),
-    observationCount: obsCount,
-  };
-}
+import { getSummaryBudgetConfig } from "../config.js";
+import { createSummaryProducer } from "./summary-producer.js";
+import { parseSummaryXml } from "./summary-xml.js";
 
 export function registerSummarizeFunction(
   sdk: IIIClient,
@@ -290,6 +66,7 @@ export function registerSummarizeFunction(
       }
 
       try {
+        const produceSummaryXml = createSummaryProducer(provider, llmRouter, getSummaryBudgetConfig(), sessionId, session.project);
         // #783: chunk-level produceSummaryXml retries internally, but
         // the final merge used to parse once and bail. Wrap the
         // produce-and-parse pair in the same 2-attempt loop so a
@@ -300,13 +77,7 @@ export function registerSummarizeFunction(
         let mode = "single";
         let chunks = 1;
         for (let attempt = 1; attempt <= 2; attempt++) {
-          const produced = await produceSummaryXml(
-            provider,
-            llmRouter,
-            compressed,
-            sessionId,
-            session.project,
-          );
+          const produced = await produceSummaryXml(compressed);
           response = produced.response;
           mode = produced.mode;
           chunks = produced.chunks;
@@ -367,7 +138,7 @@ export function registerSummarizeFunction(
           }
           logger.warn("Summary validation failed", {
             sessionId,
-            errors: validation.result.errors,
+            errorCount: validation.result.errors.length,
           });
           return { success: false, error: "validation_failed" };
         }
@@ -392,7 +163,6 @@ export function registerSummarizeFunction(
 
         logger.info("Session summarized", {
           sessionId,
-          title: summary.title,
           decisions: summary.keyDecisions.length,
           qualityScore,
           valid: validation.valid,
@@ -407,7 +177,7 @@ export function registerSummarizeFunction(
         }
         logger.error("Summarize failed", {
           sessionId,
-          error: msg,
+          reason: "summary_failed",
         });
         return { success: false, error: msg };
       }

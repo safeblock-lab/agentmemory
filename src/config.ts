@@ -15,6 +15,7 @@ import type {
   LlmRoutingConfig,
   LlmTask,
   OpenAIReasoningEffort,
+  SummaryBudgetConfig,
 } from "./types.js";
 
 function safeParseInt(value: string | undefined, fallback: number): number {
@@ -781,6 +782,36 @@ function getMergedEnv(
 
 export function getEnvVar(key: string): string | undefined {
   return getMergedEnv()[key];
+}
+
+export function parseSummaryBudgetConfig(env: Record<string, string | undefined>): SummaryBudgetConfig {
+  const integer = (key: string, fallback: number): number => {
+    const raw = env[key];
+    if (raw === undefined) return fallback;
+    const value = Number(raw);
+    if (!raw.trim() || !Number.isSafeInteger(value) || value <= 0) {
+      throw new Error(`invalid_summary_budget: ${key} must be a positive finite integer`);
+    }
+    return value;
+  };
+  const config = {
+    contextTokens: integer("AGENTMEMORY_SUMMARY_CONTEXT_TOKENS", 131072),
+    outputTokens: integer("AGENTMEMORY_SUMMARY_OUTPUT_TOKENS", 8192),
+    safetyMarginTokens: integer("AGENTMEMORY_SUMMARY_SAFETY_MARGIN_TOKENS", 4096),
+    chunkSize: integer("SUMMARIZE_CHUNK_SIZE", 400),
+    concurrency: integer("SUMMARIZE_CHUNK_CONCURRENCY", 6),
+  };
+  if (config.concurrency > 32) {
+    throw new Error("invalid_summary_budget: SUMMARIZE_CHUNK_CONCURRENCY must be at most 32");
+  }
+  if (config.contextTokens - config.outputTokens - config.safetyMarginTokens <= 0) {
+    throw new Error("invalid_summary_budget: context must exceed output plus safety margin");
+  }
+  return config;
+}
+
+export function getSummaryBudgetConfig(): SummaryBudgetConfig {
+  return parseSummaryBudgetConfig(getMergedEnv());
 }
 
 function parseBooleanSetting(

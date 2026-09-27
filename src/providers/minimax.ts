@@ -1,4 +1,4 @@
-import type { MemoryProvider } from '../types.js'
+import type { LlmCallOptions, MemoryProvider } from '../types.js'
 import { getEnvVar } from '../config.js'
 import { fetchWithTimeout } from './_fetch.js'
 import { extractLlmTokenUsage, startLlmCallTelemetry } from './_llm-logging.js'
@@ -17,6 +17,8 @@ import { extractLlmTokenUsage, startLlmCallTelemetry } from './_llm-logging.js'
  * Optional:
  *   MINIMAX_BASE_URL — base URL without path (default: https://api.minimax.io/anthropic)
  */
+import { summaryOutputTokens } from './task-output-limits.js';
+
 export class MinimaxProvider implements MemoryProvider {
   name = 'minimax'
   private apiKey: string
@@ -32,15 +34,15 @@ export class MinimaxProvider implements MemoryProvider {
       getEnvVar('MINIMAX_BASE_URL') || 'https://api.minimax.io/anthropic'
   }
 
-  async compress(systemPrompt: string, userPrompt: string): Promise<string> {
-    return this.call(systemPrompt, userPrompt, 'compress')
+  async compress(systemPrompt: string, userPrompt: string, options?: LlmCallOptions): Promise<string> {
+    return this.call(systemPrompt, userPrompt, 'compress', options)
   }
 
-  async summarize(systemPrompt: string, userPrompt: string): Promise<string> {
-    return this.call(systemPrompt, userPrompt, 'summarize')
+  async summarize(systemPrompt: string, userPrompt: string, options?: LlmCallOptions): Promise<string> {
+    return this.call(systemPrompt, userPrompt, 'summarize', options)
   }
 
-  private async call(systemPrompt: string, userPrompt: string, operation: 'compress' | 'summarize'): Promise<string> {
+  private async call(systemPrompt: string, userPrompt: string, operation: 'compress' | 'summarize', options?: LlmCallOptions): Promise<string> {
     const url = `${this.baseUrl}/v1/messages`
     const telemetry = startLlmCallTelemetry({ provider: this.name, model: this.model, operation })
     let response: Response
@@ -54,7 +56,7 @@ export class MinimaxProvider implements MemoryProvider {
       },
       body: JSON.stringify({
         model: this.model,
-        max_tokens: this.maxTokens,
+        max_tokens: summaryOutputTokens(options, this.maxTokens),
         system: systemPrompt,
         messages: [{ role: 'user', content: userPrompt }],
       }),

@@ -37,6 +37,38 @@ export function buildSummaryPrompt(observations: Array<{
   return `Session observations (${observations.length} total):\n\n${lines.join('\n\n---\n\n')}`
 }
 
+export interface SummaryPromptItem {
+  text: string
+  obsRangeStart: number
+  obsRangeEnd: number
+  fragment?: boolean
+}
+
+export function formatSummaryObservation(observation: {
+  type: string; title: string; narrative: string; facts: string[]; files: string[]; concepts: string[]
+}, index: number): string {
+  return `[${index}] ${observation.type}: ${observation.title}\n${observation.narrative}\nFacts:\n${observation.facts.map(f => `  - ${f}`).join('\n')}\nFiles: ${observation.files.join(', ')}\nConcepts: ${observation.concepts.join(', ')}`
+}
+
+export function buildSummaryItemsPrompt(items: SummaryPromptItem[]): string {
+  const count = new Set(items.flatMap(item => [item.obsRangeStart])).size
+  const sections = items.map(item => item.fragment
+    ? `[Observation ${item.obsRangeStart} fragment, in source order]\n${item.text}`
+    : item.text)
+  return `Session observations (${count} total):\n\n${sections.join('\n\n---\n\n')}`
+}
+
+export function buildReduceItemsPrompt(items: SummaryPromptItem[]): string {
+  const sections = items.map((item, index) => `[Chunk ${index + 1} of ${items.length} — obs ${item.obsRangeStart}-${item.obsRangeEnd}${item.fragment ? ', fragment in source order' : ''}]\n${item.text}`)
+  return `Partial summaries (${items.length} chunks of one session, chronological):\n\n${sections.join('\n\n---\n\n')}`
+}
+
+export function formatSummaryPartial(partial: {
+  title: string; narrative: string; keyDecisions: string[]; filesModified: string[]; concepts: string[]
+}): string {
+  return `Title: ${partial.title}\nNarrative: ${partial.narrative}\nDecisions:\n${partial.keyDecisions.map(d => `  - ${d}`).join('\n')}\nFiles:\n${partial.filesModified.map(f => `  - ${f}`).join('\n')}\nConcepts: ${partial.concepts.join(', ')}`
+}
+
 export const REDUCE_SYSTEM = `You are merging multiple partial summaries of the SAME coding session into one final session summary. The partials are chronological chunks of one continuous session — not separate sessions.
 
 Output EXACTLY this XML format with no additional text:
