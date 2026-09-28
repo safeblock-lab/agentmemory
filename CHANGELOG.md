@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.67] — 2026-09-28
+
+### Fixed
+
+- An explicit `AGENTMEMORY_FIREWORKS_BATCH_ENABLED=false` in `~/.agentmemory/.env` now remains authoritative when the parent process exports `true`; other settings keep process environment precedence.
+
 ## [0.9.56] — 2026-09-27
 
 ### Integrated

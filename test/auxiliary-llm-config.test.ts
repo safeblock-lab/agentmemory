@@ -1,5 +1,33 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { loadConfig } from "../src/config.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const envFileFixture = vi.hoisted(() => ({ exists: false, contents: "" }));
+
+vi.mock("node:os", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:os")>();
+  return { ...actual, homedir: () => "D:/mock-auxiliary-llm-home" };
+});
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  const isEnvFile = (path: unknown) =>
+    String(path).replaceAll("\\", "/") === "D:/mock-auxiliary-llm-home/.agentmemory/.env";
+  return {
+    ...actual,
+    existsSync: (path: unknown) => isEnvFile(path)
+      ? envFileFixture.exists
+      : actual.existsSync(path as Parameters<typeof actual.existsSync>[0]),
+    readFileSync: (path: unknown, options?: unknown) => isEnvFile(path)
+      ? envFileFixture.contents
+      : Reflect.apply(actual.readFileSync, actual, [path, options]),
+  };
+});
+
+import {
+  __resetEnvFileCache,
+  getEnvVar,
+  hydrateProcessEnvFromFile,
+  loadConfig,
+} from "../src/config.js";
 
 const AUX_KEYS = [
   "AGENTMEMORY_AUX_LLM_PROVIDER",
@@ -47,6 +75,9 @@ const BATCH_KEYS = [
 const original = new Map<string, string | undefined>();
 
 beforeEach(() => {
+  envFileFixture.exists = false;
+  envFileFixture.contents = "";
+  __resetEnvFileCache();
   for (const key of [...AUX_KEYS, ...ROUTE_KEYS, ...THINKING_KEYS, ...BATCH_KEYS]) {
     original.set(key, process.env[key]);
     process.env[key] = "";
@@ -59,7 +90,16 @@ afterEach(() => {
     else process.env[key] = value;
   }
   original.clear();
+  envFileFixture.exists = false;
+  envFileFixture.contents = "";
+  __resetEnvFileCache();
 });
+
+function configureValidBatchCredentials(): void {
+  process.env["AGENTMEMORY_FIREWORKS_BATCH_ACCOUNT_ID"] = "test-account";
+  process.env["AGENTMEMORY_FIREWORKS_BATCH_API_KEY"] = "test-key";
+  process.env["AGENTMEMORY_FIREWORKS_BATCH_MODEL"] = "accounts/test/models/test";
+}
 
 describe("auxiliary LLM configuration", () => {
   it("keeps auxiliary optional and preserves role defaults", () => {
@@ -136,6 +176,38 @@ describe("auxiliary LLM configuration", () => {
   it("keeps Fireworks Batch disabled unless explicitly configured", () => {
     const config = loadConfig();
     expect(config.fireworksBatch.enabled).toBe(false);
+  });
+
+  it("keeps the .env Batch opt-out authoritative through bootstrap hydration", () => {
+    envFileFixture.exists = true;
+    envFileFixture.contents = [
+      "AGENTMEMORY_FIREWORKS_BATCH_ENABLED=false",
+      "OPENAI_MODEL=file-model",
+    ].join("\n");
+    process.env["AGENTMEMORY_FIREWORKS_BATCH_ENABLED"] = "true";
+    process.env["OPENAI_MODEL"] = "process-model";
+    configureValidBatchCredentials();
+
+    expect(loadConfig().fireworksBatch.enabled).toBe(false);
+    expect(getEnvVar("OPENAI_MODEL")).toBe("process-model");
+
+    hydrateProcessEnvFromFile();
+
+    expect(process.env["AGENTMEMORY_FIREWORKS_BATCH_ENABLED"]).toBe("false");
+    expect(process.env["OPENAI_MODEL"]).toBe("process-model");
+    expect(loadConfig().fireworksBatch.enabled).toBe(false);
+  });
+
+  it("still enables Batch from a process flag when no file opt-out exists", () => {
+    process.env["AGENTMEMORY_FIREWORKS_BATCH_ENABLED"] = "true";
+    configureValidBatchCredentials();
+
+    expect(loadConfig().fireworksBatch).toMatchObject({
+      enabled: true,
+      accountId: "test-account",
+      apiKey: "test-key",
+      model: "accounts/test/models/test",
+    });
   });
 
   it("reuses the primary Fireworks key and model without changing aux", () => {

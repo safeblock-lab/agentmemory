@@ -55,6 +55,7 @@ const FIREWORKS_BATCH_DEFAULT_POLL_MAX_INTERVAL_MS = 120_000;
 const FIREWORKS_BATCH_DEFAULT_POLL_DEADLINE_MS = 24 * 60 * 60_000;
 const FIREWORKS_BATCH_DEFAULT_RECOVERY_STALE_MS = 15 * 60_000;
 const FIREWORKS_BATCH_DEFAULT_MAX_QUEUED_ITEMS = 1_000;
+const FIREWORKS_BATCH_ENABLED_ENV = "AGENTMEMORY_FIREWORKS_BATCH_ENABLED";
 const GRAPH_EXTRACTION_DEFAULT_INPUT_TARGET_CHARS = 32_000;
 const CONSOLIDATION_DEFAULT_MIN_NEW_SUMMARIES = 5;
 const TYPESAFE_DEFAULT_TIMEOUT_MS = 5_000;
@@ -483,7 +484,7 @@ function parseFireworksBatchConfig(
     ),
   };
 
-  const enabledRaw = env["AGENTMEMORY_FIREWORKS_BATCH_ENABLED"];
+  const enabledRaw = env[FIREWORKS_BATCH_ENABLED_ENV];
   defaults.minBatchItems = Math.min(defaults.minBatchItems, defaults.maxBatchItems);
   const explicitlyEnabled = hasRealValue(enabledRaw) &&
     (enabledRaw!.trim().toLowerCase() === "true" || enabledRaw!.trim() === "1");
@@ -491,7 +492,7 @@ function parseFireworksBatchConfig(
     (enabledRaw!.trim().toLowerCase() === "false" || enabledRaw!.trim() === "0");
   if (hasRealValue(enabledRaw) && !explicitlyEnabled && !explicitlyDisabled) {
     warnings.push(
-      "AGENTMEMORY_FIREWORKS_BATCH_ENABLED must be true, false, 1, or 0; Batch remains disabled.",
+      `${FIREWORKS_BATCH_ENABLED_ENV} must be true, false, 1, or 0; Batch remains disabled.`,
     );
   }
   if (!explicitlyEnabled) return { config: defaults, warnings };
@@ -603,14 +604,16 @@ function parseLlmRoutingConfig(
   return { routes, explicitRoutes, thinking, warnings };
 }
 
-// Hydrate ~/.agentmemory/.env into process.env at boot. loadEnvFile() is
-// otherwise only consumed via getMergedEnv(), which the many modules that
-// read raw process.env["X"] never call — so .env-only values were silently
-// ignored by them. Copy the file's vars into process.env, but only when the
-// key is currently unset so a real process.env value still wins (this
-// preserves the {...fileEnv, ...process.env} precedence getMergedEnv uses).
+// Hydrate ~/.agentmemory/.env into process.env for modules that read raw
+// process.env. Existing process values normally win; an explicit Batch opt-out
+// in the file stays authoritative even when a parent process exports true.
 export function hydrateProcessEnvFromFile(): void {
-  for (const [k, v] of Object.entries(loadEnvFile())) {
+  const fileEnv = loadEnvFile();
+  for (const [k, v] of Object.entries(fileEnv)) {
+    if (k === FIREWORKS_BATCH_ENABLED_ENV && isFireworksBatchExplicitlyDisabled(v)) {
+      process.env[k] = v;
+      continue;
+    }
     if (process.env[k] === undefined) process.env[k] = v;
   }
 }
@@ -778,7 +781,18 @@ function getMergedEnv(
   overrides?: Record<string, string>,
 ): Record<string, string> {
   const fileEnv = loadEnvFile();
-  return { ...fileEnv, ...process.env, ...overrides } as Record<string, string>;
+  const merged = { ...fileEnv, ...process.env, ...overrides } as Record<string, string>;
+  const batchEnabledInFile = fileEnv[FIREWORKS_BATCH_ENABLED_ENV];
+  if (isFireworksBatchExplicitlyDisabled(batchEnabledInFile)) {
+    merged[FIREWORKS_BATCH_ENABLED_ENV] = batchEnabledInFile;
+  }
+  return merged;
+}
+
+function isFireworksBatchExplicitlyDisabled(value: string | undefined): boolean {
+  if (!hasRealValue(value)) return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === "false" || normalized === "0";
 }
 
 export function getEnvVar(key: string): string | undefined {

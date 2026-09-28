@@ -124,7 +124,7 @@ describe("Export/Import Functions", () => {
   it("export produces valid ExportData structure", async () => {
     const result = (await sdk.trigger("mem::export", {})) as ExportData;
 
-    expect(result.version).toBe("0.9.66");
+    expect(result.version).toBe("0.9.67");
     expect(result.exportedAt).toBeDefined();
     expect(result.sessions.length).toBe(1);
     expect(result.sessions[0].id).toBe("ses_1");
@@ -133,7 +133,7 @@ describe("Export/Import Functions", () => {
     expect(result.summaries.length).toBe(1);
   });
 
-  it.each(["0.9.62", "0.9.63", "0.9.64", "0.9.65"] as const)("import with merge strategy adds %s data", async (version) => {
+  it.each(["0.9.62", "0.9.63", "0.9.64", "0.9.65", "0.9.66"] as const)("import with merge strategy adds %s data", async (version) => {
     const exportData: ExportData = {
       version,
       exportedAt: new Date().toISOString(),

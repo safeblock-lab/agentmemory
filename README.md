@@ -1516,6 +1516,8 @@ OPENAI_REASONING_EFFORT=none
 
 Replace `<your-fireworks-model>` with a model identifier available in your Fireworks account. Keep embedding access separate with `OPENAI_EMBEDDING_*` overrides when needed.
 
+The Fireworks Batch queue is disabled by default. Set `AGENTMEMORY_FIREWORKS_BATCH_ENABLED=true` to opt in with valid Batch credentials and a model. An explicit `AGENTMEMORY_FIREWORKS_BATCH_ENABLED=false` in `~/.agentmemory/.env` remains authoritative when the parent process exports `true`; process environment values keep precedence for other settings.
+
 ### Cost-aware model selection
 
 When LLM-written background compression is enabled with both a provider and `AGENTMEMORY_AUTO_COMPRESS=true`, it runs on every observation, so model choice meaningfully changes monthly spend. Captured workload data: 635 requests / 888K tokens / 35 hours of active use, run against three OpenRouter models at 2026-05-23 pricing.
