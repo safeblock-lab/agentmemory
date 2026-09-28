@@ -65,6 +65,21 @@ describe("fresh native engine startup", () => {
     );
   });
 
+  it("exports the default REST port for updater ownership checks while preserving custom ports", () => {
+    const start = source.indexOf('const restPort = parseInt(process.env["III_REST_PORT"] || "3111", 10);');
+    const end = source.indexOf("const dataDirResolution =", start);
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    const bootstrap = new Function("process", `${source.slice(start, end)}\nreturn process.env;`) as
+      (context: { env: Record<string, string> }) => Record<string, string>;
+    expect(bootstrap({ env: {} })).toMatchObject({
+      III_REST_PORT: "3111", III_STREAM_PORT: "3112", III_VIEWER_PORT: "3113", III_ENGINE_PORT: "49134",
+    });
+    expect(bootstrap({ env: { III_REST_PORT: "3211", III_STREAM_PORT: "9000" } })).toMatchObject({
+      III_REST_PORT: "3211", III_STREAM_PORT: "9000", III_VIEWER_PORT: "3213", III_ENGINE_PORT: "49234",
+    });
+  });
+
   it("checks every Unix engine installer prerequisite before downloading", () => {
     const installerStart = source.indexOf("async function runIiiInstaller");
     const installerEnd = source.indexOf("type StartupFailure", installerStart);

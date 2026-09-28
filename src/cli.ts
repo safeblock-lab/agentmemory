@@ -314,6 +314,7 @@ if (hasInstanceArgument) {
 
 const restPort = parseInt(process.env["III_REST_PORT"] || "3111", 10);
 if (Number.isFinite(restPort) && restPort > 0) {
+  process.env["III_REST_PORT"] ||= String(restPort);
   process.env["III_STREAM_PORT"] ??=
     process.env["III_STREAMS_PORT"] ?? String(restPort + 1);
   process.env["III_VIEWER_PORT"] ??= String(restPort + 2);
