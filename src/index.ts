@@ -851,12 +851,12 @@ async function main() {
   const consolidationIntervalMs = parseInt(process.env.CONSOLIDATION_INTERVAL_MS || "7200000", 10);
 
   let summaryRecoveryRunning = false;
-  const recoverSummaryQueue = async () => {
+  const recoverSummaryQueue = async (functionId: "mem::summary-recover" | "mem::summary-reconcile") => {
     if (summaryRecoveryRunning) return;
     summaryRecoveryRunning = true;
     try {
       const result: unknown = await sdk.trigger({
-        function_id: "mem::summary-recover",
+        function_id: functionId,
         payload: {},
       });
       if (typeof result !== "object" || result === null ||
@@ -869,9 +869,11 @@ async function main() {
       summaryRecoveryRunning = false;
     }
   };
-  void recoverSummaryQueue();
-  const summaryRecoveryTimer = setInterval(() => void recoverSummaryQueue(), 60 * 60 * 1000);
+  void recoverSummaryQueue("mem::summary-recover");
+  const summaryRecoveryTimer = setInterval(() => void recoverSummaryQueue("mem::summary-recover"), 60 * 60 * 1000);
   summaryRecoveryTimer.unref();
+  const summaryReconcileTimer = setInterval(() => void recoverSummaryQueue("mem::summary-reconcile"), 60 * 1000);
+  summaryReconcileTimer.unref();
 
   if (process.env.AUTO_FORGET_ENABLED !== "false") {
     const autoForgetTimer = setInterval(async () => {

@@ -55,6 +55,9 @@ function harness(kv = store(), run: (call: number) => Promise<string> | string =
       if (type === "durable:subscriber") subscribers.set(config.topic, function_id);
     },
     trigger: async ({ function_id, payload }: { function_id: string; payload: never }) => {
+      if (function_id === "engine::queue::topic_stats") {
+        return { depth: messages.filter(message => message.function_id === "mem::summary-unit").length, dlq_depth: 0 };
+      }
       if (function_id === "iii::durable::publish") {
         const message = payload as { topic: string; data: never };
         const subscriber = subscribers.get(message.topic);
@@ -202,6 +205,77 @@ describe("durable summary queue", () => {
     expect(h.calls).toBeGreaterThan(job!.unitIds.length);
     expect(await h.kv.get(KV.summaries, "session")).toMatchObject({ observationCount: 20 });
     expect(await h.kv.list(KV.summaryQueueUnits(result.jobId))).toHaveLength(0);
+  });
+
+  it("keeps a 12-unit window and refills it as each map unit finishes", async () => {
+    const h = harness();
+    await seed(h.kv, Array.from({ length: 30 }, (_, i) => observation(i, "detail ".repeat(110))));
+    const result = await h.invoke("mem::summary-enqueue", { sessionId: "session" }) as { jobId: string };
+    const job = await h.kv.get<SummaryQueueJob>(KV.summaryQueueJobs, result.jobId);
+    expect(job!.unitIds.length).toBeGreaterThan(12);
+    const dispatch = h.messages.shift()!;
+    await h.invoke(dispatch.function_id, dispatch.payload);
+    expect(h.messages).toHaveLength(12);
+    expect(h.messages.every(message => message.function_id === "mem::summary-unit")).toBe(true);
+    const first = h.messages.shift()!;
+    await h.invoke(first.function_id, first.payload);
+    expect(h.messages).toHaveLength(12);
+    await h.drain();
+    expect(await h.kv.get(KV.summaries, "session")).toMatchObject({ observationCount: 30 });
+  });
+
+  it("requeues a lost undelivered unit after the topic is empty and continues reduction", async () => {
+    const h = harness();
+    await seed(h.kv, Array.from({ length: 20 }, (_, i) => observation(i, "detail ".repeat(110))));
+    const result = await h.invoke("mem::summary-enqueue", { sessionId: "session" }) as { jobId: string };
+    const dispatch = h.messages.shift()!;
+    await h.invoke(dispatch.function_id, dispatch.payload);
+    const lost = h.messages.shift()!;
+    const unitId = (lost.payload as { unitId: string }).unitId;
+    await h.drain();
+    expect(h.messages).toHaveLength(0);
+    expect(await h.kv.get(KV.summaries, "session")).toBeNull();
+    const scope = KV.summaryQueueUnits(result.jobId);
+    const unit = await h.kv.get<{ attempts: number; dispatchedAt: string; startedAt?: string }>(scope, unitId);
+    expect(unit).toMatchObject({ attempts: 0 });
+    expect(unit?.startedAt).toBeUndefined();
+    await h.kv.set(scope, unitId, {
+      ...unit!, dispatchedAt: "2026-01-01T00:00:00Z", startedAt: new Date().toISOString(),
+    });
+    expect(await h.invoke("mem::summary-reconcile")).toMatchObject({ replayed: 0 });
+    expect(h.messages).toHaveLength(0);
+    await h.kv.set(scope, unitId, {
+      ...unit!, dispatchedAt: "2026-01-01T00:00:00Z", startedAt: "2026-01-01T00:00:00Z",
+    });
+    expect(await h.invoke("mem::summary-reconcile")).toMatchObject({ replayed: 1, recovered: 1 });
+    expect(h.messages).toHaveLength(1);
+    await h.drain();
+    expect(await h.kv.get(KV.summaries, "session")).toMatchObject({ observationCount: 20 });
+  });
+
+  it("does not bypass the 15-minute retry delay for a failed unit", async () => {
+    const h = harness(undefined, call => {
+      if (call === 1) throw new Error("fetch failed");
+      return xml();
+    });
+    await seed(h.kv, [observation(1)]);
+    const result = await h.invoke("mem::summary-enqueue", { sessionId: "session" }) as { jobId: string };
+    const dispatch = h.messages.shift()!;
+    await h.invoke(dispatch.function_id, dispatch.payload);
+    const message = h.messages.shift()!;
+    await expect(h.invoke(message.function_id, message.payload)).rejects.toThrow("fetch failed");
+    expect(await h.invoke("mem::summary-reconcile")).toMatchObject({ replayed: 0 });
+    expect(h.messages).toHaveLength(0);
+    const unitId = (message.payload as { unitId: string }).unitId;
+    const scope = KV.summaryQueueUnits(result.jobId);
+    const unit = await h.kv.get<{ attempts: number; dispatchedAt: string; lastAttemptAt: string }>(scope, unitId);
+    expect(unit?.attempts).toBe(1);
+    await h.kv.set(scope, unitId, {
+      ...unit!, dispatchedAt: "2026-01-01T00:00:00Z", lastAttemptAt: "2026-01-01T00:00:00Z",
+    });
+    expect(await h.invoke("mem::summary-reconcile")).toMatchObject({ replayed: 1 });
+    await h.drain();
+    expect(await h.kv.get(KV.summaries, "session")).toMatchObject({ title: "Finished" });
   });
 
   it("keeps only a compact failed diagnosis for 30 days, then cleans it", async () => {

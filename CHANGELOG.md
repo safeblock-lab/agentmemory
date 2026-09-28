@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.71] — 2026-09-29
+
+### Fixed
+
+- Summary jobs now dispatch a persisted window of at most 12 units and refill it as units finish. A bounded reconciliation restores deliveries lost during worker disconnects without replaying completed units or bypassing provider retry delays.
+
 ## [0.9.70] — 2026-09-29
 
 ### Added

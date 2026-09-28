@@ -30,6 +30,23 @@ const DISPATCH_BATCH = 12;
 const MAX_ATTEMPTS = 6; // Five subscriber retries plus the first delivery.
 const FAILED_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_RECOVERY_INTENTS = 100;
+const STALE_DELIVERY_MS = 60_000;
+const RETRY_BACKOFF_MS = 900_000;
+
+function maxUnitRuntimeMs(): number {
+  const configured = Number.parseInt(
+    process.env.OPENAI_TIMEOUT_MS ?? process.env.AGENTMEMORY_LLM_TIMEOUT_MS ?? "300000", 10);
+  return Number.isSafeInteger(configured) && configured > 0
+    ? Math.max(600_000, configured + STALE_DELIVERY_MS)
+    : 600_000;
+}
+
+function retryEligible(unit: SummaryQueueUnit, now: number): boolean {
+  if (unit.attempts === 0) return true;
+  if (!unit.lastAttemptAt || unit.attempts >= MAX_ATTEMPTS) return false;
+  const due = Date.parse(unit.lastAttemptAt) + RETRY_BACKOFF_MS * 2 ** (unit.attempts - 1);
+  return Number.isFinite(due) && now >= due + STALE_DELIVERY_MS;
+}
 
 interface SummaryQueueUnit {
   id: string;
@@ -38,6 +55,9 @@ interface SummaryQueueUnit {
   round: number;
   items: SummaryPromptItem[];
   attempts: number;
+  dispatchedAt?: string;
+  startedAt?: string;
+  lastAttemptAt?: string;
   output?: SummaryPromptItem;
   summary?: SessionSummary;
   lastError?: string;
@@ -117,6 +137,12 @@ async function writeUnits(kv: StateKV, jobId: string, units: SummaryQueueUnit[])
     await Promise.all(units.slice(start, start + DISPATCH_BATCH)
       .map(unit => kv.set(KV.summaryQueueUnits(jobId), unit.id, unit)));
   }
+}
+
+async function loadJobUnits(kv: StateKV, job: SummaryQueueJob): Promise<Array<SummaryQueueUnit | undefined>> {
+  const units = await kv.list<SummaryQueueUnit>(KV.summaryQueueUnits(job.id));
+  const byId = new Map(units.map(unit => [unit.id, unit]));
+  return job.unitIds.map(id => byId.get(id));
 }
 
 async function failJob(kv: StateKV, jobId: string, reason: string): Promise<void> {
@@ -223,26 +249,32 @@ export function registerSummaryQueueFunctions(
   });
 
   sdk.registerFunction("mem::summary-dispatch", async (data: { jobId: string; round: number; offset: number }) => {
-    const job = await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, data.jobId);
-    if (!job || job.status !== "pending" || job.round !== data.round) return { success: true, skipped: true };
-    if (!Number.isSafeInteger(data.offset) || data.offset < 0 || data.offset >= job.unitIds.length) {
-      return { success: true, skipped: true };
-    }
-    const ids = job.unitIds.slice(data.offset, data.offset + DISPATCH_BATCH);
-    for (const unitId of ids) await enqueue(sdk, "mem::summary-unit", { jobId: job.id, unitId });
-    const nextOffset = data.offset + DISPATCH_BATCH;
-    if (nextOffset < job.unitIds.length) {
-      await enqueue(sdk, "mem::summary-dispatch", { jobId: job.id, round: job.round, offset: nextOffset });
-    }
-    if (data.offset === 0 && job.dispatchPending) {
-      await withKeyedLock(`summary-job:${job.id}`, async () => {
-        const latest = await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, job.id);
-        if (latest?.status === "pending" && latest.round === data.round) {
-          await kv.set(KV.summaryQueueJobs, job.id, { ...latest, dispatchPending: false });
+    if (data.offset !== 0) return { success: true, skipped: true };
+    return withKeyedLock(`summary-job:${data.jobId}`, async () => {
+      const job = await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, data.jobId);
+      if (!job || job.status !== "pending" || job.round !== data.round) {
+        return { success: true, skipped: true };
+      }
+      const units = await loadJobUnits(kv, job);
+      const waiting = units.filter((unit): unit is SummaryQueueUnit => Boolean(unit && !unit.output));
+      const outstanding = waiting.filter(unit => unit.dispatchedAt && unit.attempts === 0).length;
+      const available = Math.max(0, DISPATCH_BATCH - outstanding);
+      const now = Date.now();
+      const selected = waiting.filter(unit => !unit.dispatchedAt && retryEligible(unit, now)).slice(0, available);
+      for (const unit of selected) {
+        await kv.set(KV.summaryQueueUnits(job.id), unit.id, { ...unit, dispatchedAt: new Date().toISOString() });
+        try {
+          await enqueue(sdk, "mem::summary-unit", { jobId: job.id, unitId: unit.id });
+        } catch (error) {
+          await kv.set(KV.summaryQueueUnits(job.id), unit.id, unit);
+          throw error;
         }
-      });
-    }
-    return { success: true, dispatched: ids.length };
+      }
+      if (job.dispatchPending) {
+        await kv.set(KV.summaryQueueJobs, job.id, { ...job, dispatchPending: false });
+      }
+      return { success: true, dispatched: selected.length };
+    });
   });
   sdk.registerTrigger({
     type: "durable:subscriber",
@@ -254,7 +286,7 @@ export function registerSummaryQueueFunctions(
     withKeyedLock(`summary-job:${jobId}`, async () => {
       const job = await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, jobId);
       if (!job || job.status !== "pending") return { completed: false };
-      const units = await Promise.all(job.unitIds.map(id => kv.get<SummaryQueueUnit>(KV.summaryQueueUnits(jobId), id)));
+      const units = await loadJobUnits(kv, job);
       if (units.some(unit => !unit?.output || !unit.summary)) return { completed: false };
       const complete = units as SummaryQueueUnit[];
       if (complete.length === 1) {
@@ -293,6 +325,9 @@ export function registerSummaryQueueFunctions(
         return { success: true, skipped: true };
       }
       if (!unit.output) {
+        await kv.set(KV.summaryQueueUnits(job.id), unit.id, {
+          ...unit, startedAt: new Date().toISOString(),
+        });
         const system = unit.stage === "map" ? SUMMARY_SYSTEM : REDUCE_SYSTEM;
         const prompt = unit.stage === "map" ? buildSummaryItemsPrompt(unit.items) : buildReduceItemsPrompt(unit.items);
         try {
@@ -334,16 +369,22 @@ export function registerSummaryQueueFunctions(
             return { success: true, skipped: true };
           }
           await kv.set(KV.summaryQueueUnits(job.id), unit.id, {
-            ...unit, summary, output: unitOutput(summary, unit.items), lastError: undefined,
+            ...unit, summary, output: unitOutput(summary, unit.items),
+            startedAt: undefined, lastError: undefined,
           });
         } catch (error) {
           const attempts = unit.attempts + 1;
           const reason = failureCode(error);
-          await kv.set(KV.summaryQueueUnits(job.id), unit.id, { ...unit, attempts, lastError: reason });
+          await kv.set(KV.summaryQueueUnits(job.id), unit.id, {
+            ...unit, attempts, startedAt: undefined,
+            lastError: reason, lastAttemptAt: new Date().toISOString(),
+          });
           if (attempts >= MAX_ATTEMPTS || error instanceof SummaryBudgetError) {
             await failJob(kv, job.id, reason);
             return { success: false, error: reason, terminal: true };
           }
+          await sdk.trigger({ function_id: "mem::summary-dispatch",
+            payload: { jobId: job.id, round: job.round, offset: 0 } });
           throw error;
         }
       }
@@ -351,6 +392,9 @@ export function registerSummaryQueueFunctions(
         const result = await advance(job.id);
         if (result.nextRound !== undefined) {
           await enqueue(sdk, "mem::summary-dispatch", { jobId: job.id, round: result.nextRound, offset: 0 });
+        } else if (!result.completed) {
+          await sdk.trigger({ function_id: "mem::summary-dispatch",
+            payload: { jobId: job.id, round: job.round, offset: 0 } });
         }
         if (result.completed) {
           await sdk.trigger({ function_id: "mem::summary-enqueue", payload: { sessionId: job.sessionId } });
@@ -370,21 +414,83 @@ export function registerSummaryQueueFunctions(
     config: {
       topic: UNIT_TOPIC,
       queue_config: {
-        type: "concurrent", concurrency: 12, maxRetries: 5, backoffDelayMs: 900_000,
+        type: "concurrent", concurrency: 12, maxRetries: 5, backoffDelayMs: RETRY_BACKOFF_MS,
       },
     },
   });
 
-  sdk.registerFunction("mem::summary-recover", async () => {
+  const reconcilePendingJobs = async (): Promise<{ recovered: number; replayed: number }> => {
+    let idle = false;
+    try {
+      const queue = await sdk.trigger<unknown, { depth?: number; dlq_depth?: number }>({
+        function_id: "engine::queue::topic_stats", payload: { topic: UNIT_TOPIC }, timeoutMs: 5000,
+      });
+      idle = queue.depth === 0 && queue.dlq_depth === 0;
+    } catch {
+      // New work can still be dispatched; only stale-delivery replay needs an idle signal.
+    }
+
     let recovered = 0;
+    let replayed = 0;
+    for (const candidate of await kv.list<SummaryQueueJob>(KV.summaryQueueJobs)) {
+      if (candidate.status !== "pending") continue;
+      if (idle) {
+        await withKeyedLock(`summary-job:${candidate.id}`, async () => {
+          const job = await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, candidate.id);
+          if (!job || job.status !== "pending") return;
+          const now = Date.now();
+          for (const unit of await loadJobUnits(kv, job)) {
+            if (unit && !unit.output && unit.attempts > 0 && !unit.lastAttemptAt) {
+              const markedAt = new Date(now).toISOString();
+              await kv.set(KV.summaryQueueUnits(job.id), unit.id, {
+                ...unit, lastAttemptAt: markedAt, dispatchedAt: unit.dispatchedAt ?? markedAt,
+              });
+              continue;
+            }
+            if (!unit || unit.output || !unit.dispatchedAt ||
+                now - Date.parse(unit.dispatchedAt) < STALE_DELIVERY_MS ||
+                unit.startedAt && now - Date.parse(unit.startedAt) < maxUnitRuntimeMs() ||
+                !retryEligible(unit, now)) continue;
+            await kv.set(KV.summaryQueueUnits(job.id), unit.id, {
+              ...unit, dispatchedAt: undefined, startedAt: undefined,
+            });
+            replayed++;
+          }
+        });
+      }
+      try {
+        const progress = await advance(candidate.id);
+        if (progress.completed) {
+          await sdk.trigger({ function_id: "mem::summary-enqueue",
+            payload: { sessionId: candidate.sessionId } });
+          recovered++;
+          continue;
+        }
+        const job = await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, candidate.id);
+        if (!job || job.status !== "pending") continue;
+        const result = await sdk.trigger<unknown, { dispatched?: number }>({
+          function_id: "mem::summary-dispatch",
+          payload: { jobId: job.id, round: job.round, offset: 0 },
+        });
+        if (progress.nextRound !== undefined || result.dispatched) recovered++;
+      } catch (error) {
+        if (!(error instanceof SummaryBudgetError)) throw error;
+        await failJob(kv, candidate.id, error.message);
+      }
+    }
+    if (replayed > 0) logger.warn("Summary queue replayed undelivered units", { replayed });
+    return { recovered, replayed };
+  };
+  sdk.registerFunction("mem::summary-reconcile", reconcilePendingJobs);
+
+  sdk.registerFunction("mem::summary-recover", async () => {
+    let { recovered } = await reconcilePendingJobs();
     let cleaned = 0;
     const jobs = await kv.list<SummaryQueueJob>(KV.summaryQueueJobs);
     const coveredSessions = new Set<string>();
     for (const job of jobs) {
       if (job.status === "pending") {
         coveredSessions.add(job.sessionId);
-        await enqueue(sdk, "mem::summary-dispatch", { jobId: job.id, round: job.round, offset: 0 });
-        recovered++;
       } else if (job.status === "completed") {
         await sdk.trigger({ function_id: "mem::summary-enqueue", payload: { sessionId: job.sessionId } });
         await cleanupUnits(kv, job.id);
