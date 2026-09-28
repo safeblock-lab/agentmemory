@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.72] — 2026-09-29
+
+### Fixed
+
+- The built-in queue now uses file-backed storage under the AgentMemory data directory when starting from older local configurations, so upgrades preserve queued deliveries.
+- Summary reduction recognizes progress when fragments combine even if their aggregate text grows, and uses the safe per-call input budget to avoid unnecessary reduction rounds.
+
 ## [0.9.71] — 2026-09-29
 
 ### Fixed

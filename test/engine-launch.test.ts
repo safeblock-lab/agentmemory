@@ -88,6 +88,10 @@ describe("rewriteBundledConfig", () => {
   const SAMPLE = [
     "          file_path: ./data/state_store.db",
     "          file_path: ./data/stream_store",
+    "  - name: iii-queue",
+    "    config:",
+    "      adapter:",
+    "        name: builtin",
     "  - name: iii-exec",
     "    config:",
     "      watch:",
@@ -112,6 +116,10 @@ describe("rewriteBundledConfig", () => {
   it("preserves unrelated commands in the bundled iii-exec worker", () => {
     const bundled = [
       "workers:",
+      "  - name: iii-queue",
+      "    config:",
+      "      adapter:",
+      "        name: builtin",
       "  - name: iii-exec",
       "    config:",
       "      exec:",

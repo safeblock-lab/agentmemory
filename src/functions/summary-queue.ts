@@ -295,12 +295,14 @@ export function registerSummaryQueueFunctions(
         return { completed: true };
       }
       const outputs = complete.map(unit => unit.output!);
-      if (job.stage === "reduce" && summaryProgressSize(outputs) >= job.sourceProgressSize) {
+      const groups = packSummaryItems(outputs, REDUCE_SYSTEM, buildReduceItemsPrompt,
+        summaryReduceInputLimit(job.config));
+      const sizeProgress = summaryProgressSize(outputs) < job.sourceProgressSize;
+      const unitProgress = groups.length < complete.length;
+      if (job.stage === "reduce" && !sizeProgress && !unitProgress) {
         throw new SummaryBudgetError("summary_reduce_no_progress");
       }
       if (job.round >= MAX_SUMMARY_DEPTH) throw new SummaryBudgetError("summary_depth_limit_exceeded");
-      const groups = packSummaryItems(outputs, REDUCE_SYSTEM, buildReduceItemsPrompt,
-        summaryReduceInputLimit(job.config));
       const nextRound = job.round + 1;
       const nextUnits = createUnits(job.id, "reduce", nextRound, groups);
       await writeUnits(kv, job.id, nextUnits);

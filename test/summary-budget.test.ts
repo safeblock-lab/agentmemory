@@ -3,7 +3,7 @@ import { getSummaryBudgetConfig, parseSummaryBudgetConfig } from "../src/config.
 import {
   estimateSummaryTokens, summaryOutputTokenBudget, packSummaryItems, summaryInputLimit, summaryCallInputLimit, summaryChunkInputLimit,
   summaryReduceInputLimit, isExplicitSummarySizeError, MAX_SUMMARY_ITEMS,
-  MIN_SUMMARY_CHUNK_CONTENT_TOKENS, MIN_SUMMARY_REDUCE_CONTENT_TOKENS,
+  MIN_SUMMARY_CHUNK_CONTENT_TOKENS,
 } from "../src/functions/summary-budget.js";
 import {
   SUMMARY_SYSTEM, REDUCE_SYSTEM, buildSummaryItemsPrompt, buildReduceItemsPrompt,
@@ -34,6 +34,24 @@ describe("summary budget configuration", () => {
     vi.stubEnv("AGENTMEMORY_SUMMARY_SAFETY_MARGIN_TOKENS", "512");
     expect(getSummaryBudgetConfig().contextTokens).toBe(8192);
     expect(summaryInputLimit(getSummaryBudgetConfig())).toBe(6656);
+  });
+  it("uses the full safe per-call budget to merge five production-sized reduce partials", () => {
+    const config = parseSummaryBudgetConfig({
+      AGENTMEMORY_SUMMARY_CONTEXT_TOKENS: "8192",
+      AGENTMEMORY_SUMMARY_OUTPUT_TOKENS: "1024",
+      AGENTMEMORY_SUMMARY_SAFETY_MARGIN_TOKENS: "512",
+    });
+    const partials = Array.from({ length: 5 }, (_, index) => item("x".repeat(1200), index + 1));
+    const limit = summaryReduceInputLimit(config);
+    const groups = packSummaryItems(partials, REDUCE_SYSTEM, buildReduceItemsPrompt, limit);
+
+    expect(summaryCallInputLimit(config)).toBe(6656);
+    expect(limit).toBe(6656);
+    expect(groups).toHaveLength(3);
+    expect(groups.length).toBeLessThan(partials.length);
+    for (const group of groups) {
+      expect(estimateSummaryTokens(REDUCE_SYSTEM, buildReduceItemsPrompt(group))).toBeLessThanOrEqual(limit);
+    }
   });
   it("derives a positive output ceiling from each prompt and honors only an explicit admin cap", () => {
     const config = parseSummaryBudgetConfig({});
@@ -100,13 +118,12 @@ describe("summary prompt packing", () => {
     expect(Math.max(...sizes) - Math.min(...sizes), JSON.stringify({ sizes, lengths: groups.map(group => group.map(part => part.text.length)) })).toBeLessThan(Math.max(...sizes) * 0.2);
     expect(sizes.every(size => size <= inputLimit)).toBe(true);
   });
-  it("keeps the minimum target based on content tokens, not fixed prompt overhead", () => {
+  it("keeps the minimum chunk target based on content tokens, not fixed prompt overhead", () => {
     const empty = item("");
     const fixed = estimateSummaryTokens(SUMMARY_SYSTEM, buildSummaryItemsPrompt([empty]));
     const small = item("x".repeat(400));
     const content = estimateSummaryTokens(SUMMARY_SYSTEM, buildSummaryItemsPrompt([small])) - fixed;
     expect(MIN_SUMMARY_CHUNK_CONTENT_TOKENS).toBe(500);
-    expect(MIN_SUMMARY_REDUCE_CONTENT_TOKENS).toBe(2000);
     expect(content).toBeLessThan(MIN_SUMMARY_CHUNK_CONTENT_TOKENS);
     expect(packSummaryItems([small], SUMMARY_SYSTEM, buildSummaryItemsPrompt, fixed + 550)).toHaveLength(1);
     expect(packSummaryItems([item("x".repeat(1000))], SUMMARY_SYSTEM, buildSummaryItemsPrompt, fixed + 600))

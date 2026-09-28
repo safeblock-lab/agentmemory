@@ -9,7 +9,6 @@ export const MAX_SUMMARY_ITEMS = 4096;
 export const MAX_SUMMARY_CALLS = 4096;
 export const MAX_SUMMARY_DEPTH = 12;
 export const MIN_SUMMARY_CHUNK_CONTENT_TOKENS = 500;
-export const MIN_SUMMARY_REDUCE_CONTENT_TOKENS = 2000;
 // Covers role framing and the supported Ollama JSON output instruction/schema.
 export const SUMMARY_ENVELOPE_TOKENS = 512;
 
@@ -77,12 +76,7 @@ export function summaryChunkInputLimit(config: SummaryBudgetConfig): number {
 }
 
 export function summaryReduceInputLimit(config: SummaryBudgetConfig): number {
-  const limit = summaryCallInputLimit(config);
-  const emptyFragment: SummaryPromptItem = { text: "", obsRangeStart: 1, obsRangeEnd: 1, fragment: true };
-  const fixedPromptTokens = estimateSummaryTokens(REDUCE_SYSTEM, buildReduceItemsPrompt([emptyFragment]));
-  const parallelTarget = Math.ceil(summaryInputLimit(config) / Math.min(4, Math.max(1, config.concurrency)));
-  const minimumContentTarget = fixedPromptTokens + MIN_SUMMARY_REDUCE_CONTENT_TOKENS;
-  return Math.min(limit, Math.max(parallelTarget, minimumContentTarget));
+  return summaryCallInputLimit(config);
 }
 
 export function isExplicitSummarySizeError(error: unknown): boolean {

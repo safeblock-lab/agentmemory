@@ -41,9 +41,94 @@ describe("renderEngineConfig", () => {
       `file_path: '${join(dataDir, "stream_store")}'`,
     );
     expect(rendered).toContain(
-      `file_path: '${join(dataDir, "queue_store")}'`,
+      `file_path: '${resolve(dataDir, "queue_store")}'`,
     );
+    expect(rendered).toContain("store_method: file_based");
     expect(rendered).not.toContain("./data/");
+  });
+
+  it("migrates a legacy builtin queue adapter to the persistent data directory", () => {
+    const legacy = [
+      "workers:",
+      "  - name: iii-queue",
+      "    config:",
+      "      adapter:",
+      "        name: builtin",
+    ].join("\n");
+    const dataDir = join("/var", "lib", "agentmemory");
+
+    const rendered = renderEngineConfig(legacy, { dataDir });
+
+    expect(rendered).toContain("        name: builtin\n        config:\n          store_method: file_based");
+    expect(rendered).toContain(`file_path: '${resolve(dataDir, "queue_store")}'`);
+  });
+
+  it("preserves custom builtin adapter fields when adding the persistent queue store", () => {
+    const legacy = [
+      "workers:",
+      "  - name: iii-queue",
+      "    config:",
+      "      adapter:",
+      "        name: builtin",
+      "        config:",
+      "          retention: 17",
+    ].join("\n");
+
+    const dataDir = join("/var", "lib", "agentmemory");
+    const rendered = renderEngineConfig(legacy, { dataDir });
+
+    expect(rendered).toContain("          retention: 17");
+    expect(rendered).toContain("          store_method: file_based");
+    expect(rendered).toContain(`          file_path: '${resolve(dataDir, "queue_store")}'`);
+  });
+
+  it("forces explicit in-memory builtin queue storage to the persistent data directory", () => {
+    const explicitInMemory = [
+      "workers:",
+      "  - name: iii-queue",
+      "    config:",
+      "      adapter:",
+      "        name: builtin",
+      "        config:",
+      "          store_method: in_memory",
+    ].join("\n");
+
+    const rendered = renderEngineConfig(explicitInMemory, {
+      dataDir: "/var/lib/agentmemory",
+    });
+
+    expect(rendered).toContain("store_method: file_based");
+    expect(rendered).not.toContain("store_method: in_memory");
+    expect(rendered).toContain(`file_path: '${join(resolve("/var", "lib", "agentmemory"), "queue_store")}'`);
+  });
+
+  it.skipIf(process.platform !== "win32")("writes an absolute Windows queue path with spaces", () => {
+    const legacy = [
+      "workers:",
+      "  - name: iii-queue",
+      "    config:",
+      "      adapter:",
+      "        name: builtin",
+    ].join("\n");
+    const dataDir = "C:\\Users\\Agent Memory\\.agentmemory\\data";
+
+    const rendered = renderEngineConfig(legacy, { dataDir });
+
+    expect(rendered).toContain(`file_path: '${resolve(dataDir, "queue_store")}'`);
+  });
+
+  it("leaves non-builtin queue adapters untouched", () => {
+    const customAdapter = [
+      "workers:",
+      "  - name: iii-queue",
+      "    config:",
+      "      adapter:",
+      "        name: redis",
+    ].join("\n");
+
+    expect(renderEngineConfig(customAdapter, { dataDir: "/var/lib/agentmemory" })).toBe(
+      customAdapter,
+    );
   });
 
   it("keeps the Docker queue store under the mounted data directory", () => {

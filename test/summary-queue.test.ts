@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import type { CompressedObservation, MemoryProvider, Session, SummaryQueueJob } from "../src/types.js";
+import type {
+  CompressedObservation, MemoryProvider, Session, SessionSummary, SummaryQueueJob,
+} from "../src/types.js";
 import { KV } from "../src/state/schema.js";
 import { registerSummaryQueueFunctions } from "../src/functions/summary-queue.js";
+import { summaryProgressSize } from "../src/functions/summary-budget.js";
+import { formatSummaryPartial, type SummaryPromptItem } from "../src/prompts/summary.js";
 
 vi.mock("../src/logger.js", () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
 vi.mock("../src/config.js", async importOriginal => ({
@@ -38,16 +42,79 @@ function observation(index: number, narrative = "source"): CompressedObservation
   };
 }
 
-const xml = (title = "Finished") => `<summary><title>${title}</title><narrative>Completed the requested work and persisted the resulting summary.</narrative><decisions><decision>persist</decision></decisions><files><file>src/file.ts</file></files><concepts><concept>queue</concept></concepts></summary>`;
+const xml = (title = "Finished", narrative = "Completed the requested work and persisted the resulting summary.") => `<summary><title>${title}</title><narrative>${narrative}</narrative><decisions><decision>persist</decision></decisions><files><file>src/file.ts</file></files><concepts><concept>queue</concept></concepts></summary>`;
 
-function harness(kv = store(), run: (call: number) => Promise<string> | string = () => xml()) {
+function partialOutput(
+  title: string, narrative: string, obsRangeStart: number,
+  keyDecisions = ["persist"], filesModified = ["src/file.ts"], concepts = ["queue"],
+): SummaryPromptItem {
+  return {
+    text: formatSummaryPartial({ title, narrative, keyDecisions, filesModified, concepts }),
+    obsRangeStart, obsRangeEnd: obsRangeStart,
+  };
+}
+
+function reduceXmlFromPrompt(prompt: string): string {
+  const values = (pattern: RegExp) => [...new Set([...prompt.matchAll(pattern)].map(match => match[0]))];
+  const decisions = values(/decision-\d+/g);
+  const files = values(/src\/file-\d+\.ts/g);
+  const concepts = values(/concept-\d+/g);
+  return `<summary><title>Complete session summary</title><narrative>Preserved all decisions, files and concepts through every reduction round.</narrative>` +
+    `<decisions>${decisions.map(value => `<decision>${value}</decision>`).join("")}</decisions>` +
+    `<files>${files.map(value => `<file>${value}</file>`).join("")}</files>` +
+    `<concepts>${concepts.map(value => `<concept>${value}</concept>`).join("")}</concepts></summary>`;
+}
+
+async function seedReduceJob(
+  kv: ReturnType<typeof store>, sourceProgressSize: number, completedOutputs: SummaryPromptItem[],
+  pendingInput?: SummaryPromptItem,
+): Promise<{ jobId: string; pendingUnitId: string }> {
+  const jobId = "job-reduce-progress";
+  const pendingUnitId = "unit-reduce-pending";
+  const completedUnitIds = completedOutputs.map((_, index) => `unit-reduce-completed-${index + 1}`);
+  const now = "2026-09-28T00:00:00.000Z";
+  const config = {
+    contextTokens: 8192, outputTokens: 1024, safetyMarginTokens: 512,
+    maxCallInputBytes: 7500, chunkSize: 400, concurrency: 12,
+  };
+  const job: SummaryQueueJob = {
+    id: jobId, sessionId: "session", project: "project", snapshotFingerprint: "snapshot",
+    observationCount: completedOutputs.length + 1, config, createdAt: now, updatedAt: now, status: "pending", stage: "reduce",
+    round: 1, unitIds: [...completedUnitIds, pendingUnitId], sourceProgressSize,
+  };
+  await kv.set(KV.summaryQueueJobs, jobId, job);
+  await kv.set(KV.summaryQueueActive, "session", { jobId });
+  for (let index = 0; index < completedOutputs.length; index++) {
+    const id = completedUnitIds[index];
+    const output = completedOutputs[index];
+    const completedSummary: SessionSummary = {
+      sessionId: "session", project: "project", createdAt: now, title: "Previous chunk",
+      narrative: "A previous partial summary covering an earlier chunk.",
+      keyDecisions: ["persist"], filesModified: ["src/file.ts"], concepts: ["queue"], observationCount: 2,
+    };
+    await kv.set(KV.summaryQueueUnits(jobId), id, {
+      id, jobId, stage: "reduce", round: 1, items: [output], attempts: 0,
+      output, summary: completedSummary,
+    });
+  }
+  await kv.set(KV.summaryQueueUnits(jobId), pendingUnitId, {
+    id: pendingUnitId, jobId, stage: "reduce", round: 1,
+    items: [pendingInput ?? {
+      text: "Previous partial summary", obsRangeStart: completedOutputs.length + 1,
+      obsRangeEnd: completedOutputs.length + 1,
+    }], attempts: 0,
+  });
+  return { jobId, pendingUnitId };
+}
+
+function harness(kv = store(), run: (call: number, prompt: string) => Promise<string> | string = () => xml()) {
   const handlers = new Map<string, Handler>();
   const subscribers = new Map<string, string>();
   const messages: Queued[] = [];
   let calls = 0;
   const provider: MemoryProvider = {
     name: "test", compress: async () => "",
-    summarize: async () => run(++calls),
+    summarize: async (_systemPrompt, userPrompt) => run(++calls, userPrompt),
   };
   const sdk = {
     registerFunction: (id: string, handler: Handler) => handlers.set(id, handler),
@@ -205,6 +272,79 @@ describe("durable summary queue", () => {
     expect(h.calls).toBeGreaterThan(job!.unitIds.length);
     expect(await h.kv.get(KV.summaries, "session")).toMatchObject({ observationCount: 20 });
     expect(await h.kv.list(KV.summaryQueueUnits(result.jobId))).toHaveLength(0);
+  });
+
+  it("continues reduction when packed unit count falls despite larger aggregate text", async () => {
+    const kv = store();
+    const existingOutput = partialOutput("Expanded", "previous detail ".repeat(25), 1);
+    const { jobId, pendingUnitId } = await seedReduceJob(kv, 1, [existingOutput]);
+    const h = harness(kv, call => call === 1
+      ? xml("Expanded", "preserved decision detail ".repeat(15))
+      : xml());
+
+    expect(await h.invoke("mem::summary-unit", { jobId, unitId: pendingUnitId }))
+      .toMatchObject({ success: true, completed: false });
+    const nextRound = await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, jobId);
+    expect(nextRound).toMatchObject({ status: "pending", stage: "reduce", round: 2 });
+    expect(nextRound?.unitIds).toHaveLength(1);
+    expect(nextRound!.sourceProgressSize).toBeGreaterThan(1);
+
+    await h.drain();
+    expect(h.calls).toBe(2);
+    expect(await kv.get(KV.summaries, "session")).toMatchObject({ title: "Finished", observationCount: 2 });
+    expect(await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, jobId)).toMatchObject({ status: "completed" });
+  });
+
+  it("reduces five partials to fewer groups and one final summary without dropping lists", async () => {
+    const kv = store();
+    const completedOutputs = Array.from({ length: 4 }, (_, index) => partialOutput(
+      `Chunk ${index + 1}`, "source chunk detail ".repeat(80), index + 1,
+      [`decision-${index + 1}`], [`src/file-${index + 1}.ts`], [`concept-${index + 1}`],
+    ));
+    const pendingInput = partialOutput(
+      "Chunk 5", "source chunk detail ".repeat(80), 5,
+      ["decision-5"], ["src/file-5.ts"], ["concept-5"],
+    );
+    const { jobId, pendingUnitId } = await seedReduceJob(kv, 1, completedOutputs, pendingInput);
+    const h = harness(kv, (_call, prompt) => reduceXmlFromPrompt(prompt));
+
+    expect(await h.invoke("mem::summary-unit", { jobId, unitId: pendingUnitId }))
+      .toMatchObject({ success: true, completed: false });
+    const firstReducedRound = await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, jobId);
+    expect(firstReducedRound?.round).toBe(2);
+    expect(firstReducedRound?.unitIds).toHaveLength(3);
+
+    let deliveries = 0;
+    while ((await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, jobId))?.round === 2 && h.messages.length) {
+      if (++deliveries > 50) throw new Error("reduction did not reach round 3");
+      const message = h.messages.shift()!;
+      await h.invoke(message.function_id, message.payload);
+    }
+    const finalReducedRound = await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, jobId);
+    expect(finalReducedRound).toMatchObject({ status: "pending", stage: "reduce", round: 3 });
+    expect(finalReducedRound?.unitIds).toHaveLength(1);
+
+    await h.drain();
+    const summary = await kv.get<SessionSummary>(KV.summaries, "session");
+    expect(summary?.keyDecisions).toEqual(Array.from({ length: 5 }, (_, index) => `decision-${index + 1}`));
+    expect(summary?.filesModified).toEqual(Array.from({ length: 5 }, (_, index) => `src/file-${index + 1}.ts`));
+    expect(summary?.concepts).toEqual(Array.from({ length: 5 }, (_, index) => `concept-${index + 1}`));
+    expect(await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, jobId)).toMatchObject({ status: "completed" });
+  });
+
+  it("fails reduction when packed unit count and aggregate text do not improve", async () => {
+    const kv = store();
+    const expandedNarrative = "preserved decision detail ".repeat(140);
+    const existingOutput = partialOutput("Expanded", expandedNarrative, 1);
+    const pendingOutput = partialOutput("Expanded", expandedNarrative.trimEnd(), 2);
+    const sourceProgressSize = summaryProgressSize([existingOutput, pendingOutput]);
+    const { jobId, pendingUnitId } = await seedReduceJob(kv, sourceProgressSize, [existingOutput]);
+    const h = harness(kv, () => xml("Expanded", expandedNarrative));
+
+    const result = await h.invoke("mem::summary-unit", { jobId, unitId: pendingUnitId });
+    expect(result).toMatchObject({ success: false, error: "summary_reduce_no_progress", terminal: true });
+    expect(await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, jobId))
+      .toMatchObject({ status: "failed", failure: "summary_reduce_no_progress" });
   });
 
   it("keeps a 12-unit window and refills it as each map unit finishes", async () => {
