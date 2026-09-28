@@ -121,6 +121,21 @@ function summaryXml(opts: {
 </summary>`;
 }
 
+function mapCalls(calls: Array<{ system: string; user: string }>) {
+  return calls.filter((call) => call.system.includes("session summarizer"));
+}
+
+function observationRange(prompt: string): [number, number] {
+  const indexes = [...prompt.matchAll(/^\[(\d+)\]\s/gm)].map((match) => Number(match[1]));
+  if (!indexes.length) throw new Error("map prompt contains no observation indexes");
+  return [Math.min(...indexes), Math.max(...indexes)];
+}
+
+function reducedRanges(prompt: string): Array<[number, number]> {
+  return [...prompt.matchAll(/obs (\d+)-(\d+)/g)]
+    .map((match) => [Number(match[1]), Number(match[2])]);
+}
+
 async function setupHandler(opts: {
   sessionId: string;
   obsCount: number;
@@ -150,6 +165,10 @@ describe("mem::summarize chunking", () => {
   const ORIGINAL_ENV = { ...process.env };
 
   beforeEach(() => {
+    // Keep chunking tests independent of the developer's ~/.agentmemory/.env.
+    process.env.AGENTMEMORY_SUMMARY_CONTEXT_TOKENS = "1000000";
+    process.env.AGENTMEMORY_SUMMARY_OUTPUT_TOKENS = "8192";
+    process.env.AGENTMEMORY_SUMMARY_SAFETY_MARGIN_TOKENS = "4096";
     delete process.env.SUMMARIZE_CHUNK_SIZE;
     delete process.env.SUMMARIZE_CHUNK_CONCURRENCY;
   });
@@ -232,11 +251,12 @@ describe("mem::summarize chunking", () => {
       summaryXml({ title: "Chunk 1", decisions: ["dA"], files: ["src/a.ts"], concepts: ["ca"] }),
       summaryXml({ title: "Chunk 2", decisions: ["dB"], files: ["src/b.ts"], concepts: ["cb"] }),
       summaryXml({ title: "Chunk 3", decisions: ["dC"], files: ["src/c.ts"], concepts: ["cc"] }),
+      summaryXml({ title: "Chunk 4", decisions: ["dD"], files: ["src/d.ts"], concepts: ["cd"] }),
       summaryXml({
         title: "Merged",
-        decisions: ["dA", "dB", "dC"],
-        files: ["src/a.ts", "src/b.ts", "src/c.ts"],
-        concepts: ["ca", "cb", "cc"],
+        decisions: ["dA", "dB", "dC", "dD"],
+        files: ["src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts"],
+        concepts: ["ca", "cb", "cc", "cd"],
       }),
     ]);
     const { handler, kv } = await setupHandler({
@@ -248,21 +268,21 @@ describe("mem::summarize chunking", () => {
     const result: any = await handler({ sessionId: "ses_large" });
 
     expect(result.success).toBe(true);
-    expect(provider.calls).toHaveLength(4);
-    // First three are chunk calls (use the summary system prompt).
-    expect(provider.calls[0].system).toContain("session summarizer");
-    expect(provider.calls[2].system).toContain("session summarizer");
-    // Last is the reduce call (uses the merge system prompt).
-    expect(provider.calls[3].system).toContain("merging multiple partial summaries");
-    expect(provider.calls[3].user).toContain("Chunk 1 of 3");
-    expect(provider.calls[3].user).toContain("Chunk 3 of 3");
+    const chunks = mapCalls(provider.calls);
+    expect(chunks).toHaveLength(4);
+    expect(provider.calls).toHaveLength(chunks.length + 1);
+    expect(provider.calls[3].system).toContain("session summarizer");
+    const reduceCall = provider.calls.at(-1)!;
+    expect(reduceCall.system).toContain("merging multiple partial summaries");
+    expect(reduceCall.user).toContain(`Chunk 1 of ${chunks.length}`);
+    expect(reduceCall.user).toContain(`Chunk ${chunks.length} of ${chunks.length}`);
 
     const stored: any = await kv.get("summaries", "ses_large");
     expect(stored?.title).toBe("Merged");
     // observationCount on the persisted summary should reflect the full session,
     // not just the final chunk.
     expect(stored?.observationCount).toBe(250);
-    expect(stored?.keyDecisions).toEqual(["dA", "dB", "dC"]);
+    expect(stored?.keyDecisions).toEqual(["dA", "dB", "dC", "dD"]);
   });
 
   it("SUMMARIZE_CHUNK_SIZE env override is respected", async () => {
@@ -285,7 +305,12 @@ describe("mem::summarize chunking", () => {
 
     expect(result.success).toBe(true);
     // 175 obs ÷ 50 = 4 chunks (last chunk has 25) + 1 reduce = 5 calls.
-    expect(provider.calls).toHaveLength(5);
+    const chunks = mapCalls(provider.calls);
+    expect(chunks.length).toBeGreaterThanOrEqual(4);
+    expect(provider.calls).toHaveLength(chunks.length + 1);
+    const counts = chunks.map((call) => Number(call.user.match(/^Session observations \((\d+) total\)/)?.[1]));
+    expect(counts.every((count) => count > 0 && count <= 50)).toBe(true);
+    expect(counts.reduce((total, count) => total + count, 0)).toBe(175);
   });
 
   it("flaky chunk: parse fails once, retried, then succeeds — no skip", async () => {
@@ -307,8 +332,10 @@ describe("mem::summarize chunking", () => {
     const result: any = await handler({ sessionId: "ses_flaky" });
 
     expect(result.success).toBe(true);
-    // 3 chunks × 1 attempt + 1 retry on chunk 2 + 1 reduce = 5 calls.
-    expect(provider.calls).toHaveLength(5);
+    const chunks = mapCalls(provider.calls);
+    const uniqueChunkPrompts = new Set(chunks.map((call) => call.user));
+    expect(chunks.length).toBe(uniqueChunkPrompts.size + 1);
+    expect(provider.calls.at(-1)?.system).toContain("merging multiple partial summaries");
     const stored: any = await kv.get("summaries", "ses_flaky");
     expect(stored?.title).toBe("merged");
   });
@@ -331,16 +358,15 @@ describe("mem::summarize chunking", () => {
     const result: any = await handler({ sessionId: "ses_skip" });
 
     expect(result.success).toBe(true);
-    // 1 ok + (1 + 1 retry skip) + 1 ok + 1 reduce = 5 calls.
-    expect(provider.calls).toHaveLength(5);
-    // Reduce input should mention only 2 of 3 chunks (chunk 2 skipped) —
-    // but the chunk indices in the reduce labels should reflect chunk 1 and 3,
-    // preserving chronological boundaries.
-    const reduceCall = provider.calls[4];
-    expect(reduceCall.user).toContain("Chunk 1 of 2");
-    expect(reduceCall.user).toContain("Chunk 2 of 2");
-    expect(reduceCall.user).toContain("obs 1-100");        // first surviving chunk
-    expect(reduceCall.user).toContain("obs 201-250");      // third surviving chunk (was idx 2, range 201-250)
+    const chunks = mapCalls(provider.calls);
+    const uniquePrompts = [...new Set(chunks.map((call) => call.user))];
+    expect(chunks.length).toBe(uniquePrompts.length + 1);
+    const reduceCall = provider.calls.at(-1)!;
+    expect(reduceCall.system).toContain("merging multiple partial summaries");
+    const expectedRanges = uniquePrompts
+      .filter((_, index) => index !== 1)
+      .map(observationRange);
+    expect(reducedRanges(reduceCall.user)).toEqual(expectedRanges);
     const stored: any = await kv.get("summaries", "ses_skip");
     expect(stored?.title).toBe("merged-with-skip");
   });
@@ -363,7 +389,9 @@ describe("mem::summarize chunking", () => {
     const result: any = await handler({ sessionId: "ses_too_broken" });
 
     expect(result.success).toBe(false);
-    expect(result.error).toMatch(/too_many_chunks_skipped: 2\/3/);
+    const skipped = result.error?.match(/too_many_chunks_skipped: (\d+)\/(\d+)/);
+    expect(skipped).not.toBeNull();
+    expect(Number(skipped?.[1])).toBeGreaterThan(Number(skipped?.[2]) / 2);
   });
 
   it("provider error on one chunk after retry is skipped, not propagated", async () => {
@@ -393,8 +421,9 @@ describe("mem::summarize chunking", () => {
     const result: any = await handler({ sessionId: "ses_net" });
 
     expect(result.success).toBe(true);
-    // 1 ok + 2 fail + 1 ok + 1 reduce = 5 calls.
-    expect((provider as any).calls.length).toBe(5);
+    const chunks = mapCalls((provider as any).calls);
+    expect(chunks.length).toBe(new Set(chunks.map((call) => call.user)).size + 1);
+    expect((provider as any).calls.at(-1).system).toContain("merging multiple partial summaries");
     const stored: any = await kv.get("summaries", "ses_net");
     expect(stored?.title).toBe("merged-with-skip");
   });
@@ -421,7 +450,9 @@ describe("mem::summarize chunking", () => {
     const result: any = await handler({ sessionId: "ses_all_400" });
 
     expect(result.success).toBe(false);
-    expect(result.error).toMatch(/too_many_chunks_skipped: 3\/3/);
+    const skipped = result.error?.match(/too_many_chunks_skipped: (\d+)\/(\d+)/);
+    expect(skipped).not.toBeNull();
+    expect(skipped?.[1]).toBe(skipped?.[2]);
   });
 
   it("chunks run in parallel batches according to SUMMARIZE_CHUNK_CONCURRENCY", async () => {

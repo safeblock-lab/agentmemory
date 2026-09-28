@@ -1,8 +1,9 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import { getSummaryBudgetConfig, parseSummaryBudgetConfig } from "../src/config.js";
 import {
-  estimateSummaryTokens, packSummaryItems, summaryInputLimit, isExplicitSummarySizeError,
-  MAX_SUMMARY_ITEMS,
+  estimateSummaryTokens, packSummaryItems, summaryInputLimit, summaryChunkInputLimit,
+  summaryReduceInputLimit, isExplicitSummarySizeError, MAX_SUMMARY_ITEMS,
+  MIN_SUMMARY_CHUNK_CONTENT_TOKENS, MIN_SUMMARY_REDUCE_CONTENT_TOKENS,
 } from "../src/functions/summary-budget.js";
 import {
   SUMMARY_SYSTEM, REDUCE_SYSTEM, buildSummaryItemsPrompt, buildReduceItemsPrompt,
@@ -15,8 +16,12 @@ const item = (text: string, index = 1): SummaryPromptItem => ({ text, obsRangeSt
 describe("summary budget configuration", () => {
   it("reserves the correct model output and safety margin", () => {
     const config = parseSummaryBudgetConfig({});
-    expect(config).toEqual({ contextTokens: 131072, outputTokens: 8192, safetyMarginTokens: 4096, chunkSize: 400, concurrency: 6 });
+    expect(config).toEqual({ contextTokens: 131072, outputTokens: 8192, safetyMarginTokens: 4096, chunkSize: 400, concurrency: 12 });
     expect(summaryInputLimit(config)).toBe(118784);
+    expect(summaryChunkInputLimit(config)).toBeLessThan(summaryInputLimit(config));
+    expect(summaryChunkInputLimit(config)).toBeGreaterThanOrEqual(500);
+    expect(summaryReduceInputLimit(config)).toBeGreaterThan(summaryChunkInputLimit(config));
+    expect(summaryReduceInputLimit(config)).toBeLessThan(summaryInputLimit(config));
   });
   it.each(["", "0", "-1", "Infinity", "NaN", "1.5", "4096junk", "9007199254740992"])("rejects invalid integers: %j", raw => {
     expect(() => parseSummaryBudgetConfig({ AGENTMEMORY_SUMMARY_CONTEXT_TOKENS: raw })).toThrow("positive finite integer");
@@ -43,6 +48,29 @@ describe("summary prompt packing", () => {
     const chunks = packSummaryItems([item(entry.text + "x")], SUMMARY_SYSTEM, buildSummaryItemsPrompt, limit);
     expect(chunks.length).toBeGreaterThan(1);
     for (const chunk of chunks) expect(estimateSummaryTokens(SUMMARY_SYSTEM, buildSummaryItemsPrompt(chunk))).toBeLessThanOrEqual(limit);
+  });
+  it("splits a formerly single near-limit item into balanced contiguous chunks", () => {
+    const source = item("x".repeat(6000), 17);
+    const inputLimit = 5000;
+    const groups = packSummaryItems([source], SUMMARY_SYSTEM, buildSummaryItemsPrompt, inputLimit);
+    const sizes = groups.map(group => estimateSummaryTokens(SUMMARY_SYSTEM, buildSummaryItemsPrompt(group)));
+    expect(groups.length).toBeGreaterThan(1);
+    expect(groups.flat().map(part => part.text).join("")).toBe(source.text);
+    expect(groups.flat().every(part => part.obsRangeStart === 17 && part.obsRangeEnd === 17)).toBe(true);
+    expect(Math.max(...sizes) - Math.min(...sizes), JSON.stringify({ sizes, lengths: groups.map(group => group.map(part => part.text.length)) })).toBeLessThan(Math.max(...sizes) * 0.2);
+    expect(sizes.every(size => size <= inputLimit)).toBe(true);
+  });
+  it("keeps the minimum target based on content tokens, not fixed prompt overhead", () => {
+    const empty = item("");
+    const fixed = estimateSummaryTokens(SUMMARY_SYSTEM, buildSummaryItemsPrompt([empty]));
+    const small = item("x".repeat(400));
+    const content = estimateSummaryTokens(SUMMARY_SYSTEM, buildSummaryItemsPrompt([small])) - fixed;
+    expect(MIN_SUMMARY_CHUNK_CONTENT_TOKENS).toBe(500);
+    expect(MIN_SUMMARY_REDUCE_CONTENT_TOKENS).toBe(2000);
+    expect(content).toBeLessThan(MIN_SUMMARY_CHUNK_CONTENT_TOKENS);
+    expect(packSummaryItems([small], SUMMARY_SYSTEM, buildSummaryItemsPrompt, fixed + 550)).toHaveLength(1);
+    expect(packSummaryItems([item("x".repeat(1000))], SUMMARY_SYSTEM, buildSummaryItemsPrompt, fixed + 600))
+      .toHaveLength(2);
   });
   it.each(["漢字🧠é", "const value = \"quoted\";\n\t\u0000", "abcdefghijklmnop"])("splits huge source records losslessly and in order: %j", content => {
     const source = formatSummaryObservation({ type: "conversation", title: content.repeat(100), narrative: content.repeat(200), facts: [content.repeat(100)], files: [content.repeat(100)], concepts: [content.repeat(100)] }, 17);

@@ -8,6 +8,8 @@ import {
 export const MAX_SUMMARY_ITEMS = 4096;
 export const MAX_SUMMARY_CALLS = 4096;
 export const MAX_SUMMARY_DEPTH = 12;
+export const MIN_SUMMARY_CHUNK_CONTENT_TOKENS = 500;
+export const MIN_SUMMARY_REDUCE_CONTENT_TOKENS = 2000;
 // Covers role framing and the supported Ollama JSON output instruction/schema.
 export const SUMMARY_ENVELOPE_TOKENS = 512;
 
@@ -30,21 +32,30 @@ export function summaryInputLimit(config: SummaryBudgetConfig): number {
   return limit;
 }
 
+export function summaryChunkInputLimit(config: SummaryBudgetConfig): number {
+  const limit = summaryInputLimit(config);
+  const emptyItem: SummaryPromptItem = { text: "", obsRangeStart: 1, obsRangeEnd: 1, fragment: true };
+  const fixedPromptTokens = Math.max(
+    estimateSummaryTokens(SUMMARY_SYSTEM, buildSummaryItemsPrompt([emptyItem])),
+    estimateSummaryTokens(REDUCE_SYSTEM, buildReduceItemsPrompt([emptyItem])),
+  );
+  const concurrencyTarget = Math.ceil(limit / Math.max(1, config.concurrency));
+  const minimumContentTarget = fixedPromptTokens + MIN_SUMMARY_CHUNK_CONTENT_TOKENS;
+  return Math.min(limit, Math.max(concurrencyTarget, minimumContentTarget));
+}
+
+export function summaryReduceInputLimit(config: SummaryBudgetConfig): number {
+  const limit = summaryInputLimit(config);
+  const emptyFragment: SummaryPromptItem = { text: "", obsRangeStart: 1, obsRangeEnd: 1, fragment: true };
+  const fixedPromptTokens = estimateSummaryTokens(REDUCE_SYSTEM, buildReduceItemsPrompt([emptyFragment]));
+  const parallelTarget = Math.ceil(limit / Math.min(4, Math.max(1, config.concurrency)));
+  const minimumContentTarget = fixedPromptTokens + MIN_SUMMARY_REDUCE_CONTENT_TOKENS;
+  return Math.min(limit, Math.max(parallelTarget, minimumContentTarget));
+}
+
 export function isExplicitSummarySizeError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /context_length_exceeded|maximum context length|context (?:window|length).*(?:exceed|limit)|(?:exceed|limit).*context (?:window|length)|too many tokens|prompt (?:is )?too long|input tokens?.*(?:exceed|limit)|token limit exceeded/i.test(message);
-}
-
-function prefixEnd(text: string, maxBytes: number): number {
-  let bytes = 0;
-  let end = 0;
-  for (const character of text) {
-    const size = Buffer.byteLength(JSON.stringify(character), "utf8") - 2;
-    if (bytes + size > maxBytes) break;
-    bytes += size;
-    end += character.length;
-  }
-  return end;
 }
 
 export function packSummaryItems(
@@ -52,34 +63,96 @@ export function packSummaryItems(
   buildPrompt: (items: SummaryPromptItem[]) => string,
   inputLimit: number, observationCap = MAX_SUMMARY_ITEMS,
 ): SummaryPromptItem[][] {
+  if (!items.length) return [];
+  if (items.length > MAX_SUMMARY_ITEMS) throw new SummaryBudgetError("summary_item_limit_exceeded");
+  if (!Number.isSafeInteger(observationCap) || observationCap < 1) {
+    throw new SummaryBudgetError("summary_observation_cap_invalid");
+  }
+  if (items.length === 1 && estimateSummaryTokens(system, buildPrompt(items)) <= inputLimit) return [[items[0]]];
+  const fragmentBaseTokens = items.reduce((maximum, item) => Math.max(
+    maximum, estimateSummaryTokens(system, buildPrompt([{ ...item, text: "", fragment: true }])),
+  ), 0);
+  const contentTokens = items.reduce((total, item) => total
+    + Math.max(0, Buffer.byteLength(JSON.stringify(item.text), "utf8") - 2), 0);
+  const countGroups = Math.ceil(items.length / observationCap);
+  const perGroupContentLimit = Math.max(1, inputLimit - fragmentBaseTokens);
+  const budgetGroups = Math.ceil(contentTokens / perGroupContentLimit);
+  const balancedGroups = Math.max(1, countGroups, budgetGroups);
+  const balancedContentTarget = Math.max(
+    MIN_SUMMARY_CHUNK_CONTENT_TOKENS, Math.ceil(contentTokens / balancedGroups),
+  );
+  const balancedLimit = balancedGroups === 1 ? inputLimit : Math.min(inputLimit, Math.max(
+    fragmentBaseTokens + 6, fragmentBaseTokens + balancedContentTarget,
+  ));
   const groups: SummaryPromptItem[][] = [];
   let group: SummaryPromptItem[] = [];
   let itemCount = 0;
   const append = (item: SummaryPromptItem): void => {
     if (++itemCount > MAX_SUMMARY_ITEMS) throw new SummaryBudgetError("summary_item_limit_exceeded");
-    if (group.length && (group.length >= observationCap
-      || estimateSummaryTokens(system, buildPrompt([...group, item])) > inputLimit)) {
-      groups.push(group);
-      group = [];
-    }
     group.push(item);
   };
-  for (const item of items) {
-    if (estimateSummaryTokens(system, buildPrompt([item])) <= inputLimit) {
-      append(item);
-      continue;
+  const flush = (): void => {
+    if (!group.length) return;
+    groups.push(group);
+    group = [];
+  };
+  const largestFittingPrefix = (item: SummaryPromptItem): number => {
+    const characters = Array.from(item.text);
+    let low = 1;
+    let high = characters.length;
+    let best = 0;
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2);
+      const prefix = { ...item, text: characters.slice(0, middle).join(""), fragment: true };
+      if (estimateSummaryTokens(system, buildPrompt([...group, prefix])) <= balancedLimit) {
+        best = middle;
+        low = middle + 1;
+      } else high = middle - 1;
     }
-    const fragment = { ...item, text: "", fragment: true };
-    const available = inputLimit - estimateSummaryTokens(system, buildPrompt([fragment]));
-    let rest = item.text;
-    while (rest.length) {
-      const end = prefixEnd(rest, available);
+    return best;
+  };
+  for (const item of items) {
+    let pending = item;
+    while (true) {
+      if (group.length >= observationCap) flush();
+      if (estimateSummaryTokens(system, buildPrompt([...group, pending])) <= balancedLimit) {
+        append(pending);
+        break;
+      }
+      if (group.length) {
+        if (estimateSummaryTokens(system, buildPrompt([pending])) <= inputLimit) {
+          flush();
+          continue;
+        }
+        const end = largestFittingPrefix(pending);
+        if (end >= Array.from(pending.text).length) {
+          flush();
+          continue;
+        }
+        if (end > 0) {
+          const characters = Array.from(pending.text);
+          append({ ...pending, text: characters.slice(0, end).join(""), fragment: true });
+          pending = { ...pending, text: characters.slice(end).join(""), fragment: true };
+        }
+        flush();
+        if (!end) continue;
+        continue;
+      }
+      const end = largestFittingPrefix(pending);
       if (!end) throw new SummaryBudgetError("summary_fragment_cannot_fit");
-      append({ ...fragment, text: rest.slice(0, end) });
-      rest = rest.slice(end);
+      const characters = Array.from(pending.text);
+      append({ ...pending, text: characters.slice(0, end).join(""), fragment: true });
+      if (end >= characters.length) break;
+      pending = { ...pending, text: characters.slice(end).join(""), fragment: true };
+      flush();
     }
   }
-  if (group.length) groups.push(group);
+  flush();
+  for (const result of groups) {
+    if (estimateSummaryTokens(system, buildPrompt(result)) > inputLimit) {
+      throw new SummaryBudgetError("summary_prompt_exceeds_budget");
+    }
+  }
   return groups;
 }
 

@@ -799,7 +799,7 @@ export function parseSummaryBudgetConfig(env: Record<string, string | undefined>
     outputTokens: integer("AGENTMEMORY_SUMMARY_OUTPUT_TOKENS", 8192),
     safetyMarginTokens: integer("AGENTMEMORY_SUMMARY_SAFETY_MARGIN_TOKENS", 4096),
     chunkSize: integer("SUMMARIZE_CHUNK_SIZE", 400),
-    concurrency: integer("SUMMARIZE_CHUNK_CONCURRENCY", 6),
+    concurrency: integer("SUMMARIZE_CHUNK_CONCURRENCY", 12),
   };
   if (config.concurrency > 32) {
     throw new Error("invalid_summary_budget: SUMMARIZE_CHUNK_CONCURRENCY must be at most 32");

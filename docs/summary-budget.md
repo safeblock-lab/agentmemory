@@ -12,7 +12,7 @@ AGENTMEMORY_SUMMARY_CONTEXT_TOKENS=131072
 AGENTMEMORY_SUMMARY_OUTPUT_TOKENS=8192
 AGENTMEMORY_SUMMARY_SAFETY_MARGIN_TOKENS=4096
 SUMMARIZE_CHUNK_SIZE=400
-SUMMARIZE_CHUNK_CONCURRENCY=6
+SUMMARIZE_CHUNK_CONCURRENCY=12
 ```
 
 The default reserves 8192 output tokens and 4096 margin tokens, leaving **118784
@@ -42,9 +42,14 @@ Reducer inputs use the same fitting checks and can split oversized partials;
 fragments retain their source observation ranges and order. Fragmentation never
 truncates input text or increases the persisted `observationCount`.
 
-Map calls use the configured concurrency. Reduce calls run in bounded rounds:
-each completed nonfinal round must strictly decrease the total serialized partial
-size plus per-partial framing cost. Outputs that do not shrink cause
+Chunk groups are balanced by estimated prompt size. The available input budget is
+apportioned across the configured concurrency, with a target of at least 500
+estimated content tokens per call when the workload allows. `SUMMARIZE_CHUNK_SIZE`
+remains an additional observation-count cap. Map calls and each reduce round run
+in parallel batches, up to the configured concurrency (default 12, maximum 32);
+results retain source order. Reduce calls run in bounded rounds: each completed
+nonfinal round must strictly decrease the total serialized partial size plus
+per-partial framing cost. Outputs that do not shrink cause
 `summary_reduce_no_progress`. Work is limited to 4096 packed items per packing
 operation, 4096 selected-provider calls across a summarize invocation (including
 its final parse retry), and 12 adaptive/reduction levels. Provider wrappers and

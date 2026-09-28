@@ -2,7 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 import type { CompressedObservation, LlmCallOptions, MemoryProvider, SummaryBudgetConfig } from "../src/types.js";
 import { parseSummaryBudgetConfig } from "../src/config.js";
 import { createSummaryProducer } from "../src/functions/summary-producer.js";
-import { estimateSummaryTokens, MAX_SUMMARY_CALLS, MAX_SUMMARY_DEPTH } from "../src/functions/summary-budget.js";
+import {
+  estimateSummaryTokens, summaryInputLimit, summaryChunkInputLimit,
+  summaryReduceInputLimit, MAX_SUMMARY_CALLS, MAX_SUMMARY_DEPTH,
+} from "../src/functions/summary-budget.js";
+import { SUMMARY_SYSTEM, buildSummaryItemsPrompt, formatSummaryObservation } from "../src/prompts/summary.js";
 
 vi.mock("../src/logger.js", () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
 const xml = (narrative = "Done.") => `<summary><title>Summary</title><narrative>${narrative}</narrative><decisions><decision>decision</decision></decisions><files><file>a.ts</file></files><concepts><concept>code</concept></concepts></summary>`;
@@ -30,6 +34,67 @@ describe("bounded summary producer", () => {
     await produce(mock.selected, parseSummaryBudgetConfig({}))([observation(1)]);
     expect(mock.calls).toHaveLength(1);
     expect(mock.calls[0].options).toEqual({ task: "summary", outputTokens: 8192 });
+  });
+  it("keeps a small session in one request and balances a formerly single large request", async () => {
+    const smallMock = provider(() => xml());
+    const smallResult = await produce(smallMock.selected)([observation(1)]);
+    expect(smallResult).toMatchObject({ mode: "single", chunks: 1 });
+    expect(smallMock.calls.filter(call => !call.system.includes("merging"))).toHaveLength(1);
+
+    const medium: SummaryBudgetConfig = {
+      contextTokens: 8192, outputTokens: 1024, safetyMarginTokens: 512, chunkSize: 400, concurrency: 2,
+    };
+    const source = observation(0, "x".repeat(3000));
+    const oneItem = {
+      text: formatSummaryObservation(source, 1), obsRangeStart: 1, obsRangeEnd: 1,
+    };
+    expect(estimateSummaryTokens(SUMMARY_SYSTEM, buildSummaryItemsPrompt([oneItem])))
+      .toBeLessThan(summaryInputLimit(medium));
+    expect(estimateSummaryTokens(SUMMARY_SYSTEM, buildSummaryItemsPrompt([oneItem])))
+      .toBeGreaterThan(summaryChunkInputLimit(medium));
+
+    const largeMock = provider(() => xml("brief"));
+    const result = await produce(largeMock.selected, medium)([source]);
+    const mapCalls = largeMock.calls.filter(call => !call.system.includes("merging"));
+    const sizes = mapCalls.map(call => estimateSummaryTokens(call.system, call.prompt));
+    expect(result.mode).toBe("chunked");
+    expect(mapCalls.length).toBeGreaterThan(1);
+    expect(sizes.every(size => size <= summaryChunkInputLimit(medium))).toBe(true);
+    expect(Math.max(...sizes) - Math.min(...sizes)).toBeLessThan(Math.max(...sizes) * 0.25);
+  });
+  it("runs independent reduce chunks concurrently and preserves their source order", async () => {
+    const config: SummaryBudgetConfig = {
+      contextTokens: 20_000, outputTokens: 6000, safetyMarginTokens: 2000, chunkSize: 1, concurrency: 2,
+    };
+    let reduceInFlight = 0;
+    let maxReduceInFlight = 0;
+    const mock = provider(async (system, prompt) => {
+      const reducing = system.includes("merging");
+      if (reducing) {
+        reduceInFlight++;
+        maxReduceInFlight = Math.max(maxReduceInFlight, reduceInFlight);
+      }
+      await new Promise(resolve => setTimeout(resolve, 5));
+      try {
+        if (reducing) return xml("merged");
+        const index = prompt.match(/\[(\d+)\] conversation/)?.[1] ?? "?";
+        return xml(`obs-${index} ${"x".repeat(1500)}`);
+      } finally {
+        if (reducing) reduceInFlight--;
+      }
+    });
+    const result = await produce(mock.selected, config)(Array.from({ length: 12 }, (_, index) => observation(index)));
+    const reduceCalls = mock.calls.filter(call => call.system.includes("merging"));
+    const firstRound = reduceCalls.filter(call => /obs-(?:[1-9]|1[0-2])\b/.test(call.prompt));
+    const firstRoundText = firstRound.map(call => call.prompt).join("\n");
+    const firstPositions = Array.from({ length: 12 }, (_, index) => firstRoundText.indexOf(`obs-${index + 1}`));
+
+    expect(result.response).toContain("Summary");
+    expect(maxReduceInFlight).toBeGreaterThan(1);
+    expect(maxReduceInFlight).toBeLessThanOrEqual(config.concurrency);
+    expect(firstRound.length).toBeGreaterThan(1);
+    expect(firstPositions.every(position => position >= 0)).toBe(true);
+    expect(firstPositions).toEqual([...firstPositions].sort((left, right) => left - right));
   });
   it("fits map and multi-level reduce prompts for giant records and many partials", async () => {
     const mock = provider(() => xml("brief"));
@@ -68,8 +133,9 @@ describe("bounded summary producer", () => {
     });
     const result = await produce(mock.selected)([observation(0, "x".repeat(1800))]);
     expect(result.mode).toBe("chunked");
-    expect(mock.calls[1].prompt.length).toBeLessThan(mock.calls[0].prompt.length);
-    expect(mock.calls.filter(call => call.prompt === mock.calls[0].prompt)).toHaveLength(1);
+    const rejectedPrompt = mock.calls[0].prompt;
+    expect(mock.calls.filter(call => call.prompt === rejectedPrompt)).toHaveLength(1);
+    expect(mock.calls.slice(1).some(call => call.prompt.length < rejectedPrompt.length)).toBe(true);
   });
   it("bounds repeated explicit size failures and does not return success", async () => {
     const mock = provider(() => { throw new Error("maximum context length exceeded"); });
