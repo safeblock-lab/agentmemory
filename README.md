@@ -608,6 +608,8 @@ Imported sessions show up in the Replay picker alongside native ones. Under the 
 
 Use the matching GitHub Release installer when you intentionally want to update your local runtime.
 
+The native Windows viewer updater reports completion only after the iii engine, the expected API version, connected engine health, and the advertised viewer port respond. If any check fails, it attempts to restore the previous installation.
+
 Warning: this command mutates the current workspace/runtime. It can update JavaScript dependencies and pull the pinned `iiidev/iii:0.22.1` Docker image. It never installs an unpinned or newer iii engine.
 
 Implementation details live in `src/cli.ts` (see `runUpgrade` around the `src/cli.ts:544-595` region).
@@ -1516,7 +1518,7 @@ OPENAI_REASONING_EFFORT=none
 
 Replace `<your-fireworks-model>` with a model identifier available in your Fireworks account. Keep embedding access separate with `OPENAI_EMBEDDING_*` overrides when needed.
 
-The Fireworks Batch queue is disabled by default. Set `AGENTMEMORY_FIREWORKS_BATCH_ENABLED=true` to opt in with valid Batch credentials and a model. An explicit `AGENTMEMORY_FIREWORKS_BATCH_ENABLED=false` in `~/.agentmemory/.env` remains authoritative when the parent process exports `true`; process environment values keep precedence for other settings.
+The Fireworks Batch queue is disabled by default. Set `AGENTMEMORY_FIREWORKS_BATCH_ENABLED=true` to opt in with valid Batch credentials and a model. An explicit `AGENTMEMORY_FIREWORKS_BATCH_ENABLED=false` in `~/.agentmemory/.env` remains authoritative when the parent process exports `true`; process environment values keep precedence for other settings. With Batch disabled, previously queued work remains stored but is not processed and does not block new work through the normal LLM route.
 
 ### Cost-aware model selection
 

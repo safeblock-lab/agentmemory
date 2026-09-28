@@ -32,13 +32,13 @@ import { logger } from "../src/logger.js";
 // The client session-end hook no longer POSTs crystals/auto or
 // consolidate-pipeline, so these no longer double-fire for Claude Code.
 
-function mockKV() {
+function mockKV(observations: Array<{ title: string }> = []) {
   return {
     get: vi.fn(async () => null),
     set: vi.fn(async (_scope: string, _key: string, data: unknown) => data),
     delete: vi.fn(async () => {}),
     update: vi.fn(async () => {}),
-    list: vi.fn(async () => []),
+    list: vi.fn(async () => observations),
   };
 }
 
@@ -50,15 +50,15 @@ type StoppedHandler = (data: {
 // Builds a spy-backed sdk. `trigger` resolves for mem::summarize with a fake
 // summary; void triggers resolve unless `rejectFor` matches the function_id,
 // in which case they reject (to exercise fireVoid's .catch()).
-function mockSdk(opts?: { rejectFor?: string }) {
+function mockSdk(opts?: { rejectFor?: string; summaryResult?: unknown }) {
   const handlers = new Map<string, StoppedHandler>();
   const trigger = vi.fn(
     async (input: { function_id: string; payload?: unknown; action?: unknown }) => {
       if (opts?.rejectFor && input.function_id === opts.rejectFor) {
-        throw new Error(`boom: ${input.function_id}`);
+        throw new Error(`sensitive provider detail: ${input.function_id}`);
       }
       if (input.function_id === "mem::summarize") {
-        return { summary: "session summary", sessionId: "ses_1" };
+        return opts?.summaryResult ?? { summary: "session summary", sessionId: "ses_1" };
       }
       return { ok: true };
     },
@@ -204,6 +204,63 @@ describe("event::session::stopped consolidation fan-out", () => {
       "mem::consolidate-pipeline trigger failed",
       expect.objectContaining({ sessionId: "ses_1" }),
     );
+  });
+
+  it("dispatches graph extraction after summary rejects and logs no provider detail", async () => {
+    const observations = [{ title: "Graph source" }];
+    const { sdk, handlers, trigger } = mockSdk({ rejectFor: "mem::summarize" });
+    registerEventTriggers(sdk as never, mockKV(observations) as never);
+
+    await handlers.get("event::session::stopped")!({ sessionId: "ses_1" });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(functionIds(trigger).filter((id) => id === "mem::graph-extract")).toHaveLength(1);
+    expect(logger.warn).toHaveBeenCalledWith("mem::summarize trigger failed", {
+      sessionId: "ses_1",
+      reason: "trigger_rejected",
+    });
+    expect(JSON.stringify(vi.mocked(logger.warn).mock.calls)).not.toContain(
+      "sensitive provider detail",
+    );
+  });
+
+  it("logs a failed summary result and still dispatches graph extraction once", async () => {
+    const summaryResult = { success: false, error: "sensitive provider detail" };
+    const { sdk, handlers, trigger } = mockSdk({ summaryResult });
+    registerEventTriggers(sdk as never, mockKV([{ title: "Graph source" }]) as never);
+
+    const result = await handlers.get("event::session::stopped")!({ sessionId: "ses_1" });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(result).toBe(summaryResult);
+    expect(functionIds(trigger).filter((id) => id === "mem::graph-extract")).toHaveLength(1);
+    expect(logger.warn).toHaveBeenCalledWith("mem::summarize returned failure", {
+      sessionId: "ses_1",
+      reason: "reported_failure",
+    });
+    expect(JSON.stringify(vi.mocked(logger.warn).mock.calls)).not.toContain(
+      "sensitive provider detail",
+    );
+  });
+
+  it("logs graph dispatch rejection without exposing its error", async () => {
+    const { sdk, handlers, trigger } = mockSdk({ rejectFor: "mem::graph-extract" });
+    registerEventTriggers(sdk as never, mockKV([{ title: "Graph source" }]) as never);
+
+    await handlers.get("event::session::stopped")!({ sessionId: "ses_1" });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(logger.warn).toHaveBeenCalledWith("mem::graph-extract trigger failed", {
+      sessionId: "ses_1",
+      reason: "trigger_rejected",
+    });
+    expect(JSON.stringify(vi.mocked(logger.warn).mock.calls)).not.toContain(
+      "sensitive provider detail",
+    );
+    expect(functionIds(trigger).filter((id) => id === "mem::graph-extract")).toHaveLength(1);
   });
 });
 

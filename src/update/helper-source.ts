@@ -4,6 +4,7 @@ export const UPDATE_HELPER_SOURCE = String.raw`
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { appendFileSync, cpSync, existsSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
 
 const plan = JSON.parse(readFileSync(process.argv[2], "utf8"));
@@ -95,8 +96,101 @@ function clearMaintenance() {
   } catch {}
 }
 
+function configuredEngineAddress() {
+  if (process.env.III_ENGINE_URL) {
+    const endpoint = new URL(process.env.III_ENGINE_URL);
+    const configuredHost = endpoint.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    if (!["localhost", "127.0.0.1", "::1", "0.0.0.0", "::"].includes(configuredHost)) return null;
+    const host = configuredHost === "localhost" || configuredHost === "0.0.0.0" ? "127.0.0.1" : configuredHost === "::" ? "::1" : configuredHost;
+    return { host, port: Number(endpoint.port) || (endpoint.protocol === "wss:" ? 443 : 80) };
+  }
+  return {
+    host: "127.0.0.1",
+    port: Number(plan.enginePort || process.env.III_ENGINE_PORT) || plan.restPort + 46023,
+  };
+}
+
+function canConnectToEngine({ host, port }) {
+  return new Promise(resolve => {
+    const socket = createConnection({ host, port });
+    let settled = false;
+    const timer = setTimeout(() => finish(false), 1000);
+    const finish = connected => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(connected);
+    };
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+  });
+}
+
+async function waitForEngine(deadline) {
+  const address = configuredEngineAddress();
+  if (!address) return;
+  while (Date.now() < deadline) {
+    if (await canConnectToEngine(address)) return;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error("The AgentMemory engine did not become reachable after restart.");
+}
+
+function viewerBaseUrl(port) {
+  let host = (process.env.AGENTMEMORY_VIEWER_HOST || "127.0.0.1").replace(/^\[|\]$/g, "");
+  if (host === "localhost" || host === "0.0.0.0") host = "127.0.0.1";
+  if (host === "::") host = "::1";
+  const formattedHost = host.includes(":") ? "[" + host + "]" : host;
+  return "http://" + formattedHost + ":" + port;
+}
+
+async function waitForWorker(expectedVersion, deadline, headers, restartStartedAt) {
+  const base = "http://127.0.0.1:" + plan.restPort + "/agentmemory/";
+  while (Date.now() < deadline) {
+    try {
+      const live = await fetch(base + "livez", { headers, signal: AbortSignal.timeout(1500) });
+      if (!live.ok) throw new Error("worker liveness pending");
+      const instance = await live.json();
+      if (instance?.service !== "agentmemory") throw new Error("worker identity pending");
+      if (instance.viewerSkipped === true) {
+        throw new Error("AgentMemory started without a viewer; the update cannot be marked ready.");
+      }
+      if (!Number.isInteger(instance.viewerPort) || instance.viewerPort <= 0 || instance.viewerPort > 65535) {
+        throw new Error("viewer binding pending");
+      }
+      const flags = await fetch(base + "config/flags", { headers, signal: AbortSignal.timeout(1500) });
+      if (!flags.ok || (await flags.json())?.version !== expectedVersion) throw new Error("versioned API pending");
+      const health = await fetch(base + "health", { headers, signal: AbortSignal.timeout(1500) });
+      if (!health.ok) throw new Error("health probe pending");
+      const healthState = await health.json();
+      const engineWorker = healthState?.health?.workers?.find(worker => worker?.name === "agentmemory");
+      if (healthState?.version === expectedVersion && healthState?.health?.connectionState === "connected" &&
+          engineWorker?.status === "connected" && Number.isFinite(engineWorker.connected_at_ms) &&
+          engineWorker.connected_at_ms >= restartStartedAt) return instance.viewerPort;
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("without a viewer")) throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error("The AgentMemory worker API did not become ready with a connected engine.");
+}
+
+async function waitForViewer(port, deadline) {
+  const url = viewerBaseUrl(port) + "/";
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(1500) });
+      if (response.ok) return;
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error("The AgentMemory viewer did not become reachable after restart.");
+}
+
 async function restart(cliPath, expectedVersion) {
   let child;
+  const restartStartedAt = Date.now();
   if (plan.supervised) {
     maintenance("resume");
   } else {
@@ -109,25 +203,12 @@ async function restart(cliPath, expectedVersion) {
     child.unref();
   }
   const deadline = Date.now() + (plan.readyTimeoutMs || 15 * 60_000);
-  while (Date.now() < deadline) {
-    if (child && !alive(child.pid)) throw new Error("Restarted AgentMemory process exited before becoming ready.");
-    try {
-      const headers = process.env.AGENTMEMORY_SECRET
-        ? { Authorization: "Bearer " + process.env.AGENTMEMORY_SECRET } : {};
-      const base = "http://127.0.0.1:" + plan.restPort + "/agentmemory/";
-      const response = await fetch(base + "livez", {
-        headers, signal: AbortSignal.timeout(1500),
-      });
-      if (response.ok && (await response.json())?.service === "agentmemory") {
-        const flags = await fetch(base + "config/flags", {
-          headers, signal: AbortSignal.timeout(1500),
-        });
-        if (flags.ok && (await flags.json())?.version === expectedVersion) return;
-      }
-    } catch {}
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  }
-  throw new Error("AgentMemory did not become ready within 15 minutes.");
+  const headers = process.env.AGENTMEMORY_SECRET
+    ? { Authorization: "Bearer " + process.env.AGENTMEMORY_SECRET } : {};
+  await waitForEngine(deadline);
+  if (child && !alive(child.pid)) throw new Error("Restarted AgentMemory process exited before becoming ready.");
+  const viewerPort = await waitForWorker(expectedVersion, deadline, headers, restartStartedAt);
+  await waitForViewer(viewerPort, deadline);
 }
 
 try {

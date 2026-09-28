@@ -95,35 +95,62 @@ export function registerEventTriggers(sdk: IIIClient, kv: StateKV): void {
     config: { topic: "agentmemory.observation" },
   });
 
-  sdk.registerFunction("event::session::stopped", async (data: { sessionId: string; skipConsolidation?: boolean }) => {
-    const summary = await sdk.trigger({ function_id: "mem::summarize", payload: data });
-    const fireVoid = (function_id: string, payload: unknown) =>
-      sdk
-        .trigger({ function_id, payload, action: TriggerAction.Void() })
-        .catch((err) =>
-          logger.warn(function_id + " trigger failed", {
+  sdk.registerFunction(
+    "event::session::stopped",
+    async (data: { sessionId: string; skipConsolidation?: boolean }) => {
+      let summary: unknown;
+      try {
+        summary = await sdk.trigger({
+          function_id: "mem::summarize",
+          payload: data,
+        });
+        if (isFailureResult(summary)) {
+          logger.warn("mem::summarize returned failure", {
             sessionId: data.sessionId,
-            error: err instanceof Error ? err.message : String(err),
-          }),
-        );
-    if (isReflectEnabled()) {
-      fireVoid("mem::slot-reflect", { sessionId: data.sessionId, deferred: true });
-    }
-    // Unconditional: mem::graph-extract gates its LLM pass internally.
-    try {
-      const observations = await kv.list<CompressedObservation>(
-        KV.observations(data.sessionId),
-      );
-      const compressed = observations.filter((o) => o.title);
-      if (compressed.length > 0) {
-        fireVoid("mem::graph-extract", { observations: compressed, deferred: true });
+            reason: "reported_failure",
+          });
+        }
+      } catch {
+        logger.warn("mem::summarize trigger failed", {
+          sessionId: data.sessionId,
+          reason: "trigger_rejected",
+        });
       }
-    } catch (err) {
-      logger.warn("graph-extract trigger failed", {
-        sessionId: data.sessionId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+      const fireVoid = (function_id: string, payload: unknown) =>
+        sdk
+          .trigger({ function_id, payload, action: TriggerAction.Void() })
+          .then((result) => {
+            if (isFailureResult(result)) {
+              logger.warn(function_id + " returned failure", {
+                sessionId: data.sessionId,
+                reason: "reported_failure",
+              });
+            }
+          })
+          .catch(() =>
+            logger.warn(function_id + " trigger failed", {
+              sessionId: data.sessionId,
+              reason: "trigger_rejected",
+            }),
+          );
+      if (isReflectEnabled()) {
+        fireVoid("mem::slot-reflect", { sessionId: data.sessionId, deferred: true });
+      }
+      // Unconditional: mem::graph-extract gates its LLM pass internally.
+      try {
+        const observations = await kv.list<CompressedObservation>(
+          KV.observations(data.sessionId),
+        );
+        const compressed = observations.filter((o) => o.title);
+        if (compressed.length > 0) {
+          fireVoid("mem::graph-extract", { observations: compressed, deferred: true });
+        }
+      } catch {
+        logger.warn("graph-extract dispatch failed", {
+          sessionId: data.sessionId,
+          reason: "observation_lookup_failed",
+        });
+      }
     // Crystals + lessons consolidation. The stop lifecycle is the single
     // source of truth: event::session::stopped fires for ALL agents (the
     // client-side session-end hook no longer drives consolidation directly).
@@ -149,8 +176,9 @@ export function registerEventTriggers(sdk: IIIClient, kv: StateKV): void {
         }
       }
     }
-    return summary;
-  });
+      return summary;
+    },
+  );
   sdk.registerTrigger({
     type: "durable:subscriber",
     function_id: "event::session::stopped",
@@ -251,6 +279,15 @@ export function registerEventTriggers(sdk: IIIClient, kv: StateKV): void {
     function_id: "event::memory::changed",
     config: { scope: KV.memories },
   });
+}
+
+function isFailureResult(result: unknown): boolean {
+  return (
+    typeof result === "object" &&
+    result !== null &&
+    "success" in result &&
+    result.success === false
+  );
 }
 
 function isStateDelete(payload: { event_type: string; new_value?: unknown }): boolean {

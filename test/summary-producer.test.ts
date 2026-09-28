@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { CompressedObservation, LlmCallOptions, MemoryProvider, SummaryBudgetConfig } from "../src/types.js";
+import { logger } from "../src/logger.js";
 import { parseSummaryBudgetConfig } from "../src/config.js";
 import { createSummaryProducer } from "../src/functions/summary-producer.js";
 import {
@@ -29,6 +30,34 @@ const small: SummaryBudgetConfig = { contextTokens: 4096, outputTokens: 512, saf
 const produce = (selected: MemoryProvider, config = small) => createSummaryProducer(selected, undefined, config, "session", "project");
 
 describe("bounded summary producer", () => {
+  it("logs only a stable category and HTTP status for the first provider failure", async () => {
+    const mock = provider(() => {
+      throw new Error("OpenAI API error (503): Authorization: Bearer sk-test-private upstream body");
+    });
+    vi.mocked(logger.warn).mockClear();
+
+    await expect(produce(mock.selected)([observation(1)])).rejects.toThrow("OpenAI API error");
+
+    const firstFailure = vi.mocked(logger.warn).mock.calls.find(([message]) => message === "Summarize first provider failure");
+    expect(firstFailure).toEqual(["Summarize first provider failure", {
+      sessionId: "session", category: "http_error", httpStatus: 503,
+    }]);
+    expect(JSON.stringify(vi.mocked(logger.warn).mock.calls)).not.toContain("sk-test-private");
+    expect(JSON.stringify(vi.mocked(logger.warn).mock.calls)).not.toContain("upstream body");
+  });
+  it("uses the provider-error fallback without retaining an arbitrary message", async () => {
+    const mock = provider(() => { throw new Error("secret-token response text 700"); });
+    vi.mocked(logger.warn).mockClear();
+
+    await expect(produce(mock.selected)([observation(1)])).rejects.toThrow("secret-token");
+
+    const firstFailure = vi.mocked(logger.warn).mock.calls.find(([message]) => message === "Summarize first provider failure");
+    expect(firstFailure).toEqual(["Summarize first provider failure", {
+      sessionId: "session", category: "provider_error",
+    }]);
+    expect(JSON.stringify(vi.mocked(logger.warn).mock.calls)).not.toContain("secret-token");
+    expect(JSON.stringify(vi.mocked(logger.warn).mock.calls)).not.toContain("response text");
+  });
   it("sends the summary output budget on every call", async () => {
     const mock = provider(() => xml());
     await produce(mock.selected, parseSummaryBudgetConfig({}))([observation(1)]);

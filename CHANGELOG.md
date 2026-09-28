@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.68] — 2026-09-28
+
+### Fixed
+
+- The Windows viewer updater now waits for the iii engine, the expected API version, a freshly connected AgentMemory worker, and the viewer HTTP endpoint before reporting success. Missing or unreachable viewer readiness triggers rollback.
+- A session summary failure no longer prevents graph extraction and the remaining session-stop work from being dispatched. The first summary provider failure is logged with a safe error category and optional HTTP status for diagnosis.
+- With Fireworks Batch disabled, previously queued work remains stored and does not block new work through the normal LLM route. The old queue is not replayed during update.
+
 ## [0.9.67] — 2026-09-28
 
 ### Fixed

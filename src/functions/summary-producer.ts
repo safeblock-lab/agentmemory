@@ -19,6 +19,54 @@ interface ProducedSummary {
   skipped?: number;
 }
 
+type SummaryProviderErrorCategory =
+  | "circuit_breaker_open"
+  | "http_error"
+  | "invalid_response"
+  | "network_error"
+  | "provider_error"
+  | "timeout";
+
+interface SummaryProviderErrorDetails {
+  category: SummaryProviderErrorCategory;
+  httpStatus?: number;
+}
+
+const NETWORK_ERROR_CODES = new Set([
+  "ECONNREFUSED", "ECONNRESET", "EHOSTUNREACH", "ENOTFOUND", "EAI_AGAIN", "ETIMEDOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+]);
+
+function summaryProviderErrorDetails(error: unknown): SummaryProviderErrorDetails {
+  const record = typeof error === "object" && error !== null ? error as Record<string, unknown> : undefined;
+  const message = error instanceof Error ? error.message : "";
+  const name = error instanceof Error ? error.name : "";
+  const code = record?.code;
+  const statusValue = record?.status ?? record?.statusCode ?? record?.status_code;
+  const directStatus = typeof statusValue === "number"
+    ? statusValue
+    : typeof statusValue === "string" && /^\d{3}$/.test(statusValue) ? Number(statusValue) : undefined;
+  const messageStatus = message.match(/^OpenAI API error \((\d{3})\):/)?.[1];
+  const status = directStatus ?? (messageStatus ? Number(messageStatus) : undefined);
+  const httpStatus = status !== undefined && Number.isInteger(status) && status >= 100 && status <= 599
+    ? status
+    : undefined;
+
+  let category: SummaryProviderErrorCategory = "provider_error";
+  if (message === "circuit_breaker_open") category = "circuit_breaker_open";
+  else if (httpStatus !== undefined) category = "http_error";
+  else if (name === "AbortError" || /^OpenAI API request timed out(?:\s|$)/.test(message)) category = "timeout";
+  else if (
+    message === "OpenAI returned an invalid JSON response." ||
+    message.startsWith("OpenAI returned unexpected response:")
+  ) category = "invalid_response";
+  else if ((typeof code === "string" && NETWORK_ERROR_CODES.has(code)) || name === "FetchError" || message === "fetch failed") {
+    category = "network_error";
+  }
+
+  return { category, ...(httpStatus === undefined ? {} : { httpStatus }) };
+}
+
 export function createSummaryProducer(
   provider: MemoryProvider, llmRouter: LlmTaskRouter | undefined,
   config: SummaryBudgetConfig, sessionId: string, project: string,
@@ -27,15 +75,27 @@ export function createSummaryProducer(
   const chunkInputLimit = summaryChunkInputLimit(config);
   const concurrency = Math.max(1, config.concurrency);
   let calls = 0;
+  let firstProviderFailureLogged = false;
   const call = async (system: string, prompt: string): Promise<string> => {
     if (estimateSummaryTokens(system, prompt) > inputLimit) throw new SummaryBudgetError("summary_prompt_exceeds_budget");
     const operation = (selected: MemoryProvider): Promise<string> => {
       if (++calls > MAX_SUMMARY_CALLS) throw new SummaryBudgetError("summary_call_limit_exceeded");
       return selected.summarize(system, prompt, { task: "summary", outputTokens: config.outputTokens });
     };
-    return llmRouter
-      ? llmRouter.run("summary", operation, candidate => parseSummaryXml(candidate, sessionId, project, 0) !== null)
-      : operation(provider);
+    try {
+      return await (llmRouter
+        ? llmRouter.run("summary", operation, candidate => parseSummaryXml(candidate, sessionId, project, 0) !== null)
+        : operation(provider));
+    } catch (error) {
+      if (!(error instanceof SummaryBudgetError) && !firstProviderFailureLogged) {
+        firstProviderFailureLogged = true;
+        logger.warn("Summarize first provider failure", {
+          sessionId,
+          ...summaryProviderErrorDetails(error),
+        });
+      }
+      throw error;
+    }
   };
   const partial = (summary: SessionSummary, items: SummaryPromptItem[]): SummaryPromptItem => ({
     text: formatSummaryPartial(summary),

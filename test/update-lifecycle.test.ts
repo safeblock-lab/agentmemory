@@ -43,6 +43,104 @@ function releaseResponse() {
   }), { status: 200 });
 }
 
+function runReadinessUpdate(options: {
+  livez?: Array<{ viewerPort: number | null; viewerSkipped: boolean }>;
+  versions: string[];
+  engineStates: Array<"connected" | "disconnected">;
+  workerConnectedAtMs?: Array<number | "now">;
+  readyTimeoutMs?: number;
+}) {
+  const root = mkdtempSync(join(process.cwd(), "test", ".update-readiness-"));
+  try {
+    const jobDir = join(root, "job");
+    const packageRoot = join(root, "agentmemory");
+    const cliPath = join(packageRoot, "dist", "cli.mjs");
+    const pidPath = join(root, "fake-service.pid");
+    const tracePath = join(root, "readiness-trace.json");
+    mkdirSync(jobDir);
+    mkdirSync(join(packageRoot, "dist"), { recursive: true });
+    writeFileSync(cliPath, `import { readFileSync, writeFileSync } from "node:fs";
+      const path = ${JSON.stringify(pidPath)};
+      if (process.argv.includes("stop")) { try { process.kill(Number(readFileSync(path, "utf8")), "SIGTERM"); } catch {} }
+      else { writeFileSync(path, String(process.pid)); setInterval(() => {}, 1000); }`);
+    writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ name: "@agentmemory/agentmemory", version: "0.9.58" }));
+    const npmCli = join(root, "fake-npm.mjs");
+    writeFileSync(npmCli, `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(join(packageRoot, "package.json"))}, JSON.stringify({name:"@agentmemory/agentmemory",version:"0.9.59"}));`);
+    const tarballPath = join(jobDir, "release.tgz");
+    const helperPath = join(jobDir, "helper.mjs");
+    const wrapperPath = join(jobDir, "wrapper.mjs");
+    const planPath = join(jobDir, "plan.json");
+    const statusPath = join(root, "status.json");
+    writeFileSync(tarballPath, "verified");
+    writeFileSync(helperPath, UPDATE_HELPER_SOURCE);
+    writeFileSync(planPath, JSON.stringify({
+      jobId: "readiness", jobDir, packageRoot, cliPath, npmCli, tarballPath,
+      sha256: createHash("sha256").update("verified").digest("hex"),
+      targetVersion: "0.9.59", currentVersion: "0.9.58", statusPath,
+      lockPath: join(root, "update.lock"), logPath: join(root, "update.log"),
+      restPort: 3111, dataDir: join(root, "data"), readyTimeoutMs: options.readyTimeoutMs ?? 500,
+    }));
+    const responses = JSON.stringify({
+      livez: options.livez ?? [{ viewerPort: 4317, viewerSkipped: false }],
+      versions: options.versions,
+      engineStates: options.engineStates,
+      workerConnectedAtMs: options.workerConnectedAtMs ?? ["now"],
+    });
+    writeFileSync(wrapperPath, `import { createServer } from "node:net";
+      import { readFileSync, writeFileSync } from "node:fs";
+      const plan = JSON.parse(readFileSync(${JSON.stringify(planPath)}, "utf8"));
+      const responses = ${responses};
+      const counts = { livez: 0, versions: 0, health: 0 };
+      const trace = [];
+      const engine = createServer(() => trace.push("engine"));
+      engine.listen(0, "127.0.0.1", async () => {
+        const address = engine.address();
+        process.env.III_ENGINE_URL = "ws://127.0.0.1:" + address.port;
+        globalThis.fetch = async (input) => {
+          const url = new URL(String(input));
+          if (url.pathname === "/agentmemory/livez") {
+            trace.push("livez");
+            const item = responses.livez[Math.min(counts.livez++, responses.livez.length - 1)];
+            return Response.json({ service: "agentmemory", ...item });
+          }
+          if (url.pathname === "/agentmemory/config/flags") {
+            trace.push("versioned-api");
+            const version = responses.versions[Math.min(counts.versions++, responses.versions.length - 1)];
+            return Response.json({ version });
+          }
+          if (url.pathname === "/agentmemory/health") {
+            trace.push("health");
+            const healthIndex = counts.health++;
+            const connectionState = responses.engineStates[Math.min(healthIndex, responses.engineStates.length - 1)];
+            const configuredTimestamp = responses.workerConnectedAtMs[Math.min(healthIndex, responses.workerConnectedAtMs.length - 1)];
+            const connectedAt = configuredTimestamp === "now" ? Date.now() : configuredTimestamp;
+            return Response.json({
+              version: healthIndex === 0 ? responses.versions[0] : "0.9.58",
+              health: { connectionState, workers: [{ name: "agentmemory", status: connectionState, connected_at_ms: connectedAt }] },
+            });
+          }
+          trace.push("viewer:" + url.port);
+          return new Response("<html>AgentMemory</html>", { status: 200 });
+        };
+        await import(${JSON.stringify(pathToFileURL(helperPath).href)});
+        writeFileSync(${JSON.stringify(tracePath)}, JSON.stringify(trace));
+        engine.close();
+      });`);
+    const result = spawnSync(process.execPath, [wrapperPath, planPath], { encoding: "utf8", timeout: 8000 });
+    const status = JSON.parse(readFileSync(statusPath, "utf8"));
+    const trace = JSON.parse(readFileSync(tracePath, "utf8")) as string[];
+    const log = existsSync(join(root, "update.log")) ? readFileSync(join(root, "update.log"), "utf8") : "";
+    const fakePid = existsSync(pidPath) ? Number(readFileSync(pidPath, "utf8")) : 0;
+    if (fakePid > 0) { try { process.kill(fakePid, "SIGTERM"); } catch {} }
+    const installedVersion = existsSync(packageRoot)
+      ? JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")).version
+      : "missing";
+    return { result, status, trace, log, installedVersion };
+  } finally {
+    rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+}
+
 afterEach(() => vi.unstubAllGlobals());
 
 describe("GitHub release update", () => {
@@ -228,7 +326,15 @@ describe("update lifecycle", () => {
       const statusPath = join(root, "status.json");
       writeFileSync(tarballPath, "verified");
       writeFileSync(helperPath, UPDATE_HELPER_SOURCE);
-      writeFileSync(wrapperPath, `globalThis.fetch = async (url) => Response.json(url.endsWith("livez") ? {service:"agentmemory"} : {version:"0.9.59"}); await import(${JSON.stringify(pathToFileURL(helperPath).href)});`);
+      writeFileSync(wrapperPath, `process.env.III_ENGINE_URL = "ws://engine.example:49134";
+        globalThis.fetch = async (input) => {
+          const url = new URL(String(input));
+          if (url.pathname.endsWith("livez")) return Response.json({service:"agentmemory",viewerPort:4321,viewerSkipped:false});
+          if (url.pathname.endsWith("config/flags")) return Response.json({version:"0.9.59"});
+          if (url.pathname.endsWith("health")) return Response.json({version:"0.9.59",health:{connectionState:"connected",workers:[{name:"agentmemory",status:"connected",connected_at_ms:Date.now()}]}});
+          return new Response("<html>AgentMemory</html>", {status:200});
+        };
+        await import(${JSON.stringify(pathToFileURL(helperPath).href)});`);
       writeFileSync(planPath, JSON.stringify({
         jobId: "supervised-success", jobDir, packageRoot, cliPath, npmCli, tarballPath,
         sha256: createHash("sha256").update("verified").digest("hex"),
@@ -271,7 +377,7 @@ describe("update lifecycle", () => {
         tarballPath, sha256: createHash("sha256").update("verified").digest("hex"),
         targetVersion: "0.9.59", currentVersion: "0.9.58", statusPath,
         lockPath: join(root, "update.lock"), logPath: join(root, "update.log"),
-        restPort: 65534, dataDir: join(root, "data"), readyTimeoutMs: 1000,
+        restPort: 10000, dataDir: join(root, "data"), readyTimeoutMs: 1000,
       }));
       spawnSync(process.execPath, [helperPath, planPath], { encoding: "utf8" });
       expect(existsSync(restartedPath)).toBe(true);
@@ -282,51 +388,64 @@ describe("update lifecycle", () => {
     }
   });
 
-  it("does not accept an old service version as a successful update", () => {
-    const root = mkdtempSync(join(process.cwd(), "test", ".update-version-"));
-    let fakePid = 0;
-    try {
-      const jobDir = join(root, "job");
-      const packageRoot = join(root, "agentmemory");
-      const cliPath = join(packageRoot, "dist", "cli.mjs");
-      const pidPath = join(root, "fake-service.pid");
-      const jobId = "version-check";
-      mkdirSync(jobDir);
-      mkdirSync(join(packageRoot, "dist"), { recursive: true });
-      writeFileSync(cliPath, `import { readFileSync, writeFileSync } from "node:fs";
-        const path = ${JSON.stringify(pidPath)};
-        if (process.argv.includes("stop")) { try { process.kill(Number(readFileSync(path, "utf8")), "SIGTERM"); } catch {} }
-        else { writeFileSync(path, String(process.pid)); setInterval(() => {}, 1000); }`);
-      writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ name: "@agentmemory/agentmemory", version: "0.9.58" }));
-      const npmCli = join(root, "fake-npm.mjs");
-      writeFileSync(npmCli, `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(join(packageRoot, "package.json"))}, JSON.stringify({name:"@agentmemory/agentmemory",version:"0.9.59"}));`);
-      const tarballPath = join(jobDir, "release.tgz");
-      const helperPath = join(jobDir, "helper.mjs");
-      const wrapperPath = join(jobDir, "wrapper.mjs");
-      const planPath = join(jobDir, "plan.json");
-      const statusPath = join(root, "status.json");
-      writeFileSync(tarballPath, "verified");
-      writeFileSync(helperPath, UPDATE_HELPER_SOURCE);
-      writeFileSync(wrapperPath, `globalThis.fetch = async (url) => new Response(JSON.stringify(url.endsWith("livez") ? {service:"agentmemory"} : {version:"0.9.58"}), {status:200}); await import(${JSON.stringify(pathToFileURL(helperPath).href)});`);
-      writeFileSync(planPath, JSON.stringify({
-        jobId, jobDir, packageRoot, cliPath, npmCli, tarballPath,
-        sha256: createHash("sha256").update("verified").digest("hex"),
-        targetVersion: "0.9.59", currentVersion: "0.9.58", statusPath,
-        lockPath: join(root, "update.lock"), logPath: join(root, "update.log"),
-        restPort: 3111, dataDir: join(root, "data"), readyTimeoutMs: 1000,
-      }));
-      const result = spawnSync(process.execPath, [wrapperPath, planPath], { encoding: "utf8", timeout: 10_000 });
-      expect(result.status, result.stderr).toBe(0);
-      const status = JSON.parse(readFileSync(statusPath, "utf8"));
-      expect(status.phase).toBe("failed");
-      expect(status.message).toContain("previous version was restored and restarted");
-      expect(status.errorCode).toBe("UPDATE_FAILED");
-      expect(JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")).version).toBe("0.9.58");
-      fakePid = Number(readFileSync(pidPath, "utf8"));
-    } finally {
-      if (fakePid > 0) { try { process.kill(fakePid, "SIGTERM"); } catch {} }
-      rmSync(root, { recursive: true, force: true });
-    }
+  it("waits for the advertised fallback viewer port before completing", () => {
+    const update = runReadinessUpdate({
+      livez: [{ viewerPort: 4327, viewerSkipped: false }],
+      versions: ["0.9.59"], engineStates: ["connected"],
+    });
+    expect(update.result.status, update.result.stderr).toBe(0);
+    expect(update.status.phase).toBe("complete");
+    expect(update.trace).toContain("viewer:4327");
+    expect(update.trace.indexOf("engine")).toBeLessThan(update.trace.indexOf("livez"));
+    expect(update.trace.indexOf("livez")).toBeLessThan(update.trace.indexOf("versioned-api"));
+    expect(update.trace.indexOf("versioned-api")).toBeLessThan(update.trace.indexOf("health"));
+    expect(update.trace.indexOf("health")).toBeLessThan(update.trace.indexOf("viewer:4327"));
+  });
+
+  it("rolls back when an open engine socket has no connected worker health", () => {
+    const update = runReadinessUpdate({
+      versions: ["0.9.59", "0.9.58"], engineStates: ["disconnected", "connected"],
+    });
+    expect(update.status).toMatchObject({ phase: "failed", errorCode: "UPDATE_FAILED" });
+    expect(update.status.message).toContain("previous version was restored and restarted");
+    expect(update.installedVersion).toBe("0.9.58");
+    expect(update.trace).toContain("engine");
+  });
+
+  it("does not accept a persisted connected snapshot from before the restart", () => {
+    const update = runReadinessUpdate({
+      versions: ["0.9.59", "0.9.58"],
+      engineStates: ["connected", "connected"],
+      workerConnectedAtMs: [Date.now() - 60_000, "now"],
+    });
+    expect(update.status).toMatchObject({ phase: "failed", errorCode: "UPDATE_FAILED" });
+    expect(update.status.message).toContain("previous version was restored and restarted");
+    expect(update.installedVersion).toBe("0.9.58");
+    expect(update.trace.filter((entry) => entry === "health")).toHaveLength(2);
+  });
+
+  it("rejects a stale viewer port when the worker says its viewer was skipped", () => {
+    const update = runReadinessUpdate({
+      livez: [
+        { viewerPort: 4327, viewerSkipped: true },
+        { viewerPort: 4327, viewerSkipped: false },
+      ],
+      versions: ["0.9.58"], engineStates: ["connected"],
+    });
+    expect(update.status).toMatchObject({ phase: "failed", errorCode: "UPDATE_FAILED" });
+    expect(update.status.message).toContain("previous version was restored and restarted");
+    expect(update.log).toContain("started without a viewer");
+    expect(update.installedVersion).toBe("0.9.58");
+  });
+
+  it("rolls back when readiness times out on the wrong API version", () => {
+    const update = runReadinessUpdate({
+      versions: ["0.9.58"], engineStates: ["connected"], readyTimeoutMs: 300,
+    });
+    expect(update.status).toMatchObject({ phase: "failed", errorCode: "UPDATE_FAILED" });
+    expect(update.status.message).toContain("previous version was restored and restarted");
+    expect(update.installedVersion).toBe("0.9.58");
+    expect(update.trace).toContain("viewer:4317");
   });
 
   it("refuses a source checkout or unsupported host without triggering installation", () => {
