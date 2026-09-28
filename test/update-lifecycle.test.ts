@@ -57,7 +57,10 @@ describe("GitHub release update", () => {
   it("accepts only the fixed release assets and matching SHA256", async () => {
     const tarball = packageArchive();
     const hash = createHash("sha256").update(tarball).digest("hex");
-    const fetchMock = vi.fn(async (url: URL) => {
+    const fetchMock = vi.fn(async (url: URL, options: RequestInit) => {
+      expect(options.headers).toMatchObject({
+        Accept: url.hostname === "api.github.com" ? "application/vnd.github+json" : "application/octet-stream",
+      });
       if (url.hostname === "api.github.com") return releaseResponse();
       if (url.pathname.endsWith("SHA256SUMS.txt")) return new Response(`${hash}  ${assetName}\n`);
       return new Response(tarball);
@@ -68,6 +71,7 @@ describe("GitHub release update", () => {
     expect(result.sha256).toBe(hash);
     expect(result.tarball).toEqual(tarball);
     expect(fetchMock.mock.calls.every(([url]) => url.hostname === "api.github.com" || url.hostname === "github.com")).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
   it("rejects release metadata pointing to any other asset URL", async () => {

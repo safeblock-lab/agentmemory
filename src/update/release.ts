@@ -113,7 +113,7 @@ export function isNewerRelease(tag: string, current = VERSION): boolean {
   return next.some((n, i) => n !== installed[i] && next.slice(0, i).every((part, j) => part === installed[j]) && n > installed[i]);
 }
 
-async function boundedFetch(url: string, maxBytes: number, allowedHosts: Set<string>): Promise<Buffer> {
+async function boundedFetch(url: string, maxBytes: number, allowedHosts: Set<string>, accept: string): Promise<Buffer> {
   let current = url;
   for (let redirect = 0; redirect <= 5; redirect++) {
     const uri = new URL(current);
@@ -122,7 +122,7 @@ async function boundedFetch(url: string, maxBytes: number, allowedHosts: Set<str
     }
     const response = await fetch(uri, {
       redirect: "manual",
-      headers: { "User-Agent": "agentmemory-updater", Accept: "application/octet-stream" },
+      headers: { "User-Agent": "agentmemory-updater", Accept: accept },
       signal: AbortSignal.timeout(60_000),
     });
     if (response.status >= 300 && response.status < 400) {
@@ -152,7 +152,7 @@ async function boundedFetch(url: string, maxBytes: number, allowedHosts: Set<str
 }
 
 async function latestRelease(): Promise<{ info: ReleaseInfo; assetUrl: string; sumsUrl: string }> {
-  const raw = await boundedFetch(RELEASE_API, MAX_METADATA_BYTES, new Set(["api.github.com"]));
+  const raw = await boundedFetch(RELEASE_API, MAX_METADATA_BYTES, new Set(["api.github.com"]), "application/vnd.github+json");
   let release: GithubRelease;
   try {
     release = JSON.parse(raw.toString("utf8")) as GithubRelease;
@@ -188,8 +188,8 @@ export async function downloadVerifiedRelease(): Promise<VerifiedRelease> {
   if (!info.available) throw new Error("AgentMemory is already up to date.");
   const filename = `agentmemory-${info.tag}.tgz`;
   const [tarball, sums] = await Promise.all([
-    boundedFetch(assetUrl, MAX_PACKAGE_BYTES, ALLOWED_DOWNLOAD_HOSTS),
-    boundedFetch(sumsUrl, MAX_CHECKSUM_BYTES, ALLOWED_DOWNLOAD_HOSTS),
+    boundedFetch(assetUrl, MAX_PACKAGE_BYTES, ALLOWED_DOWNLOAD_HOSTS, "application/octet-stream"),
+    boundedFetch(sumsUrl, MAX_CHECKSUM_BYTES, ALLOWED_DOWNLOAD_HOSTS, "application/octet-stream"),
   ]);
   const line = sums.toString("utf8").split(/\r?\n/).find((entry) => entry.endsWith(`  ${filename}`) || entry.endsWith(` *${filename}`));
   const match = line && /^([0-9a-fA-F]{64})\s+\*?(.+)$/.exec(line);
