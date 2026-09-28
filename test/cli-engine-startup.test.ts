@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 describe("fresh native engine startup", () => {
   const source = readFileSync("src/cli.ts", "utf8").replace(/\r\n/g, "\n");
@@ -18,7 +18,7 @@ describe("fresh native engine startup", () => {
     const engineEnd = source.indexOf("async function waitForEngine", engineStart);
     const engineBody = source.slice(engineStart, engineEnd);
     expect(engineBody).not.toContain("writeRuntimeIiiConfig");
-    expect(engineBody.match(/startIiiBin\(iiiBin, configPath\)/g)).toHaveLength(2);
+    expect(engineBody.match(/startIiiBinOnce\(iiiBin, configPath\)/g)).toHaveLength(2);
   });
 
   it("reports buffered engine stderr when a verbose startup times out", () => {
@@ -26,17 +26,17 @@ describe("fresh native engine startup", () => {
     const spawnEnd = source.indexOf("function prepareEngineLaunch", spawnStart);
     const spawnBody = source.slice(spawnStart, spawnEnd);
     expect(spawnBody).toContain(
-      "activeStartupStderr = createStartupStderrCapture()",
+      "activeStartupStderr = stderrCapture",
     );
-    expect(spawnBody).toContain("activeStartupStderr.append(chunk)");
+    expect(spawnBody).toContain("stderrCapture.append(chunk)");
 
-    const timeoutStart = source.indexOf("const ready = await waitForEngine(15000)");
+    const timeoutStart = source.indexOf("const ready = await waitForEngine(ENGINE_READINESS_TIMEOUT_MS)");
     const timeoutEnd = source.indexOf('s.stop(c.ok("iii-engine is ready"))', timeoutStart);
     expect(source.slice(timeoutStart, timeoutEnd)).toContain(
       "printCapturedStartupStderr()",
     );
 
-    const demoTimeoutStart = source.indexOf("await waitForEngine(15000)", timeoutEnd);
+    const demoTimeoutStart = source.indexOf("await waitForEngine(ENGINE_READINESS_TIMEOUT_MS)", timeoutEnd);
     const demoTimeoutEnd = source.indexOf("await import(\"./index.js\")", demoTimeoutStart);
     expect(source.slice(demoTimeoutStart, demoTimeoutEnd)).toContain(
       "printCapturedStartupStderr()",
@@ -157,8 +157,147 @@ describe("fresh native engine startup", () => {
     const spawnStart = source.indexOf("function spawnEngineBackground");
     const spawnEnd = source.indexOf("function prepareEngineLaunch", spawnStart);
     const spawnBody = source.slice(spawnStart, spawnEnd);
-    expect(spawnBody).toContain("if (!isDocker)");
-    expect(spawnBody).toContain("clearEngineState()");
-    expect(spawnBody).not.toContain("if (!isDocker) clearEnginePidfile();\n      clearEngineState();");
+    expect(spawnBody).toContain('if (!isDocker && typeof child.pid === "number")');
+    expect(spawnBody).toContain("clearExitedNativeEngineOwnership(child.pid)");
+    expect(spawnBody).not.toContain("clearEngineState()");
+  });
+
+  it("waits for a delayed REST endpoint and does not mistake another child's crash for engine failure", async () => {
+    vi.useFakeTimers();
+    try {
+      const start = source.indexOf("async function waitForEngine(timeoutMs: number): Promise<boolean> {");
+      const end = source.indexOf("\n}", start) + 2;
+      const waitSource = source.slice(start, end).replace(
+        "async function waitForEngine(timeoutMs: number): Promise<boolean>", "async function waitForEngine(timeoutMs)",
+      );
+      const since = Date.now();
+      const probe = vi.fn(async () => Date.now() - since >= 46_000);
+      const wait = new Function("isEngineRunning", "startupFailure", "liveOwnedNativeEnginePid", "expectedEnginePid", "pidAlive",
+        "IS_WINDOWS", "getRestPort", "windowsListenerBelongsToOwnedEngine",
+        `${waitSource}; return waitForEngine;`)(probe, { kind: "engine-crashed" }, () => 101, 101, () => true,
+        false, () => 3111, () => true) as
+        (timeoutMs: number) => Promise<boolean>;
+      const result = wait(15 * 60 * 1000);
+      await vi.advanceTimersByTimeAsync(46_000);
+      await expect(result).resolves.toBe(true);
+      expect(probe).toHaveBeenCalled();
+      expect(source).toContain("const ENGINE_READINESS_TIMEOUT_MS = 15 * 60 * 1000;");
+      expect(source.match(/waitForEngine\(ENGINE_READINESS_TIMEOUT_MS\)/g)).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reuses a live owned engine and only clears metadata for the exited PID and state", () => {
+    const liveStart = source.indexOf("function liveOwnedNativeEnginePid(): number | null {");
+    const liveEnd = source.indexOf("\n}", liveStart) + 2;
+    const liveSource = source.slice(liveStart, liveEnd).replace(
+      "function liveOwnedNativeEnginePid(): number | null", "function liveOwnedNativeEnginePid()",
+    );
+    const state = { kind: "native", configPath: "config", restPort: 3111, pid: 202 };
+    let recordedPid = 202;
+    let requestedPort = 3111;
+    const live = new Function("readEngineState", "readEnginePidfile", "engineStateRestPort", "getRestPort", "pidAlive",
+      `${liveSource}; return liveOwnedNativeEnginePid;`)(
+      () => state, () => recordedPid, (value: typeof state) => value.restPort, () => requestedPort, (pid: number) => pid === 202,
+    ) as () => number | null;
+    expect(live()).toBe(202);
+    const originalPid = state.pid;
+    state.pid = undefined as unknown as number;
+    expect(live()).toBeNull();
+    state.pid = originalPid;
+    requestedPort = 3211;
+    expect(live()).toBeNull();
+    state.restPort = 3211;
+    expect(live()).toBe(202);
+    recordedPid = 101;
+    expect(live()).toBeNull();
+    recordedPid = 202;
+
+    const clearStart = source.indexOf("function clearExitedNativeEngineOwnership(exitedPid: number): void {");
+    const clearEnd = source.indexOf("\n}", clearStart) + 2;
+    const clearSource = source.slice(clearStart, clearEnd).replace(
+      "function clearExitedNativeEngineOwnership(exitedPid: number): void", "function clearExitedNativeEngineOwnership(exitedPid)",
+    );
+    const clearPid = vi.fn();
+    const clearState = vi.fn();
+    const clear = new Function("readEngineState", "readEnginePidfile", "clearEnginePidfile", "clearEngineState",
+      `${clearSource}; return clearExitedNativeEngineOwnership;`)(
+      () => state, () => recordedPid, clearPid, clearState,
+    ) as (pid: number) => void;
+    clear(101);
+    expect(clearPid).not.toHaveBeenCalled();
+    expect(clearState).not.toHaveBeenCalled();
+    clear(202);
+    expect(clearPid).toHaveBeenCalledOnce();
+    expect(clearState).toHaveBeenCalledOnce();
+
+    const engineStart = source.indexOf("async function startEngine()");
+    const engineEnd = source.indexOf("async function waitForEngine", engineStart);
+    const engineBody = source.slice(engineStart, engineEnd);
+    expect(engineBody.indexOf("liveOwnedNativeEnginePid()")).toBeLessThan(engineBody.indexOf("startIiiBinOnce(iiiBin, configPath)"));
+  });
+
+  it("fails promptly if the owned engine exits before REST becomes ready", async () => {
+    vi.useFakeTimers();
+    try {
+      const start = source.indexOf("async function waitForEngine(timeoutMs: number): Promise<boolean> {");
+      const end = source.indexOf("\n}", start) + 2;
+      const waitSource = source.slice(start, end).replace(
+        "async function waitForEngine(timeoutMs: number): Promise<boolean>", "async function waitForEngine(timeoutMs)",
+      );
+      let alive = true;
+      const wait = new Function("isEngineRunning", "startupFailure", "liveOwnedNativeEnginePid", "expectedEnginePid", "pidAlive",
+        "IS_WINDOWS", "getRestPort", "windowsListenerBelongsToOwnedEngine",
+        `${waitSource}; return waitForEngine;`)(async () => false, null, () => null, 202, () => alive,
+        false, () => 3111, () => true) as
+        (timeoutMs: number) => Promise<boolean>;
+      const result = wait(15 * 60 * 1000);
+      alive = false;
+      await vi.advanceTimersByTimeAsync(500);
+      await expect(result).resolves.toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("requires a matching owned PID on Windows before attaching to a running listener", () => {
+    const mainStart = source.indexOf("async function main()");
+    const mainEnd = source.indexOf("async function apiFetch", mainStart);
+    const running = source.slice(mainStart, mainEnd);
+    const branch = running.indexOf("if (await isEngineRunning())");
+    const adoption = running.indexOf("adoptRunningEngine()", branch);
+    const verification = running.indexOf("windowsListenerBelongsToOwnedEngine", branch);
+    expect(verification).toBeGreaterThan(branch);
+    expect(verification).toBeLessThan(adoption);
+    expect(running.slice(branch, adoption)).toContain("process.exit(1)");
+
+    const start = source.indexOf("function windowsListenerBelongsToOwnedEngine(");
+    const end = source.indexOf("\n}", start) + 2;
+    const body = source.slice(start, end).replace(
+      "function windowsListenerBelongsToOwnedEngine(port: number, ownedPid: number): boolean",
+      "function windowsListenerBelongsToOwnedEngine(port, ownedPid)",
+    );
+    const verify = new Function("execFileSync", `${body}; return windowsListenerBelongsToOwnedEngine;`)(
+      () => "  TCP    127.0.0.1:3111    0.0.0.0:0    LISTENING    202\r\n",
+    ) as (port: number, pid: number) => boolean;
+    expect(verify(3111, 202)).toBe(true);
+    expect(verify(3111, 101)).toBe(false);
+    expect(verify(3211, 202)).toBe(false);
+  });
+
+  it("rejects REST readiness from a Windows listener owned by another process", async () => {
+    const start = source.indexOf("async function waitForEngine(timeoutMs: number): Promise<boolean> {");
+    const end = source.indexOf("\n}", start) + 2;
+    const waitSource = source.slice(start, end).replace(
+      "async function waitForEngine(timeoutMs: number): Promise<boolean>", "async function waitForEngine(timeoutMs)",
+    );
+    const verify = vi.fn(() => false);
+    const wait = new Function("isEngineRunning", "startupFailure", "liveOwnedNativeEnginePid", "expectedEnginePid", "pidAlive",
+      "IS_WINDOWS", "getRestPort", "windowsListenerBelongsToOwnedEngine",
+      `${waitSource}; return waitForEngine;`)(async () => true, null, () => 202, 202, () => true,
+      true, () => 3111, verify) as (timeoutMs: number) => Promise<boolean>;
+    await expect(wait(1000)).resolves.toBe(false);
+    expect(verify).toHaveBeenCalledWith(3111, 202);
   });
 });

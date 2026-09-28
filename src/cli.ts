@@ -39,6 +39,7 @@ const c = {
   accent: (s: string) => pc.bold(pc.yellow(s)),
 };
 import { generateId } from "./state/schema.js";
+import { acquireEngineStartupLock } from "./cli/engine-startup-lock.js";
 import {
   buildDiagnostics,
   dryRunPlan,
@@ -480,6 +481,7 @@ async function isAgentmemoryReady(): Promise<boolean> {
 }
 
 const WORKER_READINESS_TIMEOUT_MS = 15 * 60 * 1000;
+const ENGINE_READINESS_TIMEOUT_MS = 15 * 60 * 1000;
 
 function findIiiConfig(): string {
   // Precedence (user-overridable wins): explicit env > project cwd >
@@ -638,6 +640,7 @@ type NativeEngineState = {
   configPath: string;
   attached?: boolean;
   binPath?: string;
+  pid?: number;
   restPort?: number;
 };
 
@@ -737,6 +740,52 @@ function clearEngineState(): void {
   try {
     unlinkSync(engineStatePath());
   } catch {}
+}
+
+function liveOwnedNativeEnginePid(): number | null {
+  const state = readEngineState();
+  const pid = readEnginePidfile();
+  if (state?.kind !== "native" || !pid ||
+      engineStateRestPort(state) !== getRestPort() ||
+      state.pid !== pid || !pidAlive(pid)) return null;
+  return pid;
+}
+
+function liveUnverifiedNativeEnginePid(): number | null {
+  const state = readEngineState();
+  const pid = readEnginePidfile();
+  if (state?.kind !== "native" || !pid ||
+      engineStateRestPort(state) !== getRestPort() ||
+      state.pid === pid || !pidAlive(pid)) return null;
+  return pid;
+}
+
+function windowsListenerBelongsToOwnedEngine(port: number, ownedPid: number): boolean {
+  try {
+    const output = execFileSync("netstat", ["-ano", "-p", "tcp"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    const listeners = output.split(/\r?\n/).flatMap((line) => {
+      const fields = line.trim().split(/\s+/);
+      return fields.length === 5 && fields[0] === "TCP" &&
+        fields[1].endsWith(`:${port}`) && fields[3] === "LISTENING"
+        ? [Number(fields[4])]
+        : [];
+    });
+    return listeners.length > 0 && listeners.every((pid) => pid === ownedPid);
+  } catch {
+    return false;
+  }
+}
+
+function clearExitedNativeEngineOwnership(exitedPid: number): void {
+  const state = readEngineState();
+  if (readEnginePidfile() !== exitedPid || state?.kind !== "native" || state.pid !== exitedPid) return;
+  clearEnginePidfile();
+  clearEngineState();
 }
 
 function engineStateRestPort(state: EngineState): number {
@@ -1314,6 +1363,7 @@ type StartupFailure = {
 };
 
 let startupFailure: StartupFailure | null = null;
+let expectedEnginePid: number | null = null;
 let activeStartupStderr = createStartupStderrCapture();
 
 function printCapturedStartupStderr(): void {
@@ -1360,7 +1410,8 @@ function spawnEngineBackground(
   cwd?: string,
 ): ChildProcess {
   vlog(`spawn: ${bin} ${spawnArgs.join(" ")}${cwd ? ` (cwd: ${cwd})` : ""}`);
-  activeStartupStderr = createStartupStderrCapture();
+  const stderrCapture = createStartupStderrCapture();
+  activeStartupStderr = stderrCapture;
   const child = spawn(bin, spawnArgs, {
     detached: true,
     stdio: ["ignore", "ignore", "pipe"],
@@ -1373,13 +1424,20 @@ function spawnEngineBackground(
     writeEnginePidfile(child.pid);
   }
   child.stderr?.on("data", (chunk: Buffer) => {
-    activeStartupStderr.append(chunk);
+    stderrCapture.append(chunk);
+  });
+  child.on("error", (error) => {
+    startupFailure = {
+      kind: isDocker ? "docker-crashed" : "engine-crashed",
+      stderr: error.message,
+      binary: bin,
+    };
   });
   child.on("exit", (code, signal) => {
     const abnormal =
       (code !== null && code !== 0) || (code === null && signal !== null);
     if (abnormal) {
-      const stderr = activeStartupStderr.text();
+      const stderr = stderrCapture.text();
       startupFailure = {
         kind: isDocker ? "docker-crashed" : "engine-crashed",
         stderr:
@@ -1393,11 +1451,8 @@ function spawnEngineBackground(
       if (IS_VERBOSE && stderr.trim()) {
         p.log.error(`engine stderr:\n${stderr}`);
       }
-      if (!isDocker) {
-        clearEnginePidfile();
-        clearEngineState();
-      }
     }
+    if (!isDocker && typeof child.pid === "number") clearExitedNativeEngineOwnership(child.pid);
   });
   child.unref();
   return child;
@@ -1487,19 +1542,63 @@ function startIiiBin(iiiBin: string, configPath: string): boolean {
   const s = p.spinner();
   s.start(`Starting iii-engine: ${iiiBin}`);
   const launch = prepareEngineLaunch(configPath);
-  writeEngineState({
+  const state: NativeEngineState = {
     kind: "native",
     configPath: launch.configPath,
     binPath: iiiBin,
-  });
-  spawnEngineBackground(
+  };
+  writeEngineState(state);
+  const child = spawnEngineBackground(
     iiiBin,
     ["--config", launch.configPath, "--no-update-check"],
     "iii-engine",
     launch.cwd,
   );
+  if (typeof child.pid === "number" && readEnginePidfile() === child.pid) {
+    writeEngineState({ ...state, pid: child.pid });
+    const persisted = readEngineState();
+    if (persisted?.kind === "native" && persisted.pid === child.pid) {
+      expectedEnginePid = child.pid;
+    } else {
+      child.kill("SIGTERM");
+      clearExitedNativeEngineOwnership(child.pid);
+      startupFailure = { kind: "engine-crashed", binary: iiiBin, stderr: "Engine ownership could not be persisted." };
+      s.stop(c.err("iii-engine ownership could not be persisted"));
+      return false;
+    }
+  } else {
+    if (typeof child.pid === "number") child.kill("SIGTERM");
+    clearEngineState();
+    startupFailure = { kind: "engine-crashed", binary: iiiBin, stderr: "Engine process did not start." };
+    s.stop(c.err("iii-engine process did not start"));
+    return false;
+  }
   s.stop(c.ok("iii-engine process started"));
   return true;
+}
+
+async function startIiiBinOnce(iiiBin: string, configPath: string): Promise<boolean> {
+  let release: () => void;
+  try {
+    release = await acquireEngineStartupLock(runtimeMetadataPath("engine-startup.lock"), pidAlive);
+  } catch (error) {
+    p.log.error(error instanceof Error ? error.message : String(error));
+    return false;
+  }
+  try {
+    const ownedPid = liveOwnedNativeEnginePid();
+    if (ownedPid) {
+      expectedEnginePid = ownedPid;
+      return true;
+    }
+    if (liveUnverifiedNativeEnginePid()) {
+      p.log.error("A live iii-engine PID has unverifiable ownership. Refusing to launch another engine.");
+      return false;
+    }
+    return startIiiBin(iiiBin, configPath);
+  } finally {
+    release();
+  }
 }
 
 // Find a pinned-compatible iii path from a list of candidates. Returns
@@ -1518,6 +1617,17 @@ function pickCompatibleIii(candidates: Array<string | null | undefined>): string
 
 async function startEngine(): Promise<boolean> {
   await assertRuntimePortOwnership();
+  expectedEnginePid = null;
+  const startingPid = liveOwnedNativeEnginePid();
+  if (startingPid) {
+    expectedEnginePid = startingPid;
+    vlog(`Waiting for owned iii-engine pid ${startingPid} to finish starting.`);
+    return true;
+  }
+  if (liveUnverifiedNativeEnginePid()) {
+    p.log.error("A live iii-engine PID has unverifiable ownership. Refusing to launch another engine.");
+    return false;
+  }
   const persistedState = readEngineState();
   if (persistedState?.kind === "docker") {
     const inspection = inspectOwnedDockerEngine(persistedState);
@@ -1569,7 +1679,7 @@ async function startEngine(): Promise<boolean> {
       p.log.info(`Using iii at: ${c.dim(iiiBin)} (v${c.accent(IIPINNED_VERSION)})`);
       process.env["PATH"] = `${dirname(iiiBin)}${PATH_DELIMITER}${process.env["PATH"] ?? ""}`;
     }
-    return startIiiBin(iiiBin, configPath);
+    return startIiiBinOnce(iiiBin, configPath);
   }
 
   if (pathIii && !iiiBin) {
@@ -1646,7 +1756,7 @@ async function startEngine(): Promise<boolean> {
     if (result.ok && result.binPath) {
       process.env["PATH"] = `${dirname(result.binPath)}${PATH_DELIMITER}${process.env["PATH"] ?? ""}`;
       iiiBin = result.binPath;
-      return startIiiBin(iiiBin, configPath);
+      return startIiiBinOnce(iiiBin, configPath);
     }
     if (dockerBin && composeFile && interactive) {
       const fallback = await p.confirm({
@@ -1699,7 +1809,13 @@ async function startEngine(): Promise<boolean> {
 async function waitForEngine(timeoutMs: number): Promise<boolean> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    if (await isEngineRunning()) return true;
+    if (expectedEnginePid && !pidAlive(expectedEnginePid)) return false;
+    if (await isEngineRunning()) {
+      return !IS_WINDOWS || !expectedEnginePid ||
+        windowsListenerBelongsToOwnedEngine(getRestPort(), expectedEnginePid);
+    }
+    if (startupFailure?.kind === "docker-crashed" ||
+        (startupFailure?.kind === "engine-crashed" && !liveOwnedNativeEnginePid())) return false;
     await new Promise((r) => setTimeout(r, 500));
   }
   return false;
@@ -1912,6 +2028,13 @@ async function main() {
 
   if (await isEngineRunning()) {
     if (IS_VERBOSE) p.log.success("iii-engine is running");
+    if (IS_WINDOWS) {
+      const ownedPid = liveOwnedNativeEnginePid();
+      if (!ownedPid || !windowsListenerBelongsToOwnedEngine(getRestPort(), ownedPid)) {
+        p.log.error("The process listening on the REST port cannot be verified as this instance's iii-engine. Refusing to attach.");
+        process.exit(1);
+      }
+    }
     // Prefer the binary path persisted at launch time over whatever's on
     // PATH now. PATH lookups misfire when a global iii install gets added
     // after agentmemory started (or when the running engine was launched
@@ -1999,10 +2122,10 @@ async function main() {
   const s = p.spinner();
   s.start("Waiting for iii-engine to be ready...");
 
-  const ready = await waitForEngine(15000);
+  const ready = await waitForEngine(ENGINE_READINESS_TIMEOUT_MS);
   if (!ready) {
     const port = getRestPort();
-    s.stop("iii-engine did not become ready within 15s");
+    s.stop("iii-engine did not become ready within 15 minutes");
     printDockerStartupLogs();
 
     if (startupFailure?.kind === "engine-crashed" || startupFailure?.kind === "docker-crashed") {
@@ -2363,10 +2486,10 @@ function buildDoctorEffects(): DoctorEffects {
       try {
         const started = await startEngine();
         if (!started) return { ok: false, message: "startEngine() returned false" };
-        const ready = await waitForEngine(15000);
+        const ready = await waitForEngine(ENGINE_READINESS_TIMEOUT_MS);
         return {
           ok: ready,
-          message: ready ? "Engine ready" : "Engine did not become ready within 15s",
+          message: ready ? "Engine ready" : "Engine did not become ready within 15 minutes",
         };
       } catch (err) {
         return {
@@ -2879,10 +3002,10 @@ async function startServerForDemo(): Promise<() => Promise<void>> {
       p.note(installInstructions().join("\n"), "Setup required");
       process.exit(1);
     }
-    if (!(await waitForEngine(15000))) {
+    if (!(await waitForEngine(ENGINE_READINESS_TIMEOUT_MS))) {
       printCapturedStartupStderr();
       printDockerStartupLogs();
-      p.log.error("iii-engine did not become ready within 15s.");
+      p.log.error("iii-engine did not become ready within 15 minutes.");
       process.exit(1);
     }
   }
