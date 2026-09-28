@@ -19,8 +19,27 @@ export function estimateSummaryTokens(system: string, prompt: string): number {
   return Buffer.byteLength(JSON.stringify([system, prompt]), "utf8") + SUMMARY_ENVELOPE_TOKENS;
 }
 
+export function summaryOutputTokenBudget(
+  config: SummaryBudgetConfig, system: string, prompt: string,
+): number {
+  const inputTokens = estimateSummaryTokens(system, prompt);
+  const contextOutput = config.contextTokens - inputTokens - config.safetyMarginTokens;
+  const outputTokens = Math.min(inputTokens, contextOutput, config.outputTokens ?? Number.MAX_SAFE_INTEGER);
+  if (!Number.isSafeInteger(outputTokens) || outputTokens <= 0) {
+    throw new SummaryBudgetError("invalid_summary_budget: context cannot fit summary input, output and margin");
+  }
+  return outputTokens;
+}
+
 export function summaryInputLimit(config: SummaryBudgetConfig): number {
-  const limit = config.contextTokens - config.outputTokens - config.safetyMarginTokens;
+  if (config.outputTokens !== undefined && (!Number.isSafeInteger(config.outputTokens) || config.outputTokens <= 0)) {
+    throw new SummaryBudgetError("invalid_summary_budget: outputTokens must be a positive finite integer");
+  }
+  const contextAndMargin = config.contextTokens - config.safetyMarginTokens;
+  const halfContext = Math.floor(contextAndMargin / 2);
+  const limit = config.outputTokens === undefined
+    ? halfContext
+    : Math.max(halfContext, contextAndMargin - config.outputTokens);
   for (const [system, prompt] of [
     [SUMMARY_SYSTEM, buildSummaryItemsPrompt([{ text: "", obsRangeStart: 1, obsRangeEnd: 1, fragment: true }])],
     [REDUCE_SYSTEM, buildReduceItemsPrompt([{ text: "", obsRangeStart: 1, obsRangeEnd: 1, fragment: true }])],

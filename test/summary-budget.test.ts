@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import { getSummaryBudgetConfig, parseSummaryBudgetConfig } from "../src/config.js";
 import {
-  estimateSummaryTokens, packSummaryItems, summaryInputLimit, summaryCallInputLimit, summaryChunkInputLimit,
+  estimateSummaryTokens, summaryOutputTokenBudget, packSummaryItems, summaryInputLimit, summaryCallInputLimit, summaryChunkInputLimit,
   summaryReduceInputLimit, isExplicitSummarySizeError, MAX_SUMMARY_ITEMS,
   MIN_SUMMARY_CHUNK_CONTENT_TOKENS, MIN_SUMMARY_REDUCE_CONTENT_TOKENS,
 } from "../src/functions/summary-budget.js";
@@ -14,15 +14,16 @@ afterEach(() => vi.unstubAllEnvs());
 const item = (text: string, index = 1): SummaryPromptItem => ({ text, obsRangeStart: index, obsRangeEnd: index });
 
 describe("summary budget configuration", () => {
-  it("reserves the correct model output and safety margin", () => {
+  it("derives the input budget from the dynamic output ceiling and safety margin", () => {
     const config = parseSummaryBudgetConfig({});
-    expect(config).toEqual({ contextTokens: 131072, outputTokens: 8192, safetyMarginTokens: 4096, maxCallInputBytes: 7500, chunkSize: 400, concurrency: 12 });
-    expect(summaryInputLimit(config)).toBe(118784);
+    expect(config).toEqual({ contextTokens: 131072, safetyMarginTokens: 4096, maxCallInputBytes: 7500, chunkSize: 400, concurrency: 12 });
+    expect(summaryInputLimit(config)).toBe(63488);
     expect(summaryCallInputLimit(config)).toBe(7500);
-    expect(summaryChunkInputLimit(config)).toBe(7500);
+    expect(summaryChunkInputLimit(config)).toBeLessThanOrEqual(summaryCallInputLimit(config));
     expect(summaryChunkInputLimit(config)).toBeGreaterThanOrEqual(500);
     expect(summaryReduceInputLimit(config)).toBe(7500);
     expect(summaryReduceInputLimit(config)).toBeLessThan(summaryInputLimit(config));
+    expect(summaryInputLimit({ ...config, outputTokens: 8192 })).toBe(118784);
   });
   it.each(["", "0", "-1", "Infinity", "NaN", "1.5", "4096junk", "9007199254740992"])("rejects invalid integers: %j", raw => {
     expect(() => parseSummaryBudgetConfig({ AGENTMEMORY_SUMMARY_CONTEXT_TOKENS: raw })).toThrow("positive finite integer");
@@ -34,9 +35,40 @@ describe("summary budget configuration", () => {
     expect(getSummaryBudgetConfig().contextTokens).toBe(8192);
     expect(summaryInputLimit(getSummaryBudgetConfig())).toBe(6656);
   });
+  it("derives a positive output ceiling from each prompt and honors only an explicit admin cap", () => {
+    const config = parseSummaryBudgetConfig({});
+    const short = summaryOutputTokenBudget(config, SUMMARY_SYSTEM, "short summary input");
+    const larger = summaryOutputTokenBudget(config, SUMMARY_SYSTEM, "source detail ".repeat(120));
+    const unicode = summaryOutputTokenBudget(config, SUMMARY_SYSTEM, "漢字🧠".repeat(120));
+
+    expect(short).toBeGreaterThan(768);
+    expect(larger).toBeGreaterThan(short);
+    expect(unicode).toBeGreaterThan(short);
+    expect(unicode).toBe(estimateSummaryTokens(SUMMARY_SYSTEM, "漢字🧠".repeat(120)));
+    for (const [prompt, output] of [
+      ["short summary input", short], ["source detail ".repeat(120), larger], ["漢字🧠".repeat(120), unicode],
+    ] as const) {
+      const input = estimateSummaryTokens(SUMMARY_SYSTEM, prompt);
+      expect(input + output + config.safetyMarginTokens).toBeLessThanOrEqual(config.contextTokens);
+      expect(output).toBeLessThanOrEqual(input);
+    }
+    expect(summaryOutputTokenBudget({ ...config, outputTokens: 256 }, SUMMARY_SYSTEM, "x".repeat(1000))).toBe(256);
+  });
+  it("clamps an administrator ceiling that exceeds the configured context", () => {
+    const config = parseSummaryBudgetConfig({
+      AGENTMEMORY_SUMMARY_CONTEXT_TOKENS: "8192",
+      AGENTMEMORY_SUMMARY_OUTPUT_TOKENS: "16384",
+      AGENTMEMORY_SUMMARY_SAFETY_MARGIN_TOKENS: "512",
+    });
+    const prompt = "small request";
+    const input = estimateSummaryTokens(SUMMARY_SYSTEM, prompt);
+    const output = summaryOutputTokenBudget(config, SUMMARY_SYSTEM, prompt);
+    expect(output).toBe(input);
+    expect(input + output + config.safetyMarginTokens).toBeLessThanOrEqual(config.contextTokens);
+  });
   it("rejects impossible reserves and fixed prompt overhead", () => {
-    expect(() => parseSummaryBudgetConfig({ AGENTMEMORY_SUMMARY_CONTEXT_TOKENS: "12288" })).toThrow("context must exceed");
-    expect(() => summaryInputLimit({ ...parseSummaryBudgetConfig({}), contextTokens: 13000 })).toThrow("fixed prompts");
+    expect(() => parseSummaryBudgetConfig({ AGENTMEMORY_SUMMARY_CONTEXT_TOKENS: "4096", AGENTMEMORY_SUMMARY_SAFETY_MARGIN_TOKENS: "4096" })).toThrow("context must exceed safety margin");
+    expect(() => summaryInputLimit({ ...parseSummaryBudgetConfig({}), contextTokens: 4096 })).toThrow("fixed prompts");
     expect(() => parseSummaryBudgetConfig({ SUMMARIZE_CHUNK_CONCURRENCY: "33" })).toThrow("at most 32");
     expect(() => parseSummaryBudgetConfig({ AGENTMEMORY_SUMMARY_MAX_CALL_INPUT_BYTES: "0" })).toThrow("positive finite integer");
     const fixed = Math.max(

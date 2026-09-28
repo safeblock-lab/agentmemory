@@ -188,7 +188,7 @@ describe("mem::summarize chunking", () => {
   });
 
   it("does not persist a summary when the reserve leaves no prompt capacity", async () => {
-    process.env.AGENTMEMORY_SUMMARY_CONTEXT_TOKENS = "13000";
+    process.env.AGENTMEMORY_SUMMARY_CONTEXT_TOKENS = "5000";
     const provider = makeProvider([summaryXml({ title: "invalid budget" })]);
     const { handler, kv } = await setupHandler({ sessionId: "invalid-budget", obsCount: 1, provider });
     const result = await handler({ sessionId: "invalid-budget" });

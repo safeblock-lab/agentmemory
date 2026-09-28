@@ -809,9 +809,19 @@ export function parseSummaryBudgetConfig(env: Record<string, string | undefined>
     }
     return value;
   };
-  const config = {
+  const optionalInteger = (key: string): number | undefined => {
+    const raw = env[key];
+    if (raw === undefined) return undefined;
+    const value = Number(raw);
+    if (!raw.trim() || !Number.isSafeInteger(value) || value <= 0) {
+      throw new Error(`invalid_summary_budget: ${key} must be a positive finite integer`);
+    }
+    return value;
+  };
+  const outputTokens = optionalInteger("AGENTMEMORY_SUMMARY_OUTPUT_TOKENS");
+  const config: SummaryBudgetConfig = {
     contextTokens: integer("AGENTMEMORY_SUMMARY_CONTEXT_TOKENS", 131072),
-    outputTokens: integer("AGENTMEMORY_SUMMARY_OUTPUT_TOKENS", 8192),
+    ...(outputTokens === undefined ? {} : { outputTokens }),
     safetyMarginTokens: integer("AGENTMEMORY_SUMMARY_SAFETY_MARGIN_TOKENS", 4096),
     maxCallInputBytes: integer("AGENTMEMORY_SUMMARY_MAX_CALL_INPUT_BYTES", 7500),
     chunkSize: integer("SUMMARIZE_CHUNK_SIZE", 400),
@@ -820,8 +830,8 @@ export function parseSummaryBudgetConfig(env: Record<string, string | undefined>
   if (config.concurrency > 32) {
     throw new Error("invalid_summary_budget: SUMMARIZE_CHUNK_CONCURRENCY must be at most 32");
   }
-  if (config.contextTokens - config.outputTokens - config.safetyMarginTokens <= 0) {
-    throw new Error("invalid_summary_budget: context must exceed output plus safety margin");
+  if (config.contextTokens - config.safetyMarginTokens <= 0) {
+    throw new Error("invalid_summary_budget: context must exceed safety margin");
   }
   summaryCallInputLimit(config);
   return config;

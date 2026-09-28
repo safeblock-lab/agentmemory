@@ -4,7 +4,7 @@ import { logger } from "../src/logger.js";
 import { parseSummaryBudgetConfig } from "../src/config.js";
 import { createSummaryProducer } from "../src/functions/summary-producer.js";
 import {
-  estimateSummaryTokens, summaryInputLimit, summaryChunkInputLimit,
+  estimateSummaryTokens, summaryOutputTokenBudget, summaryInputLimit, summaryChunkInputLimit,
   summaryReduceInputLimit, MAX_SUMMARY_CALLS, MAX_SUMMARY_DEPTH,
 } from "../src/functions/summary-budget.js";
 import { SUMMARY_SYSTEM, buildSummaryItemsPrompt, formatSummaryObservation } from "../src/prompts/summary.js";
@@ -58,11 +58,37 @@ describe("bounded summary producer", () => {
     expect(JSON.stringify(vi.mocked(logger.warn).mock.calls)).not.toContain("secret-token");
     expect(JSON.stringify(vi.mocked(logger.warn).mock.calls)).not.toContain("response text");
   });
-  it("sends the summary output budget on every call", async () => {
+  it("calculates the output ceiling from each prompt when there is no administrator cap", async () => {
     const mock = provider(() => xml());
-    await produce(mock.selected, parseSummaryBudgetConfig({}))([observation(1)]);
+    const config = parseSummaryBudgetConfig({});
+    await produce(mock.selected, config)([observation(1)]);
     expect(mock.calls).toHaveLength(1);
-    expect(mock.calls[0].options).toEqual({ task: "summary", outputTokens: 8192 });
+    const call = mock.calls[0];
+    expect(call.options).toEqual({
+      task: "summary",
+      outputTokens: summaryOutputTokenBudget(config, call.system, call.prompt),
+    });
+    expect(call.options?.outputTokens).toBeGreaterThan(768);
+    expect(call.options?.outputTokens).toBeLessThan(8192);
+  });
+  it("gives larger map prompts a larger ceiling and calculates reducer ceilings per call", async () => {
+    const config = parseSummaryBudgetConfig({ AGENTMEMORY_SUMMARY_MAX_CALL_INPUT_BYTES: "5000" });
+    const smallMock = provider(() => xml());
+    const largeMock = provider((system, prompt) => system.includes("merging") ? xml("merged") : xml());
+    await produce(smallMock.selected, config)([observation(1)]);
+    await produce(largeMock.selected, config)([observation(1, "source detail ".repeat(450))]);
+
+    const smallMap = smallMock.calls[0];
+    const largeMap = largeMock.calls.find(call => !call.system.includes("merging"));
+    const reducers = largeMock.calls.filter(call => call.system.includes("merging"));
+    expect(largeMap).toBeDefined();
+    expect(reducers.length).toBeGreaterThan(0);
+    expect(largeMap?.options?.outputTokens).toBeGreaterThan(smallMap.options?.outputTokens ?? 0);
+    for (const call of largeMock.calls) {
+      expect(call.options?.outputTokens).toBe(summaryOutputTokenBudget(config, call.system, call.prompt));
+      expect(estimateSummaryTokens(call.system, call.prompt) + (call.options?.outputTokens ?? 0) + config.safetyMarginTokens)
+        .toBeLessThanOrEqual(config.contextTokens);
+    }
   });
   it("bounds single, map and reduce calls independently of a large context window", async () => {
     const cap = 3000;
@@ -86,8 +112,11 @@ describe("bounded summary producer", () => {
       .map(match => Number(match[1]));
     expect(sourceIndices.length).toBeGreaterThan(1);
     expect(sourceIndices).toEqual([...sourceIndices].sort((left, right) => left - right));
-    for (const call of mock.calls) expect(estimateSummaryTokens(call.system, call.prompt)).toBeLessThanOrEqual(cap);
-    expect(config.contextTokens - config.outputTokens - config.safetyMarginTokens).toBeGreaterThan(cap);
+    for (const call of mock.calls) {
+      expect(estimateSummaryTokens(call.system, call.prompt)).toBeLessThanOrEqual(cap);
+      expect(call.options?.outputTokens).toBe(summaryOutputTokenBudget(config, call.system, call.prompt));
+    }
+    expect(config.contextTokens - config.safetyMarginTokens).toBeGreaterThan(cap);
   });
   it("keeps a small session in one request and balances a formerly single large request", async () => {
     const smallMock = provider(() => xml());

@@ -9,26 +9,27 @@ overrides. File settings are cached until the worker restarts.
 
 ```dotenv
 AGENTMEMORY_SUMMARY_CONTEXT_TOKENS=131072
-AGENTMEMORY_SUMMARY_OUTPUT_TOKENS=8192
 AGENTMEMORY_SUMMARY_SAFETY_MARGIN_TOKENS=4096
 AGENTMEMORY_SUMMARY_MAX_CALL_INPUT_BYTES=7500
 SUMMARIZE_CHUNK_SIZE=400
 SUMMARIZE_CHUNK_CONCURRENCY=12
 ```
 
-The default reserves 8192 output tokens and 4096 margin tokens, leaving **118784
-estimated input tokens before fixed system, prompt formatting and envelope
-overhead**. Every request includes those costs in its fit check. Choose a context
-window supported by every primary, auxiliary and fallback model reachable by the
-summary route. Smaller windows can be configured independently of output size.
+Each map and reduce call calculates its output ceiling from that complete prompt:
+the ceiling is the minimum of the conservative input estimate, the remaining
+configured context after the safety margin, and `AGENTMEMORY_SUMMARY_OUTPUT_TOKENS`
+when an administrator explicitly sets it. There is no default fixed output cap;
+the 7500-byte per-call input ceiling still bounds ordinary request size.
+Every fit check reserves the same per-call ceiling that is sent to the provider.
+Choose a context window supported by every primary, auxiliary and fallback model
+reachable by the summary route.
 The separate 7500-byte ceiling applies to the complete system and user prompt
 of every map and reduce call, including a single-call summary. It keeps the
-estimated input below the router's 8000-byte Groq cutoff without shrinking the
-global context or output reserves. Increase it only when every routed provider
+estimated input below the router's 8000-byte Groq cutoff. Increase it only when every routed provider
 accepts the resulting request size.
 
-All settings must be positive finite safe integers. Concurrency cannot exceed
-32. Invalid reserves, or a context or per-call ceiling too small for the fixed
+Configured settings must be positive finite safe integers. Concurrency cannot exceed
+32. Invalid context reserves, or a context or per-call ceiling too small for the fixed
 prompts and 500 estimated bytes of content,
 fail before a summary is persisted. `SUMMARIZE_CHUNK_SIZE` remains an optional
 additional observation cap (default 400); it is no longer a token estimate.
@@ -65,7 +66,8 @@ internal attempts are additional to the selected-provider call limit. These
 limits bound work, not elapsed completion time or the iii invocation deadline.
 
 Explicit context or token-limit errors trigger bounded subdivision with a
-smaller input budget while retaining the configured output reserve. Ambiguous
+smaller input budget; each retry recalculates its output ceiling from the new
+prompt. Ambiguous
 errors such as `invalid_content: empty or too large` do not prove a size failure
 and retain the existing retry-once behavior. Unusable map chunks can still be
 skipped; more than half failing aborts the summary. Intermediate reduce failures,
@@ -73,13 +75,16 @@ budget exhaustion and lack of progress abort without persisting a final summary.
 
 ## Output reserve and providers
 
-Summary requests send the configured output cap as an explicit per-call option.
-The task router preserves it through auxiliary selection and primary fallback.
+Summary requests send the calculated output ceiling as an explicit per-call
+option. `AGENTMEMORY_SUMMARY_OUTPUT_TOKENS`, when set, is an administrator ceiling
+and has no default. The task router preserves the per-call value through auxiliary
+selection and primary fallback.
 OpenAI-compatible (including Fireworks, DeepSeek and Azure), OpenRouter/Gemini
-compatibility, Anthropic, MiniMax and native Ollama requests receive the cap in
-their request bodies. Existing resilience, account-pool and fallback-chain
-wrappers forward it. The default 8192 overrides the old summary task cap of 768
-and constructor cap of 4096 **only for session summary calls**. `MAX_TOKENS`,
+compatibility, Anthropic, MiniMax and native Ollama requests receive the ceiling
+in their request bodies. Existing resilience, account-pool and fallback-chain
+wrappers forward it. The calculated ceiling can exceed the old summary task cap
+of 768 and constructor cap of 4096 **only for session summary calls**.
+`MAX_TOKENS`,
 `AGENTMEMORY_AUX_LLM_MAX_TOKENS`, other tasks, Fireworks Batch and TypeSafe keep
 their existing behavior.
 

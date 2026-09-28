@@ -7,7 +7,8 @@ import {
 import { logger } from "../logger.js";
 import {
   SummaryBudgetError, MAX_SUMMARY_CALLS, MAX_SUMMARY_DEPTH, summaryCallInputLimit,
-  summaryChunkInputLimit, summaryReduceInputLimit, estimateSummaryTokens, packSummaryItems, summaryProgressSize,
+  summaryChunkInputLimit, summaryReduceInputLimit, estimateSummaryTokens, summaryOutputTokenBudget,
+  packSummaryItems, summaryProgressSize,
   isExplicitSummarySizeError, smallerSummaryLimit,
 } from "./summary-budget.js";
 import { parseSummaryXml } from "./summary-xml.js";
@@ -77,10 +78,15 @@ export function createSummaryProducer(
   let calls = 0;
   let firstProviderFailureLogged = false;
   const call = async (system: string, prompt: string): Promise<string> => {
-    if (estimateSummaryTokens(system, prompt) > inputLimit) throw new SummaryBudgetError("summary_prompt_exceeds_budget");
+    const inputTokens = estimateSummaryTokens(system, prompt);
+    if (inputTokens > inputLimit) throw new SummaryBudgetError("summary_prompt_exceeds_budget");
+    const outputTokens = summaryOutputTokenBudget(config, system, prompt);
+    if (inputTokens + outputTokens + config.safetyMarginTokens > config.contextTokens) {
+      throw new SummaryBudgetError("summary_prompt_exceeds_budget");
+    }
     const operation = (selected: MemoryProvider): Promise<string> => {
       if (++calls > MAX_SUMMARY_CALLS) throw new SummaryBudgetError("summary_call_limit_exceeded");
-      return selected.summarize(system, prompt, { task: "summary", outputTokens: config.outputTokens });
+      return selected.summarize(system, prompt, { task: "summary", outputTokens });
     };
     try {
       return await (llmRouter
