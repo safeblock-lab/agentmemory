@@ -543,7 +543,7 @@ agentmemory connect claude-code
 agentmemory doctor
 ```
 
-For an update, download the installer from the matching newer GitHub Release and run it again with that release tag.
+For a running native Windows global npm installation, set a random `AGENTMEMORY_UPDATE_SECRET` of at least 32 characters in `~/.agentmemory/.env` and restart AgentMemory. Then open the local viewer's **Health** tab and select **Check for update**. Enter the secret in the masked dialog; after it shows the current and latest stable GitHub Release versions, confirm **Install and restart**. The updater verifies the release checksum, preserves the instance's data directory and port, and reports progress while the service restarts. Other installation types show why the button is unavailable. See the [fork usage guide](docs/fork-local-usage.md#update-from-the-local-viewer) for recovery steps and the manual installer alternative.
 
 ### Validate a fresh install and restart persistence
 

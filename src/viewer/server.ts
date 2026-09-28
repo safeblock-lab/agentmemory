@@ -5,10 +5,18 @@ import {
   type ServerResponse,
 } from "node:http";
 import { readFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { renderViewerDocument } from "./document.js";
 import { timingSafeCompare } from "../auth.js";
+import { configuredUpdateSecret, UPDATE_SECRET_REQUIRED } from "../update/auth.js";
+import {
+  getUpdateSupport,
+  checkForUpdate,
+  startReleaseUpdate,
+  readUpdateStatus,
+} from "../update/lifecycle.js";
 
 // Self-host the viewer favicon at /favicon.svg instead of an inline
 // data: URI so the viewer CSP can stay tight at `img-src 'self'`.
@@ -156,6 +164,32 @@ function json(
   res.end(body);
 }
 
+function updateJson(res: ServerResponse, status: number, data: unknown): void {
+  res.writeHead(status, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+    "Cross-Origin-Resource-Policy": "same-origin",
+  });
+  res.end(JSON.stringify(data));
+}
+
+function isUpdateOriginAllowed(
+  origin: string | undefined,
+  hostHeader: string | undefined,
+  actualPort: number,
+): boolean {
+  if (!origin || !hostHeader) return false;
+  try {
+    const host = new URL(`http://${hostHeader}`);
+    return host.port === String(actualPort) &&
+      isLoopbackHost(host.hostname.replace(/^\[|\]$/g, "")) &&
+      host.host.toLowerCase() === hostHeader.toLowerCase() &&
+      origin === host.origin;
+  } catch {
+    return false;
+  }
+}
+
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -232,6 +266,8 @@ export function startViewerServer(
   // or the EADDRINUSE retry loop below may bump us to a different port,
   // so we read the actual bound port from server.address() on first hit.
   let allowedHosts: Set<string> | null = null;
+  let updateToken = randomBytes(32).toString("hex");
+  let updateStarting = false;
 
   const server = createServer(async (req, res) => {
     if (!allowedHosts) {
@@ -253,6 +289,108 @@ export function startViewerServer(
     const pathname = qIdx >= 0 ? raw.slice(0, qIdx) : raw;
     const qs = qIdx >= 0 ? raw.slice(qIdx + 1) : "";
     const method = req.method || "GET";
+
+    if (pathname === "/update/support" || pathname === "/update/status" || pathname === "/update/check" || pathname === "/update/start") {
+      if (!isLoopbackHost(host)) {
+        updateJson(res, 403, { error: "Updates are available only on a local viewer." });
+        return;
+      }
+      const addr = server.address();
+      const actualPort = addr && typeof addr === "object" ? addr.port : -1;
+      const requestHost = typeof req.headers.host === "string" ? req.headers.host : undefined;
+      if (!isUpdateOriginAllowed(`http://${requestHost}`, requestHost, actualPort) ||
+          (req.headers.origin !== undefined && !isUpdateOriginAllowed(req.headers.origin, requestHost, actualPort)) ||
+          (req.headers["sec-fetch-site"] && req.headers["sec-fetch-site"] !== "same-origin")) {
+        updateJson(res, 403, { error: "Updates require the local viewer origin." });
+        return;
+      }
+      if (qs) {
+        updateJson(res, 400, { error: "Update requests do not accept query parameters." });
+        return;
+      }
+      const secret = configuredUpdateSecret();
+      if (!secret) {
+        updateJson(res, 409, { error: UPDATE_SECRET_REQUIRED });
+        return;
+      }
+      const submittedSecret = req.headers["x-agentmemory-update-secret"];
+      if (typeof submittedSecret !== "string" || !timingSafeCompare(submittedSecret, secret)) {
+        updateJson(res, 401, { error: "Update secret is missing or incorrect." });
+        return;
+      }
+      if (pathname === "/update/support" && method === "GET") {
+        updateJson(res, 200, { support: getUpdateSupport() });
+        return;
+      }
+      if (pathname === "/update/status" && method === "GET") {
+        try {
+          const support = getUpdateSupport();
+          updateJson(res, 200, {
+            support,
+            status: readUpdateStatus(),
+            ...(support.supported ? { csrfToken: updateToken } : {}),
+          });
+        } catch {
+          updateJson(res, 500, { error: "Unable to read update status." });
+        }
+        return;
+      }
+      if (pathname === "/update/check" && method === "GET") {
+        const support = getUpdateSupport();
+        if (!support.supported) {
+          updateJson(res, 409, { error: support.reason });
+          return;
+        }
+        try {
+          updateJson(res, 200, await checkForUpdate());
+        } catch {
+          updateJson(res, 502, { error: "Unable to check for updates." });
+        }
+        return;
+      }
+      if (pathname === "/update/start" && method === "POST") {
+        if (!isUpdateOriginAllowed(req.headers.origin, requestHost, actualPort)) {
+          updateJson(res, 403, { error: "Update start requires the local viewer origin." });
+          return;
+        }
+        if ((req.headers["content-length"] && req.headers["content-length"] !== "0") || req.headers["transfer-encoding"]) {
+          updateJson(res, 400, { error: "Update start does not accept a request body." });
+          return;
+        }
+        const submittedToken = req.headers["x-agentmemory-update-token"];
+        if (typeof submittedToken !== "string" || !timingSafeCompare(submittedToken, updateToken)) {
+          updateJson(res, 403, { error: "Invalid update token." });
+          return;
+        }
+        const support = getUpdateSupport();
+        if (!support.supported) {
+          updateJson(res, 409, { error: support.reason });
+          return;
+        }
+        if (updateStarting) {
+          updateJson(res, 409, { error: "An update is already starting." });
+          return;
+        }
+        updateToken = randomBytes(32).toString("hex");
+        updateStarting = true;
+        try {
+          updateJson(res, 202, await startReleaseUpdate());
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "";
+          if (message === "An AgentMemory update is already in progress." ||
+              message === "AgentMemory is already up to date.") {
+            updateJson(res, 409, { error: message });
+          } else {
+            updateJson(res, 500, { error: "Unable to start the update." });
+          }
+        } finally {
+          updateStarting = false;
+        }
+        return;
+      }
+      updateJson(res, 405, { error: "Method not allowed." });
+      return;
+    }
 
     if (method === "OPTIONS") {
       res.writeHead(204, {

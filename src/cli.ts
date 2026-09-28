@@ -333,9 +333,11 @@ if (Number.isFinite(restPort) && restPort > 0) {
 
 const dataDirResolution = resolveDataDir({ args });
 process.env["AGENTMEMORY_DATA_DIR"] = dataDirResolution.dataDir;
-process.env["AGENTMEMORY_RUNTIME_DIR"] = selectedInstance > 0
-  ? dataDirResolution.dataDir
-  : join(homedir(), ".agentmemory");
+if (process.env["AGENTMEMORY_UPDATE_RESTART"] !== "1" || !process.env["AGENTMEMORY_RUNTIME_DIR"]) {
+  process.env["AGENTMEMORY_RUNTIME_DIR"] = selectedInstance > 0
+    ? dataDirResolution.dataDir
+    : join(homedir(), ".agentmemory");
+}
 
 const skipEngine = args.includes("--no-engine");
 

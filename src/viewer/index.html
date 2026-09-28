@@ -310,6 +310,10 @@
     .health-dot.healthy { background: var(--green); }
     .health-dot.degraded { background: var(--yellow); }
     .health-dot.critical { background: var(--accent); }
+    .update-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
+    .update-note { color: var(--ink-muted); font-size: 12px; line-height: 1.5; margin: 8px 0 0; overflow-wrap: anywhere; }
+    .update-note.error { color: var(--accent); }
+    .btn:disabled, .btn:disabled:hover { cursor: not-allowed; opacity: 0.55; box-shadow: none; transform: none; }
 
     .badge {
       display: inline-block;
@@ -930,6 +934,10 @@
       justify-content: flex-end;
       gap: 8px;
     }
+    .update-secret-dialog { color: var(--ink); margin: auto; }
+    .update-secret-dialog::backdrop { background: rgba(0,0,0,0.45); }
+    .update-secret-dialog label { display: block; font-size: 12px; font-weight: 700; margin-bottom: 6px; }
+    .update-secret-dialog input { box-sizing: border-box; width: 100%; margin-bottom: 16px; padding: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--ink); }
     .selected-node-info {
       margin-top: 16px;
       padding-top: 16px;
@@ -1182,7 +1190,7 @@
       actions: { loaded: false, items: [], frontier: [], statusFilter: '', search: '' },
       crystals: { loaded: false, items: [], search: '', lessonMap: {} },
       profile: { loaded: false, projects: [], selectedProject: '', data: null },
-      health: { report: null, error: null },
+      health: { report: null, error: null, update: { support: null, status: null, csrfToken: '', check: null, checking: false, starting: false, error: '', reconnecting: false, pollTimer: null, pollMisses: 0 } },
       replay: { loaded: false, sessions: [], selectedId: '', timeline: null, cursor: 0, playing: false, speed: 1, timer: null, startAt: 0, offsetAt: 0 },
       flagsConfig: null,
       flagsDismissed: {},
@@ -3790,9 +3798,257 @@
 
     var HEALTH_LEVEL_BADGES = { ok: 'badge-green', info: 'badge-blue', warn: 'badge-yellow', error: 'badge-red' };
 
+    var UPDATE_ACTIVE_PHASES = { downloading: true, stopping: true, installing: true, starting: true };
+    var UPDATE_PHASE_LABELS = {
+      idle: 'Ready to check for a release', downloading: 'Downloading verified release',
+      stopping: 'Stopping AgentMemory', installing: 'Installing release',
+      starting: 'Starting AgentMemory', complete: 'Update complete', failed: 'Update failed'
+    };
+    var updateControls = (function() {
+    var updateSecret = '';
+
+    async function updateRequest(path, options) {
+      var response;
+      try {
+        var settings = Object.assign({ cache: 'no-store', credentials: 'same-origin', mode: 'same-origin' }, options || {});
+        if (updateSecret) {
+          settings.headers = Object.assign({}, settings.headers || {}, { 'X-AgentMemory-Update-Secret': updateSecret });
+        }
+        response = await fetch('/update/' + path, settings);
+      } catch (error) {
+        var offline = new Error('Cannot reach the local viewer.');
+        offline.status = 0;
+        throw offline;
+      }
+      var body = await response.json().catch(function() { return null; });
+      if (!response.ok) {
+        var failed = new Error(body && typeof body.error === 'string' ? body.error : 'Update request failed (' + response.status + ').');
+        failed.status = response.status;
+        throw failed;
+      }
+      if (!body || typeof body !== 'object') throw new Error('The update response was invalid.');
+      return body;
+    }
+
+    function updateError(error) {
+      return error && error.message ? error.message : 'The update request failed.';
+    }
+
+    function requestUpdateSecret() {
+      return new Promise(function(resolve) {
+        var dialog = document.createElement('dialog');
+        dialog.className = 'modal update-secret-dialog';
+        dialog.setAttribute('aria-labelledby', 'update-secret-title');
+        dialog.innerHTML = '<form><h3 id="update-secret-title">Authorize release update</h3>' +
+          '<p>Enter the update secret configured in ~/.agentmemory/.env.</p>' +
+          '<label for="update-secret-input">Update secret</label>' +
+          '<input id="update-secret-input" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" required>' +
+          '<div class="modal-actions"><button type="button" class="btn" data-update-cancel>Cancel</button>' +
+          '<button type="submit" class="btn btn-primary">Continue</button></div></form>';
+        document.body.appendChild(dialog);
+        var input = dialog.querySelector('#update-secret-input');
+        function finish(value) {
+          input.value = '';
+          dialog.close();
+          dialog.remove();
+          resolve(value);
+        }
+        dialog.querySelector('form').addEventListener('submit', function(event) {
+          event.preventDefault();
+          finish(input.value);
+        });
+        dialog.querySelector('[data-update-cancel]').addEventListener('click', function() { finish(null); });
+        dialog.addEventListener('cancel', function(event) { event.preventDefault(); finish(null); });
+        dialog.showModal();
+        input.focus();
+      });
+    }
+
+    async function askUpdateSecret() {
+      if (updateSecret) return true;
+      var entered = await requestUpdateSecret();
+      if (entered === null) return false;
+      if (!entered) {
+        state.health.update.error = 'The update secret is required.';
+        renderHealth();
+        return false;
+      }
+      updateSecret = entered;
+      return true;
+    }
+
+    function scheduleUpdatePoll() {
+      var u = state.health.update;
+      if (u.pollTimer) return;
+      u.pollTimer = setTimeout(async function() {
+        u.pollTimer = null;
+        try {
+          var data = await updateRequest('status');
+          u.support = data.support;
+          u.status = data.status;
+          u.csrfToken = data.csrfToken || '';
+          u.reconnecting = false;
+          u.pollMisses = 0;
+          u.error = '';
+          if (u.status && UPDATE_ACTIVE_PHASES[u.status.phase]) scheduleUpdatePoll();
+          else updateSecret = '';
+        } catch (error) {
+          if (error.status === 401 || error.status === 409) {
+            updateSecret = '';
+            u.csrfToken = '';
+            u.reconnecting = false;
+            u.error = updateError(error);
+          } else {
+            u.reconnecting = true;
+            u.pollMisses++;
+            if (u.pollMisses < 1200) scheduleUpdatePoll();
+            else u.error = 'AgentMemory did not reconnect. Check the service, then retry the status check.';
+          }
+        }
+        renderHealth();
+      }, 2000);
+    }
+
+    async function loadUpdateStatus(promptForSecret) {
+      var u = state.health.update;
+      if (promptForSecret && !await askUpdateSecret()) return;
+      if (!updateSecret) return;
+      try {
+        var data = await updateRequest('status');
+        u.support = data.support;
+        u.status = data.status;
+        u.csrfToken = data.csrfToken || '';
+        u.reconnecting = false;
+        u.pollMisses = 0;
+        u.error = '';
+        if (u.status && UPDATE_ACTIVE_PHASES[u.status.phase]) scheduleUpdatePoll();
+      } catch (error) {
+        if (error.status === 401 || error.status === 409) {
+          updateSecret = '';
+          u.csrfToken = '';
+        }
+        u.error = updateError(error);
+      }
+      renderHealth();
+    }
+
+    function focusUpdateAction(action) {
+      var button = document.querySelector('#view-health [data-action="' + action + '"]');
+      if (button) button.focus();
+    }
+
+    async function checkReleaseUpdate() {
+      var u = state.health.update;
+      if (u.checking || u.starting || (u.support && !u.support.supported) || (u.status && UPDATE_ACTIVE_PHASES[u.status.phase])) return;
+      if (!await askUpdateSecret()) return;
+      u.checking = true;
+      u.check = null;
+      u.error = '';
+      renderHealth();
+      try {
+        u.check = await updateRequest('check');
+        u.support = { supported: true };
+      } catch (error) {
+        if (error.status === 401 || error.status === 409) updateSecret = '';
+        u.error = updateError(error);
+      } finally {
+        u.checking = false;
+        renderHealth();
+        if (u.check && u.check.available) focusUpdateAction('confirm-update');
+        else focusUpdateAction('check-update');
+      }
+    }
+
+    async function startReleaseUpdateFromViewer() {
+      var u = state.health.update;
+      if (u.starting || u.checking || !u.check || !u.check.available || !u.support || !u.support.supported) return;
+      if (!await askUpdateSecret()) return;
+      u.starting = true;
+      u.error = '';
+      renderHealth();
+      var postAttempted = false;
+      try {
+        var fresh = await updateRequest('status');
+        u.support = fresh.support;
+        u.status = fresh.status;
+        u.csrfToken = fresh.csrfToken || '';
+        if (!u.support || !u.support.supported) throw new Error((u.support && u.support.reason) || 'Updates are unavailable.');
+        if (u.status && UPDATE_ACTIVE_PHASES[u.status.phase]) throw new Error('An update is already in progress.');
+        postAttempted = true;
+        var result = await updateRequest('start', {
+          method: 'POST',
+          headers: { 'X-AgentMemory-Update-Token': u.csrfToken }
+        });
+        u.status = result;
+        u.check = null;
+        if (UPDATE_ACTIVE_PHASES[result.phase]) scheduleUpdatePoll();
+      } catch (error) {
+        if (error.status === 401) {
+          updateSecret = '';
+          u.csrfToken = '';
+          u.error = updateError(error);
+        } else if (postAttempted && error.status === 0) {
+          u.check = null;
+          u.reconnecting = true;
+          scheduleUpdatePoll();
+        } else {
+          u.check = null;
+          if (error.status === 403 || error.status === 409) await loadUpdateStatus();
+          u.error = error.status === 403 ? 'Update authorization expired. Check for a release again.' : updateError(error);
+        }
+      } finally {
+        u.starting = false;
+        renderHealth();
+      }
+    }
+
+    function renderUpdateCard() {
+      var u = state.health.update;
+      var s = u.status || { phase: 'idle' };
+      var busy = !!UPDATE_ACTIVE_PHASES[s.phase] || u.starting || u.reconnecting;
+      var current = (s.phase === 'complete' && s.targetVersion) || s.currentVersion ||
+        (state.health.report && state.health.report.service && state.health.report.service.version) || 'unknown';
+      var html = '<section class="card" aria-labelledby="update-title" aria-busy="' +
+        (u.checking || u.starting ? 'true' : 'false') + '"><div class="card-title" id="update-title">Release update</div>';
+      html += '<div role="status" aria-live="polite" aria-atomic="true">';
+      html += '<p class="update-note">Current version: v' + esc(current) +
+        (s.targetVersion && s.phase !== 'complete' ? ' · Target: v' + esc(s.targetVersion) : '') + '</p>';
+      html += '<p class="update-note">' + esc(u.reconnecting ? 'Reconnecting to AgentMemory…' : UPDATE_PHASE_LABELS[s.phase] || 'Checking update status') + '</p>';
+      if (s.message) html += '<p class="update-note">' + esc(s.message) + '</p>';
+      if (s.errorCode) html += '<p class="update-note error">Error code: ' + esc(s.errorCode) + '</p>';
+      if (u.error) html += '<p class="update-note error">' + esc(u.error) + '</p>';
+      if (!u.support && !u.status) html += '<p class="update-note">Enter the update secret to check releases or view update status.</p>';
+      html += '</div>';
+      if (u.support && !u.support.supported) {
+        html += '<p class="update-note">' + esc(u.support.reason || 'Updates are unavailable for this installation.') + '</p>';
+        html += '<div class="update-actions"><button class="btn" disabled title="' + esc(u.support.reason || 'Updates unavailable') + '">Check for update</button></div>';
+      } else if (u.check && u.check.available && !busy) {
+        html += '<p class="update-note">Release v' + esc(u.check.version) + ' is available (currently v' + esc(u.check.currentVersion) + '). Installing it will briefly restart AgentMemory.</p>';
+        html += '<div class="update-actions"><button class="btn btn-primary" data-action="confirm-update">Install and restart</button><button class="btn" data-action="cancel-update">Cancel</button></div>';
+      } else if (u.check && !u.check.available && !busy) {
+        html += '<p class="update-note">Already up to date.</p><div class="update-actions"><button class="btn" data-action="check-update">Check again</button></div>';
+      } else {
+        html += '<div class="update-actions"><button class="btn btn-primary" data-action="check-update"' +
+          (busy || u.checking ? ' disabled' : '') + '>' + (u.checking ? 'Checking release…' : 'Check for update') + '</button>';
+        if (!busy) html += '<button class="btn" data-action="refresh-update-status">View update status</button>';
+        else if (u.error || u.reconnecting) html += '<button class="btn" data-action="refresh-update-status">Retry status</button>';
+        html += '</div>';
+      }
+      return html + '</section>';
+    }
+    return { checkReleaseUpdate: checkReleaseUpdate, startReleaseUpdateFromViewer: startReleaseUpdateFromViewer,
+      scheduleUpdatePoll: scheduleUpdatePoll, renderUpdateCard: renderUpdateCard, loadUpdateStatus: loadUpdateStatus };
+    })();
+    var checkReleaseUpdate = updateControls.checkReleaseUpdate;
+    var startReleaseUpdateFromViewer = updateControls.startReleaseUpdateFromViewer;
+    var scheduleUpdatePoll = updateControls.scheduleUpdatePoll;
+    var renderUpdateCard = updateControls.renderUpdateCard;
+    var loadUpdateStatus = updateControls.loadUpdateStatus;
+
     async function loadHealth() {
       var el = document.getElementById('view-health');
       if (!state.health.report) el.innerHTML = '<div class="loading">Checking agentmemory...</div>';
+      var updateStatusPromise = loadUpdateStatus();
       var report = await api('status', { headers: { Accept: 'application/json' } });
       if (report && report.problems) {
         state.health.report = report;
@@ -3801,6 +4057,7 @@
         state.health.error = 'The status check did not answer. The server may be restarting.';
       }
       renderHealth();
+      await updateStatusPromise;
     }
 
     function healthRow(label, value) {
@@ -3825,7 +4082,7 @@
           esc(state.health.error) + (r ? ' Showing the last result.' : '') + '</div>';
       }
       if (!r) {
-        el.innerHTML = html + '<div style="text-align:center;"><button class="btn btn-primary" data-action="refresh-health">Retry</button></div>';
+        el.innerHTML = html + renderUpdateCard() + '<div style="text-align:center;"><button class="btn btn-primary" data-action="refresh-health">Retry</button></div>';
         return;
       }
       html += '<div class="card" style="margin-bottom:16px;"><div class="card-title">Status <span class="badge ' + (HEALTH_LEVEL_BADGES[r.status] || 'badge-muted') + '">' + esc(r.status) + '</span>' +
@@ -3868,6 +4125,8 @@
           healthRow('Graph snapshot age', r.graph.fromSnapshot ? formatSeconds(r.graph.ageSeconds) : 'no snapshot');
       }
       html += '</div></div>';
+
+      html += renderUpdateCard();
 
       var fns = (r.functions || []).slice().sort(function(a, b) { return b.totalCalls - a.totalCalls; });
       html += '<div class="card" style="margin-top:16px;"><div class="card-title">Functions</div>';
@@ -4523,6 +4782,24 @@
       }
       if (action === 'refresh-health') {
         loadHealth();
+        return;
+      }
+      if (action === 'check-update') {
+        checkReleaseUpdate();
+        return;
+      }
+      if (action === 'confirm-update') {
+        startReleaseUpdateFromViewer();
+        return;
+      }
+      if (action === 'cancel-update') {
+        state.health.update.check = null;
+        renderHealth();
+        focusUpdateAction('check-update');
+        return;
+      }
+      if (action === 'refresh-update-status') {
+        loadUpdateStatus(true);
         return;
       }
       if (action === 'zoom-graph') {
