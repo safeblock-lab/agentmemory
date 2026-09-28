@@ -25,7 +25,7 @@ function provider(run: (system: string, prompt: string, index: number) => Promis
   };
   return { selected, calls };
 }
-const small: SummaryBudgetConfig = { contextTokens: 4096, outputTokens: 512, safetyMarginTokens: 256, chunkSize: 400, concurrency: 2 };
+const small: SummaryBudgetConfig = { contextTokens: 4096, outputTokens: 512, safetyMarginTokens: 256, maxCallInputBytes: 3328, chunkSize: 400, concurrency: 2 };
 const produce = (selected: MemoryProvider, config = small) => createSummaryProducer(selected, undefined, config, "session", "project");
 
 describe("bounded summary producer", () => {
@@ -35,6 +35,31 @@ describe("bounded summary producer", () => {
     expect(mock.calls).toHaveLength(1);
     expect(mock.calls[0].options).toEqual({ task: "summary", outputTokens: 8192 });
   });
+  it("bounds single, map and reduce calls independently of a large context window", async () => {
+    const cap = 3000;
+    const config = parseSummaryBudgetConfig({ AGENTMEMORY_SUMMARY_MAX_CALL_INPUT_BYTES: String(cap) });
+    const mock = provider((system, prompt) => system.includes("merging")
+      ? xml("merged")
+      : xml(`partial-${prompt.match(/\[(\d+)\] conversation/)?.[1] ?? "fragment"} ${"x".repeat(900)}`));
+    await produce(mock.selected, config)([observation(1)]);
+    expect(mock.calls).toHaveLength(1);
+    expect(estimateSummaryTokens(mock.calls[0].system, mock.calls[0].prompt)).toBeLessThanOrEqual(cap);
+
+    mock.calls.length = 0;
+    const result = await produce(mock.selected, config)(Array.from({ length: 20 }, (_, index) => observation(index, "x".repeat(1000))));
+    expect(result.mode).toBe("chunked");
+    expect(mock.calls.filter(call => !call.system.includes("merging")).length).toBeGreaterThan(1);
+    const reduction = mock.calls.filter(call => call.system.includes("merging"));
+    const firstRound = reduction.filter(call => call.prompt.includes("partial-"));
+    expect(firstRound.length).toBeGreaterThan(1);
+    expect(reduction.some(call => !call.prompt.includes("partial-") && call.prompt.includes("merged"))).toBe(true);
+    const sourceIndices = [...firstRound.map(call => call.prompt).join("\n").matchAll(/partial-(\d+)/g)]
+      .map(match => Number(match[1]));
+    expect(sourceIndices.length).toBeGreaterThan(1);
+    expect(sourceIndices).toEqual([...sourceIndices].sort((left, right) => left - right));
+    for (const call of mock.calls) expect(estimateSummaryTokens(call.system, call.prompt)).toBeLessThanOrEqual(cap);
+    expect(config.contextTokens - config.outputTokens - config.safetyMarginTokens).toBeGreaterThan(cap);
+  });
   it("keeps a small session in one request and balances a formerly single large request", async () => {
     const smallMock = provider(() => xml());
     const smallResult = await produce(smallMock.selected)([observation(1)]);
@@ -42,7 +67,7 @@ describe("bounded summary producer", () => {
     expect(smallMock.calls.filter(call => !call.system.includes("merging"))).toHaveLength(1);
 
     const medium: SummaryBudgetConfig = {
-      contextTokens: 8192, outputTokens: 1024, safetyMarginTokens: 512, chunkSize: 400, concurrency: 2,
+      contextTokens: 8192, outputTokens: 1024, safetyMarginTokens: 512, maxCallInputBytes: 6656, chunkSize: 400, concurrency: 2,
     };
     const source = observation(0, "x".repeat(3000));
     const oneItem = {
@@ -64,7 +89,7 @@ describe("bounded summary producer", () => {
   });
   it("runs independent reduce chunks concurrently and preserves their source order", async () => {
     const config: SummaryBudgetConfig = {
-      contextTokens: 20_000, outputTokens: 6000, safetyMarginTokens: 2000, chunkSize: 1, concurrency: 2,
+      contextTokens: 20_000, outputTokens: 6000, safetyMarginTokens: 2000, maxCallInputBytes: 12000, chunkSize: 1, concurrency: 2,
     };
     let reduceInFlight = 0;
     let maxReduceInFlight = 0;

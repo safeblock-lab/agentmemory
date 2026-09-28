@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import pc from "picocolors";
+import { summaryCallInputLimit } from "./functions/summary-budget.js";
 import type {
   AgentMemoryConfig,
   ProviderConfig,
@@ -798,6 +799,7 @@ export function parseSummaryBudgetConfig(env: Record<string, string | undefined>
     contextTokens: integer("AGENTMEMORY_SUMMARY_CONTEXT_TOKENS", 131072),
     outputTokens: integer("AGENTMEMORY_SUMMARY_OUTPUT_TOKENS", 8192),
     safetyMarginTokens: integer("AGENTMEMORY_SUMMARY_SAFETY_MARGIN_TOKENS", 4096),
+    maxCallInputBytes: integer("AGENTMEMORY_SUMMARY_MAX_CALL_INPUT_BYTES", 7500),
     chunkSize: integer("SUMMARIZE_CHUNK_SIZE", 400),
     concurrency: integer("SUMMARIZE_CHUNK_CONCURRENCY", 12),
   };
@@ -807,6 +809,7 @@ export function parseSummaryBudgetConfig(env: Record<string, string | undefined>
   if (config.contextTokens - config.outputTokens - config.safetyMarginTokens <= 0) {
     throw new Error("invalid_summary_budget: context must exceed output plus safety margin");
   }
+  summaryCallInputLimit(config);
   return config;
 }
 

@@ -6,7 +6,7 @@ import {
 } from "../prompts/summary.js";
 import { logger } from "../logger.js";
 import {
-  SummaryBudgetError, MAX_SUMMARY_CALLS, MAX_SUMMARY_DEPTH, summaryInputLimit,
+  SummaryBudgetError, MAX_SUMMARY_CALLS, MAX_SUMMARY_DEPTH, summaryCallInputLimit,
   summaryChunkInputLimit, summaryReduceInputLimit, estimateSummaryTokens, packSummaryItems, summaryProgressSize,
   isExplicitSummarySizeError, smallerSummaryLimit,
 } from "./summary-budget.js";
@@ -23,7 +23,7 @@ export function createSummaryProducer(
   provider: MemoryProvider, llmRouter: LlmTaskRouter | undefined,
   config: SummaryBudgetConfig, sessionId: string, project: string,
 ): (observations: CompressedObservation[]) => Promise<ProducedSummary> {
-  const inputLimit = summaryInputLimit(config);
+  const inputLimit = summaryCallInputLimit(config);
   const chunkInputLimit = summaryChunkInputLimit(config);
   const concurrency = Math.max(1, config.concurrency);
   let calls = 0;

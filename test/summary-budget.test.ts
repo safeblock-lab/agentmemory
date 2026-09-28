@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import { getSummaryBudgetConfig, parseSummaryBudgetConfig } from "../src/config.js";
 import {
-  estimateSummaryTokens, packSummaryItems, summaryInputLimit, summaryChunkInputLimit,
+  estimateSummaryTokens, packSummaryItems, summaryInputLimit, summaryCallInputLimit, summaryChunkInputLimit,
   summaryReduceInputLimit, isExplicitSummarySizeError, MAX_SUMMARY_ITEMS,
   MIN_SUMMARY_CHUNK_CONTENT_TOKENS, MIN_SUMMARY_REDUCE_CONTENT_TOKENS,
 } from "../src/functions/summary-budget.js";
@@ -16,11 +16,12 @@ const item = (text: string, index = 1): SummaryPromptItem => ({ text, obsRangeSt
 describe("summary budget configuration", () => {
   it("reserves the correct model output and safety margin", () => {
     const config = parseSummaryBudgetConfig({});
-    expect(config).toEqual({ contextTokens: 131072, outputTokens: 8192, safetyMarginTokens: 4096, chunkSize: 400, concurrency: 12 });
+    expect(config).toEqual({ contextTokens: 131072, outputTokens: 8192, safetyMarginTokens: 4096, maxCallInputBytes: 7500, chunkSize: 400, concurrency: 12 });
     expect(summaryInputLimit(config)).toBe(118784);
-    expect(summaryChunkInputLimit(config)).toBeLessThan(summaryInputLimit(config));
+    expect(summaryCallInputLimit(config)).toBe(7500);
+    expect(summaryChunkInputLimit(config)).toBe(7500);
     expect(summaryChunkInputLimit(config)).toBeGreaterThanOrEqual(500);
-    expect(summaryReduceInputLimit(config)).toBeGreaterThan(summaryChunkInputLimit(config));
+    expect(summaryReduceInputLimit(config)).toBe(7500);
     expect(summaryReduceInputLimit(config)).toBeLessThan(summaryInputLimit(config));
   });
   it.each(["", "0", "-1", "Infinity", "NaN", "1.5", "4096junk", "9007199254740992"])("rejects invalid integers: %j", raw => {
@@ -37,6 +38,13 @@ describe("summary budget configuration", () => {
     expect(() => parseSummaryBudgetConfig({ AGENTMEMORY_SUMMARY_CONTEXT_TOKENS: "12288" })).toThrow("context must exceed");
     expect(() => summaryInputLimit({ ...parseSummaryBudgetConfig({}), contextTokens: 13000 })).toThrow("fixed prompts");
     expect(() => parseSummaryBudgetConfig({ SUMMARIZE_CHUNK_CONCURRENCY: "33" })).toThrow("at most 32");
+    expect(() => parseSummaryBudgetConfig({ AGENTMEMORY_SUMMARY_MAX_CALL_INPUT_BYTES: "0" })).toThrow("positive finite integer");
+    const fixed = Math.max(
+      estimateSummaryTokens(SUMMARY_SYSTEM, buildSummaryItemsPrompt([{ ...item(""), fragment: true }])),
+      estimateSummaryTokens(REDUCE_SYSTEM, buildReduceItemsPrompt([{ ...item(""), fragment: true }])),
+    );
+    expect(() => parseSummaryBudgetConfig({ AGENTMEMORY_SUMMARY_MAX_CALL_INPUT_BYTES: String(fixed + 499) })).toThrow("500 bytes of content");
+    expect(summaryCallInputLimit(parseSummaryBudgetConfig({ AGENTMEMORY_SUMMARY_MAX_CALL_INPUT_BYTES: String(fixed + 500) }))).toBe(fixed + 500);
   });
 });
 

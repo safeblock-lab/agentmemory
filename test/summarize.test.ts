@@ -30,6 +30,7 @@ vi.mock("../src/functions/audit.js", () => ({
 }));
 
 import { registerSummarizeFunction } from "../src/functions/summarize.js";
+import { estimateSummaryTokens } from "../src/functions/summary-budget.js";
 import type {
   CompressedObservation,
   Session,
@@ -244,7 +245,7 @@ describe("mem::summarize chunking", () => {
     expect(stored?.title).toBe("Small session");
   });
 
-  it("large session map-reduces: N chunk calls + 1 reduce call", async () => {
+  it("large session map-reduces within the per-call ceiling", async () => {
     process.env.SUMMARIZE_CHUNK_SIZE = "100";
     process.env.SUMMARIZE_CHUNK_CONCURRENCY = "1"; // serial keeps call ordering deterministic
     const provider = makeProvider([
@@ -269,8 +270,9 @@ describe("mem::summarize chunking", () => {
 
     expect(result.success).toBe(true);
     const chunks = mapCalls(provider.calls);
-    expect(chunks).toHaveLength(4);
+    expect(chunks.length).toBeGreaterThanOrEqual(4);
     expect(provider.calls).toHaveLength(chunks.length + 1);
+    expect(provider.calls.every(call => estimateSummaryTokens(call.system, call.user) <= 7500)).toBe(true);
     expect(provider.calls[3].system).toContain("session summarizer");
     const reduceCall = provider.calls.at(-1)!;
     expect(reduceCall.system).toContain("merging multiple partial summaries");

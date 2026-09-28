@@ -32,23 +32,36 @@ export function summaryInputLimit(config: SummaryBudgetConfig): number {
   return limit;
 }
 
+export function summaryCallInputLimit(config: SummaryBudgetConfig): number {
+  const limit = Math.min(summaryInputLimit(config), config.maxCallInputBytes);
+  const emptyFragment: SummaryPromptItem = { text: "", obsRangeStart: 1, obsRangeEnd: 1, fragment: true };
+  const fixedPromptBytes = Math.max(
+    estimateSummaryTokens(SUMMARY_SYSTEM, buildSummaryItemsPrompt([emptyFragment])),
+    estimateSummaryTokens(REDUCE_SYSTEM, buildReduceItemsPrompt([emptyFragment])),
+  );
+  if (limit < fixedPromptBytes + MIN_SUMMARY_CHUNK_CONTENT_TOKENS) {
+    throw new SummaryBudgetError("invalid_summary_budget: per-call input cannot fit fixed prompts and 500 bytes of content");
+  }
+  return limit;
+}
+
 export function summaryChunkInputLimit(config: SummaryBudgetConfig): number {
-  const limit = summaryInputLimit(config);
+  const limit = summaryCallInputLimit(config);
   const emptyItem: SummaryPromptItem = { text: "", obsRangeStart: 1, obsRangeEnd: 1, fragment: true };
   const fixedPromptTokens = Math.max(
     estimateSummaryTokens(SUMMARY_SYSTEM, buildSummaryItemsPrompt([emptyItem])),
     estimateSummaryTokens(REDUCE_SYSTEM, buildReduceItemsPrompt([emptyItem])),
   );
-  const concurrencyTarget = Math.ceil(limit / Math.max(1, config.concurrency));
+  const concurrencyTarget = Math.ceil(summaryInputLimit(config) / Math.max(1, config.concurrency));
   const minimumContentTarget = fixedPromptTokens + MIN_SUMMARY_CHUNK_CONTENT_TOKENS;
   return Math.min(limit, Math.max(concurrencyTarget, minimumContentTarget));
 }
 
 export function summaryReduceInputLimit(config: SummaryBudgetConfig): number {
-  const limit = summaryInputLimit(config);
+  const limit = summaryCallInputLimit(config);
   const emptyFragment: SummaryPromptItem = { text: "", obsRangeStart: 1, obsRangeEnd: 1, fragment: true };
   const fixedPromptTokens = estimateSummaryTokens(REDUCE_SYSTEM, buildReduceItemsPrompt([emptyFragment]));
-  const parallelTarget = Math.ceil(limit / Math.min(4, Math.max(1, config.concurrency)));
+  const parallelTarget = Math.ceil(summaryInputLimit(config) / Math.min(4, Math.max(1, config.concurrency)));
   const minimumContentTarget = fixedPromptTokens + MIN_SUMMARY_REDUCE_CONTENT_TOKENS;
   return Math.min(limit, Math.max(parallelTarget, minimumContentTarget));
 }

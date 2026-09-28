@@ -11,6 +11,7 @@ overrides. File settings are cached until the worker restarts.
 AGENTMEMORY_SUMMARY_CONTEXT_TOKENS=131072
 AGENTMEMORY_SUMMARY_OUTPUT_TOKENS=8192
 AGENTMEMORY_SUMMARY_SAFETY_MARGIN_TOKENS=4096
+AGENTMEMORY_SUMMARY_MAX_CALL_INPUT_BYTES=7500
 SUMMARIZE_CHUNK_SIZE=400
 SUMMARIZE_CHUNK_CONCURRENCY=12
 ```
@@ -20,9 +21,15 @@ estimated input tokens before fixed system, prompt formatting and envelope
 overhead**. Every request includes those costs in its fit check. Choose a context
 window supported by every primary, auxiliary and fallback model reachable by the
 summary route. Smaller windows can be configured independently of output size.
+The separate 7500-byte ceiling applies to the complete system and user prompt
+of every map and reduce call, including a single-call summary. It keeps the
+estimated input below the router's 8000-byte Groq cutoff without shrinking the
+global context or output reserves. Increase it only when every routed provider
+accepts the resulting request size.
 
 All settings must be positive finite safe integers. Concurrency cannot exceed
-32. Invalid reserves, or a context too small for the fixed prompts and a fragment,
+32. Invalid reserves, or a context or per-call ceiling too small for the fixed
+prompts and 500 estimated bytes of content,
 fail before a summary is persisted. `SUMMARIZE_CHUNK_SIZE` remains an optional
 additional observation cap (default 400); it is no longer a token estimate.
 
