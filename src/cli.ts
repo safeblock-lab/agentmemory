@@ -476,6 +476,8 @@ async function isAgentmemoryReady(): Promise<boolean> {
   }
 }
 
+const WORKER_READINESS_TIMEOUT_MS = 15 * 60 * 1000;
+
 function findIiiConfig(): string {
   // Precedence (user-overridable wins): explicit env > project cwd >
   // ~/.agentmemory/ > bundled. The bundled config used to win
@@ -1737,8 +1739,8 @@ async function reconcilePersistedDockerEngine(): Promise<boolean> {
     process.exit(1);
   }
   await startWorkerForEngineState();
-  if (!(await waitForAgentmemoryReady(15000))) {
-    p.log.error("agentmemory worker did not become ready within 15s.");
+  if (!(await waitForAgentmemoryReady(WORKER_READINESS_TIMEOUT_MS))) {
+    p.log.error("agentmemory worker did not become ready within 15 minutes.");
     process.exit(1);
   }
   await maybeOfferGlobalInstall();
@@ -1896,7 +1898,7 @@ async function main() {
   if (skipEngine) {
     if (IS_VERBOSE) p.log.info("Skipping engine check (--no-engine)");
     await import("./index.js");
-    if (await waitForAgentmemoryReady(15000)) {
+    if (await waitForAgentmemoryReady(WORKER_READINESS_TIMEOUT_MS)) {
       await maybeOfferGlobalInstall();
       printReadyHint();
     }
@@ -1932,8 +1934,8 @@ async function main() {
     if (detected === IIPINNED_VERSION) {
       adoptRunningEngine();
       await startWorkerForEngineState();
-      if (!(await waitForAgentmemoryReady(15000))) {
-        p.log.error("agentmemory worker did not become ready within 15s.");
+      if (!(await waitForAgentmemoryReady(WORKER_READINESS_TIMEOUT_MS))) {
+        p.log.error("agentmemory worker did not become ready within 15 minutes.");
         process.exit(1);
       }
       await maybeOfferGlobalInstall();
@@ -2043,8 +2045,8 @@ async function main() {
 
   s.stop(c.ok("iii-engine is ready"));
   await startWorkerForEngineState();
-  if (!(await waitForAgentmemoryReady(15000))) {
-    p.log.error("agentmemory worker did not become ready within 15s.");
+  if (!(await waitForAgentmemoryReady(WORKER_READINESS_TIMEOUT_MS))) {
+    p.log.error("agentmemory worker did not become ready within 15 minutes.");
     process.exit(1);
   }
   await maybeOfferGlobalInstall();
@@ -2883,8 +2885,8 @@ async function startServerForDemo(): Promise<() => Promise<void>> {
   }
 
   await startWorkerForEngineState();
-  if (!(await waitForAgentmemoryReady(15000))) {
-    p.log.error("agentmemory worker did not become ready within 15s.");
+  if (!(await waitForAgentmemoryReady(WORKER_READINESS_TIMEOUT_MS))) {
+    p.log.error("agentmemory worker did not become ready within 15 minutes.");
     process.exit(1);
   }
 
