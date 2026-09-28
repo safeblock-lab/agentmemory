@@ -98,10 +98,40 @@ describe("CircuitBreaker", () => {
     );
   });
 
-  it("success in closed state is a no-op", () => {
+  it("success in closed state clears previous failures", () => {
     const cb = new CircuitBreaker();
+    cb.recordFailure();
+    cb.recordFailure();
     cb.recordSuccess();
     expect(cb.getState().state).toBe("closed");
     expect(cb.getState().failures).toBe(0);
+    expect(cb.getState().lastFailureAt).toBeNull();
+    cb.recordFailure();
+    cb.recordFailure();
+    expect(cb.isAllowed).toBe(true);
+    cb.recordFailure();
+    expect(cb.isAllowed).toBe(false);
+  });
+
+  it("does not let in-flight completions change an open circuit or delay recovery", () => {
+    const cb = new CircuitBreaker();
+    cb.recordFailure();
+    cb.recordFailure();
+    cb.recordFailure();
+    const openedAt = cb.getState().openedAt;
+    const lastFailureAt = cb.getState().lastFailureAt;
+    vi.advanceTimersByTime(10_000);
+    cb.recordSuccess();
+    cb.recordFailure();
+    expect(cb.getState()).toMatchObject({
+      state: "open", openedAt, lastFailureAt, failures: 3,
+    });
+    vi.advanceTimersByTime(20_000);
+    expect(cb.isAllowed).toBe(true);
+    expect(cb.getState().state).toBe("half-open");
+    cb.recordSuccess();
+    expect(cb.getState()).toMatchObject({
+      state: "closed", failures: 0, lastFailureAt: null, openedAt: null,
+    });
   });
 });
