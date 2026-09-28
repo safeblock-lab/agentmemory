@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.70] — 2026-09-29
+
+### Added
+
+- Session summaries now run as durable queued work with up to 12 concurrent fragments. Pending work is recovered after restart; retryable failures receive up to five retries with a 15-minute backoff, and failed job records are retained for at least 30 days before cleanup. Completed summaries remain stored with their sessions.
+
 ## [0.9.68] — 2026-09-28
 
 ### Fixed

@@ -40,7 +40,19 @@ describe("renderEngineConfig", () => {
     expect(rendered).toContain(
       `file_path: '${join(dataDir, "stream_store")}'`,
     );
+    expect(rendered).toContain(
+      `file_path: '${join(dataDir, "queue_store")}'`,
+    );
     expect(rendered).not.toContain("./data/");
+  });
+
+  it("keeps the Docker queue store under the mounted data directory", () => {
+    const source = readFileSync(
+      join(import.meta.dirname, "..", "iii-config.docker.yaml"),
+      "utf8",
+    );
+
+    expect(source).toContain("file_path: /data/queue_store");
   });
 
   it("moves the complete native port quartet from one REST override", () => {

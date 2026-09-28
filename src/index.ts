@@ -52,6 +52,7 @@ import {
 } from "./functions/search.js";
 import { registerContextFunction } from "./functions/context.js";
 import { registerSummarizeFunction } from "./functions/summarize.js";
+import { registerSummaryQueueFunctions } from "./functions/summary-queue.js";
 import { registerMigrateFunction } from "./functions/migrate.js";
 import { registerFileIndexFunction } from "./functions/file-index.js";
 import { registerConsolidateFunction } from "./functions/consolidate.js";
@@ -545,6 +546,7 @@ async function main() {
   registerSearchFunction(sdk, kv);
   registerContextFunction(sdk, kv, config.tokenBudget);
   registerSummarizeFunction(sdk, kv, provider, metricsStore, taskRouter);
+  registerSummaryQueueFunctions(sdk, kv, provider, taskRouter);
   registerMigrateFunction(sdk, kv);
   registerFileIndexFunction(sdk, kv);
   registerConsolidateFunction(sdk, kv, provider);
@@ -847,6 +849,29 @@ async function main() {
 
   const autoForgetIntervalMs = parseInt(process.env.AUTO_FORGET_INTERVAL_MS || "3600000", 10);
   const consolidationIntervalMs = parseInt(process.env.CONSOLIDATION_INTERVAL_MS || "7200000", 10);
+
+  let summaryRecoveryRunning = false;
+  const recoverSummaryQueue = async () => {
+    if (summaryRecoveryRunning) return;
+    summaryRecoveryRunning = true;
+    try {
+      const result: unknown = await sdk.trigger({
+        function_id: "mem::summary-recover",
+        payload: {},
+      });
+      if (typeof result !== "object" || result === null ||
+          !("success" in result) || result.success !== true) {
+        console.warn("[agentmemory] Summary queue recovery reported failure");
+      }
+    } catch {
+      console.warn("[agentmemory] Summary queue recovery trigger failed");
+    } finally {
+      summaryRecoveryRunning = false;
+    }
+  };
+  void recoverSummaryQueue();
+  const summaryRecoveryTimer = setInterval(() => void recoverSummaryQueue(), 60 * 60 * 1000);
+  summaryRecoveryTimer.unref();
 
   if (process.env.AUTO_FORGET_ENABLED !== "false") {
     const autoForgetTimer = setInterval(async () => {

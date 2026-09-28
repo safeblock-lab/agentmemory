@@ -1,4 +1,4 @@
-import { TriggerAction, type IIIClient } from "iii-sdk";
+import type { IIIClient } from "iii-sdk";
 import type { HttpRequest } from "@iii-dev/helpers/http";
 import { randomBytes } from "node:crypto";
 import type { Session, CompressedObservation, HookPayload, CommitLink, SessionSummary } from "../types.js";
@@ -774,22 +774,44 @@ export function registerApiTriggers(
           body: { error: "sessionId is required and must be a non-empty string" },
         };
       }
+      const endedAt = new Date().toISOString();
+      try {
+        await kv.set(KV.summaryQueueIntents, sessionId, {
+          sessionId,
+          createdAt: endedAt,
+        });
+      } catch {
+        logger.warn("session end summary intent write failed", {
+          sessionId,
+          reason: "state_write_rejected",
+        });
+        return { status_code: 503, body: { success: false, error: "summary_enqueue_failed" } };
+      }
       await kv.update(KV.sessions, sessionId, [
-        { type: "set", path: "endedAt", value: new Date().toISOString() },
+        { type: "set", path: "endedAt", value: endedAt },
         { type: "set", path: "status", value: "completed" },
       ]);
-      // Fan out session-stopped lifecycle (non-blocking).
+      // The lifecycle returns once the summary job is durably accepted; the
+      // queued LLM work runs independently of this HTTP request.
       try {
-        sdk.trigger({
+        const result: unknown = await sdk.trigger({
           function_id: "event::session::stopped",
           payload: { sessionId },
-          action: TriggerAction.Void(),
         });
-      } catch (err) {
+        if (typeof result !== "object" || result === null ||
+            !("success" in result) || result.success !== true) {
+          logger.warn("event::session::stopped did not acknowledge summary enqueue", {
+            sessionId,
+            reason: "reported_failure",
+          });
+          return { status_code: 503, body: { success: false, error: "summary_enqueue_failed" } };
+        }
+      } catch {
         logger.warn("event::session::stopped trigger failed", {
           sessionId,
-          error: err instanceof Error ? err.message : String(err),
+          reason: "trigger_rejected",
         });
+        return { status_code: 503, body: { success: false, error: "summary_enqueue_failed" } };
       }
       return { status_code: 200, body: { success: true } };
     },

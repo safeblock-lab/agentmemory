@@ -101,20 +101,22 @@ export function registerEventTriggers(sdk: IIIClient, kv: StateKV): void {
       let summary: unknown;
       try {
         summary = await sdk.trigger({
-          function_id: "mem::summarize",
-          payload: data,
+          function_id: "mem::summary-enqueue",
+          payload: { sessionId: data.sessionId },
         });
-        if (isFailureResult(summary)) {
-          logger.warn("mem::summarize returned failure", {
+        if (!isSuccessResult(summary)) {
+          logger.warn("mem::summary-enqueue returned failure", {
             sessionId: data.sessionId,
             reason: "reported_failure",
           });
+          summary = { success: false };
         }
       } catch {
-        logger.warn("mem::summarize trigger failed", {
+        logger.warn("mem::summary-enqueue trigger failed", {
           sessionId: data.sessionId,
           reason: "trigger_rejected",
         });
+        summary = { success: false };
       }
       const fireVoid = (function_id: string, payload: unknown) =>
         sdk
@@ -287,6 +289,15 @@ function isFailureResult(result: unknown): boolean {
     result !== null &&
     "success" in result &&
     result.success === false
+  );
+}
+
+function isSuccessResult(result: unknown): boolean {
+  return (
+    typeof result === "object" &&
+    result !== null &&
+    "success" in result &&
+    result.success === true
   );
 }
 

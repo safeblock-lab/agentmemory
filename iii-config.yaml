@@ -18,6 +18,9 @@ workers:
     config:
       adapter:
         name: builtin
+        config:
+          store_method: file_based
+          file_path: ./data/queue_store
   - name: iii-pubsub
     config:
       adapter:

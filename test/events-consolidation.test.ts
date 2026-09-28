@@ -27,7 +27,7 @@ import { isReflectEnabled } from "../src/functions/slots.js";
 import { logger } from "../src/logger.js";
 
 // event::session::stopped is the single source of truth for consolidation.
-// It fans out mem::summarize (awaited) plus fire-and-forget void triggers for
+// It awaits durable summary enqueue plus fire-and-forget void triggers for
 // slot-reflect / consolidate-pipeline / auto-crystallize, each gated by config.
 // The client session-end hook no longer POSTs crystals/auto or
 // consolidate-pipeline, so these no longer double-fire for Claude Code.
@@ -47,18 +47,18 @@ type StoppedHandler = (data: {
   skipConsolidation?: boolean;
 }) => Promise<unknown>;
 
-// Builds a spy-backed sdk. `trigger` resolves for mem::summarize with a fake
-// summary; void triggers resolve unless `rejectFor` matches the function_id,
+// Builds a spy-backed sdk. `trigger` resolves for mem::summary-enqueue with an
+// acknowledgment; void triggers resolve unless `rejectFor` matches the function_id,
 // in which case they reject (to exercise fireVoid's .catch()).
-function mockSdk(opts?: { rejectFor?: string; summaryResult?: unknown }) {
+function mockSdk(opts?: { rejectFor?: string; enqueueResult?: unknown }) {
   const handlers = new Map<string, StoppedHandler>();
   const trigger = vi.fn(
     async (input: { function_id: string; payload?: unknown; action?: unknown }) => {
       if (opts?.rejectFor && input.function_id === opts.rejectFor) {
         throw new Error(`sensitive provider detail: ${input.function_id}`);
       }
-      if (input.function_id === "mem::summarize") {
-        return opts?.summaryResult ?? { summary: "session summary", sessionId: "ses_1" };
+      if (input.function_id === "mem::summary-enqueue") {
+        return opts?.enqueueResult ?? { success: true, queued: true, jobId: "job_1" };
       }
       return { ok: true };
     },
@@ -95,7 +95,7 @@ describe("event::session::stopped consolidation fan-out", () => {
     await stopped({ sessionId: "ses_1" });
 
     const ids = functionIds(trigger);
-    expect(ids).toContain("mem::summarize");
+    expect(ids).toContain("mem::summary-enqueue");
     expect(ids).toContain("mem::consolidate-pipeline");
     expect(ids).toContain("mem::auto-crystallize");
 
@@ -115,7 +115,7 @@ describe("event::session::stopped consolidation fan-out", () => {
     });
   });
 
-  it("skips consolidate-pipeline and auto-crystallize when consolidation disabled but still summarizes", async () => {
+  it("skips consolidate-pipeline and auto-crystallize when consolidation disabled but still enqueues", async () => {
     vi.mocked(isConsolidationEnabled).mockReturnValue(false);
     const { sdk, handlers, trigger } = mockSdk();
     registerEventTriggers(sdk as never, mockKV() as never);
@@ -124,7 +124,7 @@ describe("event::session::stopped consolidation fan-out", () => {
     await stopped({ sessionId: "ses_1" });
 
     const ids = functionIds(trigger);
-    expect(ids).toContain("mem::summarize");
+    expect(ids).toContain("mem::summary-enqueue");
     expect(ids).not.toContain("mem::consolidate-pipeline");
     expect(ids).not.toContain("mem::auto-crystallize");
   });
@@ -143,7 +143,7 @@ describe("event::session::stopped consolidation fan-out", () => {
 
     const ids = functionIds(trigger);
     // Per-session work still happens...
-    expect(ids).toContain("mem::summarize");
+    expect(ids).toContain("mem::summary-enqueue");
     // ...but the corpus-wide fan-out is deferred to evict's single pass.
     expect(ids).not.toContain("mem::consolidate-pipeline");
     expect(ids).not.toContain("mem::auto-crystallize");
@@ -189,7 +189,7 @@ describe("event::session::stopped consolidation fan-out", () => {
     expect(functionIds(on.trigger)).toContain("mem::slot-reflect");
   });
 
-  it("does not throw and still returns the summary when consolidate-pipeline trigger rejects", async () => {
+  it("does not throw and still returns the enqueue acknowledgment when consolidate-pipeline rejects", async () => {
     vi.mocked(isConsolidationEnabled).mockReturnValue(true);
     const { sdk, handlers } = mockSdk({ rejectFor: "mem::consolidate-pipeline" });
     registerEventTriggers(sdk as never, mockKV() as never);
@@ -197,7 +197,7 @@ describe("event::session::stopped consolidation fan-out", () => {
     const stopped = handlers.get("event::session::stopped")!;
     const summary = await stopped({ sessionId: "ses_1" });
 
-    expect(summary).toEqual({ summary: "session summary", sessionId: "ses_1" });
+    expect(summary).toEqual({ success: true, queued: true, jobId: "job_1" });
     await Promise.resolve();
     await Promise.resolve();
     expect(logger.warn).toHaveBeenCalledWith(
@@ -206,9 +206,9 @@ describe("event::session::stopped consolidation fan-out", () => {
     );
   });
 
-  it("dispatches graph extraction after summary rejects and logs no provider detail", async () => {
+  it("dispatches graph extraction after enqueue rejects and logs no provider detail", async () => {
     const observations = [{ title: "Graph source" }];
-    const { sdk, handlers, trigger } = mockSdk({ rejectFor: "mem::summarize" });
+    const { sdk, handlers, trigger } = mockSdk({ rejectFor: "mem::summary-enqueue" });
     registerEventTriggers(sdk as never, mockKV(observations) as never);
 
     await handlers.get("event::session::stopped")!({ sessionId: "ses_1" });
@@ -216,7 +216,7 @@ describe("event::session::stopped consolidation fan-out", () => {
     await Promise.resolve();
 
     expect(functionIds(trigger).filter((id) => id === "mem::graph-extract")).toHaveLength(1);
-    expect(logger.warn).toHaveBeenCalledWith("mem::summarize trigger failed", {
+    expect(logger.warn).toHaveBeenCalledWith("mem::summary-enqueue trigger failed", {
       sessionId: "ses_1",
       reason: "trigger_rejected",
     });
@@ -225,18 +225,18 @@ describe("event::session::stopped consolidation fan-out", () => {
     );
   });
 
-  it("logs a failed summary result and still dispatches graph extraction once", async () => {
-    const summaryResult = { success: false, error: "sensitive provider detail" };
-    const { sdk, handlers, trigger } = mockSdk({ summaryResult });
+  it("logs a failed enqueue result and still dispatches graph extraction once", async () => {
+    const enqueueResult = { success: false, error: "sensitive provider detail" };
+    const { sdk, handlers, trigger } = mockSdk({ enqueueResult });
     registerEventTriggers(sdk as never, mockKV([{ title: "Graph source" }]) as never);
 
     const result = await handlers.get("event::session::stopped")!({ sessionId: "ses_1" });
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(result).toBe(summaryResult);
+    expect(result).toEqual({ success: false });
     expect(functionIds(trigger).filter((id) => id === "mem::graph-extract")).toHaveLength(1);
-    expect(logger.warn).toHaveBeenCalledWith("mem::summarize returned failure", {
+    expect(logger.warn).toHaveBeenCalledWith("mem::summary-enqueue returned failure", {
       sessionId: "ses_1",
       reason: "reported_failure",
     });
@@ -343,8 +343,8 @@ describe("session-stop consolidation debounce", () => {
     // Corpus consolidation runs ONCE, not five times.
     expect(count("mem::consolidate-pipeline")).toBe(1);
     expect(count("mem::auto-crystallize")).toBe(1);
-    // Per-turn summary capture still runs every turn (the cheap path).
-    expect(count("mem::summarize")).toBe(5);
+    // Every Stop requests a durable handoff; enqueue deduplicates snapshots.
+    expect(count("mem::summary-enqueue")).toBe(5);
   });
 
   it("consolidates once when stops arrive concurrently (serialized cooldown check)", async () => {

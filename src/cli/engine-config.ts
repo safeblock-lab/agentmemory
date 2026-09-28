@@ -189,6 +189,10 @@ export function renderEngineConfig(
     .replace(
       "file_path: ./data/stream_store",
       `file_path: ${yamlSingleQuote(join(options.dataDir, "stream_store"))}`,
+    )
+    .replace(
+      "file_path: ./data/queue_store",
+      `file_path: ${yamlSingleQuote(join(options.dataDir, "queue_store"))}`,
     );
   if (!options.ports) return rendered;
 
