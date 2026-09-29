@@ -41,11 +41,11 @@ function maxUnitRuntimeMs(): number {
     : 600_000;
 }
 
-function retryEligible(unit: SummaryQueueUnit, now: number): boolean {
+function retryEligible(unit: SummaryQueueUnit, now: number, graceMs = STALE_DELIVERY_MS): boolean {
   if (unit.attempts === 0) return true;
   if (!unit.lastAttemptAt || unit.attempts >= MAX_ATTEMPTS) return false;
   const due = Date.parse(unit.lastAttemptAt) + RETRY_BACKOFF_MS * 2 ** (unit.attempts - 1);
-  return Number.isFinite(due) && now >= due + STALE_DELIVERY_MS;
+  return Number.isFinite(due) && now >= due + graceMs;
 }
 
 interface SummaryQueueUnit {
@@ -56,6 +56,7 @@ interface SummaryQueueUnit {
   items: SummaryPromptItem[];
   attempts: number;
   dispatchedAt?: string;
+  deliveryId?: string;
   startedAt?: string;
   lastAttemptAt?: string;
   output?: SummaryPromptItem;
@@ -257,6 +258,7 @@ async function completeJob(
 export function registerSummaryQueueFunctions(
   sdk: IIIClient, kv: StateKV, provider: MemoryProvider, llmRouter?: LlmTaskRouter,
 ): void {
+  const activeUnits = new Set<string>();
   sdk.registerFunction("mem::summary-enqueue", async (data: { sessionId?: string } | undefined) => {
     if (typeof data?.sessionId !== "string" || !data.sessionId.trim()) {
       return { success: false, error: "sessionId is required" };
@@ -326,9 +328,12 @@ export function registerSummaryQueueFunctions(
       const now = Date.now();
       const selected = waiting.filter(unit => !unit.dispatchedAt && retryEligible(unit, now)).slice(0, available);
       for (const unit of selected) {
-        await kv.set(KV.summaryQueueUnits(job.id), unit.id, { ...unit, dispatchedAt: new Date().toISOString() });
+        const deliveryId = generateId("sqd");
+        await kv.set(KV.summaryQueueUnits(job.id), unit.id, {
+          ...unit, dispatchedAt: new Date().toISOString(), deliveryId,
+        });
         try {
-          await enqueue(sdk, "mem::summary-unit", { jobId: job.id, unitId: unit.id });
+          await enqueue(sdk, "mem::summary-unit", { jobId: job.id, unitId: unit.id, deliveryId });
         } catch (error) {
           await kv.set(KV.summaryQueueUnits(job.id), unit.id, unit);
           throw error;
@@ -400,7 +405,7 @@ export function registerSummaryQueueFunctions(
       return { completed: false, nextRound };
     });
 
-  sdk.registerFunction("mem::summary-unit", async (data: { jobId: string; unitId: string }) =>
+  sdk.registerFunction("mem::summary-unit", async (data: { jobId: string; unitId: string; deliveryId?: string }) =>
     withKeyedLock(`summary-unit:${data.unitId}`, async () => {
       const job = await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, data.jobId);
       if (!job || job.status !== "pending") return { success: true, skipped: true };
@@ -411,10 +416,22 @@ export function registerSummaryQueueFunctions(
         }
         return { success: true, skipped: true };
       }
+      if (unit.deliveryId && (data.deliveryId !== unit.deliveryId || !unit.dispatchedAt)) {
+        return { success: true, skipped: true };
+      }
+      if (!unit.output && !retryEligible(unit, Date.now(), 0)) {
+        return { success: true, skipped: true };
+      }
       if (!unit.output) {
-        await kv.set(KV.summaryQueueUnits(job.id), unit.id, {
-          ...unit, startedAt: new Date().toISOString(),
-        });
+        activeUnits.add(unit.id);
+        try {
+          await kv.set(KV.summaryQueueUnits(job.id), unit.id, {
+            ...unit, startedAt: new Date().toISOString(),
+          });
+        } catch (error) {
+          activeUnits.delete(unit.id);
+          throw error;
+        }
         const system = unit.stage === "map" ? SUMMARY_SYSTEM : REDUCE_SYSTEM;
         const prompt = unit.stage === "map" ? buildSummaryItemsPrompt(unit.items) : buildReduceItemsPrompt(unit.items);
         try {
@@ -473,6 +490,8 @@ export function registerSummaryQueueFunctions(
           await sdk.trigger({ function_id: "mem::summary-dispatch",
             payload: { jobId: job.id, round: job.round, offset: 0 } });
           throw error;
+        } finally {
+          activeUnits.delete(unit.id);
         }
       }
       try {
@@ -521,30 +540,30 @@ export function registerSummaryQueueFunctions(
     let replayed = 0;
     for (const candidate of await kv.list<SummaryQueueJob>(KV.summaryQueueJobs)) {
       if (candidate.status !== "pending") continue;
-      if (idle) {
-        await withKeyedLock(`summary-job:${candidate.id}`, async () => {
-          const job = await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, candidate.id);
-          if (!job || job.status !== "pending") return;
-          const now = Date.now();
-          for (const unit of await loadJobUnits(kv, job)) {
-            if (unit && !unit.output && unit.attempts > 0 && !unit.lastAttemptAt) {
-              const markedAt = new Date(now).toISOString();
-              await kv.set(KV.summaryQueueUnits(job.id), unit.id, {
-                ...unit, lastAttemptAt: markedAt, dispatchedAt: unit.dispatchedAt ?? markedAt,
-              });
-              continue;
-            }
-            if (!unit || unit.output || !unit.dispatchedAt ||
-                now - Date.parse(unit.dispatchedAt) < STALE_DELIVERY_MS ||
-                unit.startedAt && now - Date.parse(unit.startedAt) < maxUnitRuntimeMs() ||
-                !retryEligible(unit, now)) continue;
+      await withKeyedLock(`summary-job:${candidate.id}`, async () => {
+        const job = await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, candidate.id);
+        if (!job || job.status !== "pending") return;
+        const now = Date.now();
+        for (const unit of await loadJobUnits(kv, job)) {
+          if (unit && !unit.output && unit.attempts > 0 && !unit.lastAttemptAt) {
+            const markedAt = new Date(now).toISOString();
             await kv.set(KV.summaryQueueUnits(job.id), unit.id, {
-              ...unit, dispatchedAt: undefined, startedAt: undefined,
+              ...unit, lastAttemptAt: markedAt, dispatchedAt: unit.dispatchedAt ?? markedAt,
             });
-            replayed++;
+            continue;
           }
-        });
-      }
+          if (!unit || unit.output || !unit.dispatchedAt || activeUnits.has(unit.id) ||
+              (unit.attempts === 0 && !idle) ||
+              now - Date.parse(unit.dispatchedAt) < STALE_DELIVERY_MS ||
+              unit.startedAt && now - Date.parse(unit.startedAt) < maxUnitRuntimeMs() ||
+              !retryEligible(unit, now)) continue;
+          await kv.set(KV.summaryQueueUnits(job.id), unit.id, {
+            ...unit, dispatchedAt: undefined, startedAt: undefined,
+            deliveryId: unit.deliveryId ?? generateId("sqd"),
+          });
+          replayed++;
+        }
+      });
       try {
         const progress = await advance(candidate.id);
         if (progress.completed) {

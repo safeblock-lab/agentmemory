@@ -227,8 +227,18 @@ describe("durable summary queue", () => {
       return xml();
     });
     await seed(h.kv, [observation(1)]);
-    await h.invoke("mem::summary-enqueue", { sessionId: "session" });
-    await h.drain();
+    const { jobId } = await h.invoke("mem::summary-enqueue", { sessionId: "session" }) as { jobId: string };
+    const dispatch = h.messages.shift()!;
+    await h.invoke(dispatch.function_id, dispatch.payload);
+    const delivery = h.messages.shift()!;
+    await expect(h.invoke(delivery.function_id, delivery.payload)).rejects.toThrow("fetch failed");
+    expect(await h.invoke(delivery.function_id, delivery.payload)).toMatchObject({ skipped: true });
+    expect(h.calls).toBe(1);
+    const unitId = (delivery.payload as { unitId: string }).unitId;
+    const scope = KV.summaryQueueUnits(jobId);
+    const unit = await h.kv.get<{ lastAttemptAt: string }>(scope, unitId);
+    await h.kv.set(scope, unitId, { ...unit!, lastAttemptAt: "2026-01-01T00:00:00Z" });
+    await h.invoke(delivery.function_id, delivery.payload);
     expect(h.calls).toBe(2);
     expect(await h.kv.get(KV.summaries, "session")).toMatchObject({ title: "Finished" });
   });
@@ -526,6 +536,68 @@ describe("durable summary queue", () => {
     });
     expect(await h.invoke("mem::summary-reconcile")).toMatchObject({ replayed: 1 });
     await h.drain();
+    expect(await h.kv.get(KV.summaries, "session")).toMatchObject({ title: "Finished" });
+  });
+
+  it("replays an eligible failed unit while other deliveries occupy the topic", async () => {
+    const h = harness(undefined, call => {
+      if (call === 1) throw new Error("fetch failed");
+      return xml();
+    });
+    await seed(h.kv, [observation(1)]);
+    const { jobId } = await h.invoke("mem::summary-enqueue", { sessionId: "session" }) as { jobId: string };
+    const dispatch = h.messages.shift()!;
+    await h.invoke(dispatch.function_id, dispatch.payload);
+    const failedDelivery = h.messages.shift()!;
+    h.messages.push({ function_id: "mem::summary-unit", payload: { jobId: "other", unitId: "other" } as never });
+    const failedId = (failedDelivery.payload as { unitId: string }).unitId;
+    const scope = KV.summaryQueueUnits(jobId);
+    const initialUnit = await h.kv.get<{ dispatchedAt: string; deliveryId: string }>(scope, failedId);
+    await h.kv.set(scope, failedId, { ...initialUnit!, dispatchedAt: "2026-01-01T00:00:00Z" });
+    expect(await h.invoke("mem::summary-reconcile")).toMatchObject({ replayed: 0 });
+    expect(await h.kv.get(scope, failedId)).toMatchObject({ deliveryId: initialUnit!.deliveryId });
+    await h.kv.set(scope, failedId, initialUnit!);
+    await expect(h.invoke(failedDelivery.function_id, failedDelivery.payload)).rejects.toThrow("fetch failed");
+
+    const failedUnit = await h.kv.get<{ dispatchedAt: string; lastAttemptAt: string }>(scope, failedId);
+    await h.kv.set(scope, failedId, {
+      ...failedUnit!, dispatchedAt: "2026-01-01T00:00:00Z", lastAttemptAt: "2026-01-01T00:00:00Z",
+    });
+    expect(await h.invoke("mem::summary-reconcile")).toMatchObject({ replayed: 1 });
+    const replay = h.messages.find(message =>
+      (message.payload as { unitId?: string }).unitId === failedId &&
+      (message.payload as { deliveryId?: string }).deliveryId !==
+        (failedDelivery.payload as { deliveryId?: string }).deliveryId);
+    expect(replay).toBeDefined();
+    expect(await h.invoke(failedDelivery.function_id, failedDelivery.payload))
+      .toMatchObject({ skipped: true });
+    expect(h.calls).toBe(1);
+    await h.invoke(replay!.function_id, replay!.payload);
+    expect(h.calls).toBe(2);
+  });
+
+  it("does not replay an active provider call even after its persisted start looks stale", async () => {
+    let release!: (value: string) => void;
+    const providerResult = new Promise<string>(resolve => { release = resolve; });
+    const h = harness(undefined, () => providerResult);
+    await seed(h.kv, [observation(1)]);
+    const { jobId } = await h.invoke("mem::summary-enqueue", { sessionId: "session" }) as { jobId: string };
+    const dispatch = h.messages.shift()!;
+    await h.invoke(dispatch.function_id, dispatch.payload);
+    const delivery = h.messages.shift()!;
+    const inFlight = h.invoke(delivery.function_id, delivery.payload);
+    await vi.waitFor(() => expect(h.calls).toBe(1));
+    const unitId = (delivery.payload as { unitId: string }).unitId;
+    const scope = KV.summaryQueueUnits(jobId);
+    const unit = await h.kv.get<{ dispatchedAt: string; startedAt: string }>(scope, unitId);
+    await h.kv.set(scope, unitId, {
+      ...unit!, dispatchedAt: "2026-01-01T00:00:00Z", startedAt: "2026-01-01T00:00:00Z",
+    });
+    expect(await h.invoke("mem::summary-reconcile")).toMatchObject({ replayed: 0 });
+    expect(h.messages).toHaveLength(0);
+    release(xml());
+    await inFlight;
+    expect(h.calls).toBe(1);
     expect(await h.kv.get(KV.summaries, "session")).toMatchObject({ title: "Finished" });
   });
 
