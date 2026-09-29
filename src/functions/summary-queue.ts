@@ -506,7 +506,7 @@ export function registerSummaryQueueFunctions(
     },
   });
 
-  const reconcilePendingJobs = async (): Promise<{ recovered: number; replayed: number }> => {
+  const reconcilePendingJobs = async (): Promise<{ success: true; recovered: number; replayed: number }> => {
     let idle = false;
     try {
       const queue = await sdk.trigger<unknown, { depth?: number; dlq_depth?: number }>({
@@ -566,7 +566,7 @@ export function registerSummaryQueueFunctions(
       }
     }
     if (replayed > 0) logger.warn("Summary queue replayed undelivered units", { replayed });
-    return { recovered, replayed };
+    return { success: true, recovered, replayed };
   };
   sdk.registerFunction("mem::summary-reconcile", reconcilePendingJobs);
 

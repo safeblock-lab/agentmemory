@@ -493,7 +493,7 @@ describe("durable summary queue", () => {
     await h.kv.set(scope, unitId, {
       ...unit!, dispatchedAt: "2026-01-01T00:00:00Z", startedAt: new Date().toISOString(),
     });
-    expect(await h.invoke("mem::summary-reconcile")).toMatchObject({ replayed: 0 });
+    expect(await h.invoke("mem::summary-reconcile")).toMatchObject({ success: true, replayed: 0 });
     expect(h.messages).toHaveLength(0);
     await h.kv.set(scope, unitId, {
       ...unit!, dispatchedAt: "2026-01-01T00:00:00Z", startedAt: "2026-01-01T00:00:00Z",

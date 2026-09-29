@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.74] — 2026-09-29
+
+### Fixed
+
+- Periodic summary reconciliation now returns an explicit success status, preventing a false recovery-failure warning while the queue is healthy.
+
 ## [0.9.73] — 2026-09-29
 
 ### Fixed
