@@ -51,8 +51,17 @@ async function fetchOnce(
   const signal = init.signal
     ? AbortSignal.any([init.signal, ctl.signal])
     : ctl.signal;
-  const t = setTimeout(() => ctl.abort(), ms);
-  return fetch(url, { ...init, signal }).finally(() => clearTimeout(t));
+  const timer = setTimeout(() => ctl.abort(), ms);
+  timer.unref();
+  try {
+    const response = await fetch(url, { ...init, signal });
+    // The body is consumed by the caller after fetch resolves; keep its deadline active.
+    if (!response.body) clearTimeout(timer);
+    return response;
+  } catch (error) {
+    clearTimeout(timer);
+    throw error;
+  }
 }
 
 export async function fetchWithTimeout(

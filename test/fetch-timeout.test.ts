@@ -51,6 +51,21 @@ describe("fetchWithTimeout", () => {
     expect(res.status).toBe(200);
   });
 
+  it("keeps the timeout active while the response body is being read", async () => {
+    vi.restoreAllMocks();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const signal = init?.signal;
+      const body = new ReadableStream({
+        start(controller) {
+          signal?.addEventListener("abort", () => controller.error(signal.reason), { once: true });
+        },
+      });
+      return new Response(body, { status: 200 });
+    });
+    const response = await fetchWithTimeout("https://example.com", {}, 50);
+    await expect(response.text()).rejects.toThrow();
+  });
+
   it("aborts with an AbortError when fetch hangs beyond the configured timeout", async () => {
     await expect(
       fetchWithTimeout("https://example.com", {}, 50),

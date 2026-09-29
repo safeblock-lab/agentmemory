@@ -172,7 +172,7 @@ export class OpenAIProvider implements MemoryProvider {
         this.timeoutMs,
       );
     } catch (err) {
-      const aborted = err instanceof Error && err.name === "AbortError";
+      const aborted = err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError");
       telemetry.failure({ errorKind: aborted ? "timeout" : "network" });
       if (aborted) {
         throw new Error(
@@ -196,7 +196,11 @@ export class OpenAIProvider implements MemoryProvider {
     };
     try {
       data = (await response.json()) as typeof data;
-    } catch {
+    } catch (error) {
+      if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) {
+        telemetry.failure({ errorKind: "timeout" });
+        throw new Error(`OpenAI API response timed out after ${this.timeoutMs}ms`);
+      }
       telemetry.failure({ httpStatus: response.status, errorKind: "invalid_response" });
       throw new Error("OpenAI returned an invalid JSON response.");
     }
@@ -272,4 +276,3 @@ function parsePositiveInt(raw: string | null | undefined): number | undefined {
   const n = Number(trimmed);
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
-

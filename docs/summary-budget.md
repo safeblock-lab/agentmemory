@@ -108,6 +108,7 @@ bounded to 150 seconds. Failed provider calls retry every 30 seconds, up to
 six total attempts. Each replay gets a new delivery ID, so an older queued delivery
 cannot start the same unit after the replay is recorded. A unit already running
 in the current worker is protected for the same runtime window.
+The HTTP provider timeout also remains active while the response body is read.
 
 The application-level reconciliation does not alter iii-queue's transport
 records. If a completed job still appears as an active delivery after an
