@@ -4,7 +4,7 @@ import type {
 } from "../src/types.js";
 import { KV } from "../src/state/schema.js";
 import { registerSummaryQueueFunctions } from "../src/functions/summary-queue.js";
-import { summaryProgressSize } from "../src/functions/summary-budget.js";
+import { MAX_SUMMARY_DEPTH, summaryProgressSize } from "../src/functions/summary-budget.js";
 import { formatSummaryPartial, type SummaryPromptItem } from "../src/prompts/summary.js";
 
 vi.mock("../src/logger.js", () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
@@ -42,7 +42,17 @@ function observation(index: number, narrative = "source"): CompressedObservation
   };
 }
 
-const xml = (title = "Finished", narrative = "Completed the requested work and persisted the resulting summary.") => `<summary><title>${title}</title><narrative>${narrative}</narrative><decisions><decision>persist</decision></decisions><files><file>src/file.ts</file></files><concepts><concept>queue</concept></concepts></summary>`;
+function xmlWithLists(
+  title: string, narrative: string, decisions: string[], files: string[], concepts: string[],
+): string {
+  return `<summary><title>${title}</title><narrative>${narrative}</narrative>` +
+    `<decisions>${decisions.map(value => `<decision>${value}</decision>`).join("")}</decisions>` +
+    `<files>${files.map(value => `<file>${value}</file>`).join("")}</files>` +
+    `<concepts>${concepts.map(value => `<concept>${value}</concept>`).join("")}</concepts></summary>`;
+}
+
+const xml = (title = "Finished", narrative = "Completed the requested work and persisted the resulting summary.") =>
+  xmlWithLists(title, narrative, ["persist"], ["src/file.ts"], ["queue"]);
 
 function partialOutput(
   title: string, narrative: string, obsRangeStart: number,
@@ -67,7 +77,7 @@ function reduceXmlFromPrompt(prompt: string): string {
 
 async function seedReduceJob(
   kv: ReturnType<typeof store>, sourceProgressSize: number, completedOutputs: SummaryPromptItem[],
-  pendingInput?: SummaryPromptItem,
+  pendingInput?: SummaryPromptItem, round = 1,
 ): Promise<{ jobId: string; pendingUnitId: string }> {
   const jobId = "job-reduce-progress";
   const pendingUnitId = "unit-reduce-pending";
@@ -80,25 +90,28 @@ async function seedReduceJob(
   const job: SummaryQueueJob = {
     id: jobId, sessionId: "session", project: "project", snapshotFingerprint: "snapshot",
     observationCount: completedOutputs.length + 1, config, createdAt: now, updatedAt: now, status: "pending", stage: "reduce",
-    round: 1, unitIds: [...completedUnitIds, pendingUnitId], sourceProgressSize,
+    round, unitIds: [...completedUnitIds, pendingUnitId], sourceProgressSize,
   };
   await kv.set(KV.summaryQueueJobs, jobId, job);
   await kv.set(KV.summaryQueueActive, "session", { jobId });
   for (let index = 0; index < completedOutputs.length; index++) {
     const id = completedUnitIds[index];
     const output = completedOutputs[index];
+    const chunk = output.obsRangeStart;
     const completedSummary: SessionSummary = {
-      sessionId: "session", project: "project", createdAt: now, title: "Previous chunk",
-      narrative: "A previous partial summary covering an earlier chunk.",
-      keyDecisions: ["persist"], filesModified: ["src/file.ts"], concepts: ["queue"], observationCount: 2,
+      sessionId: "session", project: "project", createdAt: now, title: `Chunk ${chunk}`,
+      narrative: `Partial summary for chunk ${chunk} describing its completed work.`,
+      keyDecisions: [`decision-${chunk}`, "shared"],
+      filesModified: [`src/file-${chunk}.ts`, "src/shared.ts"],
+      concepts: [`concept-${chunk}`, "shared-concept"], observationCount: 2,
     };
     await kv.set(KV.summaryQueueUnits(jobId), id, {
-      id, jobId, stage: "reduce", round: 1, items: [output], attempts: 0,
+      id, jobId, stage: "reduce", round, items: [output], attempts: 0,
       output, summary: completedSummary,
     });
   }
   await kv.set(KV.summaryQueueUnits(jobId), pendingUnitId, {
-    id: pendingUnitId, jobId, stage: "reduce", round: 1,
+    id: pendingUnitId, jobId, stage: "reduce", round,
     items: [pendingInput ?? {
       text: "Previous partial summary", obsRangeStart: completedOutputs.length + 1,
       obsRangeEnd: completedOutputs.length + 1,
@@ -332,19 +345,117 @@ describe("durable summary queue", () => {
     expect(await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, jobId)).toMatchObject({ status: "completed" });
   });
 
-  it("fails reduction when packed unit count and aggregate text do not improve", async () => {
+  it("completes stalled reduction deterministically and preserves ordered, deduplicated lists", async () => {
     const kv = store();
-    const expandedNarrative = "preserved decision detail ".repeat(140);
-    const existingOutput = partialOutput("Expanded", expandedNarrative, 1);
-    const pendingOutput = partialOutput("Expanded", expandedNarrative.trimEnd(), 2);
-    const sourceProgressSize = summaryProgressSize([existingOutput, pendingOutput]);
-    const { jobId, pendingUnitId } = await seedReduceJob(kv, sourceProgressSize, [existingOutput]);
-    const h = harness(kv, () => xml("Expanded", expandedNarrative));
+    const firstNarrative = `The session began with initial planning. ${"preserved decision detail ".repeat(400)}`;
+    const lastNarrative = `The session ended after final verification. ${"preserved decision detail ".repeat(400)}`;
+    const firstOutput = partialOutput("First chunk", firstNarrative, 1,
+      ["decision-1", "shared"], ["src/file-1.ts", "src/shared.ts"], ["concept-1", "shared-concept"]);
+    const lastOutput = partialOutput("Last chunk", lastNarrative, 2,
+      ["decision-2", "shared"], ["src/file-2.ts", "src/shared.ts"], ["concept-2", "shared-concept"]);
+    const { jobId, pendingUnitId } = await seedReduceJob(
+      kv, summaryProgressSize([lastOutput, firstOutput]), [lastOutput], firstOutput,
+    );
+    const scope = KV.summaryQueueUnits(jobId);
+    const seeded = await kv.get<{ summary: SessionSummary }>(scope, "unit-reduce-completed-1");
+    await kv.set(scope, "unit-reduce-completed-1", {
+      ...seeded!, summary: {
+        ...seeded!.summary, title: "Last chunk", narrative: lastNarrative,
+        keyDecisions: ["decision-2", "shared"],
+        filesModified: ["src/file-2.ts", "src/shared.ts"],
+        concepts: ["concept-2", "shared-concept"],
+      },
+    });
+    const pending = await kv.get<{ items: SummaryPromptItem[] }>(scope, pendingUnitId);
+    await kv.set(scope, pendingUnitId, {
+      ...pending!, output: firstOutput,
+      summary: {
+        sessionId: "session", project: "project", createdAt: "2026-09-28T00:00:00.000Z",
+        title: "First chunk", narrative: firstNarrative,
+        keyDecisions: ["decision-1", "shared"],
+        filesModified: ["src/file-1.ts", "src/shared.ts"],
+        concepts: ["concept-1", "shared-concept"], observationCount: 1,
+      },
+    });
+    const h = harness(kv, () => { throw new Error("unexpected provider call"); });
 
-    const result = await h.invoke("mem::summary-unit", { jobId, unitId: pendingUnitId });
-    expect(result).toMatchObject({ success: false, error: "summary_reduce_no_progress", terminal: true });
+    expect(await h.invoke("mem::summary-unit", { jobId, unitId: pendingUnitId }))
+      .toMatchObject({ success: true, completed: true, method: "deterministic_fallback" });
+    expect(h.calls).toBe(0);
+    const summary = await kv.get<SessionSummary>(KV.summaries, "session");
+    expect(summary).toMatchObject({
+      observationCount: 2,
+      keyDecisions: ["decision-1", "shared", "decision-2"],
+      filesModified: ["src/file-1.ts", "src/shared.ts", "src/file-2.ts"],
+      concepts: ["concept-1", "shared-concept", "concept-2"],
+    });
+    expect(summary?.narrative).toContain("Beginning: The session began with initial planning.");
+    expect(summary?.narrative).toContain("Ending: The session ended after final verification.");
     expect(await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, jobId))
-      .toMatchObject({ status: "failed", failure: "summary_reduce_no_progress" });
+      .toMatchObject({ status: "completed", round: 1 });
+    const audit = await kv.list<{ details: Record<string, unknown> }>(KV.audit);
+    expect(audit[0]?.details).toMatchObject({ method: "deterministic_fallback", observationCount: 2 });
+    expect(audit[0]?.details).not.toHaveProperty("title");
+    expect(h.messages).toHaveLength(0);
+  });
+
+  it("uses deterministic fallback at maximum depth without another provider call or round", async () => {
+    const kv = store();
+    const first = partialOutput("Chunk 1", "The first chunk records the initial work in the session.", 1,
+      ["decision-1"], ["src/file-1.ts"], ["concept-1"]);
+    const last = partialOutput("Chunk 2", "The last chunk records the completed work in the session.", 2,
+      ["decision-2"], ["src/file-2.ts"], ["concept-2"]);
+    const { jobId, pendingUnitId } = await seedReduceJob(
+      kv, summaryProgressSize([first, last]), [first], last, MAX_SUMMARY_DEPTH,
+    );
+    const scope = KV.summaryQueueUnits(jobId);
+    const pending = await kv.get<{ items: SummaryPromptItem[] }>(scope, pendingUnitId);
+    await kv.set(scope, pendingUnitId, {
+      ...pending!, items: [last], output: last,
+      summary: {
+        sessionId: "session", project: "project", createdAt: "2026-09-28T00:00:00.000Z",
+        title: "Chunk 2", narrative: "The last chunk records the completed work in the session.",
+        keyDecisions: ["decision-2"], filesModified: ["src/file-2.ts"], concepts: ["concept-2"],
+        observationCount: 1,
+      },
+    });
+    const h = harness(kv, () => { throw new Error("unexpected provider call"); });
+
+    expect(await h.invoke("mem::summary-unit", { jobId, unitId: pendingUnitId }))
+      .toMatchObject({ success: true, completed: true, method: "deterministic_fallback" });
+    expect(h.calls).toBe(0);
+    expect(await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, jobId))
+      .toMatchObject({ status: "completed", round: MAX_SUMMARY_DEPTH });
+    expect(h.messages).toHaveLength(0);
+    expect(await kv.get<SessionSummary>(KV.summaries, "session"))
+      .toMatchObject({ keyDecisions: ["decision-1", "shared", "decision-2"] });
+  });
+
+  it("fails deterministic fallback when any partial summary fails schema validation", async () => {
+    const kv = store();
+    const first = partialOutput("Chunk 1", "The first chunk records the initial work in the session.", 1);
+    const last = partialOutput("Chunk 2", "The last chunk records the completed work in the session.", 2);
+    const { jobId, pendingUnitId } = await seedReduceJob(
+      kv, summaryProgressSize([first, last]), [first], last, MAX_SUMMARY_DEPTH,
+    );
+    const scope = KV.summaryQueueUnits(jobId);
+    const pending = await kv.get<{ items: SummaryPromptItem[] }>(scope, pendingUnitId);
+    await kv.set(scope, pendingUnitId, {
+      ...pending!, items: [last], output: last,
+      summary: {
+        sessionId: "session", project: "project", createdAt: "2026-09-28T00:00:00.000Z",
+        title: "Chunk 2", narrative: "too short", keyDecisions: ["decision-2"],
+        filesModified: ["src/file-2.ts"], concepts: ["concept-2"], observationCount: 1,
+      },
+    });
+    const h = harness(kv, () => { throw new Error("unexpected provider call"); });
+
+    expect(await h.invoke("mem::summary-unit", { jobId, unitId: pendingUnitId }))
+      .toMatchObject({ success: false, error: "summary_validation_failed", terminal: true });
+    expect(h.calls).toBe(0);
+    expect(await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, jobId))
+      .toMatchObject({ status: "failed", failure: "summary_validation_failed" });
+    expect(await kv.get(KV.summaries, "session")).toBeNull();
   });
 
   it("keeps a 12-unit window and refills it as each map unit finishes", async () => {

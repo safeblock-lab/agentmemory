@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.73] — 2026-09-29
+
+### Fixed
+
+- Large session summaries can finish from validated partial summaries when another LLM reduction cannot fit within the per-call input budget or would exceed the reduction depth. Distinct decisions, files, and concepts remain in the final summary.
+
 ## [0.9.72] — 2026-09-29
 
 ### Fixed

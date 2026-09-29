@@ -162,18 +162,82 @@ async function failJob(kv: StateKV, jobId: string, reason: string): Promise<void
   });
 }
 
-async function completeJob(kv: StateKV, job: SummaryQueueJob, summary: SessionSummary): Promise<void> {
-  const fields = {
+type SummaryMethod = "llm" | "deterministic_fallback";
+
+function summaryFields(summary: SessionSummary) {
+  return {
     title: summary.title, narrative: summary.narrative,
     keyDecisions: summary.keyDecisions, filesModified: summary.filesModified,
     concepts: summary.concepts,
   };
-  const validation = validateOutput(SummaryOutputSchema, fields, "mem::summary-unit");
-  if (!validation.valid) throw new SummaryBudgetError("summary_validation_failed");
+}
+
+function validateSummary(summary: SessionSummary): void {
+  if (!validateOutput(SummaryOutputSchema, summaryFields(summary), "mem::summary-unit").valid) {
+    throw new SummaryBudgetError("summary_validation_failed");
+  }
+}
+
+function stableSummaryValues(summaries: SessionSummary[], field: "keyDecisions" | "filesModified" | "concepts"): string[] {
+  const seen = new Set<string>();
+  const merged: string[] = [];
+  for (const summary of summaries) {
+    for (const value of summary[field]) {
+      const normalized = value.trim();
+      if (normalized && !seen.has(normalized)) {
+        seen.add(normalized);
+        merged.push(normalized);
+      }
+    }
+  }
+  return merged;
+}
+
+function compactSummaryText(value: string, limit: number): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (normalized.length <= limit) return normalized;
+  const end = normalized.lastIndexOf(" ", limit - 1);
+  return `${normalized.slice(0, end > limit / 2 ? end : limit - 1).trimEnd()}…`;
+}
+
+function deterministicSummary(job: SummaryQueueJob, units: SummaryQueueUnit[]): SessionSummary {
+  const ordered = [...units].sort((a, b) =>
+    a.output!.obsRangeStart - b.output!.obsRangeStart ||
+    a.output!.obsRangeEnd - b.output!.obsRangeEnd || a.id.localeCompare(b.id));
+  const summaries = ordered.map(unit => unit.summary!);
+  summaries.forEach(validateSummary);
+  const beginning = summaries[0];
+  const progress = summaries[Math.floor(summaries.length / 2)];
+  const ending = summaries[summaries.length - 1];
+  const title = beginning.title === ending.title
+    ? compactSummaryText(ending.title, 100)
+    : `${compactSummaryText(beginning.title, 48)} / ${compactSummaryText(ending.title, 48)}`;
+  return {
+    sessionId: job.sessionId,
+    project: job.project,
+    createdAt: new Date().toISOString(),
+    title: title || "Session summary",
+    narrative: [
+      `Beginning: ${compactSummaryText(beginning.narrative, 180)}`,
+      `Progress: ${compactSummaryText(progress.narrative, 180)}`,
+      `Ending: ${compactSummaryText(ending.narrative, 180)}`,
+    ].join(" "),
+    keyDecisions: stableSummaryValues(summaries, "keyDecisions"),
+    filesModified: stableSummaryValues(summaries, "filesModified"),
+    concepts: stableSummaryValues(summaries, "concepts"),
+    observationCount: job.observationCount,
+  };
+}
+
+async function completeJob(
+  kv: StateKV, job: SummaryQueueJob, summary: SessionSummary, method: SummaryMethod = "llm",
+): Promise<void> {
+  const fields = summaryFields(summary);
+  validateSummary(summary);
   const qualityScore = scoreSummary(fields);
   await kv.set(KV.summaries, job.sessionId, summary);
   await recordAudit(kv, "compress", "mem::summary-unit", [job.sessionId],
-    { jobId: job.id, title: summary.title, observationCount: job.observationCount, qualityScore },
+    { jobId: job.id, observationCount: job.observationCount, qualityScore, method },
     qualityScore, undefined, `${job.id}:completed`);
   const completedAt = new Date().toISOString();
   await kv.set(KV.summaryQueueCompleted, job.sessionId, {
@@ -186,7 +250,7 @@ async function completeJob(kv: StateKV, job: SummaryQueueJob, summary: SessionSu
   if (active?.jobId === job.id) await kv.delete(KV.summaryQueueActive, job.sessionId);
   await cleanupUnits(kv, job.id);
   logger.info("Session summarized from queue", {
-    sessionId: job.sessionId, observationCount: job.observationCount, qualityScore,
+    sessionId: job.sessionId, observationCount: job.observationCount, qualityScore, method,
   });
 }
 
@@ -282,7 +346,9 @@ export function registerSummaryQueueFunctions(
     config: { topic: DISPATCH_TOPIC },
   });
 
-  const advance = async (jobId: string): Promise<{ completed: boolean; nextRound?: number }> =>
+  const advance = async (jobId: string): Promise<{
+    completed: boolean; nextRound?: number; method?: SummaryMethod;
+  }> =>
     withKeyedLock(`summary-job:${jobId}`, async () => {
       const job = await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, jobId);
       if (!job || job.status !== "pending") return { completed: false };
@@ -292,17 +358,36 @@ export function registerSummaryQueueFunctions(
       if (complete.length === 1) {
         const summary = { ...complete[0].summary!, observationCount: job.observationCount };
         await completeJob(kv, job, summary);
-        return { completed: true };
+        return { completed: true, method: "llm" };
       }
       const outputs = complete.map(unit => unit.output!);
-      const groups = packSummaryItems(outputs, REDUCE_SYSTEM, buildReduceItemsPrompt,
-        summaryReduceInputLimit(job.config));
+      let groups: SummaryPromptItem[][];
+      try {
+        groups = packSummaryItems(outputs, REDUCE_SYSTEM, buildReduceItemsPrompt,
+          summaryReduceInputLimit(job.config));
+      } catch (error) {
+        const unableToFit = error instanceof SummaryBudgetError &&
+          ["summary_fragment_cannot_fit", "summary_prompt_exceeds_budget"].includes(error.message);
+        if (job.stage !== "reduce" || !unableToFit) throw error;
+        const summary = deterministicSummary(job, complete);
+        await completeJob(kv, job, summary, "deterministic_fallback");
+        return { completed: true, method: "deterministic_fallback" };
+      }
       const sizeProgress = summaryProgressSize(outputs) < job.sourceProgressSize;
       const unitProgress = groups.length < complete.length;
       if (job.stage === "reduce" && !sizeProgress && !unitProgress) {
-        throw new SummaryBudgetError("summary_reduce_no_progress");
+        const summary = deterministicSummary(job, complete);
+        await completeJob(kv, job, summary, "deterministic_fallback");
+        return { completed: true, method: "deterministic_fallback" };
       }
-      if (job.round >= MAX_SUMMARY_DEPTH) throw new SummaryBudgetError("summary_depth_limit_exceeded");
+      if (job.round >= MAX_SUMMARY_DEPTH) {
+        if (job.stage === "reduce") {
+          const summary = deterministicSummary(job, complete);
+          await completeJob(kv, job, summary, "deterministic_fallback");
+          return { completed: true, method: "deterministic_fallback" };
+        }
+        throw new SummaryBudgetError("summary_depth_limit_exceeded");
+      }
       const nextRound = job.round + 1;
       const nextUnits = createUnits(job.id, "reduce", nextRound, groups);
       await writeUnits(kv, job.id, nextUnits);
@@ -401,7 +486,7 @@ export function registerSummaryQueueFunctions(
         if (result.completed) {
           await sdk.trigger({ function_id: "mem::summary-enqueue", payload: { sessionId: job.sessionId } });
         }
-        return { success: true, completed: result.completed };
+        return { success: true, completed: result.completed, ...(result.method && { method: result.method }) };
       } catch (error) {
         if (error instanceof SummaryBudgetError) {
           await failJob(kv, job.id, error.message);
