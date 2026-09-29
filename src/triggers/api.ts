@@ -432,6 +432,13 @@ export function registerApiTriggers(
         data: body.data,
       };
       const result = await sdk.trigger({ function_id: "mem::observe", payload });
+      if (!result || typeof result !== "object") {
+        return { status_code: 500, body: { error: "Observation could not be captured" } };
+      }
+      if ("success" in result && result.success === false) {
+        const code = "code" in result ? result.code : undefined;
+        return { status_code: code === "SESSION_OBSERVATION_LIMIT" ? 409 : 500, body: result };
+      }
       return { status_code: 201, body: result };
     },
   );

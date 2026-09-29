@@ -771,7 +771,7 @@ export function loadConfig(): AgentMemoryConfig {
     fireworksBatch: fireworksBatch.config,
     llmRouting,
     tokenBudget: safeParseInt(env["TOKEN_BUDGET"], 2000),
-    maxObservationsPerSession: safeParseInt(env["MAX_OBS_PER_SESSION"], 500),
+    maxObservationsPerSession: safeParseInt(env["MAX_OBS_PER_SESSION"], 0),
     compressionModel: provider.model,
     dataDir: DATA_DIR,
   };

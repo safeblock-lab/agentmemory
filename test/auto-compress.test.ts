@@ -160,6 +160,38 @@ describe("mem::observe auto-compress gate (#138)", () => {
     const compressCalls = sdk.triggered.filter((t) => t.id === "mem::compress");
     expect(compressCalls).toHaveLength(0);
   });
+
+  it("keeps accepting observations beyond the former 500-item cap when the cap is disabled", async () => {
+    process.env["AGENTMEMORY_AUTO_COMPRESS"] = "true";
+    const { registerObserveFunction } = await import("../src/functions/observe.js");
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerObserveFunction(sdk as never, kv as never, undefined, 0);
+
+    const scope = "mem:obs:ses_test";
+    kv.store.set(scope, new Map(Array.from({ length: 500 }, (_, i) => [
+      `old_${i}`,
+      { id: `old_${i}` },
+    ])));
+    const result = await sdk.trigger("mem::observe", validPayload());
+
+    expect(result).toMatchObject({ observationId: expect.any(String) });
+    expect(kv.store.get(scope)?.size).toBe(501);
+    expect(sdk.triggered.filter((t) => t.id === "mem::compress")).toHaveLength(1);
+  });
+
+  it("returns a coded error when an explicit observation cap is reached", async () => {
+    const { registerObserveFunction } = await import("../src/functions/observe.js");
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerObserveFunction(sdk as never, kv as never, undefined, 1);
+
+    await sdk.trigger("mem::observe", validPayload());
+    const result = await sdk.trigger("mem::observe", validPayload({ timestamp: new Date(Date.now() + 1).toISOString() }));
+
+    expect(result).toMatchObject({ success: false, code: "SESSION_OBSERVATION_LIMIT" });
+    expect(kv.store.get("mem:obs:ses_test")?.size).toBe(1);
+  });
 });
 
 describe("buildSyntheticCompression", () => {

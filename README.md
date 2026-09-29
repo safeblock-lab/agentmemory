@@ -1688,6 +1688,7 @@ Create `~/.agentmemory/.env`:
 # BM25_WEIGHT=0.4
 # VECTOR_WEIGHT=0.6
 # TOKEN_BUDGET=2000
+# MAX_OBS_PER_SESSION=0  # No per-session observation cap by default; set a positive limit if needed
 
 # Auth
 # AGENTMEMORY_SECRET=your-secret

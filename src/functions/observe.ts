@@ -244,8 +244,13 @@ export function registerObserveFunction(
         if (maxObservationsPerSession && maxObservationsPerSession > 0) {
           const existing = await kv.list(KV.observations(payload.sessionId));
           if (existing.length >= maxObservationsPerSession) {
+            logger.warn("Session observation limit reached", {
+              sessionId: payload.sessionId,
+              limit: maxObservationsPerSession,
+            });
             return {
               success: false,
+              code: "SESSION_OBSERVATION_LIMIT",
               error: `Session observation limit reached (${maxObservationsPerSession})`,
             };
           }
