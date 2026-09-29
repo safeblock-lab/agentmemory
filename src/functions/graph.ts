@@ -282,6 +282,8 @@ const MAX_GRAPH_QUERY_LIMIT = 5000;
 // enumeration. Aggregate stats (nodesByType / edgesByType) are computed
 // fresh during rebuild and stored alongside.
 const SNAPSHOT_TOP_NODES = DEFAULT_GRAPH_QUERY_LIMIT;
+const SNAPSHOT_MAX_OBSERVATIONS_PER_RECORD = 64;
+const MAX_GRAPH_SNAPSHOT_BYTES = 4 * 1024 * 1024;
 const SNAPSHOT_KEY = "current";
 
 // `state::list` over a 75K-node scope can exceed the iii invocation
@@ -327,19 +329,130 @@ function emptySnapshot(): GraphSnapshot {
   };
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasCountMap(value: unknown): value is Record<string, number> {
+  return (
+    isRecord(value) &&
+    Object.values(value).every(
+      (count) => Number.isSafeInteger(count) && (count as number) >= 0,
+    )
+  );
+}
+
+function hasSnapshotNode(value: unknown): value is GraphNode {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.id === "string" &&
+    typeof value.type === "string" &&
+    typeof value.name === "string"
+  );
+}
+
+function hasSnapshotEdge(value: unknown): value is GraphEdge {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.id === "string" &&
+    typeof value.type === "string" &&
+    typeof value.sourceNodeId === "string" &&
+    typeof value.targetNodeId === "string" &&
+    typeof value.weight === "number" &&
+    Number.isFinite(value.weight)
+  );
+}
+
+function isGraphSnapshot(value: unknown): value is GraphSnapshot {
+  if (!isRecord(value) || !isRecord(value.stats)) return false;
+  return (
+    value.version === 1 &&
+    // Snapshot rebuilds can include rows written by older graph schemas.
+    // Validate the fields these cached-query and incremental-update paths use.
+    Array.isArray(value.topNodes) &&
+    value.topNodes.every(hasSnapshotNode) &&
+    Array.isArray(value.topEdges) &&
+    value.topEdges.every(hasSnapshotEdge) &&
+    isRecord(value.topDegrees) &&
+    Object.values(value.topDegrees).every(
+      (degree) => typeof degree === "number" && Number.isFinite(degree) && degree >= 0,
+    ) &&
+    Number.isSafeInteger(value.stats.totalNodes) &&
+    (value.stats.totalNodes as number) >= 0 &&
+    Number.isSafeInteger(value.stats.totalEdges) &&
+    (value.stats.totalEdges as number) >= 0 &&
+    hasCountMap(value.stats.nodesByType) &&
+    hasCountMap(value.stats.edgesByType) &&
+    typeof value.updatedAt === "string" &&
+    typeof value.dirty === "boolean" &&
+    (value.batchInProgress === undefined || typeof value.batchInProgress === "string") &&
+    (value.resetAt === undefined || typeof value.resetAt === "string") &&
+    (value.appliedBatchEffects === undefined ||
+      (Array.isArray(value.appliedBatchEffects) &&
+        value.appliedBatchEffects.every((key) => typeof key === "string")))
+  );
+}
+
 async function readSnapshot(kv: StateKV): Promise<GraphSnapshot | null> {
+  let snap: unknown;
   try {
-    const snap = await kv.get<GraphSnapshot>(KV.graphSnapshot, SNAPSHOT_KEY);
-    if (snap && typeof snap === "object" && snap.version === 1) {
-      return snap;
-    }
-    return null;
+    snap = await kv.get<GraphSnapshot>(KV.graphSnapshot, SNAPSHOT_KEY);
   } catch (err) {
     logger.warn("Graph snapshot read failed", {
       error: err instanceof Error ? err.message : String(err),
     });
-    return null;
+    throw new Error("Graph snapshot read failed; refusing to continue");
   }
+
+  if (snap == null) return null;
+  if (!isGraphSnapshot(snap)) {
+    logger.warn("Graph snapshot is malformed; refusing to continue");
+    throw new Error("Graph snapshot is malformed; refusing to continue");
+  }
+  return snap;
+}
+
+function projectGraphSnapshot(snapshot: GraphSnapshot): GraphSnapshot {
+  const projected = structuredClone(snapshot);
+  for (const node of projected.topNodes) {
+    if (
+      Array.isArray(node.sourceObservationIds) &&
+      node.sourceObservationIds.length > SNAPSHOT_MAX_OBSERVATIONS_PER_RECORD
+    ) {
+      node.sourceObservationIds = node.sourceObservationIds.slice(
+        -SNAPSHOT_MAX_OBSERVATIONS_PER_RECORD,
+      );
+    }
+  }
+  for (const edge of projected.topEdges) {
+    if (
+      Array.isArray(edge.sourceObservationIds) &&
+      edge.sourceObservationIds.length > SNAPSHOT_MAX_OBSERVATIONS_PER_RECORD
+    ) {
+      edge.sourceObservationIds = edge.sourceObservationIds.slice(
+        -SNAPSHOT_MAX_OBSERVATIONS_PER_RECORD,
+      );
+    }
+  }
+
+  const bytes = Buffer.byteLength(JSON.stringify(projected) ?? "", "utf8");
+  if (bytes > MAX_GRAPH_SNAPSHOT_BYTES) {
+    throw new Error(
+      `Graph snapshot projection is ${bytes} bytes, over the ${MAX_GRAPH_SNAPSHOT_BYTES}-byte cache limit`,
+    );
+  }
+  return projected;
+}
+
+async function writeGraphSnapshot(
+  kv: StateKV,
+  snapshot: GraphSnapshot,
+): Promise<void> {
+  await kv.set(
+    KV.graphSnapshot,
+    SNAPSHOT_KEY,
+    projectGraphSnapshot(snapshot),
+  );
 }
 
 function buildSnapshotFromArrays(
@@ -721,12 +834,12 @@ function parseGraphExtractionResponse(
 interface BatchGraphDegree extends BatchEffectMetadata { value: number }
 
 async function applyBatchGraph(kv: StateKV, parsed: ParsedGraphExtraction, obsIds: string[], key: string): Promise<void> {
-  const snap = structuredClone((await kv.get<GraphSnapshot>(KV.graphSnapshot, SNAPSHOT_KEY)) ?? emptySnapshot());
+  const snap = structuredClone((await readSnapshot(kv)) ?? emptySnapshot());
   if (snap.appliedBatchEffects?.includes(key)) return;
   if (snap.batchInProgress && snap.batchInProgress !== key) throw new Error("A batch graph application must be recovered first");
   if (!snap.batchInProgress) {
     snap.batchInProgress = key;
-    await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, snap);
+    await writeGraphSnapshot(kv, snap);
   }
   const metadata = effectMetadata(snap, key);
   const { nodes, edges } = parsed;
@@ -800,7 +913,12 @@ async function applyBatchGraph(kv: StateKV, parsed: ParsedGraphExtraction, obsId
   const topIds = new Set(snap.topNodes.map((n) => n.id));
   snap.topEdges = snap.topEdges.filter((e) => topIds.has(e.sourceNodeId) && topIds.has(e.targetNodeId));
   const { batchInProgress: _pending, ...completedSnapshot } = snap;
-  await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, { ...completedSnapshot, ...metadata, dirty: false, updatedAt: new Date().toISOString() });
+  await writeGraphSnapshot(kv, {
+    ...completedSnapshot,
+    ...metadata,
+    dirty: false,
+    updatedAt: new Date().toISOString(),
+  });
 }
 
 const HEURISTIC_EDGE_WEIGHT = 0.4;
@@ -1025,7 +1143,7 @@ export async function persistGraphDelta(
   if (newNodeCount > 0 || newEdgeCount > 0 || snapMutated) {
     snap.updatedAt = capturedAt;
     snap.dirty = false;
-    await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, snap);
+    await writeGraphSnapshot(kv, snap);
   }
 
   return { newNodeCount, newEdgeCount };
@@ -1455,9 +1573,6 @@ export function registerGraphFunction(
   sdk.registerFunction(
     "mem::graph-snapshot-rebuild",
     async (data?: { force?: boolean }) => runBatchCallback(kv, "graph", undefined, async () => {
-      if ((await kv.get<GraphSnapshot>(KV.graphSnapshot, SNAPSHOT_KEY))?.batchInProgress) {
-        return { success: false, error: "A batch graph application must be recovered first" };
-      }
       const started = Date.now();
       // #825: pre-flight refusal for legacy corpora. The old guard
       // checked node count AFTER kv.list, but the heartbeat dies at
@@ -1476,6 +1591,9 @@ export function registerGraphFunction(
       const forceRebuild = data?.force === true;
       try {
         const existing = await readSnapshot(kv);
+        if (existing?.batchInProgress) {
+          return { success: false, error: "A batch graph application must be recovered first" };
+        }
         if (!existing && !forceRebuild) {
           logger.warn("Graph snapshot rebuild refused: no prior snapshot", {
             hint: "legacy corpus or empty store",
@@ -1496,8 +1614,7 @@ export function registerGraphFunction(
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         logger.warn("Graph snapshot pre-flight read failed", { error: msg });
-        // Fall through; the user passed force=true or the snapshot
-        // read itself failed (separate problem).
+        return { success: false, error: msg };
       }
 
       try {
@@ -1564,7 +1681,7 @@ export function registerGraphFunction(
       }
 
       const snap = buildSnapshotFromArrays(nodes, edges);
-      await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, snap);
+      await writeGraphSnapshot(kv, snap);
       const tookMs = Date.now() - started;
       logger.info("Graph snapshot rebuilt", {
         totalNodes: snap.stats.totalNodes,
@@ -1624,7 +1741,7 @@ export function registerGraphFunction(
       ...emptySnapshot(),
       resetAt: new Date().toISOString(),
     };
-    await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, resetSnapshot);
+    await writeGraphSnapshot(kv, resetSnapshot);
     const counts: Record<string, number> = {
       [KV.graphSnapshot]: 1,
     };

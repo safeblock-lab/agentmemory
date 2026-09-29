@@ -258,7 +258,7 @@ async function completeJob(
 export function registerSummaryQueueFunctions(
   sdk: IIIClient, kv: StateKV, provider: MemoryProvider, llmRouter?: LlmTaskRouter,
 ): void {
-  const activeUnits = new Set<string>();
+  const activeUnits = new Map<string, number>();
   sdk.registerFunction("mem::summary-enqueue", async (data: { sessionId?: string } | undefined) => {
     if (typeof data?.sessionId !== "string" || !data.sessionId.trim()) {
       return { success: false, error: "sessionId is required" };
@@ -423,17 +423,12 @@ export function registerSummaryQueueFunctions(
         return { success: true, skipped: true };
       }
       if (!unit.output) {
-        activeUnits.add(unit.id);
-        try {
-          await kv.set(KV.summaryQueueUnits(job.id), unit.id, {
-            ...unit, startedAt: new Date().toISOString(),
-          });
-        } catch (error) {
-          activeUnits.delete(unit.id);
-          throw error;
-        }
+        await kv.set(KV.summaryQueueUnits(job.id), unit.id, {
+          ...unit, startedAt: new Date().toISOString(),
+        });
         const system = unit.stage === "map" ? SUMMARY_SYSTEM : REDUCE_SYSTEM;
         const prompt = unit.stage === "map" ? buildSummaryItemsPrompt(unit.items) : buildReduceItemsPrompt(unit.items);
+        activeUnits.set(unit.id, Date.now());
         try {
           const inputTokens = estimateSummaryTokens(system, prompt);
           if (inputTokens > summaryCallInputLimit(job.config)) throw new SummaryBudgetError("summary_prompt_exceeds_budget");
@@ -552,14 +547,17 @@ export function registerSummaryQueueFunctions(
             });
             continue;
           }
-          if (!unit || unit.output || !unit.dispatchedAt || activeUnits.has(unit.id) ||
-              (unit.attempts === 0 && !idle) ||
+          const activeSince = unit && activeUnits.get(unit.id);
+          if (!unit || unit.output || !unit.dispatchedAt ||
+              (activeSince !== undefined && now - activeSince < maxUnitRuntimeMs()) ||
+              (unit.attempts === 0 && !idle &&
+                now - Date.parse(unit.dispatchedAt) < maxUnitRuntimeMs()) ||
               now - Date.parse(unit.dispatchedAt) < STALE_DELIVERY_MS ||
               unit.startedAt && now - Date.parse(unit.startedAt) < maxUnitRuntimeMs() ||
               !retryEligible(unit, now)) continue;
           await kv.set(KV.summaryQueueUnits(job.id), unit.id, {
             ...unit, dispatchedAt: undefined, startedAt: undefined,
-            deliveryId: unit.deliveryId ?? generateId("sqd"),
+            deliveryId: generateId("sqd"),
           });
           replayed++;
         }

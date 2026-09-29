@@ -97,3 +97,19 @@ of their requested output allowance on reasoning according to provider behavior.
 Diagnostics record counts and failure categories without prompt or provider
 payloads. Existing XML parsing, summary validation, audit persistence, routing
 usage telemetry and circuit-breaker behavior remain in place.
+
+## Durable queue recovery
+
+Summary jobs keep their units in iii state and publish deliveries through
+`agentmemory.summary.unit`. The worker reconciles pending jobs every minute.
+A first delivery that remains unresolved while the topic is busy is eligible
+for replay after the configured provider timeout plus a one-minute margin,
+with a minimum of ten minutes. Failed provider calls retain their bounded
+retry delay. Each replay gets a new delivery ID, so an older queued delivery
+cannot start the same unit after the replay is recorded. A unit already running
+in the current worker is protected for the same runtime window.
+
+The application-level reconciliation does not alter iii-queue's transport
+records. If a completed job still appears as an active delivery after an
+engine restart, inspect the queue records and job state separately before any
+transport repair; do not purge the topic or its backing store.

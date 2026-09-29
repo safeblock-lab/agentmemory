@@ -7,11 +7,13 @@ vi.mock("../src/logger.js", () => ({
 import { registerGraphFunction } from "../src/functions/graph.js";
 import type {
   CompressedObservation,
+  GraphSnapshot,
   GraphNode,
   GraphEdge,
   GraphQueryResult,
 } from "../src/types.js";
 import { KV } from "../src/state/schema.js";
+import { persistGraphDelta } from "../src/functions/graph.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -652,6 +654,288 @@ describe("Graph Functions", () => {
       }
     }
 
+    function graphNode(
+      id: string,
+      name: string,
+      sourceObservationIds = ["obs_graph_snapshot_guard"],
+    ): GraphNode {
+      return {
+        id,
+        type: "concept",
+        name,
+        properties: {},
+        sourceObservationIds,
+        createdAt: "2026-09-29T00:00:00.000Z",
+      };
+    }
+
+    function graphEdge(
+      id: string,
+      sourceNodeId: string,
+      targetNodeId: string,
+      sourceObservationIds: string[],
+    ): GraphEdge {
+      return {
+        id,
+        type: "related_to",
+        sourceNodeId,
+        targetNodeId,
+        weight: 0.9,
+        sourceObservationIds,
+        createdAt: "2026-09-29T00:00:00.000Z",
+      };
+    }
+
+    function populatedSnapshot(node: GraphNode): GraphSnapshot {
+      return {
+        version: 1,
+        topNodes: [node],
+        topEdges: [],
+        topDegrees: { [node.id]: 0 },
+        stats: {
+          totalNodes: 39618,
+          totalEdges: 28695,
+          nodesByType: { concept: 39618 },
+          edgesByType: { related_to: 28695 },
+        },
+        updatedAt: "2026-09-29T00:00:00.000Z",
+        dirty: false,
+      };
+    }
+
+    it("does not replace the graph snapshot when its read times out", async () => {
+      const existing = graphNode("gn_existing", "existing");
+      const priorSnapshot = populatedSnapshot(existing);
+      await kv.set(KV.graphNodes, existing.id, existing);
+      await kv.set(KV.graphSnapshot, "current", priorSnapshot);
+      const timeoutKV = {
+        ...kv,
+        get: async <T>(scope: string, key: string): Promise<T | null> => {
+          if (scope === KV.graphSnapshot && key === "current") {
+            throw new Error("state read timeout");
+          }
+          return kv.get<T>(scope, key);
+        },
+      };
+
+      await expect(
+        persistGraphDelta(
+          timeoutKV as never,
+          [graphNode("gn_new", "new")],
+          [],
+          ["obs_new"],
+        ),
+      ).rejects.toThrow("Graph snapshot read failed");
+
+      expect(await kv.get(KV.graphSnapshot, "current")).toEqual(priorSnapshot);
+      expect(await kv.list(KV.graphNodes)).toEqual([existing]);
+    });
+
+    it("refuses graph writes when the stored snapshot is malformed", async () => {
+      const existing = graphNode("gn_existing", "existing");
+      const malformed = {
+        version: 1,
+        topNodes: [],
+        topEdges: [],
+        topDegrees: {},
+        stats: { totalNodes: 39618 },
+        updatedAt: "2026-09-29T00:00:00.000Z",
+        dirty: false,
+      };
+      await kv.set(KV.graphNodes, existing.id, existing);
+      await kv.set(KV.graphSnapshot, "current", malformed);
+
+      await expect(
+        persistGraphDelta(
+          kv as never,
+          [graphNode("gn_new", "new")],
+          [],
+          ["obs_new"],
+        ),
+      ).rejects.toThrow("Graph snapshot is malformed");
+
+      expect(await kv.get(KV.graphSnapshot, "current")).toEqual(malformed);
+      expect(await kv.list(KV.graphNodes)).toEqual([existing]);
+    });
+
+    it("keeps batch graph writes from replacing a malformed snapshot", async () => {
+      const malformed = {
+        version: 1,
+        topNodes: [],
+        topEdges: [],
+        topDegrees: {},
+        stats: { totalNodes: 39618 },
+        updatedAt: "2026-09-29T00:00:00.000Z",
+        dirty: false,
+      };
+      await kv.set(KV.graphSnapshot, "current", malformed);
+
+      await expect(
+        sdk.trigger("mem::graph-extract", {
+          observations: [testObs],
+          batchResponse: '<entities><entity type="concept" name="batch-new"/></entities>',
+          batchEffectKey: "a".repeat(64),
+        }),
+      ).rejects.toThrow("Graph snapshot is malformed");
+
+      expect(await kv.get(KV.graphSnapshot, "current")).toEqual(malformed);
+      expect(await kv.list(KV.graphNodes)).toHaveLength(0);
+    });
+
+    it("allows the first graph write to initialize a genuinely empty store", async () => {
+      const result = await persistGraphDelta(
+        kv as never,
+        [graphNode("gn_first", "first")],
+        [],
+        ["obs_first"],
+      );
+
+      expect(result.newNodeCount).toBe(1);
+      expect(await kv.get(KV.graphSnapshot, "current")).toMatchObject({
+        version: 1,
+        stats: { totalNodes: 1, totalEdges: 0 },
+        dirty: false,
+      });
+    });
+
+    it("caps cached provenance across repeated graph writes without changing canonical rows", async () => {
+      const initialIds = Array.from({ length: 100 }, (_, i) => `obs_${String(i).padStart(3, "0")}`);
+      const addedIds = Array.from({ length: 10 }, (_, i) => `obs_${String(i + 100).padStart(3, "0")}`);
+      const initialNodes = [
+        graphNode("gn_a_initial", "alpha", initialIds),
+        graphNode("gn_b_initial", "beta", initialIds),
+      ];
+      const initialEdge = graphEdge("ge_initial", "gn_a_initial", "gn_b_initial", initialIds);
+      await persistGraphDelta(kv as never, initialNodes, [initialEdge], initialIds);
+
+      await persistGraphDelta(
+        kv as never,
+        [
+          graphNode("gn_a_next", "alpha", addedIds),
+          graphNode("gn_b_next", "beta", addedIds),
+        ],
+        [graphEdge("ge_next", "gn_a_next", "gn_b_next", addedIds)],
+        addedIds,
+      );
+
+      const canonicalNodes = await kv.list<GraphNode>(KV.graphNodes);
+      const canonicalEdges = await kv.list<GraphEdge>(KV.graphEdges);
+      const snapshot = await kv.get<GraphSnapshot>(KV.graphSnapshot, "current");
+      expect(canonicalNodes.map((node) => node.sourceObservationIds.length)).toEqual([110, 110]);
+      expect(canonicalEdges[0].sourceObservationIds).toHaveLength(110);
+      expect(snapshot?.topNodes.map((node) => node.sourceObservationIds.length)).toEqual([64, 64]);
+      expect(snapshot?.topEdges[0].sourceObservationIds).toHaveLength(64);
+      expect(snapshot?.topNodes[0].sourceObservationIds[0]).toBe("obs_046");
+      expect(snapshot?.topNodes[0].sourceObservationIds.at(-1)).toBe("obs_109");
+      expect(initialNodes[0].sourceObservationIds).toHaveLength(100);
+      expect(initialEdge.sourceObservationIds).toHaveLength(100);
+    });
+
+    it("projects both batch snapshot writes and retains batch metadata", async () => {
+      const observations = Array.from({ length: 100 }, (_, i) => ({
+        ...testObs,
+        id: `batch_obs_${i}`,
+      }));
+      const key = "b".repeat(64);
+      const writes: GraphSnapshot[] = [];
+      const recordingKV = {
+        ...kv,
+        set: async <T>(scope: string, id: string, value: T): Promise<T> => {
+          if (scope === KV.graphSnapshot && id === "current") {
+            writes.push(structuredClone(value as GraphSnapshot));
+          }
+          return kv.set(scope, id, value);
+        },
+      };
+      const localSdk = mockSdk();
+      registerGraphFunction(localSdk as never, recordingKV as never, mockProvider as never);
+
+      const result = await localSdk.trigger("mem::graph-extract", {
+        observations,
+        batchEffectKey: key,
+        batchResponse:
+          '<entities><entity type="concept" name="batch-alpha"/><entity type="concept" name="batch-beta"/></entities>' +
+          '<relationships><relationship type="related_to" source="batch-alpha" target="batch-beta" weight="0.9"/></relationships>',
+      });
+
+      expect(result).toMatchObject({ success: true });
+      expect(writes).toHaveLength(2);
+      expect(writes[0].batchInProgress).toBe(key);
+      expect(writes[1].batchInProgress).toBeUndefined();
+      expect(writes[1].appliedBatchEffects).toContain(key);
+      for (const snapshot of writes) {
+        expect(snapshot.topNodes.every((node) => node.sourceObservationIds.length <= 64)).toBe(true);
+        expect(snapshot.topEdges.every((edge) => edge.sourceObservationIds.length <= 64)).toBe(true);
+      }
+      expect((await kv.list<GraphNode>(KV.graphNodes)).map((node) => node.sourceObservationIds)).toEqual([
+        observations.map((observation) => observation.id),
+        observations.map((observation) => observation.id),
+      ]);
+      expect((await kv.list<GraphEdge>(KV.graphEdges))[0].sourceObservationIds).toHaveLength(100);
+    });
+
+    it("projects rebuilt snapshots while keeping complete canonical provenance", async () => {
+      const ids = Array.from({ length: 90 }, (_, i) => `rebuild_obs_${i}`);
+      const nodes = [graphNode("gn_rebuild_a", "rebuild alpha", ids), graphNode("gn_rebuild_b", "rebuild beta", ids)];
+      const edge = graphEdge("ge_rebuild", nodes[0].id, nodes[1].id, ids);
+      for (const node of nodes) await kv.set(KV.graphNodes, node.id, node);
+      await kv.set(KV.graphEdges, edge.id, edge);
+
+      const result = (await sdk.trigger("mem::graph-snapshot-rebuild", {
+        force: true,
+      })) as { success: boolean };
+
+      expect(result.success).toBe(true);
+      expect((await kv.get<GraphNode>(KV.graphNodes, nodes[0].id))?.sourceObservationIds).toHaveLength(90);
+      const snapshot = await kv.get<GraphSnapshot>(KV.graphSnapshot, "current");
+      expect(snapshot?.topNodes.every((node) => node.sourceObservationIds.length === 64)).toBe(true);
+      expect(snapshot?.topEdges[0].sourceObservationIds).toHaveLength(64);
+      expect(snapshot?.stats).toMatchObject({ totalNodes: 2, totalEdges: 1 });
+    });
+
+    it("fails closed when a projected snapshot exceeds its byte bound", async () => {
+      const existing = graphNode("gn_existing", "existing");
+      const priorSnapshot = populatedSnapshot(existing);
+      await kv.set(KV.graphNodes, existing.id, existing);
+      await kv.set(KV.graphSnapshot, "current", priorSnapshot);
+      const oversized = graphNode("gn_large", "large");
+      oversized.properties.payload = "x".repeat(4 * 1024 * 1024);
+
+      await expect(
+        persistGraphDelta(kv as never, [oversized], [], ["obs_large"]),
+      ).rejects.toThrow(/over the 4194304-byte cache limit/);
+
+      expect(await kv.get(KV.graphSnapshot, "current")).toEqual(priorSnapshot);
+    });
+
+    it("does not force snapshot rebuild after a failed snapshot read", async () => {
+      const existing = graphNode("gn_existing", "existing");
+      const priorSnapshot = populatedSnapshot(existing);
+      await kv.set(KV.graphNodes, existing.id, existing);
+      await kv.set(KV.graphSnapshot, "current", priorSnapshot);
+      const timeoutKV = {
+        ...kv,
+        get: async <T>(scope: string, key: string): Promise<T | null> => {
+          if (scope === KV.graphSnapshot && key === "current") {
+            throw new Error("state read timeout");
+          }
+          return kv.get<T>(scope, key);
+        },
+      };
+      const localSdk = mockSdk();
+      registerGraphFunction(localSdk as never, timeoutKV as never, mockProvider as never);
+      const listSpy = vi.spyOn(kv, "list");
+
+      const result = (await localSdk.trigger("mem::graph-snapshot-rebuild", {
+        force: true,
+      })) as { success: boolean; error?: string };
+
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/Graph snapshot read failed/);
+      expect(listSpy).not.toHaveBeenCalled();
+      expect(await kv.get(KV.graphSnapshot, "current")).toEqual(priorSnapshot);
+    });
+
     it("snapshot-rebuild persists top-degree subgraph + aggregate stats", async () => {
       await seed(50, 100);
       const result = (await sdk.trigger("mem::graph-snapshot-rebuild", { force: true })) as {
@@ -804,9 +1088,11 @@ describe("Graph Functions", () => {
       // visible behavior: snapshot empty, hot path returns empty.
       const snap = await kv.get<{
         stats: { totalNodes: number; totalEdges: number };
+        resetAt: string;
       }>("mem:graph:snapshot", "current");
       expect(snap?.stats.totalNodes).toBe(0);
       expect(snap?.stats.totalEdges).toBe(0);
+      expect(snap?.resetAt).toMatch(/^2026-/);
     });
   });
 

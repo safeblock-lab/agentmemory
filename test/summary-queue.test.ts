@@ -514,6 +514,37 @@ describe("durable summary queue", () => {
     expect(await h.kv.get(KV.summaries, "session")).toMatchObject({ observationCount: 20 });
   });
 
+  it("replays a stale initial delivery while the topic is busy and fences the old delivery", async () => {
+    const h = harness();
+    await seed(h.kv, [observation(1)]);
+    const { jobId } = await h.invoke("mem::summary-enqueue", { sessionId: "session" }) as { jobId: string };
+    const dispatch = h.messages.shift()!;
+    await h.invoke(dispatch.function_id, dispatch.payload);
+    const oldDelivery = h.messages.shift()!;
+    const unitId = (oldDelivery.payload as { unitId: string }).unitId;
+    const scope = KV.summaryQueueUnits(jobId);
+    const unit = await h.kv.get<{ dispatchedAt: string; deliveryId: string }>(scope, unitId);
+    h.messages.push(oldDelivery, {
+      function_id: "mem::summary-unit", payload: { jobId: "other", unitId: "other" } as never,
+    });
+    const recent = new Date(Date.now() - 5 * 60_000).toISOString();
+    await h.kv.set(scope, unitId, { ...unit!, dispatchedAt: recent, startedAt: recent });
+    expect(await h.invoke("mem::summary-reconcile")).toMatchObject({ replayed: 0 });
+
+    await h.kv.set(scope, unitId, {
+      ...unit!, dispatchedAt: "2026-01-01T00:00:00Z", startedAt: "2026-01-01T00:00:00Z",
+    });
+    expect(await h.invoke("mem::summary-reconcile")).toMatchObject({ replayed: 1, recovered: 1 });
+    const newDelivery = h.messages.find(message =>
+      (message.payload as { unitId?: string }).unitId === unitId && message !== oldDelivery);
+    expect(newDelivery).toBeDefined();
+    expect((newDelivery!.payload as { deliveryId: string }).deliveryId).not.toBe(unit!.deliveryId);
+    expect(await h.invoke(oldDelivery.function_id, oldDelivery.payload)).toMatchObject({ skipped: true });
+    expect(h.calls).toBe(0);
+    await h.invoke(newDelivery!.function_id, newDelivery!.payload);
+    expect(await h.kv.get(KV.summaries, "session")).toMatchObject({ title: "Finished" });
+  });
+
   it("does not bypass the 15-minute retry delay for a failed unit", async () => {
     const h = harness(undefined, call => {
       if (call === 1) throw new Error("fetch failed");
@@ -553,7 +584,9 @@ describe("durable summary queue", () => {
     const failedId = (failedDelivery.payload as { unitId: string }).unitId;
     const scope = KV.summaryQueueUnits(jobId);
     const initialUnit = await h.kv.get<{ dispatchedAt: string; deliveryId: string }>(scope, failedId);
-    await h.kv.set(scope, failedId, { ...initialUnit!, dispatchedAt: "2026-01-01T00:00:00Z" });
+    await h.kv.set(scope, failedId, {
+      ...initialUnit!, dispatchedAt: new Date(Date.now() - 5 * 60_000).toISOString(),
+    });
     expect(await h.invoke("mem::summary-reconcile")).toMatchObject({ replayed: 0 });
     expect(await h.kv.get(scope, failedId)).toMatchObject({ deliveryId: initialUnit!.deliveryId });
     await h.kv.set(scope, failedId, initialUnit!);
