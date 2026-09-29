@@ -31,21 +31,29 @@ const MAX_ATTEMPTS = 6; // Five subscriber retries plus the first delivery.
 const FAILED_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_RECOVERY_INTENTS = 100;
 const STALE_DELIVERY_MS = 60_000;
-const RETRY_BACKOFF_MS = 900_000;
+const RETRY_BACKOFF_MS = 30_000;
+const SUMMARY_CALL_TIMEOUT_MS = 150_000;
+const MAX_UNIT_RUNTIME_MS = SUMMARY_CALL_TIMEOUT_MS + STALE_DELIVERY_MS;
 
-function maxUnitRuntimeMs(): number {
-  const configured = Number.parseInt(
-    process.env.OPENAI_TIMEOUT_MS ?? process.env.AGENTMEMORY_LLM_TIMEOUT_MS ?? "300000", 10);
-  return Number.isSafeInteger(configured) && configured > 0
-    ? Math.max(600_000, configured + STALE_DELIVERY_MS)
-    : 600_000;
+async function withSummaryCallTimeout<T>(call: () => Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      call(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Summary provider timed out")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
-function retryEligible(unit: SummaryQueueUnit, now: number, graceMs = STALE_DELIVERY_MS): boolean {
+function retryEligible(unit: SummaryQueueUnit, now: number): boolean {
   if (unit.attempts === 0) return true;
   if (!unit.lastAttemptAt || unit.attempts >= MAX_ATTEMPTS) return false;
-  const due = Date.parse(unit.lastAttemptAt) + RETRY_BACKOFF_MS * 2 ** (unit.attempts - 1);
-  return Number.isFinite(due) && now >= due + graceMs;
+  const due = Date.parse(unit.lastAttemptAt) + RETRY_BACKOFF_MS;
+  return Number.isFinite(due) && now >= due;
 }
 
 interface SummaryQueueUnit {
@@ -419,7 +427,7 @@ export function registerSummaryQueueFunctions(
       if (unit.deliveryId && (data.deliveryId !== unit.deliveryId || !unit.dispatchedAt)) {
         return { success: true, skipped: true };
       }
-      if (!unit.output && !retryEligible(unit, Date.now(), 0)) {
+      if (!unit.output && !retryEligible(unit, Date.now())) {
         return { success: true, skipped: true };
       }
       if (!unit.output) {
@@ -435,11 +443,17 @@ export function registerSummaryQueueFunctions(
           const outputTokens = summaryOutputTokenBudget(job.config, system, prompt);
           const call = (selected: MemoryProvider) => selected.summarize(system, prompt, { task: "summary", outputTokens });
           let summary: SessionSummary | null = null;
+          const deadline = Date.now() + SUMMARY_CALL_TIMEOUT_MS;
           for (let responseAttempt = 0; responseAttempt < 2; responseAttempt++) {
             try {
-              const response = llmRouter
-                ? await llmRouter.run("summary", call, candidate => parseSummaryXml(candidate, job.sessionId, job.project, 0) !== null)
-                : await call(provider);
+              const remaining = deadline - Date.now();
+              if (remaining <= 0) throw new Error("Summary provider timed out");
+              const response = await withSummaryCallTimeout(
+                () => llmRouter
+                  ? llmRouter.run("summary", call, candidate => parseSummaryXml(candidate, job.sessionId, job.project, 0) !== null)
+                  : call(provider),
+                remaining,
+              );
               summary = parseSummaryXml(response, job.sessionId, job.project, job.observationCount);
               if (!summary) throw new SummaryBudgetError("summary_parse_failed");
               if (job.unitIds.length === 1) {
@@ -549,11 +563,11 @@ export function registerSummaryQueueFunctions(
           }
           const activeSince = unit && activeUnits.get(unit.id);
           if (!unit || unit.output || !unit.dispatchedAt ||
-              (activeSince !== undefined && now - activeSince < maxUnitRuntimeMs()) ||
+              (activeSince !== undefined && now - activeSince < MAX_UNIT_RUNTIME_MS) ||
               (unit.attempts === 0 && !idle &&
-                now - Date.parse(unit.dispatchedAt) < maxUnitRuntimeMs()) ||
-              now - Date.parse(unit.dispatchedAt) < STALE_DELIVERY_MS ||
-              unit.startedAt && now - Date.parse(unit.startedAt) < maxUnitRuntimeMs() ||
+                now - Date.parse(unit.dispatchedAt) < MAX_UNIT_RUNTIME_MS) ||
+              (unit.attempts === 0 && now - Date.parse(unit.dispatchedAt) < STALE_DELIVERY_MS) ||
+              unit.startedAt && now - Date.parse(unit.startedAt) < MAX_UNIT_RUNTIME_MS ||
               !retryEligible(unit, now)) continue;
           await kv.set(KV.summaryQueueUnits(job.id), unit.id, {
             ...unit, dispatchedAt: undefined, startedAt: undefined,

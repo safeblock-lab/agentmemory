@@ -101,11 +101,11 @@ usage telemetry and circuit-breaker behavior remain in place.
 ## Durable queue recovery
 
 Summary jobs keep their units in iii state and publish deliveries through
-`agentmemory.summary.unit`. The worker reconciles pending jobs every minute.
+`agentmemory.summary.unit`. The worker reconciles pending jobs every 30 seconds.
 A first delivery that remains unresolved while the topic is busy is eligible
-for replay after the configured provider timeout plus a one-minute margin,
-with a minimum of ten minutes. Failed provider calls retain their bounded
-retry delay. Each replay gets a new delivery ID, so an older queued delivery
+for replay after three and a half minutes. Each summary provider call is
+bounded to 150 seconds. Failed provider calls retry every 30 seconds, up to
+six total attempts. Each replay gets a new delivery ID, so an older queued delivery
 cannot start the same unit after the replay is recorded. A unit already running
 in the current worker is protected for the same runtime window.
 

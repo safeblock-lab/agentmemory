@@ -872,7 +872,7 @@ async function main() {
   void recoverSummaryQueue("mem::summary-recover");
   const summaryRecoveryTimer = setInterval(() => void recoverSummaryQueue("mem::summary-recover"), 60 * 60 * 1000);
   summaryRecoveryTimer.unref();
-  const summaryReconcileTimer = setInterval(() => void recoverSummaryQueue("mem::summary-reconcile"), 60 * 1000);
+  const summaryReconcileTimer = setInterval(() => void recoverSummaryQueue("mem::summary-reconcile"), 30 * 1000);
   summaryReconcileTimer.unref();
 
   if (process.env.AUTO_FORGET_ENABLED !== "false") {

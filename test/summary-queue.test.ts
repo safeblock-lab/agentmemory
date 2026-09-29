@@ -527,7 +527,7 @@ describe("durable summary queue", () => {
     h.messages.push(oldDelivery, {
       function_id: "mem::summary-unit", payload: { jobId: "other", unitId: "other" } as never,
     });
-    const recent = new Date(Date.now() - 5 * 60_000).toISOString();
+    const recent = new Date(Date.now() - 2 * 60_000).toISOString();
     await h.kv.set(scope, unitId, { ...unit!, dispatchedAt: recent, startedAt: recent });
     expect(await h.invoke("mem::summary-reconcile")).toMatchObject({ replayed: 0 });
 
@@ -545,7 +545,7 @@ describe("durable summary queue", () => {
     expect(await h.kv.get(KV.summaries, "session")).toMatchObject({ title: "Finished" });
   });
 
-  it("does not bypass the 15-minute retry delay for a failed unit", async () => {
+  it("retries a failed unit after 30 seconds", async () => {
     const h = harness(undefined, call => {
       if (call === 1) throw new Error("fetch failed");
       return xml();
@@ -563,7 +563,11 @@ describe("durable summary queue", () => {
     const unit = await h.kv.get<{ attempts: number; dispatchedAt: string; lastAttemptAt: string }>(scope, unitId);
     expect(unit?.attempts).toBe(1);
     await h.kv.set(scope, unitId, {
-      ...unit!, dispatchedAt: "2026-01-01T00:00:00Z", lastAttemptAt: "2026-01-01T00:00:00Z",
+      ...unit!, lastAttemptAt: new Date(Date.now() - 29_000).toISOString(),
+    });
+    expect(await h.invoke("mem::summary-reconcile")).toMatchObject({ replayed: 0 });
+    await h.kv.set(scope, unitId, {
+      ...unit!, lastAttemptAt: new Date(Date.now() - 31_000).toISOString(),
     });
     expect(await h.invoke("mem::summary-reconcile")).toMatchObject({ replayed: 1 });
     await h.drain();
@@ -585,7 +589,7 @@ describe("durable summary queue", () => {
     const scope = KV.summaryQueueUnits(jobId);
     const initialUnit = await h.kv.get<{ dispatchedAt: string; deliveryId: string }>(scope, failedId);
     await h.kv.set(scope, failedId, {
-      ...initialUnit!, dispatchedAt: new Date(Date.now() - 5 * 60_000).toISOString(),
+      ...initialUnit!, dispatchedAt: new Date(Date.now() - 2 * 60_000).toISOString(),
     });
     expect(await h.invoke("mem::summary-reconcile")).toMatchObject({ replayed: 0 });
     expect(await h.kv.get(scope, failedId)).toMatchObject({ deliveryId: initialUnit!.deliveryId });
@@ -632,6 +636,30 @@ describe("durable summary queue", () => {
     await inFlight;
     expect(h.calls).toBe(1);
     expect(await h.kv.get(KV.summaries, "session")).toMatchObject({ title: "Finished" });
+  });
+
+  it("releases a unit when its provider call never settles", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness(undefined, () => new Promise<string>(() => {}));
+      await seed(h.kv, [observation(1)]);
+      const { jobId } = await h.invoke("mem::summary-enqueue", { sessionId: "session" }) as { jobId: string };
+      const dispatch = h.messages.shift()!;
+      await h.invoke(dispatch.function_id, dispatch.payload);
+      const delivery = h.messages.shift()!;
+      const inFlight = h.invoke(delivery.function_id, delivery.payload);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(h.calls).toBe(1);
+
+      const failed = expect(inFlight).rejects.toThrow("Summary provider timed out");
+      await vi.advanceTimersByTimeAsync(150_000);
+      await failed;
+      const unitId = (delivery.payload as { unitId: string }).unitId;
+      expect(await h.kv.get(KV.summaryQueueUnits(jobId), unitId))
+        .toMatchObject({ attempts: 1, startedAt: undefined, lastError: "timeout" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps only a compact failed diagnosis for 30 days, then cleans it", async () => {
