@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { installGraphStateWire } from "./helpers/graph-state-harness.js";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -129,6 +130,7 @@ describe("Reflect", () => {
   beforeEach(() => {
     sdk = mockSdk();
     kv = mockKV();
+    installGraphStateWire(sdk as never, kv as never);
     provider = {
       name: "test",
       compress: vi.fn(),

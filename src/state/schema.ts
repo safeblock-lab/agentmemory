@@ -43,6 +43,16 @@ export const KV = {
   graphNameIndex: "mem:graph:name-index",
   graphEdgeKey: "mem:graph:edge-key",
   graphNodeDegree: "mem:graph:node-degree",
+  graphControl: "mem:graph:control",
+  graphJobs: "mem:graph:jobs",
+  graphCheckpoints: "mem:graph:checkpoints",
+  graphReceipts: "mem:graph:receipts",
+  graphWorkingSnapshots: "mem:graph:working-snapshots",
+  graphInputs: (jobId: string) => `mem:graph:inputs:${jobId}`,
+  graphProviderResults: (jobId: string) => `mem:graph:provider-results:${jobId}`,
+  graphDeltas: (jobId: string) => `mem:graph:deltas:${jobId}`,
+  graphPrepared: (jobId: string) => `mem:graph:prepared:${jobId}`,
+  graphRemaps: (jobId: string) => `mem:graph:remaps:${jobId}`,
   semantic: "mem:semantic",
   procedural: "mem:procedural",
   teamShared: (teamId: string) => `mem:team:${teamId}:shared`,
@@ -86,6 +96,24 @@ export const KV = {
   fireworksBatchActiveJobs: "mem:fireworks-batch:active-jobs",
   batchCallbacks: "mem:batch-callbacks",
 } as const;
+
+export const GRAPH_RECORD_SCOPES = [
+  KV.graphNodes, KV.graphEdges, KV.graphSnapshot, KV.graphNameIndex,
+  KV.graphEdgeKey, KV.graphNodeDegree, KV.graphEdgeHistory,
+] as const;
+
+export const GRAPH_JOB_SCOPES = [KV.graphJobs, KV.graphWorkingSnapshots] as const;
+export const GRAPH_MANAGED_SCOPES = [KV.graphControl, KV.graphCheckpoints, KV.graphReceipts] as const;
+export const GRAPH_JOB_SCOPE_PREFIXES = [
+  "mem:graph:inputs:", "mem:graph:provider-results:", "mem:graph:deltas:",
+  "mem:graph:prepared:", "mem:graph:remaps:",
+] as const;
+
+export function isGuardedGraphRecord(scope: string, key: string): boolean {
+  return [...GRAPH_RECORD_SCOPES, ...GRAPH_JOB_SCOPES, ...GRAPH_MANAGED_SCOPES].some((s) => s === scope)
+    || GRAPH_JOB_SCOPE_PREFIXES.some((prefix) => scope.startsWith(prefix))
+    || (scope === KV.batchCallbacks && (key === "active:graph" || key.startsWith("graph:")));
+}
 
 export const STREAM = {
   name: "mem-live",

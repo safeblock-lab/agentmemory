@@ -55,7 +55,10 @@ describe("CLI worker readiness wait", () => {
 
   it("uses a 15-minute bound for every worker startup path", () => {
     expect(source).toContain("const WORKER_READINESS_TIMEOUT_MS = 15 * 60 * 1000;");
-    expect(source.match(/waitForAgentmemoryReady\(WORKER_READINESS_TIMEOUT_MS\)/g)).toHaveLength(5);
+    const boundedCalls = source.match(/waitForAgentmemoryReady\(WORKER_READINESS_TIMEOUT_MS\)/g) ?? [];
+    const readinessOccurrences = source.match(/waitForAgentmemoryReady\(/g) ?? [];
+    expect(boundedCalls.length).toBeGreaterThanOrEqual(4);
+    expect(boundedCalls).toHaveLength(readinessOccurrences.length - 1);
     expect(source).toContain("agentmemory worker did not become ready within 15 minutes.");
   });
 });

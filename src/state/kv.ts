@@ -1,7 +1,39 @@
 import type { IIIClient } from 'iii-sdk'
+import {
+  commitStateBatch, getVersionedState, requestStateLease,
+  type StateBatchReceipt, type StateGraphGuard, type StateGraphLease,
+  type StateLeaseReleased, type StateLeaseRequest, type StatePreparedBatch,
+  type StateTransactionTrigger, type StateVersioned,
+} from './state-transactions.js'
+import {
+  iterateStatePages,
+  MAX_STALE_LIST_RESTARTS,
+  StatePageError,
+  type StatePage,
+  type StatePageOptions,
+  type StatePageRequest,
+} from './state-pages.js'
+
+export type { StatePage, StatePageOptions } from './state-pages.js'
+export type { StateGraphGuard, StateGraphLease, StateLeaseRequest, StatePreparedBatch, StateBatchReceipt, StateVersioned } from './state-transactions.js'
 
 export class StateKV {
   constructor(private sdk: IIIClient) {}
+
+  private transactionTrigger: StateTransactionTrigger = (functionId, payload) =>
+    this.sdk.trigger<unknown, unknown>({ function_id: functionId, payload })
+
+  getVersioned<T = unknown>(scope: string, key: string, guard?: StateGraphGuard): Promise<StateVersioned<T>> {
+    return getVersionedState<T>(this.transactionTrigger, { scope, key, ...(guard === undefined ? {} : { guard }) })
+  }
+
+  lease(request: StateLeaseRequest): Promise<StateGraphLease | StateLeaseReleased> {
+    return requestStateLease(this.transactionTrigger, request)
+  }
+
+  commitBatch(guard: StateGraphGuard, prepared: StatePreparedBatch): Promise<StateBatchReceipt> {
+    return commitStateBatch(this.transactionTrigger, guard, prepared)
+  }
 
   async get<T = unknown>(scope: string, key: string): Promise<T | null> {
     return this.sdk.trigger<{ scope: string; key: string }, T | null>({
@@ -39,9 +71,33 @@ export class StateKV {
   }
 
   async list<T = unknown>(scope: string): Promise<T[]> {
-    return this.sdk.trigger<{ scope: string }, T[]>({
-      function_id: 'state::list',
-      payload: { scope },
-    })
+    for (let staleRestarts = 0; ; staleRestarts++) {
+      const values: T[] = []
+      try {
+        for await (const value of this.values<T>(scope)) values.push(value)
+        return values
+      } catch (error) {
+        if (!(error instanceof StatePageError) || error.code !== 'STATE_PAGE_CURSOR_STALE') throw error
+        if (staleRestarts >= MAX_STALE_LIST_RESTARTS) throw error
+      }
+    }
+  }
+
+  pages<T = unknown>(scope: string, options?: StatePageOptions): AsyncGenerator<StatePage<T>> {
+    return iterateStatePages<T>(
+      (payload: StatePageRequest) =>
+        this.sdk.trigger<StatePageRequest, unknown>({
+          function_id: 'state::list_page',
+          payload,
+        }),
+      scope,
+      options,
+    )
+  }
+
+  async *values<T = unknown>(scope: string, options?: StatePageOptions): AsyncGenerator<T> {
+    for await (const page of this.pages<T>(scope, options)) {
+      for (const value of page.items) yield value
+    }
   }
 }

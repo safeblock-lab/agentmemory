@@ -28,6 +28,7 @@ import type {
   GraphNode,
   GraphEdge,
 } from "../src/types.js";
+import { installGraphStateWire } from "./helpers/graph-state-harness.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -75,6 +76,7 @@ describe("Mesh Functions", () => {
   beforeEach(() => {
     sdk = mockSdk();
     kv = mockKV();
+    installGraphStateWire(sdk as never, kv as never);
     vi.clearAllMocks();
     registerMeshFunction(sdk as never, kv as never);
   });
@@ -213,6 +215,7 @@ describe("Mesh Functions", () => {
     it("sends authorization headers to peers when syncing", async () => {
       const authedSdk = mockSdk();
       const authedKv = mockKV();
+      installGraphStateWire(authedSdk as never, authedKv as never);
       registerMeshFunction(authedSdk as never, authedKv as never, "mesh-secret");
 
 

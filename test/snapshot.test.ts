@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { readFileSync, writeFileSync } from "node:fs";
+import { installGraphStateWire } from "./helpers/graph-state-harness.js";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -83,6 +84,7 @@ describe("Snapshot Functions", () => {
   beforeEach(async () => {
     sdk = mockSdk();
     kv = mockKV();
+    installGraphStateWire(sdk as never, kv as never);
     vi.clearAllMocks();
     registerSnapshotFunction(sdk as never, kv as never, snapshotDir);
 
@@ -216,6 +218,7 @@ describe("snapshot-create reentrancy guard", () => {
       },
     };
     const localSdk = mockSdk();
+    installGraphStateWire(localSdk as never, gatedKv as never);
     registerSnapshotFunction(localSdk as never, gatedKv as never, "/tmp/reentrant");
 
     // Start the first snapshot; it parks inside kv.list with the guard held.

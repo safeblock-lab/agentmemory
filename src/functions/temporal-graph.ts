@@ -12,6 +12,30 @@ import { batchEffectKey, runBatchCallback, withBatchRecordLocks, preserveBatchPr
 import type { StateKV } from "../state/kv.js";
 import { logger } from "../logger.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
+import { freezeGraphValue, graphCapturedAt, graphKV, graphTransactionFailure, registerGraphJobHandler, runGraphJob, withCompletedGraphRead } from "./graph-jobs.js";
+
+interface TemporalExtractionRequest {
+  observations: Array<{ id: string; title: string; narrative: string; concepts: string[]; files: string[]; type: string; timestamp: string }>;
+}
+
+async function temporalNode(kv: StateKV, node: GraphNode): Promise<GraphNode | undefined> {
+  for await (const current of kv.values<GraphNode>(KV.graphNodes)) {
+    if (current.name === node.name && current.type === node.type) return current;
+  }
+  return undefined;
+}
+
+async function temporalPredecessor(kv: StateKV, edge: GraphEdge, index: number, plannedIds: string[], added: GraphEdge[]): Promise<GraphEdge | undefined> {
+  let successor: GraphEdge | undefined;
+  let latest: GraphEdge | undefined;
+  const consider = (candidate: GraphEdge) => {
+    if (!successor && candidate.supersededBy === edge.id) successor = candidate;
+    if (plannedIds.indexOf(candidate.id) < index && candidate.isLatest !== false && candidate.sourceNodeId === edge.sourceNodeId && candidate.targetNodeId === edge.targetNodeId && candidate.type === edge.type && (!latest || (candidate.version ?? 1) > (latest.version ?? 1))) latest = candidate;
+  };
+  for await (const candidate of kv.values<GraphEdge>(KV.graphEdges)) consider(candidate);
+  for (const candidate of added) consider(candidate);
+  return successor ?? latest;
+}
 
 const TEMPORAL_EXTRACTION_SYSTEM = `You are a temporal knowledge extraction engine. Given observations, extract entities AND their temporal relationships with full context metadata.
 
@@ -53,7 +77,7 @@ function parseTemporalGraphXml(
 ): { nodes: GraphNode[]; edges: GraphEdge[] } {
   const nodes: GraphNode[] = [];
   const edges: GraphEdge[] = [];
-  const now = new Date().toISOString();
+  const now = graphCapturedAt();
 
   const entityRegex =
     /<entity\s+type="([^"]+)"\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/entity>/g;
@@ -157,18 +181,9 @@ export function registerTemporalGraphFunctions(
   provider: MemoryProvider,
   llmRouter?: LlmTaskRouter,
 ): void {
-  sdk.registerFunction("mem::temporal-graph-extract",
-    async (data: {
-      observations: Array<{
-        id: string;
-        title: string;
-        narrative: string;
-        concepts: string[];
-        files: string[];
-        type: string;
-        timestamp: string;
-      }>;
-    }) => {
+  kv = graphKV(kv);
+  const extract = async (request: TemporalExtractionRequest, durableId?: string) => runGraphJob(kv, "temporal", request, async (frozen) => {
+      const data = frozen as TemporalExtractionRequest;
       if (!data.observations || data.observations.length === 0) {
         return { success: false, error: "No observations provided" };
       }
@@ -182,8 +197,8 @@ export function registerTemporalGraphFunctions(
 
       try {
         const prompt = `Extract temporal knowledge graph from:\n\n${items}`;
-        const response = llmRouter
-          ? await llmRouter.run(
+        const response = await freezeGraphValue(kv, "temporal-response", () => llmRouter
+          ? llmRouter.run(
             "temporal_graph_extraction",
             (selectedProvider) => selectedProvider.compress(TEMPORAL_EXTRACTION_SYSTEM, prompt),
             (candidate) => {
@@ -191,24 +206,24 @@ export function registerTemporalGraphFunctions(
               return parsed.nodes.length > 0 || parsed.edges.length > 0;
             },
           )
-          : await provider.compress(TEMPORAL_EXTRACTION_SYSTEM, prompt);
+          : provider.compress(TEMPORAL_EXTRACTION_SYSTEM, prompt));
 
         const obsIds = data.observations.map((o) => o.id);
-        const { nodes, edges } = parseTemporalGraphXml(response, obsIds);
+        const { nodes, edges } = await freezeGraphValue(kv, "temporal-parsed", () => parseTemporalGraphXml(response, obsIds));
         const effectKey = batchEffectKey(`temporal:${JSON.stringify(data.observations)}`);
         return await runBatchCallback(kv, "graph", effectKey, async (_resuming, admit, receipt) => {
           const resultHash = batchEffectKey(response);
           if (receipt?.resultHash && receipt.resultHash !== resultHash) throw new Error("Temporal extraction result changed during recovery");
           if ((await kv.get<{ batchInProgress?: string }>(KV.graphSnapshot, "current"))?.batchInProgress) throw new Error("A batch graph application must be recovered first");
-          const now = receipt?.effectTimestamp ?? new Date().toISOString();
+          const now = receipt?.effectTimestamp ?? graphCapturedAt();
           await admit({ resultHash, effectTimestamp: now });
-          const existingNodes = await kv.list<GraphNode>(KV.graphNodes);
-          const existingEdges = await kv.list<GraphEdge>(KV.graphEdges);
+          const addedNodes: GraphNode[] = [];
+          const addedEdges: GraphEdge[] = [];
           const plannedEdgeIds = edges.map((_, index) => fingerprintId("ge", `${effectKey}:${index}`));
 
           const idRemap = new Map<string, string>();
           for (const node of nodes) {
-            const existing = existingNodes.find(
+            const existing = await temporalNode(kv, node) ?? addedNodes.find(
               (n) =>
                 n.name === node.name && n.type === node.type,
             );
@@ -221,7 +236,7 @@ export function registerTemporalGraphFunctions(
               await kv.set(KV.graphNodes, node.id, merged);
             });
             idRemap.set(oldId, node.id);
-            if (!existing) existingNodes.push(node);
+            if (!existing) addedNodes.push(node);
           }
 
           for (const [index, edge] of edges.entries()) {
@@ -234,13 +249,7 @@ export function registerTemporalGraphFunctions(
             if (idRemap.has(edge.targetNodeId)) {
               edge.targetNodeId = idRemap.get(edge.targetNodeId)!;
             }
-            const existingKey = `${edge.sourceNodeId}|${edge.targetNodeId}|${edge.type}`;
-            const existingEdge = existingEdges.find((e) => e.supersededBy === edge.id) ?? existingEdges.filter(
-              (e) =>
-                plannedEdgeIds.indexOf(e.id) < index && e.isLatest !== false &&
-                `${e.sourceNodeId}|${e.targetNodeId}|${e.type}` ===
-                existingKey,
-            ).sort((a, b) => (b.version ?? 1) - (a.version ?? 1))[0];
+            const existingEdge = await temporalPredecessor(kv, edge, index, plannedEdgeIds, addedEdges);
             const records: Array<[string, string]> = [[KV.graphEdges, edge.id]];
             if (existingEdge) records.push([KV.graphEdges, existingEdge.id], [KV.graphEdgeHistory, existingEdge.id]);
             await withBatchRecordLocks(records, async () => {
@@ -263,7 +272,7 @@ export function registerTemporalGraphFunctions(
               const current = await kv.get<GraphEdge>(KV.graphEdges, edge.id);
               await kv.set(KV.graphEdges, edge.id, preserveBatchProvenance(current, edge));
             });
-            existingEdges.push(edge);
+            addedEdges.push(edge);
           }
 
           logger.info("Temporal graph extraction complete", {
@@ -277,19 +286,21 @@ export function registerTemporalGraphFunctions(
           };
         });
       } catch (err) {
+        if (graphTransactionFailure(err)) throw err;
         const msg = err instanceof Error ? err.message : String(err);
         logger.error("Temporal graph extraction failed", { error: msg });
         return { success: false, error: msg };
       }
-    },
-  );
+    }, durableId);
+  sdk.registerFunction("mem::temporal-graph-extract", (input: TemporalExtractionRequest) => extract(input));
+  registerGraphJobHandler(kv, "temporal", (input, id) => extract(input as TemporalExtractionRequest, id));
 
   sdk.registerFunction("mem::temporal-query",
     async (data: {
       entityName: string;
       asOf?: string;
       includeHistory?: boolean;
-    }): Promise<TemporalState | { error: string }> => {
+    }): Promise<TemporalState | { error: string }> => withCompletedGraphRead(kv, async () => {
       const allNodes = await kv.list<GraphNode>(KV.graphNodes);
       const allEdges = await kv.list<GraphEdge>(KV.graphEdges);
 
@@ -313,7 +324,7 @@ export function registerTemporalGraphFunctions(
 
       const historicalEdges = await kv
         .list<GraphEdge>(KV.graphEdgeHistory)
-        .catch(() => [] as GraphEdge[]);
+        .catch((error) => { if (graphTransactionFailure(error)) throw error; return [] as GraphEdge[]; });
       const entityHistory = historicalEdges.filter(
         (e) => e.sourceNodeId === entity.id || e.targetNodeId === entity.id,
       );
@@ -359,7 +370,7 @@ export function registerTemporalGraphFunctions(
         historicalEdges: data.includeHistory ? entityHistory : [],
         timeline: buildTimeline(allEntityEdges),
       };
-    },
+    }),
   );
 
   sdk.registerFunction("mem::differential-state",
@@ -367,12 +378,12 @@ export function registerTemporalGraphFunctions(
       entityName: string;
       from?: string;
       to?: string;
-    }) => {
+    }) => withCompletedGraphRead(kv, async () => {
       const allNodes = await kv.list<GraphNode>(KV.graphNodes);
       const allEdges = await kv.list<GraphEdge>(KV.graphEdges);
       const historicalEdges = await kv
         .list<GraphEdge>(KV.graphEdgeHistory)
-        .catch(() => [] as GraphEdge[]);
+        .catch((error) => { if (graphTransactionFailure(error)) throw error; return [] as GraphEdge[]; });
 
       const entity = allNodes.find(
         (n) => n.name.toLowerCase() === data.entityName.toLowerCase(),
@@ -427,7 +438,7 @@ export function registerTemporalGraphFunctions(
         totalChanges: changes.length,
         changes,
       };
-    },
+    }),
   );
 }
 

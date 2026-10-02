@@ -9,7 +9,7 @@ import type {
   BatchEffectMetadata,
 } from "../types.js";
 import { KV, generateId, fingerprintId } from "../state/schema.js";
-import { batchEffectKey, effectMetadata, runBatchCallback } from "../state/batch-effects.js";
+import { batchEffectKey, createGraphBatchCallbackPreflight, effectMetadata, runBatchCallback } from "../state/batch-effects.js";
 import type { StateKV } from "../state/kv.js";
 import {
   GRAPH_EXTRACTION_SYSTEM,
@@ -29,6 +29,7 @@ import {
 import { stripPrivateData } from "./privacy.js";
 import type { FireworksBatchQueue } from "./fireworks-batch.js";
 import { selectCompactionCandidates } from "./typesafe-compaction.js";
+import { freezeGraphHandledValue, freezeGraphSessionObservations, freezeGraphValue, graphCapturedAt, graphJobId, graphKV, hasGraphDelta, registerGraphJobHandler, runGraphJob, withCompletedGraphRead, withGraphDelta, graphTransactionFailure } from "./graph-jobs.js";
 import {
   estimateGraphObservationChars,
   isProtectedGraphObservation,
@@ -398,6 +399,7 @@ async function readSnapshot(kv: StateKV): Promise<GraphSnapshot | null> {
   try {
     snap = await kv.get<GraphSnapshot>(KV.graphSnapshot, SNAPSHOT_KEY);
   } catch (err) {
+    if (graphTransactionFailure(err)) throw err;
     logger.warn("Graph snapshot read failed", {
       error: err instanceof Error ? err.message : String(err),
     });
@@ -499,7 +501,7 @@ function buildSnapshotFromArrays(
       nodesByType,
       edgesByType,
     },
-    updatedAt: new Date().toISOString(),
+    updatedAt: graphCapturedAt(),
     dirty: false,
   };
 }
@@ -749,7 +751,7 @@ function parseGraphXml(
 } {
   const nodes: GraphNode[] = [];
   const edges: GraphEdge[] = [];
-  const now = new Date().toISOString();
+  const now = graphCapturedAt();
 
   // Two passes because <entity> can be self-closing or have a body
   // (<property> children). The self-closing form needs `[^>]*[^/]` on
@@ -917,7 +919,7 @@ async function applyBatchGraph(kv: StateKV, parsed: ParsedGraphExtraction, obsId
     ...completedSnapshot,
     ...metadata,
     dirty: false,
-    updatedAt: new Date().toISOString(),
+    updatedAt: graphCapturedAt(),
   });
 }
 
@@ -927,7 +929,7 @@ const MAX_HEURISTIC_EDGES_PER_OBS = 12;
 export function extractGraphHeuristics(
   observations: CompressedObservation[],
 ): { nodes: GraphNode[]; edges: GraphEdge[] } {
-  const now = new Date().toISOString();
+  const now = graphCapturedAt();
   const nodes: GraphNode[] = [];
   const nodeByKey = new Map<string, GraphNode>();
   const edges: GraphEdge[] = [];
@@ -1024,8 +1026,22 @@ export async function persistGraphDelta(
   edges: GraphEdge[],
   obsIds: string[],
 ): Promise<{ newNodeCount: number; newEdgeCount: number }> {
+  const guarded = graphKV(kv);
+  if (hasGraphDelta()) return persistGraphDeltaValues(guarded, nodes, edges, obsIds);
+  return runGraphJob(guarded, "import", { nodes, edges, obsIds }, async (input) => {
+    const frozen = input as { nodes: GraphNode[]; edges: GraphEdge[]; obsIds: string[] };
+    return withGraphDelta(guarded, () => persistGraphDeltaValues(guarded, frozen.nodes, frozen.edges, frozen.obsIds));
+  });
+}
+
+async function persistGraphDeltaValues(
+  kv: StateKV,
+  nodes: GraphNode[],
+  edges: GraphEdge[],
+  obsIds: string[],
+): Promise<{ newNodeCount: number; newEdgeCount: number }> {
   const snap = (await readSnapshot(kv)) ?? emptySnapshot();
-  const capturedAt = new Date().toISOString();
+  const capturedAt = graphCapturedAt();
   let newNodeCount = 0;
   let newEdgeCount = 0;
   // Merge-only batches mutate cached topNodes/topEdges entries without
@@ -1158,14 +1174,38 @@ export function registerGraphFunction(
   localCompactor?: LocalGraphCompactor,
   typeSafe?: TypeSafeDecisionProvider,
 ): void {
-  sdk.registerFunction("mem::graph-extract", 
-    async (data: { observations: CompressedObservation[]; batchResponse?: string; deferred?: boolean; force?: boolean; batchEffectKey?: string; replacementOf?: string }) => runBatchCallback(kv, "graph", data.batchEffectKey, async (_resuming, admit) => {
+  kv = graphKV(kv);
+  type ExtractionRequest = { observations?: CompressedObservation[]; sessionId?: string; batchResponse?: string; deferred?: boolean; force?: boolean; batchEffectKey?: string; replacementOf?: string; graphJobId?: string };
+  const extract = async (request: ExtractionRequest, durableId?: string) => {
+    const preflight = request.batchEffectKey === undefined
+      ? undefined
+      : createGraphBatchCallbackPreflight(request.batchEffectKey, (state) =>
+        state === "stale" ? { success: true as const, stale: true as const } : { success: true as const },
+      );
+    return runGraphJob(kv, request.batchEffectKey ? "batch_callback" : "extraction", request, async (frozen) => {
+    const captured = frozen as ExtractionRequest;
+    const auditEffectKey = (phase: string): string | undefined => {
+      const jobId = graphJobId();
+      return jobId ? `graph-extraction:${jobId}:${phase}` : undefined;
+    };
+    const data = { ...captured, observations: captured.observations ?? (captured.sessionId ? await freezeGraphSessionObservations(kv, captured.sessionId) : []) };
+    const options = await freezeGraphValue(kv, "options", () => ({
+      graphEnabled: isGraphExtractionEnabled(), llmEnabled: isGraphExtractionEnabled() && !provider.name.includes("noop"),
+      auxiliary: llmRouter?.hasAuxiliaryProvider === true, targetChars: getGraphExtractionInputTargetChars(),
+      typeSafe: Boolean(typeSafe), batchQueue: Boolean(batchQueue), providerName: provider.name,
+      localCompactor: Boolean(localCompactor), typeSafeCompaction: isTypeSafeFeatureEnabled("compaction"),
+      typeSafeMaxStateChars: getTypeSafeConfig().maxStateChars,
+    }));
+    if (options.providerName !== provider.name || options.typeSafe !== Boolean(typeSafe) || options.batchQueue !== Boolean(batchQueue) || options.localCompactor !== Boolean(localCompactor) || options.typeSafeCompaction !== isTypeSafeFeatureEnabled("compaction") || options.typeSafeMaxStateChars !== getTypeSafeConfig().maxStateChars) {
+      throw new Error("Graph job configuration changed; restore the captured provider/compaction configuration before recovery");
+    }
+    return runBatchCallback(kv, "graph", data.batchEffectKey, async (_resuming, admit) => {
       if (!data.observations || data.observations.length === 0) {
         return { success: false, error: "No observations provided" };
       }
       if (data.batchResponse !== undefined && data.batchEffectKey) {
         const obsIds = data.observations.map((o) => o.id);
-        const parsed = parseGraphExtractionResponse(data.batchResponse, obsIds);
+        const parsed = await freezeGraphValue(kv, "parsed-batch", () => parseGraphExtractionResponse(data.batchResponse, obsIds));
         if (!parsed) {
           return { success: false, error: EMPTY_GRAPH_EXTRACTION_ERROR };
         }
@@ -1178,7 +1218,7 @@ export function registerGraphFunction(
         return { success: false, error: "A batch graph application must be recovered first" };
       }
 
-      const heuristic = extractGraphHeuristics(data.observations);
+      const heuristic = await freezeGraphValue(kv, "heuristic", () => extractGraphHeuristics(data.observations));
       let heuristicNodesAdded = 0;
       let heuristicEdgesAdded = 0;
       if (heuristic.nodes.length || heuristic.edges.length) {
@@ -1187,17 +1227,16 @@ export function registerGraphFunction(
         heuristicEdgesAdded = persisted.newEdgeCount;
         await recordAudit(kv, "observe", "mem::graph-extract", data.observations.map((o) => o.id), {
           nodesExtracted: heuristic.nodes.length, edgesExtracted: heuristic.edges.length, structural: true,
-        });
+        }, undefined, undefined, auditEffectKey("heuristic"));
       }
-      const llmEnabled = isGraphExtractionEnabled() && !provider.name.includes("noop");
-      if (!data.batchResponse && (!isGraphExtractionEnabled() ||
-        (!llmEnabled && !llmRouter?.hasAuxiliaryProvider && !(data.deferred && batchQueue)))) {
+      if (!data.batchResponse && (!options.graphEnabled ||
+        (!options.llmEnabled && !options.auxiliary && !(data.deferred && batchQueue)))) {
         return { success: true, nodesAdded: heuristicNodesAdded, edgesAdded: heuristicEdgesAdded };
       }
 
       let observationsForGraph = data.observations;
       if (!data.force && data.batchResponse === undefined && !data.batchEffectKey && !data.replacementOf) {
-        observationsForGraph = await compactGraphObservations(observationsForGraph, typeSafe);
+        observationsForGraph = await freezeGraphValue(kv, "compaction", () => compactGraphObservations(observationsForGraph, typeSafe));
         if (observationsForGraph.length === 0) {
           return {
             success: true,
@@ -1225,7 +1264,7 @@ export function registerGraphFunction(
         )
       ) {
         try {
-          const decision = await typeSafe.evaluateChoice(
+          const decision = await freezeGraphHandledValue(kv, "pipeline-gate", () => typeSafe!.evaluateChoice(
             "pipelineGates",
             stripPrivateData(JSON.stringify({
               workflow: "graph-extraction",
@@ -1243,7 +1282,7 @@ export function registerGraphFunction(
               run: "Run if the observations may add useful entities or relationships to the graph.",
               skip: "Skip only when the batch is clearly routine and unlikely to add any durable graph information.",
             },
-          );
+          ));
           if (decision?.choice === "skip" && decision.confidence >= TYPESAFE_GRAPH_GATE_CONFIDENCE_THRESHOLD) {
             return {
               success: true,
@@ -1253,22 +1292,23 @@ export function registerGraphFunction(
             };
           }
         } catch (error) {
+          if (graphTransactionFailure(error)) throw error;
           logger.warn("TypeSafe graph pipeline gate failed open", {
             errorType: error instanceof Error ? error.name : "unknown",
           });
         }
       }
 
-      const inputUnits = data.batchResponse
+      const inputUnits = await freezeGraphValue(kv, "input-units", async () => data.batchResponse
         ? [{
           sourceObservations: observationsForGraph,
           promptObservations: observationsForGraph.map(toGraphPromptObservation),
         } satisfies GraphExtractionUnit]
         : await prepareGraphExtractionInputs(
           observationsForGraph,
-          data.deferred ? Math.min(8000, getGraphExtractionInputTargetChars()) : getGraphExtractionInputTargetChars(),
+          data.deferred ? Math.min(8000, options.targetChars) : options.targetChars,
           data.replacementOf ? undefined : localCompactor,
-        );
+        ));
 
       try {
         if (!data.batchResponse && data.deferred && batchQueue) {
@@ -1276,14 +1316,14 @@ export function registerGraphFunction(
           for (const unit of inputUnits) {
             const prompt = buildGraphExtractionPrompt(unit.promptObservations);
             if (prompt.length > 10000) return { success: false, error: "Graph source exceeds the bounded batch input; source retained locally" };
-            const queued = await batchQueue.enqueue({
+            const queued = await freezeGraphHandledValue(kv, `queued:${workItemIds.length}`, () => batchQueue.enqueue({
               replacementOf: data.replacementOf,
               correlationId: generateId("fwbgraph"),
               task: "graph_extraction",
               systemPrompt: GRAPH_EXTRACTION_SYSTEM,
               userPrompt: prompt,
               metadata: { observations: JSON.stringify(unit.sourceObservations), sourceFingerprint: fingerprintId("fwbgraphsrc", JSON.stringify(unit.sourceObservations)) },
-            });
+            }));
             if (!queued.queued || !queued.workItemId) {
               logger.warn("Graph extraction batch unit was not queued; retaining source locally", {
                 queuedUnits: workItemIds.length,
@@ -1316,9 +1356,9 @@ export function registerGraphFunction(
             error: "Batch response requires exactly one graph input unit",
           };
         }
-        for (const unit of inputUnits) {
+        for (const [unitOrdinal, unit] of inputUnits.entries()) {
           const prompt = buildGraphExtractionPrompt(unit.promptObservations);
-          const response = data.batchResponse ?? (llmRouter
+          const response = await freezeGraphHandledValue(kv, "provider-response", async () => data.batchResponse ?? (llmRouter
             ? await llmRouter.run(
               "graph_extraction",
               (selectedProvider) => selectedProvider.compress(
@@ -1332,10 +1372,10 @@ export function registerGraphFunction(
                 ) !== null;
               },
             )
-            : await provider.compress(GRAPH_EXTRACTION_SYSTEM, prompt));
+            : provider.compress(GRAPH_EXTRACTION_SYSTEM, prompt)));
 
           const obsIds = unit.sourceObservations.map((o) => o.id);
-          const parsed = parseGraphExtractionResponse(response, obsIds);
+          const parsed = await freezeGraphHandledValue(kv, "parsed-response", () => parseGraphExtractionResponse(response, obsIds));
           if (!parsed) {
             throw new Error(EMPTY_GRAPH_EXTRACTION_ERROR);
           }
@@ -1345,7 +1385,7 @@ export function registerGraphFunction(
         await recordAudit(kv, "observe", "mem::graph-extract", obsIds, {
           nodesExtracted: nodes.length,
           edgesExtracted: edges.length,
-        });
+        }, undefined, undefined, auditEffectKey(`provider:${unitOrdinal}`));
 
         logger.info("Graph extraction complete", {
           nodes: nodes.length,
@@ -1363,14 +1403,23 @@ export function registerGraphFunction(
           edgesAdded: totalEdgesAdded,
         };
       } catch (err) {
+        if (graphTransactionFailure(err)) throw err;
         const msg = err instanceof Error ? err.message : String(err);
         logger.error("Graph extraction failed", { error: msg });
         return heuristic.nodes.length || heuristic.edges.length
           ? { success: true, nodesAdded: heuristicNodesAdded, edgesAdded: heuristicEdgesAdded, llmError: msg }
           : { success: false, error: msg };
       }
-    }, () => recordAudit(kv, "observe", "mem::graph-extract", data.observations.map((o) => o.id), {}, undefined, undefined, data.batchEffectKey)),
-  );
+    }, () => recordAudit(kv, "observe", "mem::graph-extract", data.observations.map((o) => o.id), {}, undefined, undefined, data.batchEffectKey));
+    }, durableId ?? request.graphJobId ?? (request.batchEffectKey ? `graphcallback:${request.batchEffectKey}` : undefined), preflight);
+  };
+  sdk.registerFunction("mem::graph-extract", (input: ExtractionRequest) => extract(input));
+  registerGraphJobHandler(kv, "extraction", (data, id) => extract(data as ExtractionRequest, id));
+  registerGraphJobHandler(kv, "batch_callback", (data, id) => extract(data as ExtractionRequest, id));
+  registerGraphJobHandler(kv, "import", (input, id) => runGraphJob(kv, "import", input, async (frozen) => {
+    const data = frozen as { nodes: GraphNode[]; edges: GraphEdge[]; obsIds: string[] };
+    return withGraphDelta(kv, () => persistGraphDeltaValues(kv, data.nodes, data.edges, data.obsIds));
+  }, id));
 
   // #753: every branch now applies a default cap and reports the
   // unbounded `total*` counts. Before this change, an unfiltered POST
@@ -1428,18 +1477,19 @@ export function registerGraphFunction(
       let allNodes: GraphNode[];
       let allEdges: GraphEdge[];
       try {
-        const [rawNodes, rawEdges] = await withTimeout(
+        const [rawNodes, rawEdges] = await withCompletedGraphRead(kv, () => withTimeout(
           Promise.all([
             kv.list<GraphNode>(KV.graphNodes),
             kv.list<GraphEdge>(KV.graphEdges),
           ]),
           LIVE_ENUMERATION_BUDGET_MS,
           "graph-query enumeration",
-        );
+        ));
         allNodes = rawNodes.filter((n) => !n.stale);
         allEdges = rawEdges.filter((e) => !e.stale);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+        if (graphTransactionFailure(err)) throw err;
         logger.warn("Graph query enumeration timed out, using snapshot", {
           error: msg,
         });
@@ -1570,9 +1620,8 @@ export function registerGraphFunction(
   // run on corpora large enough that the response payload would
   // block the worker heartbeat. Above the ceiling the only safe path
   // is mem::graph-reset followed by incremental re-extraction.
-  sdk.registerFunction(
-    "mem::graph-snapshot-rebuild",
-    async (data?: { force?: boolean }) => runBatchCallback(kv, "graph", undefined, async () => {
+  const rebuild = async (request?: { force?: boolean }, durableId?: string) => runGraphJob(kv, "rebuild", request ?? {}, async (input) => runBatchCallback(kv, "graph", undefined, () => withGraphDelta(kv, async () => {
+      const data = input as { force?: boolean };
       const started = Date.now();
       // #825: pre-flight refusal for legacy corpora. The old guard
       // checked node count AFTER kv.list, but the heartbeat dies at
@@ -1612,6 +1661,7 @@ export function registerGraphFunction(
           };
         }
       } catch (err) {
+        if (graphTransactionFailure(err)) throw err;
         const msg = err instanceof Error ? err.message : String(err);
         logger.warn("Graph snapshot pre-flight read failed", { error: msg });
         return { success: false, error: msg };
@@ -1699,11 +1749,14 @@ export function registerGraphFunction(
         tookMs,
       };
     } catch (err) {
+      if (graphTransactionFailure(err)) throw err;
       const msg = err instanceof Error ? err.message : String(err);
       logger.error("Graph snapshot rebuild failed", { error: msg });
       return { success: false, error: msg };
     }
-  }));
+  })), durableId);
+  sdk.registerFunction("mem::graph-snapshot-rebuild", (input?: { force?: boolean }) => rebuild(input));
+  registerGraphJobHandler(kv, "rebuild", (input, id) => rebuild(input as { force?: boolean }, id));
 
   // #814 v2 + #825: clean-restart escape hatch for corpora of any
   // size, including the legacy 75K+ case that crashes kv.list.
@@ -1726,7 +1779,7 @@ export function registerGraphFunction(
   // read by any post-#816 code path. Cleanup is deferred to a future
   // chunked-vacuum job; #816's broken vacuum-via-list strategy is
   // what we are leaving behind here.
-  sdk.registerFunction("mem::graph-reset", async () => runBatchCallback(kv, "graph", undefined, async () => {
+  const reset = async (_input?: unknown, durableId?: string) => runGraphJob(kv, "reset", {}, async () => runBatchCallback(kv, "graph", undefined, () => withGraphDelta(kv, async () => {
     if ((await kv.get<GraphSnapshot>(KV.graphSnapshot, SNAPSHOT_KEY))?.batchInProgress) {
       return { success: false, error: "A batch graph application must be recovered first" };
     }
@@ -1739,7 +1792,7 @@ export function registerGraphFunction(
     // to a pre-reset entry.
     const resetSnapshot: GraphSnapshot = {
       ...emptySnapshot(),
-      resetAt: new Date().toISOString(),
+      resetAt: graphCapturedAt(),
     };
     await writeGraphSnapshot(kv, resetSnapshot);
     const counts: Record<string, number> = {
@@ -1748,5 +1801,7 @@ export function registerGraphFunction(
     const tookMs = Date.now() - started;
     logger.info("Graph state reset", { counts, tookMs });
     return { success: true, cleared: counts, tookMs };
-  }));
+  }, true)), durableId);
+  sdk.registerFunction("mem::graph-reset", () => reset());
+  registerGraphJobHandler(kv, "reset", (input, id) => reset(input, id));
 }

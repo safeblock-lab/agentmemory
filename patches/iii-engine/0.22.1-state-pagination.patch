@@ -1,0 +1,4973 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 82af87a26a6012ae361fa36fab77f204637548fe..04844c2fd85614af9cbe6c7e363734973be3c0b8 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1857,6 +1857,18 @@ dependencies = [
+  "async-trait",
+ ]
+ 
++[[package]]
++name = "fallible-iterator"
++version = "0.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
++
++[[package]]
++name = "fallible-streaming-iterator"
++version = "0.1.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
++
+ [[package]]
+ name = "fancy-regex"
+ version = "0.14.0"
+@@ -2261,6 +2273,15 @@ dependencies = [
+  "foldhash 0.1.5",
+ ]
+ 
++[[package]]
++name = "hashbrown"
++version = "0.16.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
++dependencies = [
++ "foldhash 0.2.0",
++]
++
+ [[package]]
+ name = "hashbrown"
+ version = "0.17.0"
+@@ -2272,6 +2293,15 @@ dependencies = [
+  "foldhash 0.2.0",
+ ]
+ 
++[[package]]
++name = "hashlink"
++version = "0.11.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "824e001ac4f3012dd16a264bec811403a67ca9deb6c102fc5049b32c4574b35f"
++dependencies = [
++ "hashbrown 0.16.1",
++]
++
+ [[package]]
+ name = "heapless"
+ version = "0.9.3"
+@@ -2731,6 +2761,7 @@ dependencies = [
+  "reqwest 0.12.28",
+  "ring",
+  "rkyv",
++ "rusqlite",
+  "scaffolder-core",
+  "schemars 0.8.22",
+  "semver",
+@@ -3427,6 +3458,17 @@ dependencies = [
+  "redox_syscall 0.7.5",
+ ]
+ 
++[[package]]
++name = "libsqlite3-sys"
++version = "0.37.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b1f111c8c41e7c61a49cd34e44c7619462967221a6443b0ec299e0ac30cfb9b1"
++dependencies = [
++ "cc",
++ "pkg-config",
++ "vcpkg",
++]
++
+ [[package]]
+ name = "linux-loader"
+ version = "0.13.0"
+@@ -5167,6 +5209,31 @@ dependencies = [
+  "syn 2.0.117",
+ ]
+ 
++[[package]]
++name = "rsqlite-vfs"
++version = "0.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c51c9ae4df8a7fba42103df5c621fa3c37eccf3a3c650879e90fc48b11cc192c"
++dependencies = [
++ "hashbrown 0.16.1",
++ "thiserror 2.0.18",
++]
++
++[[package]]
++name = "rusqlite"
++version = "0.39.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a0d2b0146dd9661bf67bb107c0bb2a55064d556eeb3fc314151b957f313bcd4e"
++dependencies = [
++ "bitflags 2.11.1",
++ "fallible-iterator",
++ "fallible-streaming-iterator",
++ "hashlink",
++ "libsqlite3-sys",
++ "smallvec",
++ "sqlite-wasm-rs",
++]
++
+ [[package]]
+ name = "rust-embed"
+ version = "8.11.0"
+@@ -5858,6 +5925,18 @@ dependencies = [
+  "der",
+ ]
+ 
++[[package]]
++name = "sqlite-wasm-rs"
++version = "0.5.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "dc3efc0da82635d7e1ced0053bbbfa8c7ab9645d0bf36ceb4f7127bb85315d75"
++dependencies = [
++ "cc",
++ "js-sys",
++ "rsqlite-vfs",
++ "wasm-bindgen",
++]
++
+ [[package]]
+ name = "stable_deref_trait"
+ version = "1.2.1"
+@@ -6795,6 +6874,12 @@ version = "0.1.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+ 
++[[package]]
++name = "vcpkg"
++version = "0.2.15"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
++
+ [[package]]
+ name = "version_check"
+ version = "0.9.5"
+diff --git a/engine/Cargo.toml b/engine/Cargo.toml
+index 2bd88afe53fcd951c0b8bac50809a1333efe21ff..95efb934aa8c1acd4f28c9b5c1c8b146c5e9d48e 100644
+--- a/engine/Cargo.toml
++++ b/engine/Cargo.toml
+@@ -154,6 +154,7 @@ winapi = { version = "0.3.9", features = ["minwindef", "wincon", "winbase", "con
+ dirs = "6"
+ machineid-rs = "1.2"
+ sha2 = "0.10"
++rusqlite = { version = "=0.39.0", features = ["bundled"] }
+ iana-time-zone = "0.1"
+ ring = "0.17.14"
+ glob = "0.3.3"
+@@ -188,4 +189,5 @@ libc = "0.2"
+ # Pulled in by engine/tests/worker_trigger_e2e.rs to spawn the
+ # `iii-worker-ops` daemon in-process so the test can assert on the
+ # `worker` custom trigger type without subprocess overhead.
++[target.'cfg(unix)'.dev-dependencies]
+ iii-worker = { path = "../crates/iii-worker" }
+diff --git a/engine/src/builtins/kv.rs b/engine/src/builtins/kv.rs
+index f7c768236fe74391e407ebcadcdf921b54b2fa9d..66b7275d5de91aabe9ad31272e6551a1138a9dcf 100644
+--- a/engine/src/builtins/kv.rs
++++ b/engine/src/builtins/kv.rs
+@@ -7,12 +7,15 @@
+ use std::{
+     collections::HashMap,
+     ffi::OsStr,
+-    io::ErrorKind,
++    io::{ErrorKind, Write},
+     path::{Path, PathBuf},
+     sync::Arc,
+ };
+ 
++use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+ use indexmap::IndexMap;
++use sha2::{Digest, Sha256};
++use uuid::Uuid;
+ 
+ use iii_helpers::stream::{StreamDeleteResult, StreamSetResult, StreamUpdateResult, UpdateOp};
+ use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
+@@ -20,6 +23,11 @@ use serde::{Deserialize, Serialize};
+ use serde_json::Value;
+ use tokio::sync::RwLock;
+ 
++use crate::workers::state::{
++    adapters::StatePageError,
++    structs::{STATE_PAGE_MAX_CURSOR_BYTES, StateListPageResult},
++};
++
+ const KEY_FILE_EXTENSION: &str = "bin";
+ 
+ /// Default persistence flush cadence (ms) for file-backed stores. Used when no
+@@ -30,6 +38,65 @@ const DEFAULT_SAVE_INTERVAL_MS: u64 = 5000;
+ /// adapter config that bypasses the configuration schema's `minimum: 100` — is
+ /// clamped up so it can never drive the save loop into a tight busy-loop.
+ const MIN_SAVE_INTERVAL_MS: u64 = 100;
++const STATE_PAGE_CURSOR_VERSION: u8 = 1;
++
++#[derive(Debug, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct StatePageCursor {
++    version: u8,
++    generation: Uuid,
++    scope_fingerprint: String,
++    revision: u64,
++    next_offset: u64,
++}
++
++#[derive(Default)]
++struct JsonSizeCounter(usize);
++
++impl Write for JsonSizeCounter {
++    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
++        self.0 = self.0.saturating_add(bytes.len());
++        Ok(bytes.len())
++    }
++
++    fn flush(&mut self) -> std::io::Result<()> {
++        Ok(())
++    }
++}
++
++fn serialized_json_len<T: Serialize>(value: &T) -> Result<usize, StatePageError> {
++    let mut counter = JsonSizeCounter::default();
++    serde_json::to_writer(&mut counter, value).map_err(|_| StatePageError::Internal)?;
++    Ok(counter.0)
++}
++
++fn state_page_scope_fingerprint(scope: &str) -> String {
++    URL_SAFE_NO_PAD.encode(Sha256::digest(scope.as_bytes()))
++}
++
++fn encode_state_page_cursor(cursor: &StatePageCursor) -> Result<String, StatePageError> {
++    let bytes = serde_json::to_vec(cursor).map_err(|_| StatePageError::Internal)?;
++    let encoded = URL_SAFE_NO_PAD.encode(bytes);
++    if encoded.len() > STATE_PAGE_MAX_CURSOR_BYTES {
++        return Err(StatePageError::Internal);
++    }
++    Ok(encoded)
++}
++
++fn decode_state_page_cursor(cursor: &str) -> Result<StatePageCursor, StatePageError> {
++    if cursor.len() > STATE_PAGE_MAX_CURSOR_BYTES {
++        return Err(StatePageError::InvalidCursor);
++    }
++    let bytes = URL_SAFE_NO_PAD
++        .decode(cursor)
++        .map_err(|_| StatePageError::InvalidCursor)?;
++    let decoded: StatePageCursor =
++        serde_json::from_slice(&bytes).map_err(|_| StatePageError::InvalidCursor)?;
++    if decoded.version != STATE_PAGE_CURSOR_VERSION {
++        return Err(StatePageError::InvalidCursor);
++    }
++    Ok(decoded)
++}
+ 
+ #[derive(Archive, RkyvSerialize, RkyvDeserialize)]
+ struct KeyStorage(String);
+@@ -177,6 +244,8 @@ async fn delete_index_from_disk(dir: &Path, index: &str) -> anyhow::Result<()> {
+ 
+ pub struct BuiltinKvStore {
+     store: Arc<RwLock<HashMap<String, IndexMap<String, Value>>>>,
++    scope_revisions: RwLock<HashMap<String, u64>>,
++    cursor_generation: RwLock<Uuid>,
+     file_store_dir: Option<PathBuf>,
+     dirty: Arc<RwLock<HashMap<String, DirtyOp>>>,
+     /// Stop signal for the current save-loop instance. Replaced (and the prior
+@@ -249,6 +318,8 @@ impl BuiltinKvStore {
+ 
+         let kv = Self {
+             store,
++            scope_revisions: RwLock::new(HashMap::new()),
++            cursor_generation: RwLock::new(Uuid::new_v4()),
+             file_store_dir,
+             dirty,
+             save_loop_stop: Arc::new(std::sync::Mutex::new(None)),
+@@ -262,6 +333,23 @@ impl BuiltinKvStore {
+         kv
+     }
+ 
++    async fn bump_scope_revision(&self, scope: &str) {
++        let reset_generation = {
++            let mut revisions = self.scope_revisions.write().await;
++            let revision = revisions.entry(scope.to_string()).or_default();
++            if let Some(next) = revision.checked_add(1) {
++                *revision = next;
++                false
++            } else {
++                *revision = 0;
++                true
++            }
++        };
++        if reset_generation {
++            *self.cursor_generation.write().await = Uuid::new_v4();
++        }
++    }
++
+     /// (Re)start the background save loop at `interval_ms`, signalling any prior
+     /// instance to exit so only the newest cadence persists. No-op for
+     /// in-memory stores. Called once from `new` and again from `reconfigure`.
+@@ -373,7 +461,7 @@ impl BuiltinKvStore {
+             let mut store = self.store.write().await;
+             let index_map = store.get_mut(&index);
+ 
+-            if let Some(index_map) = index_map {
++            let result = if let Some(index_map) = index_map {
+                 let old_value = index_map.get(&key).cloned();
+                 index_map.insert(key.clone(), data.clone());
+ 
+@@ -390,7 +478,9 @@ impl BuiltinKvStore {
+                     old_value: None,
+                     new_value: data.clone(),
+                 }
+-            }
++            };
++            self.bump_scope_revision(&index).await;
++            result
+         };
+ 
+         if self.file_store_dir.is_some() {
+@@ -418,6 +508,9 @@ impl BuiltinKvStore {
+ 
+             if let Some(index_map) = index_map {
+                 let removed = index_map.shift_remove(&key);
++                if removed.is_some() {
++                    self.bump_scope_revision(&index).await;
++                }
+                 let dirty_op = if removed.is_some() {
+                     if index_map.is_empty() {
+                         Some(DirtyOp::Delete)
+@@ -466,6 +559,7 @@ impl BuiltinKvStore {
+ 
+             if can_acquire {
+                 index_map.insert(key.to_string(), lock_value);
++                self.bump_scope_revision(index).await;
+                 true
+             } else {
+                 false
+@@ -498,6 +592,7 @@ impl BuiltinKvStore {
+ 
+                 if should_remove {
+                     index_map.shift_remove(key);
++                    self.bump_scope_revision(index).await;
+                     let dirty = if index_map.is_empty() {
+                         Some(DirtyOp::Delete)
+                     } else {
+@@ -538,6 +633,7 @@ impl BuiltinKvStore {
+ 
+         // Write the updated value back to the store
+         index_map.insert(key.clone(), updated_value.clone());
++        self.bump_scope_revision(&index).await;
+ 
+         drop(store);
+ 
+@@ -571,6 +667,96 @@ impl BuiltinKvStore {
+             .map_or(vec![], |topic| topic.values().cloned().collect())
+     }
+ 
++    pub async fn list_page(
++        &self,
++        scope: &str,
++        cursor: Option<&str>,
++        limit: usize,
++        max_bytes: usize,
++    ) -> Result<StateListPageResult, StatePageError> {
++        let decoded_cursor = cursor.map(decode_state_page_cursor).transpose()?;
++        let scope_fingerprint = state_page_scope_fingerprint(scope);
++        if let Some(decoded_cursor) = &decoded_cursor
++            && decoded_cursor.scope_fingerprint != scope_fingerprint
++        {
++            return Err(StatePageError::InvalidCursor);
++        }
++
++        let store = self.store.read().await;
++        let revisions = self.scope_revisions.read().await;
++        let generation = self.cursor_generation.read().await;
++        let revision = revisions.get(scope).copied().unwrap_or_default();
++
++        let start_offset = if let Some(decoded_cursor) = &decoded_cursor {
++            if decoded_cursor.generation != *generation || decoded_cursor.revision != revision {
++                return Err(StatePageError::StaleCursor);
++            }
++            usize::try_from(decoded_cursor.next_offset)
++                .map_err(|_| StatePageError::InvalidCursor)?
++        } else {
++            0
++        };
++
++        let values = store.get(scope);
++        let value_count = values.map_or(0, IndexMap::len);
++        if start_offset > value_count {
++            return Err(StatePageError::InvalidCursor);
++        }
++
++        let empty_page_bytes = serialized_json_len(&StateListPageResult {
++            items: Vec::new(),
++            next_cursor: None,
++        })?;
++        let mut items = Vec::with_capacity(limit.min(value_count.saturating_sub(start_offset)));
++        let mut items_bytes = 0usize;
++        let mut next_cursor = None;
++        let stop_offset = start_offset.saturating_add(limit).min(value_count);
++
++        for absolute_offset in start_offset..stop_offset {
++            let value = values
++                .and_then(|values| values.get_index(absolute_offset))
++                .map(|(_, value)| value)
++                .ok_or(StatePageError::Internal)?;
++            let value_bytes = serialized_json_len(value)?;
++            let candidate_count = items.len() + 1;
++            let candidate_offset = absolute_offset + 1;
++            let candidate_cursor = if candidate_offset < value_count {
++                Some(encode_state_page_cursor(&StatePageCursor {
++                    version: STATE_PAGE_CURSOR_VERSION,
++                    generation: *generation,
++                    scope_fingerprint: scope_fingerprint.clone(),
++                    revision,
++                    next_offset: u64::try_from(candidate_offset)
++                        .map_err(|_| StatePageError::Internal)?,
++                })?)
++            } else {
++                None
++            };
++            let cursor_json_bytes = serialized_json_len(&candidate_cursor)?;
++            let candidate_items_bytes = items_bytes
++                .saturating_add(value_bytes)
++                .saturating_add(if candidate_count > 1 { 1 } else { 0 });
++            let candidate_page_bytes = empty_page_bytes
++                .saturating_add(candidate_items_bytes)
++                .saturating_add(cursor_json_bytes.saturating_sub(4));
++
++            if candidate_page_bytes > max_bytes {
++                if items.is_empty() {
++                    return Err(StatePageError::RecordTooLarge {
++                        required_bytes: candidate_page_bytes,
++                    });
++                }
++                break;
++            }
++
++            items.push(value.clone());
++            items_bytes = candidate_items_bytes;
++            next_cursor = candidate_cursor;
++        }
++
++        Ok(StateListPageResult { items, next_cursor })
++    }
++
+     pub async fn list_groups(&self) -> Vec<String> {
+         let store = self.store.read().await;
+         store.keys().cloned().collect()
+@@ -589,6 +775,284 @@ mod test {
+         dir
+     }
+ 
++    async fn cursor_after_first_item(store: &BuiltinKvStore, scope: &str) -> String {
++        store
++            .list_page(scope, None, 1, 1024)
++            .await
++            .unwrap()
++            .next_cursor
++            .expect("a second item should produce a continuation cursor")
++    }
++
++    #[tokio::test]
++    async fn state_page_returns_an_empty_page_for_an_empty_scope() {
++        let store = BuiltinKvStore::new(None);
++        let page = store.list_page("missing", None, 256, 1024).await.unwrap();
++
++        assert!(page.items.is_empty());
++        assert_eq!(page.next_cursor, None);
++        assert!(serialized_json_len(&page).unwrap() <= 1024);
++    }
++
++    #[tokio::test]
++    async fn state_page_honors_the_exact_serialized_byte_boundary() {
++        let store = BuiltinKvStore::new(None);
++        store
++            .set(
++                "scope".to_string(),
++                "large".to_string(),
++                Value::String("x".repeat(1200)),
++            )
++            .await;
++
++        let page = store
++            .list_page("scope", None, 256, 1_048_576)
++            .await
++            .unwrap();
++        let exact_bytes = serialized_json_len(&page).unwrap();
++        assert!(exact_bytes >= 1024);
++        assert_eq!(
++            store
++                .list_page("scope", None, 256, exact_bytes)
++                .await
++                .unwrap()
++                .items,
++            page.items
++        );
++        assert!(matches!(
++            store
++                .list_page("scope", None, 256, exact_bytes - 1)
++                .await,
++            Err(StatePageError::RecordTooLarge { required_bytes }) if required_bytes == exact_bytes
++        ));
++    }
++
++    #[tokio::test]
++    async fn state_page_byte_accounting_matches_utf8_and_json_escaping() {
++        let store = BuiltinKvStore::new(None);
++        store
++            .set(
++                "scope".to_string(),
++                "escaped".to_string(),
++                Value::String("quote \" slash \\ newline\n café 東京 😀".to_string()),
++            )
++            .await;
++
++        let page = store.list_page("scope", None, 256, 1024).await.unwrap();
++        let actual_bytes = serde_json::to_vec(&page).unwrap().len();
++        assert_eq!(serialized_json_len(&page).unwrap(), actual_bytes);
++        assert_eq!(
++            store
++                .list_page("scope", None, 256, actual_bytes)
++                .await
++                .unwrap()
++                .items,
++            page.items
++        );
++    }
++
++    #[tokio::test]
++    async fn state_page_paginates_large_scopes_without_duplicates_or_oversized_pages() {
++        let store = BuiltinKvStore::new(None);
++        for index in 0..100 {
++            store
++                .set(
++                    "scope".to_string(),
++                    format!("key-{index}"),
++                    serde_json::json!({"index": index, "text": "x".repeat(80)}),
++                )
++                .await;
++        }
++
++        let mut cursor = None;
++        let mut values = Vec::new();
++        let mut page_count = 0;
++        loop {
++            page_count += 1;
++            assert!(page_count <= 100);
++            let page = store
++                .list_page("scope", cursor.as_deref(), 256, 1024)
++                .await
++                .unwrap();
++            assert!(!page.items.is_empty());
++            assert!(serialized_json_len(&page).unwrap() <= 1024);
++            values.extend(page.items);
++            cursor = page.next_cursor;
++            if cursor.is_none() {
++                break;
++            }
++        }
++
++        assert_eq!(values.len(), 100);
++        for (index, value) in values.iter().enumerate() {
++            assert_eq!(value["index"], index);
++        }
++    }
++
++    #[tokio::test]
++    async fn state_page_rejects_malformed_and_cross_scope_cursors() {
++        let store = BuiltinKvStore::new(None);
++        store
++            .set(
++                "scope-a".to_string(),
++                "one".to_string(),
++                serde_json::json!(1),
++            )
++            .await;
++        store
++            .set(
++                "scope-a".to_string(),
++                "two".to_string(),
++                serde_json::json!(2),
++            )
++            .await;
++
++        assert!(matches!(
++            store
++                .list_page("scope-a", Some("bad cursor"), 1, 1024)
++                .await,
++            Err(StatePageError::InvalidCursor)
++        ));
++        let cursor = cursor_after_first_item(&store, "scope-a").await;
++        assert!(matches!(
++            store.list_page("scope-b", Some(&cursor), 1, 1024).await,
++            Err(StatePageError::InvalidCursor)
++        ));
++        assert!(matches!(
++            store
++                .list_page(
++                    "scope-a",
++                    Some(&"x".repeat(STATE_PAGE_MAX_CURSOR_BYTES + 1)),
++                    1,
++                    1024
++                )
++                .await,
++            Err(StatePageError::InvalidCursor)
++        ));
++    }
++
++    #[tokio::test]
++    async fn state_page_rejects_cursors_after_every_builtin_mutation() {
++        for mutation in ["set", "delete", "update", "acquire", "release"] {
++            let store = BuiltinKvStore::new(None);
++            store
++                .set("scope".to_string(), "one".to_string(), serde_json::json!(1))
++                .await;
++            store
++                .set("scope".to_string(), "two".to_string(), serde_json::json!(2))
++                .await;
++            if mutation == "release" {
++                assert!(
++                    store
++                        .try_acquire_lock("scope", "lock", "owner", 60_000)
++                        .await
++                );
++            }
++            let cursor = cursor_after_first_item(&store, "scope").await;
++
++            match mutation {
++                "set" => {
++                    store
++                        .set("scope".to_string(), "one".to_string(), serde_json::json!(1))
++                        .await;
++                }
++                "delete" => {
++                    store.delete("scope".to_string(), "one".to_string()).await;
++                }
++                "update" => {
++                    store
++                        .update(
++                            "scope".to_string(),
++                            "one".to_string(),
++                            Vec::<UpdateOp>::new(),
++                        )
++                        .await;
++                }
++                "acquire" => {
++                    assert!(
++                        store
++                            .try_acquire_lock("scope", "lock", "owner", 60_000)
++                            .await
++                    );
++                }
++                "release" => {
++                    assert!(store.release_lock("scope", "lock", "owner").await);
++                }
++                _ => unreachable!(),
++            }
++
++            assert!(matches!(
++                store.list_page("scope", Some(&cursor), 1, 1024).await,
++                Err(StatePageError::StaleCursor)
++            ));
++        }
++    }
++
++    #[tokio::test]
++    async fn state_page_rejects_cursors_from_an_earlier_store_generation() {
++        let original = BuiltinKvStore::new(None);
++        original
++            .set("scope".to_string(), "one".to_string(), serde_json::json!(1))
++            .await;
++        original
++            .set("scope".to_string(), "two".to_string(), serde_json::json!(2))
++            .await;
++        let cursor = cursor_after_first_item(&original, "scope").await;
++
++        let restarted = BuiltinKvStore::new(None);
++        assert!(matches!(
++            restarted.list_page("scope", Some(&cursor), 1, 1024).await,
++            Err(StatePageError::StaleCursor)
++        ));
++    }
++
++    #[tokio::test]
++    async fn state_page_rejects_forged_offsets_beyond_the_scope() {
++        let store = BuiltinKvStore::new(None);
++        store
++            .set("scope".to_string(), "one".to_string(), serde_json::json!(1))
++            .await;
++        let revision = store
++            .scope_revisions
++            .read()
++            .await
++            .get("scope")
++            .copied()
++            .unwrap_or_default();
++        let generation = *store.cursor_generation.read().await;
++        let cursor = encode_state_page_cursor(&StatePageCursor {
++            version: STATE_PAGE_CURSOR_VERSION,
++            generation,
++            scope_fingerprint: state_page_scope_fingerprint("scope"),
++            revision,
++            next_offset: 100,
++        })
++        .unwrap();
++
++        assert!(matches!(
++            store.list_page("scope", Some(&cursor), 1, 1024).await,
++            Err(StatePageError::InvalidCursor)
++        ));
++    }
++
++    #[tokio::test]
++    async fn state_page_reports_oversized_record_without_removing_it() {
++        let store = BuiltinKvStore::new(None);
++        let value = Value::String("secret".repeat(1000));
++        store
++            .set("scope".to_string(), "large".to_string(), value.clone())
++            .await;
++
++        assert!(matches!(
++            store.list_page("scope", None, 256, 1024).await,
++            Err(StatePageError::RecordTooLarge { required_bytes }) if required_bytes > 1024
++        ));
++        assert_eq!(
++            store.get("scope".to_string(), "large".to_string()).await,
++            Some(value)
++        );
++    }
++
+     #[tokio::test(flavor = "multi_thread")]
+     async fn test_file_based_load_set_delete() {
+         let dir = temp_store_dir();
+diff --git a/engine/src/lib.rs b/engine/src/lib.rs
+index 0bedec343a198d97f159e6bef408dc8629b1c400..0c146dcbf52964f2444544cc6f6a560e7d46a649 100644
+--- a/engine/src/lib.rs
++++ b/engine/src/lib.rs
+@@ -14,6 +14,7 @@ pub mod invocation;
+ pub mod logging;
+ pub mod protocol;
+ pub mod services;
++pub mod state_migration;
+ pub mod telemetry;
+ pub mod trigger;
+ pub mod trigger_formats;
+diff --git a/engine/src/main.rs b/engine/src/main.rs
+index f12d720dee49b9bb3c66ede0b8c606c997268d1c..2adb5ff65386b486b11eebb228050a8b2444e04b 100644
+--- a/engine/src/main.rs
++++ b/engine/src/main.rs
+@@ -109,6 +109,10 @@ struct Cli {
+     #[arg(short = 'v', long)]
+     version: bool,
+ 
++    /// Print machine-readable engine capabilities and exit.
++    #[arg(long, hide = true)]
++    capabilities: bool,
++
+     /// Disable background update and security advisory checks.
+     #[arg(long)]
+     no_update_check: bool,
+@@ -128,6 +132,8 @@ struct Cli {
+ 
+ #[derive(Subcommand, Debug)]
+ enum Commands {
++    /// Import a frozen legacy state directory into a resumable SQLite shadow file.
++    StateMigrate(iii::state_migration::MigrationArgs),
+     /// Invoke a function on a running iii engine
+     #[command(visible_alias = "t")]
+     Trigger(TriggerArgs),
+@@ -203,6 +209,9 @@ fn passthrough_command_path(command: &str, args: &[String]) -> String {
+ }
+ 
+ fn cli_usage_command_path(cli: &Cli) -> String {
++    if cli.capabilities {
++        return "capabilities".to_string();
++    }
+     if cli.version {
+         return "version".to_string();
+     }
+@@ -211,6 +220,7 @@ fn cli_usage_command_path(cli: &Cli) -> String {
+     }
+ 
+     match &cli.command {
++        Some(Commands::StateMigrate(_)) => "state-migrate".to_string(),
+         Some(Commands::Trigger(_)) => "trigger".to_string(),
+         Some(Commands::Console { args }) => passthrough_command_path("console", args),
+         Some(Commands::Cloud { args }) => passthrough_command_path("cloud", args),
+@@ -342,13 +352,25 @@ async fn main() -> anyhow::Result<()> {
+         return Ok(());
+     }
+ 
+-    cli::telemetry::send_cli_usage(&cli_usage_command_path(&cli_args));
++    if cli_args.capabilities {
++        println!(
++            "{}",
++            serde_json::json!({ "capabilities": ["state::list_page", "state::get_versioned", "state::lease", "state::commit_batch", "state::sqlite_wal_v1", "state::shadow_migration_v1"] })
++        );
++        return Ok(());
++    }
+ 
+     if cli_args.version {
+         println!("{}", env!("CARGO_PKG_VERSION"));
+         return Ok(());
+     }
+ 
++    if let Some(Commands::StateMigrate(args)) = &cli_args.command {
++        println!("{}", serde_json::to_string(&iii::state_migration::run(args)?)?);
++        return Ok(());
++    }
++    cli::telemetry::send_cli_usage(&cli_usage_command_path(&cli_args));
++
+     if cli_args.install_only_generate_ids {
+         let _ = iii::workers::telemetry::environment::get_or_create_device_id();
+         let _ = iii::workers::telemetry::environment::resolve_execution_context();
+@@ -367,6 +389,7 @@ async fn main() -> anyhow::Result<()> {
+     }
+ 
+     match &cli_args.command {
++        Some(Commands::StateMigrate(_)) => unreachable!("offline migration handled above"),
+         Some(Commands::Trigger(args)) => match cli_trigger::run_trigger(args).await {
+             Ok(()) => Ok(()),
+             // exec::invoke already printed the structured JSON; exit silently.
+@@ -519,6 +542,14 @@ mod tests {
+         assert_eq!(cli_usage_command_path(&cli), "version");
+     }
+ 
++    #[test]
++    fn capabilities_flag_works_globally() {
++        let cli =
++            Cli::try_parse_from(["iii", "--capabilities"]).expect("should parse --capabilities");
++        assert!(cli.capabilities);
++        assert_eq!(cli_usage_command_path(&cli), "capabilities");
++    }
++
+     #[test]
+     fn use_default_config_is_no_longer_a_flag() {
+         // `--use-default-config` was removed: `iii` now creates config.yaml
+diff --git a/engine/src/state_migration/archive.rs b/engine/src/state_migration/archive.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..283881ad448341d59d56b8ab3dfff8994aa24667
+--- /dev/null
++++ b/engine/src/state_migration/archive.rs
+@@ -0,0 +1,176 @@
++use anyhow::{Context, ensure};
++use serde::de::{DeserializeSeed, MapAccess, Visitor};
++use serde_json::Value;
++use sha2::{Digest, Sha256};
++use std::{
++    cell::Cell,
++    fmt,
++    fs::File,
++    io::{BufReader, Read, Seek, SeekFrom},
++    path::Path,
++    rc::Rc,
++};
++
++pub fn file_digest(path: &Path) -> anyhow::Result<String> {
++    let mut file = File::open(path)?;
++    let mut hash = Sha256::new();
++    let mut buffer = [0u8; 65536];
++    loop {
++        let length = file.read(&mut buffer)?;
++        if length == 0 {
++            break;
++        }
++        hash.update(&buffer[..length]);
++    }
++    Ok(format!("{:x}", hash.finalize()))
++}
++
++fn json_region(file: &mut File) -> anyhow::Result<(u64, u64)> {
++    let bytes = file.metadata()?.len();
++    ensure!(
++        bytes >= 8 && bytes % 4 == 0,
++        "Invalid legacy archive length/alignment"
++    );
++    let root = bytes - 8;
++    file.seek(SeekFrom::Start(root))?;
++    let mut header = [0u8; 8];
++    file.read_exact(&mut header)?;
++    if header[0] & 0xc0 != 0x80 {
++        ensure!(bytes == 8, "Invalid inline archive prefix");
++        let length = header.iter().position(|b| *b == 0xff).unwrap_or(8);
++        return Ok((root, length as u64));
++    }
++    let encoded = u32::from_le_bytes(header[..4].try_into()?);
++    let length = ((encoded & 0x3f) | ((encoded & !0xff) >> 2)) as u64;
++    let offset = i32::from_le_bytes(header[4..].try_into()?) as i64;
++    ensure!(
++        length > 8 && offset < 0,
++        "Invalid out-of-line archive header"
++    );
++    let start = root
++        .checked_add_signed(offset)
++        .context("Invalid archive pointer")?;
++    ensure!(
++        start == 0 && length <= root && root - length < 4,
++        "Invalid archive bounds"
++    );
++    file.seek(SeekFrom::Start(length))?;
++    let mut padding = [0u8; 3];
++    file.read_exact(&mut padding[..(root - length) as usize])?;
++    ensure!(
++        padding[..(root - length) as usize].iter().all(|b| *b == 0),
++        "Invalid archive padding"
++    );
++    Ok((start, length))
++}
++
++pub fn visit(
++    path: &Path,
++    mut row: impl FnMut(String, Value) -> anyhow::Result<()>,
++) -> anyhow::Result<()> {
++    visit_bounded(
++        path,
++        crate::workers::state::adapters::sqlite::MAX_ENVELOPE_BYTES,
++        &mut row,
++    )
++}
++
++pub(super) fn visit_bounded(
++    path: &Path,
++    limit: usize,
++    mut row: impl FnMut(String, Value) -> anyhow::Result<()>,
++) -> anyhow::Result<()> {
++    let mut file = File::open(path)?;
++    let (start, length) = json_region(&mut file)?;
++    file.seek(SeekFrom::Start(start))?;
++    let consumed = Rc::new(Cell::new(0));
++    let reader = RecordReader {
++        inner: BufReader::with_capacity(65536, file.take(length)),
++        consumed: consumed.clone(),
++        limit,
++    };
++    let mut decoder = serde_json::Deserializer::from_reader(reader);
++    Rows(&mut row, consumed).deserialize(&mut decoder)?;
++    decoder.end()?;
++    Ok(())
++}
++
++struct RecordReader<R> {
++    inner: R,
++    consumed: Rc<Cell<usize>>,
++    limit: usize,
++}
++impl<R: Read> Read for RecordReader<R> {
++    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
++        if output.is_empty() {
++            return Ok(0);
++        }
++        let remaining = self.limit.saturating_sub(self.consumed.get());
++        if remaining == 0 {
++            return Err(std::io::Error::new(
++                std::io::ErrorKind::InvalidData,
++                "STATE_MIGRATION_RECORD_TOO_LARGE",
++            ));
++        }
++        let requested = output.len().min(remaining);
++        let read = self.inner.read(&mut output[..requested])?;
++        self.consumed.set(self.consumed.get() + read);
++        Ok(read)
++    }
++}
++
++struct Rows<'a, F>(&'a mut F, Rc<Cell<usize>>);
++impl<'de, F: FnMut(String, Value) -> anyhow::Result<()>> DeserializeSeed<'de> for Rows<'_, F> {
++    type Value = ();
++    fn deserialize<D: serde::Deserializer<'de>>(self, decoder: D) -> Result<(), D::Error> {
++        decoder.deserialize_map(self)
++    }
++}
++impl<'de, F: FnMut(String, Value) -> anyhow::Result<()>> Visitor<'de> for Rows<'_, F> {
++    type Value = ();
++    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
++        formatter.write_str("legacy ordered JSON object")
++    }
++    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<(), M::Error> {
++        loop {
++            self.1.set(0);
++            let Some(key) = map.next_key::<String>()? else {
++                break;
++            };
++            let value = map.next_value::<Value>()?;
++            (self.0)(key, value).map_err(serde::de::Error::custom)?;
++        }
++        Ok(())
++    }
++}
++
++pub fn scope_name(name: &str) -> anyhow::Result<String> {
++    let encoded = name
++        .strip_suffix(".bin")
++        .context("Invalid legacy filename")?;
++    let mut bytes = Vec::with_capacity(encoded.len());
++    let mut input = encoded.bytes();
++    while let Some(byte) = input.next() {
++        bytes.push(if byte == b'%' {
++            let high = input.next().context("Invalid scope escape")?;
++            let low = input.next().context("Invalid scope escape")?;
++            (char::from(high)
++                .to_digit(16)
++                .context("Invalid scope escape")?
++                * 16
++                + char::from(low)
++                    .to_digit(16)
++                    .context("Invalid scope escape")?) as u8
++        } else {
++            byte
++        });
++    }
++    Ok(String::from_utf8(bytes)?)
++}
++
++pub fn content_digest(hash: &mut Sha256, key: &str, value: &str) {
++    hash.update((key.len() as u64).to_le_bytes());
++    hash.update(key.as_bytes());
++    hash.update((value.len() as u64).to_le_bytes());
++    hash.update(value.as_bytes());
++}
+diff --git a/engine/src/state_migration/mod.rs b/engine/src/state_migration/mod.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..7b294918a23faf51dce33d33caea975a6b9c4081
+--- /dev/null
++++ b/engine/src/state_migration/mod.rs
+@@ -0,0 +1,249 @@
++mod archive;
++#[cfg(test)]
++mod tests;
++mod transfer;
++
++use crate::workers::state::adapters::sqlite::database;
++use anyhow::{Context, ensure};
++use clap::Args;
++use rusqlite::{Connection, OpenFlags};
++use serde::{Deserialize, Serialize};
++use sha2::{Digest, Sha256};
++use std::io::Write;
++use std::{
++    fs::{self, File, OpenOptions},
++    path::{Path, PathBuf},
++};
++
++#[derive(Args, Clone, Debug)]
++pub struct MigrationArgs {
++    /// Frozen custom rkyv/JSON state directory. Stop all source writers first.
++    #[arg(long)]
++    pub source: PathBuf,
++    /// New or previously checkpointed shadow SQLite file, outside the source directory.
++    #[arg(long)]
++    pub target: PathBuf,
++    /// Maximum target database plus WAL bytes; independently verify available disk space first.
++    #[arg(long)]
++    pub disk_budget_bytes: u64,
++}
++
++#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
++struct SourceFile {
++    name: String,
++    scope: String,
++    bytes: u64,
++    sha256: String,
++}
++#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
++struct Manifest {
++    format: String,
++    source: String,
++    files: Vec<SourceFile>,
++}
++#[derive(Serialize, Debug)]
++pub struct MigrationResult {
++    pub status: &'static str,
++    pub target: String,
++    pub scopes: usize,
++    pub records: u64,
++    pub source_retained: bool,
++    pub source_manifest_sha256: String,
++}
++
++fn manifest(source: &Path) -> anyhow::Result<Manifest> {
++    let mut files = Vec::new();
++    let mut names = std::collections::HashSet::new();
++    for entry in fs::read_dir(source)? {
++        let entry = entry?;
++        let path = entry.path();
++        if path.extension().and_then(|s| s.to_str()) != Some("bin") {
++            continue;
++        }
++        ensure!(
++            entry.file_type()?.is_file(),
++            "Legacy scope must be a regular file"
++        );
++        let name = entry
++            .file_name()
++            .into_string()
++            .map_err(|_| anyhow::anyhow!("Invalid UTF-8 scope filename"))?;
++        let scope = archive::scope_name(&name)?;
++        ensure!(
++            names.insert(scope.clone()),
++            "Duplicate decoded legacy scope"
++        );
++        ensure!(
++            ![
++                database::CONTROL_SCOPE,
++                database::CHECKPOINT_SCOPE,
++                database::RECEIPT_SCOPE
++            ]
++            .contains(&scope.as_str()),
++            "Legacy source contains reserved transaction metadata"
++        );
++        files.push(SourceFile {
++            name,
++            scope,
++            bytes: entry.metadata()?.len(),
++            sha256: archive::file_digest(&path)?,
++        });
++    }
++    files.sort_by(|a, b| a.name.cmp(&b.name));
++    Ok(Manifest {
++        format: "rkyv-0.8-le32-key-storage-json-v1".into(),
++        source: source.to_string_lossy().into_owned(),
++        files,
++    })
++}
++
++fn target_path(source: &Path, target: &Path) -> anyhow::Result<PathBuf> {
++    let name = target
++        .file_name()
++        .context("Target must name a SQLite file")?;
++    let parent = target
++        .parent()
++        .filter(|p| !p.as_os_str().is_empty())
++        .unwrap_or(Path::new("."));
++    let parent = fs::canonicalize(parent).context("Target parent directory must already exist")?;
++    let target = parent.join(name);
++    ensure!(
++        !target.starts_with(source),
++        "Shadow target must be outside the legacy source directory"
++    );
++    if target.exists() {
++        ensure!(
++            fs::symlink_metadata(&target)?.file_type().is_file(),
++            "Target must be a regular file"
++        );
++    }
++    Ok(target)
++}
++
++fn importer_lock(target: &Path) -> anyhow::Result<File> {
++    let mut lock_name = target.as_os_str().to_owned();
++    lock_name.push(".migration-lock");
++    let lock = OpenOptions::new()
++        .read(true)
++        .write(true)
++        .create(true)
++        .truncate(false)
++        .open(PathBuf::from(lock_name))?;
++    lock.try_lock()
++        .context("Another importer owns this shadow target")?;
++    Ok(lock)
++}
++
++pub fn run(args: &MigrationArgs) -> anyhow::Result<MigrationResult> {
++    run_segment(args, None, None)
++}
++
++fn run_segment(
++    args: &MigrationArgs,
++    stop_after: Option<u64>,
++    maximum_pages: Option<u64>,
++) -> anyhow::Result<MigrationResult> {
++    let source = fs::canonicalize(&args.source)?;
++    ensure!(source.is_dir(), "Source must be a frozen legacy directory");
++    let target = target_path(&source, &args.target)?;
++    let _lock = importer_lock(&target)?;
++    let input = manifest(&source)?;
++    let source_bytes = input.files.iter().try_fold(0u64, |sum, file| {
++        sum.checked_add(file.bytes).context("Source size overflow")
++    })?;
++    ensure!(
++        args.disk_budget_bytes
++            >= source_bytes
++                .saturating_mul(2)
++                .saturating_add(64 * 1024 * 1024),
++        "Reserve a disk budget of at least twice source bytes plus 64 MiB"
++    );
++    let input_json = serde_json::to_string(&input)?;
++    let mut marker_name = target.as_os_str().to_owned();
++    marker_name.push(".migration-pending");
++    let marker = PathBuf::from(marker_name);
++    if marker.exists() {
++        ensure!(
++            fs::symlink_metadata(&marker)?.file_type().is_file(),
++            "Pending marker must be a regular file"
++        );
++        ensure!(
++            archive::file_digest(&marker)?
++                == format!("{:x}", Sha256::digest(input_json.as_bytes())),
++            "Shadow pending identity does not match frozen source"
++        );
++    }
++    if target.exists() {
++        let prior = Connection::open_with_flags(&target, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
++        let tables: i64 = prior.query_row(
++            "SELECT count(*) FROM sqlite_master WHERE type='table'",
++            [],
++            |r| r.get(0),
++        )?;
++        if tables == 0 {
++            ensure!(
++                marker.exists(),
++                "Existing empty target is not an owned migration shadow"
++            );
++        } else {
++            let identity: String = prior.query_row("SELECT manifest FROM state_migration WHERE id=1 AND length(CAST(manifest AS BLOB))=?1", [i64::try_from(input_json.len())?], |r| r.get(0))
++                .context("Existing target is not a resumable migration shadow")?;
++            ensure!(
++                identity == input_json,
++                "Frozen source manifest changed; preserve this shadow and start a new target"
++            );
++        }
++    }
++    if !marker.exists() {
++        let mut pending = OpenOptions::new()
++            .write(true)
++            .create_new(true)
++            .open(&marker)?;
++        pending.write_all(input_json.as_bytes())?;
++        pending.sync_all()?;
++    }
++    {
++        let mut initialize = Connection::open(&target)?;
++        let transaction = initialize.transaction()?;
++        transaction.execute_batch("CREATE TABLE IF NOT EXISTS state_migration(id INTEGER PRIMARY KEY CHECK(id=1), manifest TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','ready')));
++            CREATE TABLE IF NOT EXISTS state_migration_scopes(scope TEXT PRIMARY KEY, ordinal INTEGER NOT NULL, digest TEXT NOT NULL, complete INTEGER NOT NULL CHECK(complete IN (0,1))) WITHOUT ROWID;")?;
++        transaction.execute(
++            "INSERT OR IGNORE INTO state_migration VALUES(1,?1,'pending')",
++            [&input_json],
++        )?;
++        transaction.pragma_update(None, "application_id", database::APPLICATION_ID)?;
++        transaction.pragma_update(None, "user_version", 1)?;
++        transaction.commit()?;
++    }
++    let mut connection = database::open_for_migration(&target)?;
++    if let Some(pages) = maximum_pages {
++        connection.pragma_update(None, "max_page_count", i64::try_from(pages)?)?;
++    }
++    let mut records = 0u64;
++    for file in &input.files {
++        records += transfer::scope(
++            &mut connection,
++            &source,
++            file,
++            &target,
++            args.disk_budget_bytes,
++            stop_after,
++        )?;
++    }
++    ensure!(
++        manifest(&source)? == input,
++        "Frozen source changed during migration; target remains unavailable"
++    );
++    transfer::reconcile(&connection, &input)?;
++    connection.execute("UPDATE state_migration SET status='ready' WHERE id=1", [])?;
++    connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
++    fs::remove_file(&marker)?;
++    Ok(MigrationResult {
++        status: "ready",
++        target: target.to_string_lossy().into_owned(),
++        scopes: input.files.len(),
++        records,
++        source_retained: true,
++        source_manifest_sha256: format!("{:x}", Sha256::digest(input_json.as_bytes())),
++    })
++}
+diff --git a/engine/src/state_migration/tests.rs b/engine/src/state_migration/tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..081a3681c3b731285f6494d92e9a6ea6babd73b1
+--- /dev/null
++++ b/engine/src/state_migration/tests.rs
+@@ -0,0 +1,271 @@
++use super::*;
++use rkyv::{Archive, Serialize as RkyvSerialize};
++
++#[derive(Archive, RkyvSerialize)]
++struct KeyStorage(String);
++fn fixture(json: &str) -> (tempfile::TempDir, MigrationArgs) {
++    let root = std::env::var_os("III_SQLITE_TEST_ROOT").expect("III_SQLITE_TEST_ROOT required");
++    let directory = tempfile::tempdir_in(root).unwrap();
++    let source = directory.path().join("legacy");
++    fs::create_dir(&source).unwrap();
++    fs::write(
++        source.join("mem%3Agraph%3Anodes.bin"),
++        rkyv::to_bytes::<rkyv::rancor::Error>(&KeyStorage(json.into())).unwrap(),
++    )
++    .unwrap();
++    let args = MigrationArgs {
++        source,
++        target: directory.path().join("shadow.sqlite3"),
++        disk_budget_bytes: 128 * 1024 * 1024,
++    };
++    (directory, args)
++}
++fn rows(args: &MigrationArgs) -> Vec<(String, String)> {
++    let connection = database::open(&args.target).unwrap();
++    connection
++        .prepare("SELECT key,value FROM state_rows WHERE scope='mem:graph:nodes' ORDER BY position")
++        .unwrap()
++        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
++        .unwrap()
++        .collect::<rusqlite::Result<_>>()
++        .unwrap()
++}
++
++#[test]
++fn migration_order_values_scope_and_immutable_source() {
++    let (_dir, args) = fixture(r#"{"z":null,"ñ":{"x":"😀","n":1.5},"a":[false,3]}"#);
++    let before = manifest(&fs::canonicalize(&args.source).unwrap()).unwrap();
++    let result = run(&args).unwrap();
++    assert_eq!(result.records, 3);
++    assert_eq!(
++        rows(&args),
++        vec![
++            ("z".into(), "null".into()),
++            ("ñ".into(), r#"{"n":1.5,"x":"😀"}"#.into()),
++            ("a".into(), "[false,3]".into())
++        ]
++    );
++    assert_eq!(
++        manifest(&fs::canonicalize(&args.source).unwrap()).unwrap(),
++        before
++    );
++    assert_eq!(run(&args).unwrap().records, 3);
++}
++
++#[test]
++fn migration_inline_empty_scope() {
++    let (_dir, args) = fixture("{}");
++    assert_eq!(run(&args).unwrap().records, 0);
++    assert!(rows(&args).is_empty());
++}
++
++#[test]
++fn migration_interruption_checkpoint_and_resume() {
++    let (_dir, args) = fixture(r#"{"b":1,"a":2,"c":3}"#);
++    assert!(
++        run_segment(&args, Some(2), None)
++            .unwrap_err()
++            .to_string()
++            .contains("interruption")
++    );
++    let prior = archive::file_digest(&args.target).unwrap();
++    assert!(
++        database::open(&args.target)
++            .unwrap_err()
++            .to_string()
++            .contains("INCOMPLETE")
++    );
++    assert_eq!(archive::file_digest(&args.target).unwrap(), prior);
++    let connection =
++        Connection::open_with_flags(&args.target, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
++    assert_eq!(
++        connection
++            .query_row("SELECT ordinal FROM state_migration_scopes", [], |r| r
++                .get::<_, i64>(0))
++            .unwrap(),
++        2
++    );
++    drop(connection);
++    assert_eq!(run(&args).unwrap().records, 3);
++    assert_eq!(
++        rows(&args).iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
++        ["b", "a", "c"]
++    );
++}
++
++#[test]
++fn migration_changed_source_rejects_resume() {
++    let (_dir, args) = fixture(r#"{"b":1,"a":2}"#);
++    assert!(run_segment(&args, Some(1), None).is_err());
++    fs::write(
++        args.source.join("mem%3Agraph%3Anodes.bin"),
++        rkyv::to_bytes::<rkyv::rancor::Error>(&KeyStorage(r#"{"b":9,"a":2}"#.into())).unwrap(),
++    )
++    .unwrap();
++    assert!(
++        run(&args).unwrap_err().to_string().contains("identity")
++            || run(&args).unwrap_err().to_string().contains("manifest")
++    );
++    assert!(database::open(&args.target).is_err());
++}
++
++#[test]
++fn migration_corrupt_archives_and_duplicate_keys_never_ready() {
++    for json in [r#"{"a":1,"a":2}"#, "[]", r#"{"a":1}{}"#] {
++        let (_dir, args) = fixture(json);
++        assert!(run(&args).is_err());
++        assert!(database::open(&args.target).is_err());
++    }
++    let (_dir, args) = fixture(r#"{"long-enough":1}"#);
++    let path = args.source.join("mem%3Agraph%3Anodes.bin");
++    let mut bytes = fs::read(&path).unwrap();
++    let end = bytes.len();
++    bytes[end - 4..].copy_from_slice(&1i32.to_le_bytes());
++    fs::write(path, bytes).unwrap();
++    assert!(run(&args).is_err());
++    assert!(database::open(&args.target).is_err());
++}
++
++#[test]
++fn migration_target_boundaries_budget_and_existing_database() {
++    let (_dir, mut args) = fixture("{}");
++    args.target = args.source.join("bad.sqlite3");
++    assert!(run(&args).is_err());
++    assert!(!args.target.exists());
++    args.target = args.source.parent().unwrap().join("unrelated.sqlite3");
++    let connection = Connection::open(&args.target).unwrap();
++    connection
++        .execute_batch(
++            "CREATE TABLE unrelated(value TEXT); INSERT INTO unrelated VALUES('retained')",
++        )
++        .unwrap();
++    drop(connection);
++    let before = archive::file_digest(&args.target).unwrap();
++    assert!(run(&args).is_err());
++    assert_eq!(archive::file_digest(&args.target).unwrap(), before);
++    args.target = args.source.parent().unwrap().join("budget.sqlite3");
++    args.disk_budget_bytes = 1;
++    assert!(run(&args).is_err());
++    assert!(!args.target.exists());
++}
++
++#[test]
++fn migration_sqlite_full_rolls_back_and_can_resume() {
++    let json = format!("{{\"a\":\"{}\",\"b\":1}}", "x".repeat(1024 * 1024));
++    let (_dir, args) = fixture(&json);
++    assert!(
++        run_segment(&args, None, Some(16))
++            .unwrap_err()
++            .to_string()
++            .contains("full")
++    );
++    assert!(database::open(&args.target).is_err());
++    let connection = Connection::open(&args.target).unwrap();
++    assert_eq!(
++        connection
++            .query_row(
++                "SELECT count(*) FROM state_rows WHERE scope='mem:graph:nodes'",
++                [],
++                |r| r.get::<_, i64>(0)
++            )
++            .unwrap(),
++        0
++    );
++    drop(connection);
++    assert_eq!(run(&args).unwrap().records, 2);
++}
++
++#[test]
++fn migration_concurrent_importer_lock_released_on_drop() {
++    let (_dir, args) = fixture("{}");
++    let lock = importer_lock(&args.target).unwrap();
++    assert!(run(&args).unwrap_err().to_string().contains("importer"));
++    drop(lock);
++    assert!(run(&args).is_ok());
++}
++
++#[test]
++fn migration_multiple_batches_reconcile_ordered_content() {
++    let mut json = String::from("{");
++    for index in 0..1025 {
++        if index > 0 {
++            json.push(',');
++        }
++        json.push_str(&format!("\"key-{index}\":{{\"value\":{index}}}"));
++    }
++    json.push('}');
++    let (_dir, args) = fixture(&json);
++    assert!(run_segment(&args, Some(513), None).is_err());
++    assert_eq!(run(&args).unwrap().records, 1025);
++    assert_eq!(rows(&args).last().unwrap().0, "key-1024");
++}
++
++#[test]
++fn migration_record_quota_rejects_before_value_callback() {
++    let (_dir, args) = fixture(&format!("{{\"oversized\":\"{}\"}}", "x".repeat(1024)));
++    let mut effects = 0;
++    let error = archive::visit_bounded(&args.source.join("mem%3Agraph%3Anodes.bin"), 64, |_, _| {
++        effects += 1;
++        Ok(())
++    })
++    .unwrap_err();
++    assert!(
++        error
++            .to_string()
++            .contains("STATE_MIGRATION_RECORD_TOO_LARGE")
++    );
++    assert_eq!(effects, 0);
++    assert!(!args.target.exists());
++}
++
++#[test]
++fn migration_resume_initial_marker_and_ready_marker_crash_boundaries() {
++    for initial_empty_database in [false, true] {
++        let (_dir, args) = fixture(r#"{"a":1}"#);
++        let input = manifest(&fs::canonicalize(&args.source).unwrap()).unwrap();
++        let mut pending = args.target.as_os_str().to_owned();
++        pending.push(".migration-pending");
++        let pending = PathBuf::from(pending);
++        fs::write(&pending, serde_json::to_vec(&input).unwrap()).unwrap();
++        if initial_empty_database {
++            drop(Connection::open(&args.target).unwrap());
++        }
++        assert_eq!(run(&args).unwrap().records, 1);
++        assert!(!pending.exists());
++        let before = rows(&args);
++        fs::write(&pending, serde_json::to_vec(&input).unwrap()).unwrap();
++        assert!(database::open(&args.target).is_err());
++        assert_eq!(run(&args).unwrap().records, 1);
++        assert!(!pending.exists());
++        assert_eq!(rows(&args), before);
++    }
++}
++
++#[test]
++fn migration_pending_metadata_refusal_does_not_write_without_sidecar() {
++    let (_dir, args) = fixture(r#"{"a":1,"b":2}"#);
++    assert!(run_segment(&args, Some(1), None).is_err());
++    let mut pending = args.target.as_os_str().to_owned();
++    pending.push(".migration-pending");
++    fs::remove_file(PathBuf::from(pending)).unwrap();
++    let before = archive::file_digest(&args.target).unwrap();
++    assert!(
++        database::open(&args.target)
++            .unwrap_err()
++            .to_string()
++            .contains("INCOMPLETE")
++    );
++    assert_eq!(archive::file_digest(&args.target).unwrap(), before);
++    let connection =
++        Connection::open_with_flags(&args.target, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
++    assert_eq!(
++        connection
++            .query_row(
++                "SELECT version FROM state_rows WHERE scope=?1 AND key='current'",
++                [database::CONTROL_SCOPE],
++                |r| r.get::<_, String>(0)
++            )
++            .unwrap(),
++        "1"
++    );
++}
+diff --git a/engine/src/state_migration/transfer.rs b/engine/src/state_migration/transfer.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..2f1d37d2c8a821cd2fe12f756932456f4fdfaf17
+--- /dev/null
++++ b/engine/src/state_migration/transfer.rs
+@@ -0,0 +1,159 @@
++use super::{Manifest, SourceFile, archive};
++use anyhow::{Context, ensure};
++use rusqlite::{Connection, OptionalExtension, params};
++use sha2::{Digest, Sha256};
++use std::{fs, path::Path};
++
++pub fn scope(
++    connection: &mut Connection,
++    source: &Path,
++    file: &SourceFile,
++    target: &Path,
++    budget: u64,
++    stop_after: Option<u64>,
++) -> anyhow::Result<u64> {
++    let path = source.join(&file.name);
++    ensure!(
++        archive::file_digest(&path)? == file.sha256,
++        "Frozen source scope changed"
++    );
++    let checkpoint: Option<(i64, String)> = connection
++        .query_row(
++            "SELECT ordinal,digest FROM state_migration_scopes WHERE scope=?1",
++            [&file.scope],
++            |r| Ok((r.get(0)?, r.get(1)?)),
++        )
++        .optional()?;
++    let (skip, prefix) = checkpoint.unwrap_or((0, format!("{:x}", Sha256::new().finalize())));
++    let skip = u64::try_from(skip).context("Invalid negative checkpoint ordinal")?;
++    let mut hash = Sha256::new();
++    let mut ordinal = 0u64;
++    let mut batch_rows = 0u64;
++    let mut batch_bytes = 0usize;
++    connection.execute_batch("BEGIN IMMEDIATE")?;
++    let result = archive::visit(&path, |key, value| {
++        let serialized = serde_json::to_string(&value)?;
++        archive::content_digest(&mut hash, &key, &serialized);
++        ordinal = ordinal.checked_add(1).context("Record count overflow")?;
++        ensure!(
++            ordinal <= 9_007_199_254_740_990,
++            "Migration record position exceeds supported state range"
++        );
++        if ordinal <= skip {
++            if ordinal == skip {
++                ensure!(
++                    format!("{:x}", hash.clone().finalize()) == prefix,
++                    "Checkpoint prefix does not match source"
++                );
++            }
++            return Ok(());
++        }
++        let duplicate: bool = connection.query_row(
++            "SELECT EXISTS(SELECT 1 FROM state_rows WHERE scope=?1 AND key=?2)",
++            params![file.scope, key],
++            |r| r.get(0),
++        )?;
++        ensure!(!duplicate, "Duplicate key or shadow content conflict");
++        connection.execute("INSERT INTO state_rows(scope,key,value,version,position,value_bytes) VALUES(?1,?2,?3,'1',?4,?5)",
++            params![file.scope,key,serialized,i64::try_from(ordinal-1)?, i64::try_from(serialized.len())?])?;
++        batch_rows += 1;
++        batch_bytes = batch_bytes
++            .saturating_add(key.len())
++            .saturating_add(serialized.len());
++        if batch_rows >= 256
++            || batch_bytes >= 4 * 1024 * 1024
++            || stop_after.is_some_and(|limit| ordinal >= limit)
++        {
++            checkpoint_scope(connection, file, ordinal, &hash, false)?;
++            connection.execute_batch("COMMIT")?;
++            check_budget(target, budget)?;
++            if stop_after.is_some_and(|limit| ordinal >= limit) {
++                anyhow::bail!("Synthetic segment interruption at durable checkpoint");
++            }
++            connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); BEGIN IMMEDIATE")?;
++            batch_rows = 0;
++            batch_bytes = 0;
++        }
++        Ok(())
++    });
++    if let Err(error) = result {
++        if !connection.is_autocommit() {
++            connection.execute_batch("ROLLBACK")?;
++        }
++        return Err(error);
++    }
++    ensure!(ordinal >= skip, "Checkpoint exceeds source scope");
++    ensure!(
++        archive::file_digest(&path)? == file.sha256,
++        "Frozen source changed during scope import"
++    );
++    checkpoint_scope(connection, file, ordinal, &hash, true)?;
++    connection.execute_batch("COMMIT; PRAGMA wal_checkpoint(TRUNCATE)")?;
++    check_budget(target, budget)?;
++    Ok(ordinal)
++}
++
++fn checkpoint_scope(
++    connection: &Connection,
++    file: &SourceFile,
++    ordinal: u64,
++    hash: &Sha256,
++    complete: bool,
++) -> anyhow::Result<()> {
++    let digest = format!("{:x}", hash.clone().finalize());
++    connection.execute("INSERT INTO state_migration_scopes VALUES(?1,?2,?3,?4) ON CONFLICT(scope) DO UPDATE SET ordinal=excluded.ordinal,digest=excluded.digest,complete=excluded.complete",
++        params![file.scope,i64::try_from(ordinal)?,digest,complete])?;
++    connection.execute("INSERT INTO state_scopes VALUES(?1,?2,?3) ON CONFLICT(scope) DO UPDATE SET revision=excluded.revision,next_position=excluded.next_position",
++        params![file.scope,ordinal.to_string(),i64::try_from(ordinal)?])?;
++    Ok(())
++}
++
++fn check_budget(target: &Path, budget: u64) -> anyhow::Result<()> {
++    let mut wal = target.as_os_str().to_owned();
++    wal.push("-wal");
++    let bytes = fs::metadata(target)?
++        .len()
++        .checked_add(match fs::metadata(Path::new(&wal)) {
++            Ok(metadata) => metadata.len(),
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
++            Err(error) => return Err(error.into()),
++        })
++        .context("Target size overflow")?;
++    ensure!(
++        bytes <= budget,
++        "Shadow target exceeded reserved disk budget; source retained and target remains unavailable"
++    );
++    Ok(())
++}
++
++pub fn reconcile(connection: &Connection, input: &Manifest) -> anyhow::Result<()> {
++    for file in &input.files {
++        let (count, digest, complete): (i64, String, bool) = connection.query_row(
++            "SELECT ordinal,digest,complete FROM state_migration_scopes WHERE scope=?1",
++            [&file.scope],
++            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
++        )?;
++        let count = u64::try_from(count).context("Invalid negative reconciliation count")?;
++        ensure!(complete, "Scope checkpoint incomplete");
++        let mut query = connection.prepare(
++            "SELECT key,value,position FROM state_rows WHERE scope=?1 ORDER BY position",
++        )?;
++        let mut rows = query.query([&file.scope])?;
++        let mut observed = 0u64;
++        let mut hash = Sha256::new();
++        while let Some(row) = rows.next()? {
++            let key: String = row.get(0)?;
++            let value: String = row.get(1)?;
++            let position =
++                u64::try_from(row.get::<_, i64>(2)?).context("Invalid negative row position")?;
++            ensure!(position == observed, "Target insertion order mismatch");
++            archive::content_digest(&mut hash, &key, &value);
++            observed += 1;
++        }
++        ensure!(
++            observed == count && format!("{:x}", hash.finalize()) == digest,
++            "Target ordered content/count mismatch"
++        );
++    }
++    Ok(())
++}
+diff --git a/engine/src/workers/state/adapters/kv_store.rs b/engine/src/workers/state/adapters/kv_store.rs
+index dd5648f27cce7b368dab5c65ef1b111801cb3461..a4515f9331e67b1184172f57969d7e418a4a14bc 100644
+--- a/engine/src/workers/state/adapters/kv_store.rs
++++ b/engine/src/workers/state/adapters/kv_store.rs
+@@ -15,8 +15,9 @@ use crate::{
+     builtins::kv::BuiltinKvStore,
+     engine::Engine,
+     workers::state::{
+-        adapters::StateAdapter,
++        adapters::{StateAdapter, StatePageError},
+         registry::{StateAdapterFuture, StateAdapterRegistration},
++        structs::StateListPageResult,
+     },
+ };
+ 
+@@ -74,6 +75,18 @@ impl StateAdapter for BuiltinKvStoreAdapter {
+         Ok(self.storage.list(scope.to_string()).await)
+     }
+ 
++    async fn list_page(
++        &self,
++        scope: &str,
++        cursor: Option<&str>,
++        limit: u32,
++        max_bytes: u32,
++    ) -> Result<StateListPageResult, StatePageError> {
++        self.storage
++            .list_page(scope, cursor, limit as usize, max_bytes as usize)
++            .await
++    }
++
+     async fn list_groups(&self) -> anyhow::Result<Vec<String>> {
+         Ok(self.storage.list_groups().await)
+     }
+diff --git a/engine/src/workers/state/adapters/mod.rs b/engine/src/workers/state/adapters/mod.rs
+index 29eafa68a884a899435ee0b4f3050fb89b6da398..587c16c8b55ec9814a57a2b5cf3c948673404745 100644
+--- a/engine/src/workers/state/adapters/mod.rs
++++ b/engine/src/workers/state/adapters/mod.rs
+@@ -7,13 +7,35 @@
+ pub mod bridge;
+ pub mod kv_store;
+ pub mod redis_adapter;
++pub mod sqlite;
+ 
+ use async_trait::async_trait;
+ use iii_helpers::stream::{StreamSetResult, StreamUpdateResult, UpdateOp};
+ use serde_json::Value;
+ 
++use crate::workers::state::structs::StateListPageResult;
++
++#[derive(Debug, Clone)]
++pub enum StatePageError {
++    Unsupported,
++    InvalidCursor,
++    StaleCursor,
++    RecordTooLarge { required_bytes: usize },
++    Internal,
++    RecoveryRequired,
++}
++
+ #[async_trait]
+ pub trait StateAdapter: Send + Sync {
++    async fn get_versioned(&self, _input: Value) -> anyhow::Result<Value> {
++        Err(sqlite::protocol_error_unsupported())
++    }
++    async fn lease(&self, _input: Value) -> anyhow::Result<Value> {
++        Err(sqlite::protocol_error_unsupported())
++    }
++    async fn commit_batch(&self, _input: Value) -> anyhow::Result<Value> {
++        Err(sqlite::protocol_error_unsupported())
++    }
+     async fn set(&self, scope: &str, key: &str, value: Value) -> anyhow::Result<StreamSetResult>;
+     async fn get(&self, scope: &str, key: &str) -> anyhow::Result<Option<Value>>;
+     async fn delete(&self, scope: &str, key: &str) -> anyhow::Result<()>;
+@@ -24,6 +46,15 @@ pub trait StateAdapter: Send + Sync {
+         ops: Vec<UpdateOp>,
+     ) -> anyhow::Result<StreamUpdateResult>;
+     async fn list(&self, scope: &str) -> anyhow::Result<Vec<Value>>;
++    async fn list_page(
++        &self,
++        _scope: &str,
++        _cursor: Option<&str>,
++        _limit: u32,
++        _max_bytes: u32,
++    ) -> Result<StateListPageResult, StatePageError> {
++        Err(StatePageError::Unsupported)
++    }
+     async fn list_groups(&self) -> anyhow::Result<Vec<String>>;
+     async fn destroy(&self) -> anyhow::Result<()>;
+ 
+diff --git a/engine/src/workers/state/adapters/sqlite/commit.rs b/engine/src/workers/state/adapters/sqlite/commit.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..cff155911263ba70f2a09929eee7d04550c2b5b3
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/commit.rs
+@@ -0,0 +1,311 @@
++use super::{
++    database::{self, CHECKPOINT_SCOPE, CONTROL_SCOPE, RECEIPT_SCOPE},
++    protocol::{
++        self, Checkpoint, CommitBody, CommitRequest, Guard, JOBS, LeaseRequest, Operation,
++        SNAPSHOT, WORKING, error, require,
++    },
++};
++use rusqlite::Connection;
++use serde::{Deserialize, Serialize};
++use serde_json::{Value, json};
++
++#[derive(Clone, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Lease {
++    owner_id: String,
++    generation: String,
++    fence: String,
++    expires_at_ms: i64,
++}
++#[derive(Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Control {
++    version: u8,
++    generation: String,
++    fence: String,
++    lease: Option<Lease>,
++    recovery: Option<Checkpoint>,
++}
++fn control(connection: &Connection) -> anyhow::Result<Control> {
++    let value = database::row(connection, CONTROL_SCOPE, "current")?
++        .value
++        .ok_or_else(|| error("STATE_TX_FAILED"))?;
++    let control: Control = serde_json::from_value(value)?;
++    require(control.version == 1 && protocol::counter(&control.generation)? > 0)?;
++    protocol::counter(&control.fence)?;
++    Ok(control)
++}
++fn save_control(connection: &Connection, control: &Control) -> anyhow::Result<()> {
++    database::write(
++        connection,
++        CONTROL_SCOPE,
++        "current",
++        Some(&serde_json::to_value(control)?),
++    )?;
++    Ok(())
++}
++fn validate_guard(control: &Control, guard: &Guard) -> anyhow::Result<()> {
++    guard.validate()?;
++    if control.generation != guard.generation {
++        return Err(error("STATE_TX_GENERATION_STALE"));
++    }
++    if !control.lease.as_ref().is_some_and(|lease| {
++        lease.generation == guard.generation
++            && lease.fence == guard.fence
++            && lease.owner_id == guard.owner_id
++            && lease.expires_at_ms > chrono::Utc::now().timestamp_millis()
++            && control.fence == guard.fence
++    }) {
++        return Err(error("STATE_TX_FENCED"));
++    }
++    Ok(())
++}
++pub fn read_allowed(
++    connection: &Connection,
++    scope: &str,
++    key: &str,
++    guard: Option<&Guard>,
++) -> anyhow::Result<()> {
++    let control = control(connection)?;
++    if let Some(guard) = guard {
++        validate_guard(&control, guard)?;
++    }
++    if control.recovery.is_some()
++        && guard.is_none()
++        && (protocol::guarded(scope, key) || (scope == "mem:batch-callbacks" && key.is_empty()))
++        && ![CONTROL_SCOPE, CHECKPOINT_SCOPE, RECEIPT_SCOPE].contains(&scope)
++        && !(scope == SNAPSHOT && key == "current")
++    {
++        return Err(error("STATE_GRAPH_RECOVERY_REQUIRED"));
++    }
++    Ok(())
++}
++pub fn lease(connection: &Connection, request: LeaseRequest) -> anyhow::Result<Value> {
++    let mut control = control(connection)?;
++    let now = chrono::Utc::now().timestamp_millis();
++    let (owner_id, generation, ttl_ms, fence) = match request {
++        LeaseRequest::Acquire {
++            owner_id,
++            generation,
++            ttl_ms,
++        } => (owner_id, generation, Some(ttl_ms), None),
++        LeaseRequest::Renew {
++            owner_id,
++            generation,
++            fence,
++            ttl_ms,
++        } => (owner_id, generation, Some(ttl_ms), Some(fence)),
++        LeaseRequest::Release {
++            owner_id,
++            generation,
++            fence,
++        } => (owner_id, generation, None, Some(fence)),
++    };
++    if generation != control.generation {
++        return Err(error("STATE_TX_GENERATION_STALE"));
++    }
++    if let Some(fence) = fence {
++        validate_guard(
++            &control,
++            &Guard {
++                owner_id: owner_id.clone(),
++                generation: generation.clone(),
++                fence,
++            },
++        )?;
++        if ttl_ms.is_none() {
++            control.lease = None;
++            save_control(connection, &control)?;
++            return Ok(json!({"released":true}));
++        }
++    } else if let Some(lease) = &control.lease {
++        if lease.expires_at_ms > now {
++            if lease.owner_id != owner_id {
++                return Err(error("STATE_TX_LEASE_BUSY"));
++            }
++            return Ok(serde_json::to_value(lease)?);
++        }
++    }
++    if control
++        .lease
++        .as_ref()
++        .is_none_or(|lease| lease.expires_at_ms <= now)
++    {
++        control.fence = protocol::next(protocol::counter(&control.fence)?)?.to_string();
++    }
++    let expires_at_ms = now
++        .checked_add(ttl_ms.unwrap_or(0) as i64)
++        .filter(|time| *time > 0 && *time <= 9_007_199_254_740_991)
++        .ok_or_else(|| error("STATE_TX_LIMIT_EXCEEDED"))?;
++    let lease = Lease {
++        owner_id,
++        generation,
++        fence: control.fence.clone(),
++        expires_at_ms,
++    };
++    control.lease = Some(lease.clone());
++    save_control(connection, &control)?;
++    Ok(serde_json::to_value(lease)?)
++}
++fn progression(old: Option<&Value>, body: &CommitBody) -> anyhow::Result<()> {
++    let point = &body.checkpoint;
++    let id = &body.identity;
++    let valid = match old {
++        None => id.chunk_ordinal == 0 && point.delta_ordinal == 0,
++        Some(old) => {
++            let previous: Checkpoint = serde_json::from_value(old.clone())?;
++            if previous.generation != id.generation || previous.job_id != id.job_id {
++                false
++            } else if previous.logical_delta_id == id.logical_delta_id {
++                previous.visibility != "complete"
++                    && previous.next_chunk_ordinal == id.chunk_ordinal
++                    && previous.delta_ordinal == point.delta_ordinal
++                    && !(previous.visibility == "applying" && point.visibility == "staging")
++            } else {
++                previous.visibility == "complete"
++                    && id.chunk_ordinal == 0
++                    && point.delta_ordinal == previous.delta_ordinal + 1
++            }
++        }
++    };
++    if !valid {
++        return Err(error("STATE_TX_CHECKPOINT_CONFLICT"));
++    }
++    Ok(())
++}
++fn pending_value(
++    connection: &Connection,
++    body: &CommitBody,
++    scope: &str,
++    key: &str,
++) -> anyhow::Result<Option<Value>> {
++    match body.operations.iter().find(|op| {
++        let (s, k, _) = op.row();
++        s == scope && k == key
++    }) {
++        Some(Operation::Set { value, .. }) => Ok(Some(value.clone())),
++        Some(Operation::Delete { .. }) => Ok(None),
++        _ => Ok(database::row(connection, scope, key)?.value),
++    }
++}
++fn job_ownership(connection: &Connection, body: &CommitBody) -> anyhow::Result<()> {
++    let job = pending_value(connection, body, JOBS, &body.identity.job_id)?
++        .ok_or_else(|| error("STATE_TX_INVALID_REQUEST"))?;
++    require(
++        job["version"] == 1
++            && job["id"] == body.identity.job_id
++            && job["generation"] == body.identity.generation,
++    )?;
++    if let Some(count) = job.get("logicalDeltaCount").and_then(Value::as_u64) {
++        require(body.checkpoint.delta_ordinal < count)?;
++    }
++    Ok(())
++}
++fn completion(connection: &Connection, body: &CommitBody) -> anyhow::Result<()> {
++    let working = pending_value(connection, body, WORKING, &body.identity.job_id)?
++        .ok_or_else(|| error("STATE_TX_INVALID_REQUEST"))?;
++    require(
++        working.as_object().is_some_and(|object| object.len() == 6)
++            && working["version"] == 1
++            && working["generation"] == body.identity.generation
++            && working["jobId"] == body.identity.job_id
++            && working["logicalDeltaId"] == body.identity.logical_delta_id,
++    )?;
++    let exists = working
++        .get("snapshotExists")
++        .and_then(Value::as_bool)
++        .ok_or_else(|| error("STATE_TX_INVALID_REQUEST"))?;
++    let snapshot = working
++        .get("snapshot")
++        .ok_or_else(|| error("STATE_TX_INVALID_REQUEST"))?;
++    let published = pending_value(connection, body, SNAPSHOT, "current")?;
++    require(
++        exists == published.is_some()
++            && (if exists {
++                published.as_ref() == Some(snapshot)
++            } else {
++                snapshot.is_null()
++            }),
++    )
++}
++
++pub fn commit(
++    connection: &Connection,
++    request: CommitRequest,
++    body: CommitBody,
++) -> anyhow::Result<Value> {
++    let mut control = control(connection)?;
++    // A historical lost acknowledgment is authorized by today's lease, not the old identity.
++    validate_guard(&control, &request.guard)?;
++    let receipt_key = serde_json::to_string(&json!([
++        body.identity.generation,
++        body.identity.job_id,
++        body.identity.logical_delta_id,
++        body.identity.chunk_ordinal
++    ]))?;
++    if let Some(receipt) = database::row(connection, RECEIPT_SCOPE, &receipt_key)?.value {
++        if receipt["payload_digest"] != request.payload_digest {
++            return Err(error("STATE_TX_REPLAY_CONFLICT"));
++        }
++        return Ok(receipt);
++    }
++    if body.identity.generation != control.generation {
++        return Err(error("STATE_TX_GENERATION_STALE"));
++    }
++    if let Some(barrier) = &control.recovery {
++        if barrier.job_id != body.identity.job_id
++            || barrier.logical_delta_id != body.identity.logical_delta_id
++            || barrier.generation != body.identity.generation
++        {
++            return Err(error("STATE_GRAPH_RECOVERY_REQUIRED"));
++        }
++    }
++    let checkpoint = database::row(connection, CHECKPOINT_SCOPE, &body.identity.job_id)?;
++    if checkpoint.version != protocol::counter(&body.expected_checkpoint_version)? {
++        return Err(error("STATE_TX_CHECKPOINT_CONFLICT"));
++    }
++    progression(checkpoint.value.as_ref(), &body)?;
++    job_ownership(connection, &body)?;
++    for op in &body.operations {
++        let (scope, key, version) = op.row();
++        if database::row(connection, scope, key)?.version != protocol::counter(version)? {
++            return Err(error("STATE_TX_CONFLICT"));
++        }
++    }
++    if body.checkpoint.visibility == "complete" {
++        completion(connection, &body)?;
++    }
++    let live_effect = body.operations.iter().any(|op| {
++        let (scope, key, _) = op.row();
++        op.changed() && protocol::live(scope, key)
++    });
++    let mut row_versions = Vec::with_capacity(body.operations.len());
++    for op in &body.operations {
++        let (scope, key, version) = op.row();
++        let version = match op {
++            Operation::Set { value, .. } => database::write(connection, scope, key, Some(value))?,
++            Operation::Delete { .. } => database::write(connection, scope, key, None)?,
++            Operation::Check { .. } => protocol::counter(version)?,
++        };
++        row_versions.push(json!({"scope":scope,"key":key,"version":version.to_string()}));
++    }
++    let checkpoint_version = database::write(
++        connection,
++        CHECKPOINT_SCOPE,
++        &body.identity.job_id,
++        Some(&serde_json::to_value(&body.checkpoint)?),
++    )?;
++    if body.checkpoint.visibility == "complete" {
++        control.recovery = None;
++    } else if live_effect || control.recovery.is_some() {
++        control.recovery = Some(body.checkpoint.clone());
++    }
++    if body.advance_generation == Some(true) {
++        control.generation = protocol::next(protocol::counter(&control.generation)?)?.to_string();
++        control.lease = None;
++    }
++    save_control(connection, &control)?;
++    let receipt = json!({"identity":body.identity,"payload_digest":request.payload_digest,"generation":control.generation,"checkpoint_version":checkpoint_version.to_string(),"row_versions":row_versions});
++    database::write(connection, RECEIPT_SCOPE, &receipt_key, Some(&receipt))?;
++    Ok(receipt)
++}
+diff --git a/engine/src/workers/state/adapters/sqlite/crash_tests.rs b/engine/src/workers/state/adapters/sqlite/crash_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..98a5d383dab350a3f2157ec3dca2282dfc49a587
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/crash_tests.rs
+@@ -0,0 +1,242 @@
++use super::*;
++
++#[test]
++#[ignore = "only run as an isolated crash subprocess"]
++fn sqlite_crash_probe() {
++    let path = match std::env::var("III_SQLITE_CRASH_PATH") {
++        Ok(path) => path,
++        Err(std::env::VarError::NotPresent) => return,
++        Err(std::env::VarError::NotUnicode(_)) => {
++            panic!("isolated crash subprocess path must be valid UTF-8")
++        }
++    };
++    let mode = std::env::var("III_SQLITE_CRASH_MODE").unwrap();
++    let runtime = tokio::runtime::Runtime::new().unwrap();
++    runtime.block_on(async {
++        let adapter = SqliteAdapter::new(Some(json!({"file_path":path}))).unwrap();
++        assert_eq!(adapter.path, std::path::PathBuf::from(&path));
++        let owner = guard(&adapter, "crash-owner", "1").await;
++        eprintln!("sqlite crash fixture path={}", adapter.path.display());
++        eprintln!("sqlite crash fixture lease={owner}");
++        let request = batch(
++            owner.clone(),
++            "crash-job",
++            "crash-delta",
++            0,
++            "0",
++            "applying",
++            vec![
++                op(JOBS, "crash-job", "0", job("crash-job", "1")),
++                op("mem:graph:nodes", "a", "0", json!({"weight":7})),
++            ],
++        );
++        if mode == "committed" {
++            let receipt = adapter.commit_batch(request).await.unwrap();
++            eprintln!("sqlite crash fixture receipt={receipt}");
++            std::process::exit(72);
++        }
++        let bytes = protocol::size(&request).unwrap();
++        let request: protocol::CommitRequest = protocol::decode(request).unwrap();
++        let body = request.validate(bytes).unwrap();
++        adapter
++            .mutate(bytes, move |connection| -> anyhow::Result<()> {
++                commit::commit(connection, request, body)?;
++                // Exit after graph/checkpoint/receipt SQL writes, before transaction COMMIT or destructor rollback.
++                std::process::exit(71);
++            })
++            .await
++            .unwrap();
++    });
++}
++
++#[tokio::test]
++async fn sqlite_process_crash_atomicity_and_committed_recovery() {
++    let root = std::env::var("III_SQLITE_TEST_ROOT").unwrap();
++    for (mode, exit) in [("uncommitted", 71), ("committed", 72)] {
++        let directory = tempfile::tempdir_in(&root).unwrap();
++        let path = directory.path().join("crash-synthetic.sqlite3");
++        assert!(!path.exists());
++        eprintln!("fresh crash database: {}", path.display());
++        let result = std::process::Command::new(std::env::current_exe().unwrap())
++            .args([
++                "--exact",
++                "workers::state::adapters::sqlite::tests::crash_tests::sqlite_crash_probe",
++                "--ignored",
++                "--nocapture",
++            ])
++            .env("III_SQLITE_CRASH_PATH", &path)
++            .env("III_SQLITE_CRASH_MODE", mode)
++            .output()
++            .unwrap();
++        let stderr = String::from_utf8_lossy(&result.stderr);
++        assert_eq!(result.status.code(), Some(exit), "{}", stderr);
++        let child_path = stderr
++            .lines()
++            .find_map(|line| line.strip_prefix("sqlite crash fixture path="))
++            .expect("crash child must report its effective fixture path");
++        assert_eq!(std::path::PathBuf::from(child_path), path);
++        let child_lease: Value = serde_json::from_str(
++            stderr
++                .lines()
++                .find_map(|line| line.strip_prefix("sqlite crash fixture lease="))
++                .expect("crash child must report its acquired lease before exiting"),
++        )
++        .unwrap();
++        assert_eq!(child_lease["owner_id"], "crash-owner");
++        assert_eq!(child_lease["generation"], "1");
++        assert_eq!(child_lease["fence"], "1");
++        let adapter = SqliteAdapter::new(Some(json!({"file_path":path}))).unwrap();
++        assert_eq!(adapter.path, path);
++        let control = adapter
++            .get(database::CONTROL_SCOPE, "current")
++            .await
++            .unwrap()
++            .unwrap();
++        assert!(
++            contains_lease(&control, &child_lease),
++            "fixture control record must persist the child lease: {control}"
++        );
++        assert_eq!(!control["recovery"].is_null(), mode == "committed");
++        if mode == "uncommitted" {
++            assert_eq!(
++                version(
++                    &adapter,
++                    "mem:graph:nodes",
++                    "a",
++                    Some(child_lease.clone())
++                )
++                .await["exists"],
++                false
++            );
++            assert_eq!(
++                version(
++                    &adapter,
++                    JOBS,
++                    "crash-job",
++                    Some(child_lease.clone())
++                )
++                .await["exists"],
++                false
++            );
++            assert_eq!(
++                version(
++                    &adapter,
++                    database::CHECKPOINT_SCOPE,
++                    "crash-job",
++                    Some(child_lease.clone())
++                )
++                .await["exists"],
++                false
++            );
++            assert!(adapter.list("mem:graph:receipts").await.unwrap().is_empty());
++        } else {
++            let receipt: Value = serde_json::from_str(
++                stderr
++                    .lines()
++                    .find_map(|line| line.strip_prefix("sqlite crash fixture receipt="))
++                    .expect("committed child must report its receipt before exiting"),
++            )
++            .unwrap();
++            assert_eq!(receipt["checkpoint_version"], "1");
++            adapter
++                .lease(json!({
++                    "action":"release",
++                    "owner_id":child_lease["owner_id"],
++                    "generation":child_lease["generation"],
++                    "fence":child_lease["fence"]
++                }))
++                .await
++                .unwrap();
++            let recovery = guard(&adapter, "recovery", "1").await;
++            assert_ne!(recovery["fence"], child_lease["fence"]);
++            let request = batch(
++                recovery.clone(),
++                "crash-job",
++                "crash-delta",
++                0,
++                "0",
++                "applying",
++                vec![
++                    op(JOBS, "crash-job", "0", job("crash-job", "1")),
++                    op("mem:graph:nodes", "a", "0", json!({"weight":7})),
++                ],
++            );
++            let original_request = batch(
++                child_lease.clone(),
++                "crash-job",
++                "crash-delta",
++                0,
++                "0",
++                "applying",
++                vec![
++                    op(JOBS, "crash-job", "0", job("crash-job", "1")),
++                    op("mem:graph:nodes", "a", "0", json!({"weight":7})),
++                ],
++            );
++            let checkpoint_before = version(
++                &adapter,
++                database::CHECKPOINT_SCOPE,
++                "crash-job",
++                Some(recovery.clone()),
++            )
++            .await;
++            assert_eq!(checkpoint_before["exists"], true);
++            assert_eq!(checkpoint_before["version"], "1");
++            let job_before = version(&adapter, JOBS, "crash-job", Some(recovery.clone())).await;
++            assert_eq!(job_before["value"], job("crash-job", "1"));
++            let graph_before = version(
++                &adapter,
++                "mem:graph:nodes",
++                "a",
++                Some(recovery.clone()),
++            )
++            .await;
++            assert_eq!(graph_before["value"], json!({"weight":7}));
++            let replay_receipt = adapter.commit_batch(request).await.unwrap();
++            assert_eq!(replay_receipt, receipt);
++            let checkpoint_after = version(
++                &adapter,
++                database::CHECKPOINT_SCOPE,
++                "crash-job",
++                Some(recovery.clone()),
++            )
++            .await;
++            assert_eq!(checkpoint_after["version"], checkpoint_before["version"]);
++            let job_after = version(&adapter, JOBS, "crash-job", Some(recovery.clone())).await;
++            assert_eq!(job_after["version"], job_before["version"]);
++            let graph_after = version(
++                &adapter,
++                "mem:graph:nodes",
++                "a",
++                Some(recovery.clone()),
++            )
++            .await;
++            assert_eq!(
++                graph_after["value"],
++                json!({"weight":7})
++            );
++            assert_eq!(graph_after["version"], graph_before["version"]);
++            assert_eq!(
++                code(adapter.commit_batch(original_request).await.unwrap_err()),
++                "STATE_TX_FENCED"
++            );
++        }
++    }
++}
++
++fn contains_lease(control: &Value, expected: &Value) -> bool {
++    let fields = ["owner_id", "generation", "fence"];
++    if fields
++        .iter()
++        .all(|field| control.get(field) == expected.get(field))
++    {
++        return true;
++    }
++    match control {
++        Value::Array(values) => values.iter().any(|value| contains_lease(value, expected)),
++        Value::Object(values) => values
++            .values()
++            .any(|value| contains_lease(value, expected)),
++        _ => false,
++    }
++}
+diff --git a/engine/src/workers/state/adapters/sqlite/database.rs b/engine/src/workers/state/adapters/sqlite/database.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..924cb5685d231d1d3ec80cbd214388916611d7d8
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/database.rs
+@@ -0,0 +1,179 @@
++use super::protocol;
++use rusqlite::{Connection, OptionalExtension, params};
++use serde_json::Value;
++use std::{path::Path, time::Duration};
++
++pub(crate) const APPLICATION_ID: i64 = 0x49494953;
++pub const CONTROL_SCOPE: &str = "mem:graph:control";
++pub const CHECKPOINT_SCOPE: &str = "mem:graph:checkpoints";
++pub const RECEIPT_SCOPE: &str = "mem:graph:receipts";
++
++pub fn open(path: &Path) -> anyhow::Result<Connection> {
++    let mut marker = path.as_os_str().to_owned(); marker.push(".migration-pending");
++    if Path::new(&marker).exists() { anyhow::bail!("STATE_MIGRATION_INCOMPLETE: shadow target is not ready"); }
++    if path.is_file() {
++        let prior = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
++        let exists: i64 = prior.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='state_migration'", [], |r| r.get(0))?;
++        if exists != 0 {
++            let ready: String = prior.query_row("SELECT status FROM state_migration WHERE id=1", [], |r| r.get(0))?;
++            if ready != "ready" { anyhow::bail!("STATE_MIGRATION_INCOMPLETE: shadow target is not ready"); }
++        }
++    }
++    let connection = open_for_migration(path)?;
++    let pending: i64 = connection.query_row(
++        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='state_migration'", [], |r| r.get(0),
++    )?;
++    if pending != 0 {
++        let ready: String = connection.query_row("SELECT status FROM state_migration WHERE id=1", [], |r| r.get(0))?;
++        if ready != "ready" { anyhow::bail!("STATE_MIGRATION_INCOMPLETE: shadow target is not ready"); }
++    }
++    Ok(connection)
++}
++
++pub(crate) fn open_for_migration(path: &Path) -> anyhow::Result<Connection> {
++    if path.is_dir() {
++        anyhow::bail!(
++            "SQLite file_path must name a database file; migration is required for legacy directories"
++        );
++    }
++    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
++        std::fs::create_dir_all(parent)?;
++    }
++    let connection = Connection::open(path)?;
++    let application: i64 = connection.pragma_query_value(None, "application_id", |r| r.get(0))?;
++    let version: i64 = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
++    let tables: i64 = connection.query_row(
++        "SELECT count(*) FROM sqlite_master WHERE type='table'",
++        [],
++        |r| r.get(0),
++    )?;
++    if (tables > 0 && (application != APPLICATION_ID || version != 1)) || version > 1 {
++        anyhow::bail!("Unsupported SQLite state format; explicit migration is required");
++    }
++    connection.busy_timeout(Duration::from_secs(5))?;
++    connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA cache_size=-65536; PRAGMA mmap_size=0; PRAGMA temp_store=FILE; PRAGMA wal_autocheckpoint=1024; PRAGMA journal_size_limit=67108864; PRAGMA foreign_keys=ON;
++        CREATE TABLE IF NOT EXISTS state_scopes(scope TEXT PRIMARY KEY, revision TEXT NOT NULL, next_position INTEGER NOT NULL) WITHOUT ROWID;
++        CREATE TABLE IF NOT EXISTS state_rows(scope TEXT NOT NULL, key TEXT NOT NULL, value TEXT, version TEXT NOT NULL, position INTEGER, value_bytes INTEGER NOT NULL, PRIMARY KEY(scope,key)) WITHOUT ROWID;
++        CREATE INDEX IF NOT EXISTS state_rows_order ON state_rows(scope,position) WHERE value IS NOT NULL;")?;
++    connection.pragma_update(None, "application_id", APPLICATION_ID)?;
++    connection.pragma_update(None, "user_version", 1)?;
++    {
++        let transaction = rusqlite::Transaction::new_unchecked(
++            &connection,
++            rusqlite::TransactionBehavior::Immediate,
++        )?;
++        if row(&transaction, CONTROL_SCOPE, "current")?.value.is_none() {
++            write(
++                &transaction,
++                CONTROL_SCOPE,
++                "current",
++                Some(
++                    &serde_json::json!({"version":1,"generation":"1","fence":"0","lease":null,"recovery":null}),
++                ),
++            )?;
++        }
++        transaction.commit()?;
++    }
++    Ok(connection)
++}
++
++pub fn wal_pressure(connection: &Connection, path: &Path) -> anyhow::Result<()> {
++    let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
++    let bytes = match std::fs::metadata(&wal) {
++        Ok(metadata) => metadata.len(),
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
++        Err(error) => return Err(error.into()),
++    };
++    if bytes >= 32 * 1024 * 1024 {
++        let (busy, _, _): (i64, i64, i64) =
++            connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
++                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
++            })?;
++        if busy != 0 && bytes >= 64 * 1024 * 1024 {
++            return Err(protocol::error("STATE_TX_LIMIT_EXCEEDED"));
++        }
++    }
++    Ok(())
++}
++
++pub struct Row {
++    pub value: Option<Value>,
++    pub version: u64,
++    pub position: Option<i64>,
++}
++pub fn row(connection: &Connection, scope: &str, key: &str) -> anyhow::Result<Row> {
++    let raw: Option<(Option<String>, String, Option<i64>)> = connection
++        .query_row(
++            "SELECT value,version,position FROM state_rows WHERE scope=?1 AND key=?2",
++            params![scope, key],
++            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
++        )
++        .optional()?;
++    match raw {
++        None => Ok(Row {
++            value: None,
++            version: 0,
++            position: None,
++        }),
++        Some((value, version, position)) => Ok(Row {
++            value: value.map(|v| serde_json::from_str(&v)).transpose()?,
++            version: protocol::counter(&version)?,
++            position,
++        }),
++    }
++}
++pub fn revision(connection: &Connection, scope: &str) -> anyhow::Result<u64> {
++    let version: Option<String> = connection
++        .query_row(
++            "SELECT revision FROM state_scopes WHERE scope=?1",
++            [scope],
++            |r| r.get(0),
++        )
++        .optional()?;
++    version.map_or(Ok(0), |v| protocol::counter(&v))
++}
++pub fn write(
++    connection: &Connection,
++    scope: &str,
++    key: &str,
++    value: Option<&Value>,
++) -> anyhow::Result<u64> {
++    let old = row(connection, scope, key)?;
++    let version = protocol::next(old.version)?;
++    let revision = protocol::next(revision(connection, scope)?)?;
++    connection.execute(
++        "INSERT OR IGNORE INTO state_scopes VALUES(?1,'0',0)",
++        [scope],
++    )?;
++    let position = if value.is_some() {
++        match old.position.filter(|_| old.value.is_some()) {
++            Some(position) => Some(position),
++            None => {
++                let position: i64 = connection.query_row(
++                    "SELECT next_position FROM state_scopes WHERE scope=?1",
++                    [scope],
++                    |r| r.get(0),
++                )?;
++                if position >= 9_007_199_254_740_990 {
++                    return Err(protocol::error("STATE_TX_LIMIT_EXCEEDED"));
++                }
++                connection.execute(
++                    "UPDATE state_scopes SET next_position=?2 WHERE scope=?1",
++                    params![scope, position + 1],
++                )?;
++                Some(position)
++            }
++        }
++    } else {
++        None
++    };
++    let serialized = value.map(serde_json::to_string).transpose()?;
++    let bytes = serialized.as_ref().map_or(0, String::len);
++    connection.execute("INSERT INTO state_rows VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(scope,key) DO UPDATE SET value=excluded.value,version=excluded.version,position=excluded.position,value_bytes=excluded.value_bytes",
++        params![scope,key,serialized,version.to_string(),position,bytes as i64])?;
++    connection.execute(
++        "UPDATE state_scopes SET revision=?2 WHERE scope=?1",
++        params![scope, revision.to_string()],
++    )?;
++    Ok(version)
++}
+diff --git a/engine/src/workers/state/adapters/sqlite/mod.rs b/engine/src/workers/state/adapters/sqlite/mod.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..554ae3af5685148000b89c07ec2a31e24fdead8f
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/mod.rs
+@@ -0,0 +1,279 @@
++mod commit;
++pub(crate) mod database;
++mod paging;
++mod protocol;
++#[cfg(test)]
++mod tests;
++
++use super::{StateAdapter, StatePageError};
++use crate::{
++    engine::Engine,
++    workers::state::{
++        registry::{StateAdapterFuture, StateAdapterRegistration},
++        structs::StateListPageResult,
++    },
++};
++use async_trait::async_trait;
++use iii_helpers::stream::{StreamSetResult, StreamUpdateResult, UpdateOp};
++pub use protocol::{error_body, guarded};
++use rusqlite::Connection;
++use serde_json::Value;
++use std::{
++    path::PathBuf,
++    sync::{Arc, mpsc},
++};
++use tokio::sync::{Semaphore, oneshot};
++pub fn protocol_error_unsupported() -> anyhow::Error {
++    protocol::error("STATE_TX_UNSUPPORTED")
++}
++pub fn plain_write(scope: &str, key: &str) -> anyhow::Result<()> {
++    protocol::plain_write(scope, key)
++}
++
++pub const ADMISSION_BYTES: usize = 64 * 1024 * 1024;
++pub const MAX_ENVELOPE_BYTES: usize = 16 * 1024 * 1024 - 64 * 1024;
++pub const LEGACY_LIST_BYTES: usize = 4 * 1024 * 1024;
++const DEFAULT_DATABASE_PATH: &str = "state_store.sqlite3";
++type Job = Box<dyn FnOnce(&mut Connection) + Send>;
++
++fn configured_path(config: Option<&Value>) -> anyhow::Result<PathBuf> {
++    let path = match config.and_then(|config| config.get("file_path")) {
++        Some(Value::String(path)) => path.as_str(),
++        Some(_) => return Err(protocol::error("STATE_TX_INVALID_REQUEST")),
++        None => DEFAULT_DATABASE_PATH,
++    };
++    if path.is_empty() {
++        return Err(protocol::error("STATE_TX_INVALID_REQUEST"));
++    }
++    Ok(PathBuf::from(path))
++}
++
++pub struct SqliteAdapter {
++    sender: mpsc::SyncSender<Job>,
++    admission: Arc<Semaphore>,
++    generation: uuid::Uuid,
++    path: PathBuf,
++}
++
++impl SqliteAdapter {
++    pub fn new(config: Option<Value>) -> anyhow::Result<Self> {
++        let path = configured_path(config.as_ref())?;
++        let mut connection = database::open(&path)?;
++        let (sender, receiver) = mpsc::sync_channel::<Job>(32);
++        std::thread::Builder::new()
++            .name("iii-state-sqlite".into())
++            .spawn(move || {
++                for job in receiver {
++                    job(&mut connection);
++                }
++                if let Err(cause) = connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)") {
++                    tracing::warn!(error = %cause, "state SQLite shutdown checkpoint failed");
++                }
++            })?;
++        Ok(Self {
++            sender,
++            admission: Arc::new(Semaphore::new(ADMISSION_BYTES)),
++            generation: uuid::Uuid::new_v4(),
++            path,
++        })
++    }
++
++    async fn run<T: Send + 'static>(
++        &self,
++        bytes: usize,
++        job: impl FnOnce(&mut Connection) -> anyhow::Result<T> + Send + 'static,
++    ) -> anyhow::Result<T> {
++        if bytes > MAX_ENVELOPE_BYTES {
++            return Err(protocol::error("STATE_RECORD_TOO_LARGE"));
++        }
++        let permit = self
++            .admission
++            .clone()
++            .try_acquire_many_owned(bytes.max(4096) as u32)
++            .map_err(|_| protocol::error("STATE_TX_LIMIT_EXCEEDED"))?;
++        let (sender, receiver) = oneshot::channel();
++        self.sender
++            .try_send(Box::new(move |connection| {
++                let result = job(connection);
++                let _ = sender.send(result);
++                drop(permit);
++            }))
++            .map_err(|error| match error {
++                mpsc::TrySendError::Full(_) => protocol::error("STATE_TX_LIMIT_EXCEEDED"),
++                mpsc::TrySendError::Disconnected(_) => protocol::error("STATE_TX_FAILED"),
++            })?;
++        receiver
++            .await
++            .map_err(|_| protocol::error("STATE_TX_FAILED"))?
++    }
++
++    async fn mutate<T: Send + 'static>(
++        &self,
++        bytes: usize,
++        job: impl FnOnce(&rusqlite::Transaction<'_>) -> anyhow::Result<T> + Send + 'static,
++    ) -> anyhow::Result<T> {
++        let path = self.path.clone();
++        self.run(bytes, move |connection| {
++            database::wal_pressure(connection, &path)?;
++            let transaction =
++                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
++            let result = job(&transaction)?;
++            transaction.commit()?;
++            Ok(result)
++        })
++        .await
++    }
++}
++
++#[async_trait]
++impl StateAdapter for SqliteAdapter {
++    async fn set(&self, scope: &str, key: &str, value: Value) -> anyhow::Result<StreamSetResult> {
++        protocol::plain_write(scope, key)?;
++        let bytes = protocol::size(&value)?.saturating_add(scope.len() + key.len() + 4096);
++        let (scope, key) = (scope.to_owned(), key.to_owned());
++        self.mutate(bytes, move |connection| {
++            let old_value = database::row(connection, &scope, &key)?.value;
++            database::write(connection, &scope, &key, Some(&value))?;
++            Ok(StreamSetResult {
++                old_value,
++                new_value: value,
++            })
++        })
++        .await
++    }
++    async fn get(&self, scope: &str, key: &str) -> anyhow::Result<Option<Value>> {
++        let (scope, key) = (scope.to_owned(), key.to_owned());
++        self.run(scope.len() + key.len(), move |connection| {
++            let transaction = connection.unchecked_transaction()?;
++            commit::read_allowed(&transaction, &scope, &key, None)?;
++            Ok(database::row(&transaction, &scope, &key)?.value)
++        })
++        .await
++    }
++    async fn delete(&self, scope: &str, key: &str) -> anyhow::Result<()> {
++        protocol::plain_write(scope, key)?;
++        let (scope, key) = (scope.to_owned(), key.to_owned());
++        self.mutate(scope.len() + key.len(), move |connection| {
++            if database::row(connection, &scope, &key)?.value.is_some() {
++                database::write(connection, &scope, &key, None)?;
++            }
++            Ok(())
++        })
++        .await
++    }
++    async fn update(
++        &self,
++        scope: &str,
++        key: &str,
++        ops: Vec<UpdateOp>,
++    ) -> anyhow::Result<StreamUpdateResult> {
++        protocol::plain_write(scope, key)?;
++        let bytes = protocol::size(&ops)?.saturating_add(scope.len() + key.len() + 4096);
++        let (scope, key) = (scope.to_owned(), key.to_owned());
++        self.mutate(bytes, move |connection| {
++            let old_value = database::row(connection, &scope, &key)?.value;
++            let (new_value, errors) = crate::update_ops::apply_update_ops(old_value.clone(), &ops);
++            if protocol::size(&new_value)? > MAX_ENVELOPE_BYTES - 4096 {
++                return Err(protocol::error("STATE_RECORD_TOO_LARGE"));
++            }
++            database::write(connection, &scope, &key, Some(&new_value))?;
++            Ok(StreamUpdateResult {
++                old_value,
++                new_value,
++                errors,
++            })
++        })
++        .await
++    }
++    async fn list(&self, scope: &str) -> anyhow::Result<Vec<Value>> {
++        let scope = scope.to_owned();
++        self.run(scope.len(), move |connection| {
++            paging::list(connection, &scope)
++        })
++        .await
++    }
++    async fn list_page(
++        &self,
++        scope: &str,
++        cursor: Option<&str>,
++        limit: u32,
++        max_bytes: u32,
++    ) -> Result<StateListPageResult, StatePageError> {
++        let (scope, cursor, generation) =
++            (scope.to_owned(), cursor.map(str::to_owned), self.generation);
++        self.run(
++            scope.len() + cursor.as_ref().map_or(0, String::len),
++            move |connection| {
++                Ok(paging::page(
++                    connection,
++                    &scope,
++                    cursor.as_deref(),
++                    limit,
++                    max_bytes,
++                    generation,
++                ))
++            },
++        )
++        .await
++        .map_err(|_| StatePageError::Internal)?
++    }
++    async fn list_groups(&self) -> anyhow::Result<Vec<String>> {
++        self.run(4096, |connection| {
++            let bytes: i64 = connection.query_row(
++                "SELECT COALESCE(SUM(length(CAST(scope AS BLOB)) + 4), 0) FROM state_scopes",
++                [],
++                |r| r.get(0),
++            )?;
++            if bytes > LEGACY_LIST_BYTES as i64 {
++                return Err(protocol::error("STATE_TX_LIMIT_EXCEEDED"));
++            }
++            let mut statement =
++                connection.prepare("SELECT scope FROM state_scopes ORDER BY scope")?;
++            Ok(statement
++                .query_map([], |row| row.get(0))?
++                .collect::<rusqlite::Result<Vec<_>>>()?)
++        })
++        .await
++    }
++    async fn get_versioned(&self, input: Value) -> anyhow::Result<Value> {
++        let bytes = protocol::size(&input)?;
++        if input.get("guard").is_some_and(Value::is_null) {
++            return Err(protocol::error("STATE_TX_INVALID_REQUEST"));
++        }
++        let request: protocol::VersionedRequest = protocol::decode(input)?;
++        request.validate()?;
++        self.run(bytes, move |connection| {
++            let transaction=connection.unchecked_transaction()?;
++            commit::read_allowed(&transaction, &request.scope, &request.key, request.guard.as_ref())?;
++            let row = database::row(&transaction, &request.scope, &request.key)?;
++            Ok(serde_json::json!({"exists": row.value.is_some(), "value": row.value, "version": row.version.to_string()}))
++        }).await
++    }
++    async fn lease(&self, input: Value) -> anyhow::Result<Value> {
++        let bytes = protocol::size(&input)?;
++        let request = protocol::lease_request(input)?;
++        self.mutate(bytes, move |connection| commit::lease(connection, request))
++            .await
++    }
++    async fn commit_batch(&self, input: Value) -> anyhow::Result<Value> {
++        let bytes = protocol::size(&input)?;
++        let request: protocol::CommitRequest = protocol::decode(input)?;
++        self.mutate(bytes, move |connection| {
++            let body = request.validate(bytes)?;
++            commit::commit(connection, request, body)
++        })
++        .await
++    }
++    async fn destroy(&self) -> anyhow::Result<()> {
++        self.run(4096, |connection| {
++            connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
++            Ok(())
++        })
++        .await
++    }
++}
++
++fn make_adapter(_engine: Arc<Engine>, config: Option<Value>) -> StateAdapterFuture {
++    Box::pin(async move { Ok(Arc::new(SqliteAdapter::new(config)?) as Arc<dyn StateAdapter>) })
++}
++crate::register_adapter!(<StateAdapterRegistration> name: "sqlite", make_adapter);
+diff --git a/engine/src/workers/state/adapters/sqlite/paging.rs b/engine/src/workers/state/adapters/sqlite/paging.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..fb301e2129e1f295bfd0923ffdcb539dd186b756
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/paging.rs
+@@ -0,0 +1,161 @@
++use super::{LEGACY_LIST_BYTES, commit, database, protocol};
++use crate::workers::state::{
++    adapters::StatePageError,
++    structs::{STATE_PAGE_MAX_CURSOR_BYTES, StateListPageResult},
++};
++use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
++use rusqlite::{Connection, params};
++use serde::{Deserialize, Serialize};
++use serde_json::Value;
++use sha2::{Digest, Sha256};
++
++#[derive(Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Cursor {
++    version: u8,
++    generation: uuid::Uuid,
++    scope_fingerprint: String,
++    revision: String,
++    after_position: i64,
++}
++fn encode(cursor: &Cursor) -> Result<String, StatePageError> {
++    let encoded =
++        URL_SAFE_NO_PAD.encode(serde_json::to_vec(cursor).map_err(|_| StatePageError::Internal)?);
++    if encoded.len() > STATE_PAGE_MAX_CURSOR_BYTES {
++        return Err(StatePageError::Internal);
++    }
++    Ok(encoded)
++}
++pub fn list(connection: &Connection, scope: &str) -> anyhow::Result<Vec<Value>> {
++    let transaction = connection.unchecked_transaction()?;
++    commit::read_allowed(&transaction, scope, "", None)?;
++    let bytes:i64=transaction.query_row("SELECT COALESCE(SUM(value_bytes+1),0)+2 FROM state_rows WHERE scope=?1 AND value IS NOT NULL",[scope],|r|r.get(0))?;
++    if bytes > LEGACY_LIST_BYTES as i64 - 4096 {
++        return Err(protocol::error("STATE_TX_LIMIT_EXCEEDED"));
++    }
++    let mut statement = transaction.prepare(
++        "SELECT value FROM state_rows WHERE scope=?1 AND value IS NOT NULL ORDER BY position",
++    )?;
++    let mut rows = statement.query([scope])?;
++    let mut values = Vec::new();
++    while let Some(row) = rows.next()? {
++        values.push(serde_json::from_str(&row.get::<_, String>(0)?)?);
++    }
++    Ok(values)
++}
++pub fn page(
++    connection: &Connection,
++    scope: &str,
++    cursor: Option<&str>,
++    limit: u32,
++    max_bytes: u32,
++    generation: uuid::Uuid,
++) -> Result<StateListPageResult, StatePageError> {
++    page_inner(connection, scope, cursor, limit, max_bytes, generation).map_err(|error| {
++        if let Some(page) = error.downcast_ref::<PageFailure>() {
++            return page.0.clone();
++        }
++        if error
++            .downcast_ref::<protocol::TxError>()
++            .is_some_and(|e| e.0 == "STATE_GRAPH_RECOVERY_REQUIRED")
++        {
++            return StatePageError::RecoveryRequired;
++        }
++        tracing::warn!(error=?error,"SQLite state page failed");
++        StatePageError::Internal
++    })
++}
++#[derive(Debug, thiserror::Error)]
++#[error("state page rejected")]
++struct PageFailure(StatePageError);
++fn reject(error: StatePageError) -> anyhow::Error {
++    PageFailure(error).into()
++}
++fn page_inner(
++    connection: &Connection,
++    scope: &str,
++    cursor: Option<&str>,
++    limit: u32,
++    max_bytes: u32,
++    generation: uuid::Uuid,
++) -> anyhow::Result<StateListPageResult> {
++    if limit == 0 || limit > 1024 || max_bytes == 0 || max_bytes > 1_048_576 {
++        return Err(reject(StatePageError::InvalidCursor));
++    }
++    let decoded = cursor
++        .map(|cursor| {
++            if cursor.len() > STATE_PAGE_MAX_CURSOR_BYTES {
++                return Err(reject(StatePageError::InvalidCursor));
++            }
++            let bytes = URL_SAFE_NO_PAD
++                .decode(cursor)
++                .map_err(|_| reject(StatePageError::InvalidCursor))?;
++            serde_json::from_slice::<Cursor>(&bytes)
++                .map_err(|_| reject(StatePageError::InvalidCursor))
++        })
++        .transpose()?;
++    let transaction = connection.unchecked_transaction()?;
++    commit::read_allowed(&transaction, scope, "", None)?;
++    let fingerprint = URL_SAFE_NO_PAD.encode(Sha256::digest(scope.as_bytes()));
++    let revision = database::revision(&transaction, scope)?.to_string();
++    let start = if let Some(decoded) = decoded {
++        if decoded.version != 2
++            || decoded.scope_fingerprint != fingerprint
++            || decoded.after_position < 0
++        {
++            return Err(reject(StatePageError::InvalidCursor));
++        }
++        if decoded.generation != generation || decoded.revision != revision {
++            return Err(reject(StatePageError::StaleCursor));
++        }
++        let exists:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM state_rows WHERE scope=?1 AND position=?2 AND value IS NOT NULL)",params![scope,decoded.after_position],|r|r.get(0))?;
++        if !exists {
++            return Err(reject(StatePageError::InvalidCursor));
++        }
++        decoded.after_position
++    } else {
++        -1
++    };
++    let mut statement=transaction.prepare("SELECT position,value,value_bytes FROM state_rows WHERE scope=?1 AND position>?2 AND value IS NOT NULL ORDER BY position LIMIT ?3")?;
++    let mut rows = statement.query(params![scope, start, limit])?;
++    let mut items = Vec::with_capacity(limit as usize);
++    let mut next_cursor = None;
++    let mut item_bytes = 0usize;
++    while let Some(row) = rows.next()? {
++        let position: i64 = row.get(0)?;
++        let value_bytes = usize::try_from(row.get::<_, i64>(2)?)?;
++        let more:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM state_rows WHERE scope=?1 AND position>?2 AND value IS NOT NULL)",params![scope,position],|r|r.get(0))?;
++        let candidate_cursor = if more {
++            Some(
++                encode(&Cursor {
++                    version: 2,
++                    generation,
++                    scope_fingerprint: fingerprint.clone(),
++                    revision: revision.clone(),
++                    after_position: position,
++                })
++                .map_err(reject)?,
++            )
++        } else {
++            None
++        };
++        let candidate_bytes = item_bytes + value_bytes + usize::from(!items.is_empty());
++        let bytes = protocol::size(&StateListPageResult {
++            items: vec![],
++            next_cursor: candidate_cursor.clone(),
++        })? + candidate_bytes;
++        if bytes > max_bytes as usize {
++            if items.is_empty() {
++                return Err(reject(StatePageError::RecordTooLarge {
++                    required_bytes: bytes,
++                }));
++            }
++            break;
++        }
++        let value: String = row.get(1)?;
++        items.push(serde_json::from_str(&value)?);
++        item_bytes = candidate_bytes;
++        next_cursor = candidate_cursor;
++    }
++    Ok(StateListPageResult { items, next_cursor })
++}
+diff --git a/engine/src/workers/state/adapters/sqlite/protocol.rs b/engine/src/workers/state/adapters/sqlite/protocol.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..8b4e257e77030b0903d7cb761a7c46a68b5fda0c
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/protocol.rs
+@@ -0,0 +1,460 @@
++use super::{
++    MAX_ENVELOPE_BYTES,
++    database::{CHECKPOINT_SCOPE, CONTROL_SCOPE, RECEIPT_SCOPE},
++};
++use crate::protocol::ErrorBody;
++use serde::{Deserialize, Serialize};
++use serde_json::Value;
++use sha2::{Digest, Sha256};
++use std::{collections::HashSet, io::Write};
++
++pub const SNAPSHOT: &str = "mem:graph:snapshot";
++pub const WORKING: &str = "mem:graph:working-snapshots";
++pub const JOBS: &str = "mem:graph:jobs";
++const PREFIXES: [&str; 5] = [
++    "mem:graph:inputs:",
++    "mem:graph:provider-results:",
++    "mem:graph:deltas:",
++    "mem:graph:prepared:",
++    "mem:graph:remaps:",
++];
++const RECORDS: [&str; 7] = [
++    "mem:graph:nodes",
++    "mem:graph:edges",
++    SNAPSHOT,
++    "mem:graph:name-index",
++    "mem:graph:edge-key",
++    "mem:graph:node-degree",
++    "mem:graph:edge-history",
++];
++
++#[derive(Debug, thiserror::Error)]
++#[error("{0}: state transaction rejected")]
++pub struct TxError(pub &'static str);
++pub fn error(code: &'static str) -> anyhow::Error {
++    TxError(code).into()
++}
++pub fn require(condition: bool) -> anyhow::Result<()> {
++    if condition {
++        Ok(())
++    } else {
++        Err(error("STATE_TX_INVALID_REQUEST"))
++    }
++}
++pub fn guarded(scope: &str, key: &str) -> bool {
++    RECORDS.contains(&scope)
++        || [
++            JOBS,
++            WORKING,
++            CONTROL_SCOPE,
++            CHECKPOINT_SCOPE,
++            RECEIPT_SCOPE,
++        ]
++        .contains(&scope)
++        || PREFIXES.iter().any(|prefix| scope.starts_with(prefix))
++        || (scope == "mem:batch-callbacks" && (key == "active:graph" || key.starts_with("graph:")))
++}
++pub fn live(scope: &str, key: &str) -> bool {
++    RECORDS.contains(&scope) || (scope == "mem:batch-callbacks" && guarded(scope, key))
++}
++pub fn plain_write(scope: &str, key: &str) -> anyhow::Result<()> {
++    if guarded(scope, key) {
++        Err(error("STATE_TX_FENCED"))
++    } else {
++        Ok(())
++    }
++}
++pub fn error_body(cause: &anyhow::Error, fallback: &str) -> ErrorBody {
++    tracing::warn!(error = ?cause, "state operation rejected");
++    let code = cause
++        .downcast_ref::<TxError>()
++        .map_or(fallback, |error| error.0);
++    ErrorBody {
++        code: code.into(),
++        message: format!("{code}: state operation rejected"),
++        stacktrace: None,
++    }
++}
++#[derive(Default)]
++struct Size(usize);
++impl Write for Size {
++    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
++        self.0 = self.0.saturating_add(bytes.len());
++        Ok(bytes.len())
++    }
++    fn flush(&mut self) -> std::io::Result<()> {
++        Ok(())
++    }
++}
++pub fn size(value: &impl Serialize) -> anyhow::Result<usize> {
++    let mut size = Size::default();
++    serde_json::to_writer(&mut size, value)?;
++    Ok(size.0)
++}
++pub fn decode<T: serde::de::DeserializeOwned>(value: Value) -> anyhow::Result<T> {
++    serde_json::from_value(value).map_err(|_| error("STATE_TX_INVALID_REQUEST"))
++}
++pub fn counter(value: &str) -> anyhow::Result<u64> {
++    require(
++        !value.is_empty()
++            && value.len() <= 20
++            && value.bytes().all(|c| c.is_ascii_digit())
++            && (value == "0" || !value.starts_with('0')),
++    )?;
++    value.parse().map_err(|_| error("STATE_TX_INVALID_REQUEST"))
++}
++pub fn next(value: u64) -> anyhow::Result<u64> {
++    value
++        .checked_add(1)
++        .ok_or_else(|| error("STATE_TX_LIMIT_EXCEEDED"))
++}
++fn ordinal(value: u64) -> bool {
++    value < 9_007_199_254_740_991
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct Guard {
++    pub owner_id: String,
++    pub generation: String,
++    pub fence: String,
++}
++impl Guard {
++    pub fn validate(&self) -> anyhow::Result<()> {
++        require(
++            !self.owner_id.is_empty()
++                && counter(&self.generation)? > 0
++                && counter(&self.fence)? > 0,
++        )
++    }
++}
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct VersionedRequest {
++    pub scope: String,
++    pub key: String,
++    pub guard: Option<Guard>,
++}
++impl VersionedRequest {
++    pub fn validate(&self) -> anyhow::Result<()> {
++        require(!self.scope.is_empty() && !self.key.is_empty())?;
++        if let Some(guard) = &self.guard {
++            guard.validate()?;
++        }
++        Ok(())
++    }
++}
++#[derive(Deserialize)]
++#[serde(tag = "action", rename_all = "lowercase", deny_unknown_fields)]
++pub enum LeaseRequest {
++    Acquire {
++        owner_id: String,
++        generation: String,
++        ttl_ms: u64,
++    },
++    Renew {
++        owner_id: String,
++        generation: String,
++        fence: String,
++        ttl_ms: u64,
++    },
++    Release {
++        owner_id: String,
++        generation: String,
++        fence: String,
++    },
++}
++pub fn lease_request(value: Value) -> anyhow::Result<LeaseRequest> {
++    let request = decode(value)?;
++    match &request {
++        LeaseRequest::Acquire {
++            owner_id,
++            generation,
++            ttl_ms,
++        } => require(
++            !owner_id.is_empty() && counter(generation)? > 0 && (1..=300_000).contains(ttl_ms),
++        )?,
++        LeaseRequest::Renew {
++            owner_id,
++            generation,
++            fence,
++            ttl_ms,
++        } => {
++            Guard {
++                owner_id: owner_id.clone(),
++                generation: generation.clone(),
++                fence: fence.clone(),
++            }
++            .validate()?;
++            require((1..=300_000).contains(ttl_ms))?;
++        }
++        LeaseRequest::Release {
++            owner_id,
++            generation,
++            fence,
++        } => Guard {
++            owner_id: owner_id.clone(),
++            generation: generation.clone(),
++            fence: fence.clone(),
++        }
++        .validate()?,
++    }
++    Ok(request)
++}
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
++#[serde(deny_unknown_fields)]
++pub struct Identity {
++    pub generation: String,
++    pub job_id: String,
++    pub logical_delta_id: String,
++    pub chunk_ordinal: u64,
++}
++#[derive(Debug, Clone, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct Checkpoint {
++    pub generation: String,
++    pub job_id: String,
++    pub logical_delta_id: String,
++    pub delta_ordinal: u64,
++    pub next_chunk_ordinal: u64,
++    pub visibility: String,
++}
++#[derive(Debug, Deserialize)]
++#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
++pub enum Operation {
++    Set {
++        scope: String,
++        key: String,
++        expected_version: String,
++        value: Value,
++    },
++    Delete {
++        scope: String,
++        key: String,
++        expected_version: String,
++    },
++    Check {
++        scope: String,
++        key: String,
++        expected_version: String,
++    },
++}
++impl Operation {
++    pub fn row(&self) -> (&str, &str, &str) {
++        match self {
++            Self::Set {
++                scope,
++                key,
++                expected_version,
++                ..
++            }
++            | Self::Delete {
++                scope,
++                key,
++                expected_version,
++            }
++            | Self::Check {
++                scope,
++                key,
++                expected_version,
++            } => (scope, key, expected_version),
++        }
++    }
++    pub fn changed(&self) -> bool {
++        !matches!(self, Self::Check { .. })
++    }
++}
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct CommitBody {
++    pub identity: Identity,
++    pub expected_checkpoint_version: String,
++    pub checkpoint: Checkpoint,
++    pub operations: Vec<Operation>,
++    pub advance_generation: Option<bool>,
++    pub allow_oversized_record: Option<bool>,
++}
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct CommitRequest {
++    pub guard: Guard,
++    pub payload_json: String,
++    pub payload_digest: String,
++}
++impl CommitRequest {
++    pub fn validate(&self, bytes: usize) -> anyhow::Result<CommitBody> {
++        self.guard.validate()?;
++        require(
++            self.payload_digest.len() == 64
++                && self
++                    .payload_digest
++                    .bytes()
++                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),
++        )?;
++        require(hex::encode(Sha256::digest(self.payload_json.as_bytes())) == self.payload_digest)?;
++        let strict: strict_json::StrictValue = serde_json::from_str(&self.payload_json)
++            .map_err(|_| error("STATE_TX_INVALID_REQUEST"))?;
++        for flag in ["advance_generation", "allow_oversized_record"] {
++            if let Some(value) = strict.0.get(flag) {
++                require(value == true)?;
++            }
++        }
++        if let Some(operations) = strict.0.get("operations").and_then(Value::as_array) {
++            for operation in operations {
++                if operation.get("type") == Some(&Value::String("set".into())) {
++                    require(operation.get("value").is_some())?;
++                }
++            }
++        }
++        let body: CommitBody = decode(strict.0)?;
++        body.validate()?;
++        if bytes > MAX_ENVELOPE_BYTES {
++            return Err(error("STATE_RECORD_TOO_LARGE"));
++        }
++        if bytes > 4 * 1024 * 1024 && body.allow_oversized_record != Some(true) {
++            return Err(error("STATE_TX_LIMIT_EXCEEDED"));
++        }
++        Ok(body)
++    }
++}
++impl CommitBody {
++    fn validate(&self) -> anyhow::Result<()> {
++        let id = &self.identity;
++        let point = &self.checkpoint;
++        require(
++            counter(&id.generation)? > 0
++                && !id.job_id.is_empty()
++                && !id.logical_delta_id.is_empty()
++                && ordinal(id.chunk_ordinal),
++        )?;
++        next(counter(&self.expected_checkpoint_version)?)?;
++        require(
++            point.generation == id.generation
++                && point.job_id == id.job_id
++                && point.logical_delta_id == id.logical_delta_id
++                && ordinal(point.delta_ordinal)
++                && ordinal(point.next_chunk_ordinal)
++                && point.next_chunk_ordinal == id.chunk_ordinal + 1
++                && ["staging", "applying", "complete"].contains(&point.visibility.as_str()),
++        )?;
++        require(
++            self.operations.len() <= 256
++                && self.advance_generation != Some(false)
++                && self.allow_oversized_record != Some(false),
++        )?;
++        if self.advance_generation == Some(true) {
++            require(point.visibility == "complete")?;
++            next(counter(&id.generation)?)?;
++        }
++        let mut seen = HashSet::new();
++        for op in &self.operations {
++            let (scope, key, version) = op.row();
++            require(
++                !scope.is_empty()
++                    && !key.is_empty()
++                    && guarded(scope, key)
++                    && ![CONTROL_SCOPE, CHECKPOINT_SCOPE, RECEIPT_SCOPE].contains(&scope)
++                    && seen.insert((scope, key)),
++            )?;
++            let version = counter(version)?;
++            if op.changed() {
++                next(version)?;
++            }
++            if point.visibility == "staging" {
++                require(
++                    ([JOBS, WORKING].contains(&scope) && key == id.job_id)
++                        || PREFIXES
++                            .iter()
++                            .any(|prefix| scope == format!("{prefix}{}", id.job_id)),
++                )?;
++            }
++            if point.visibility != "complete" {
++                require(scope != SNAPSHOT || !op.changed())?;
++            }
++            if ([JOBS, WORKING].contains(&scope) && key != id.job_id)
++                || (PREFIXES.iter().any(|prefix| scope.starts_with(prefix))
++                    && !PREFIXES
++                        .iter()
++                        .any(|prefix| scope == format!("{prefix}{}", id.job_id)))
++            {
++                return Err(error("STATE_TX_INVALID_REQUEST"));
++            }
++        }
++        if point.visibility == "complete" {
++            require(self.operations.iter().any(|op| {
++                let (scope, key, _) = op.row();
++                scope == SNAPSHOT && key == "current" && !matches!(op, Operation::Delete { .. })
++            }))?;
++        }
++        if self.allow_oversized_record == Some(true) {
++            require(
++                self.operations.iter().filter(|op| op.changed()).count() == 1
++                    && self
++                        .operations
++                        .iter()
++                        .any(|op| matches!(op, Operation::Set { .. })),
++            )?;
++        }
++        Ok(())
++    }
++}
++
++mod strict_json {
++    use serde::{
++        Deserialize, Deserializer,
++        de::{Error, MapAccess, SeqAccess, Visitor},
++    };
++    use serde_json::Value;
++    pub struct StrictValue(pub Value);
++    impl<'de> Deserialize<'de> for StrictValue {
++        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
++            d.deserialize_any(StrictVisitor).map(Self)
++        }
++    }
++    struct StrictVisitor;
++    impl<'de> Visitor<'de> for StrictVisitor {
++        type Value = Value;
++        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
++            f.write_str("strict JSON")
++        }
++        fn visit_unit<E: Error>(self) -> Result<Value, E> {
++            Ok(Value::Null)
++        }
++        fn visit_bool<E: Error>(self, v: bool) -> Result<Value, E> {
++            Ok(Value::Bool(v))
++        }
++        fn visit_i64<E: Error>(self, v: i64) -> Result<Value, E> {
++            Ok(v.into())
++        }
++        fn visit_u64<E: Error>(self, v: u64) -> Result<Value, E> {
++            Ok(v.into())
++        }
++        fn visit_f64<E: Error>(self, v: f64) -> Result<Value, E> {
++            serde_json::Number::from_f64(v)
++                .map(Value::Number)
++                .ok_or_else(|| E::custom("nonfinite number"))
++        }
++        fn visit_str<E: Error>(self, v: &str) -> Result<Value, E> {
++            Ok(v.into())
++        }
++        fn visit_string<E: Error>(self, v: String) -> Result<Value, E> {
++            Ok(v.into())
++        }
++        fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Value, A::Error> {
++            let mut values = Vec::new();
++            while let Some(value) = sequence.next_element::<StrictValue>()? {
++                values.push(value.0);
++            }
++            Ok(Value::Array(values))
++        }
++        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
++            let mut values = serde_json::Map::new();
++            while let Some((key, value)) = map.next_entry::<String, StrictValue>()? {
++                if values.insert(key, value.0).is_some() {
++                    return Err(A::Error::custom("duplicate key"));
++                }
++            }
++            Ok(Value::Object(values))
++        }
++    }
++}
+diff --git a/engine/src/workers/state/adapters/sqlite/resource_tests.rs b/engine/src/workers/state/adapters/sqlite/resource_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..8546de48a613f3900de40636d24c4dd7a9562aa6
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/resource_tests.rs
+@@ -0,0 +1,506 @@
++use super::*;
++
++#[tokio::test]
++async fn sqlite_signed_byte_metadata_and_preflight_before_json_materialization() {
++    let (_directory, adapter) = fresh();
++    adapter
++        .set("metadata", "one", json!("x".repeat(1200)))
++        .await
++        .unwrap();
++    let page = adapter
++        .list_page("metadata", None, 1, 1_048_576)
++        .await
++        .unwrap();
++    let exact = protocol::size(&page).unwrap() as u32;
++    assert_eq!(
++        adapter
++            .list_page("metadata", None, 1, exact)
++            .await
++            .unwrap()
++            .items,
++        page.items
++    );
++    assert!(
++        matches!(adapter.list_page("metadata", None, 1, exact - 1).await,
++        Err(StatePageError::RecordTooLarge { required_bytes }) if required_bytes == exact as usize)
++    );
++    adapter
++        .run(4096, |connection| {
++            connection.execute(
++                "UPDATE state_rows SET value_bytes=-1 WHERE scope='metadata'",
++                [],
++            )?;
++            Ok(())
++        })
++        .await
++        .unwrap();
++    assert!(matches!(
++        adapter.list_page("metadata", None, 1, 1024).await,
++        Err(StatePageError::Internal)
++    ));
++    adapter
++        .run(4096, |connection| {
++            connection.execute(
++                "UPDATE state_rows SET value_bytes=2e19 WHERE scope='metadata'",
++                [],
++            )?;
++            Ok(())
++        })
++        .await
++        .unwrap();
++    assert!(matches!(
++        adapter.list_page("metadata", None, 1, 1024).await,
++        Err(StatePageError::Internal)
++    ));
++    adapter
++        .run(4096, |connection| {
++            connection.execute(
++                "UPDATE state_rows SET value='{',value_bytes=1201 WHERE scope='metadata'",
++                [],
++            )?;
++            Ok(())
++        })
++        .await
++        .unwrap();
++    assert!(matches!(adapter.list_page("metadata", None, 1, 1024).await,
++        Err(StatePageError::RecordTooLarge { required_bytes }) if required_bytes > 1201));
++    adapter.run(4096, |connection| {
++        connection.execute("UPDATE state_rows SET value=NULL,position=NULL,value_bytes=0 WHERE scope='metadata'", [])?;
++        Ok(())
++    }).await.unwrap();
++    assert!(
++        adapter
++            .list_page("metadata", None, 1, 1024)
++            .await
++            .unwrap()
++            .items
++            .is_empty()
++    );
++}
++
++#[tokio::test]
++async fn sqlite_legacy_list_preflight_and_bounded_cache() {
++    let (_directory, adapter) = fresh();
++    adapter
++        .mutate(4096, |connection| {
++            let value = json!({"text":"x".repeat(2048)});
++            for i in 0..36_000 {
++                database::write(connection, "many", &i.to_string(), Some(&value))?;
++            }
++            Ok(())
++        })
++        .await
++        .unwrap();
++    assert_eq!(
++        code(adapter.list("many").await.unwrap_err()),
++        "STATE_TX_LIMIT_EXCEEDED"
++    );
++    let page = adapter
++        .list_page("many", None, 256, 1_048_576)
++        .await
++        .unwrap();
++    assert_eq!(page.items.len(), 256);
++    assert!(protocol::size(&page).unwrap() <= 1_048_576);
++    let cache = adapter
++        .run(4096, |connection| {
++            let mut current = 0;
++            let mut highwater = 0;
++            // The handle belongs exclusively to this executor thread during the status query.
++            let status = unsafe {
++                rusqlite::ffi::sqlite3_db_status(
++                    connection.handle(),
++                    rusqlite::ffi::SQLITE_DBSTATUS_CACHE_USED,
++                    &mut current,
++                    &mut highwater,
++                    0,
++                )
++            };
++            assert_eq!(status, rusqlite::ffi::SQLITE_OK);
++            Ok(current)
++        })
++        .await
++        .unwrap();
++    eprintln!(
++        "SQLite cache_used_bytes={cache}, cache_target_bytes={}",
++        64 * 1024 * 1024
++    );
++    assert!(cache <= 72 * 1024 * 1024);
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn sqlite_admission_bytes_and_queue_count_reject_overload() {
++    let (_directory, adapter) = fresh();
++    let all = adapter
++        .admission
++        .clone()
++        .acquire_many_owned(ADMISSION_BYTES as u32)
++        .await
++        .unwrap();
++    assert_eq!(
++        code(adapter.get("s", "a").await.unwrap_err()),
++        "STATE_TX_LIMIT_EXCEEDED"
++    );
++    drop(all);
++    assert_eq!(
++        code(
++            adapter
++                .set("s", "a", json!("x".repeat(MAX_ENVELOPE_BYTES)))
++                .await
++                .unwrap_err()
++        ),
++        "STATE_RECORD_TOO_LARGE"
++    );
++    let (entered_send, entered_receive) = std::sync::mpsc::channel();
++    let (release_send, release_receive) = std::sync::mpsc::channel();
++    let executing = adapter.clone();
++    let blocker = tokio::spawn(async move {
++        executing
++            .run(4096, move |_| {
++                entered_send.send(()).unwrap();
++                release_receive.recv().unwrap();
++                Ok(())
++            })
++            .await
++    });
++    tokio::task::spawn_blocking(move || entered_receive.recv().unwrap())
++        .await
++        .unwrap();
++    for _ in 0..32 {
++        assert!(adapter.sender.try_send(Box::new(|_| {})).is_ok());
++    }
++    assert_eq!(
++        code(adapter.get("s", "a").await.unwrap_err()),
++        "STATE_TX_LIMIT_EXCEEDED"
++    );
++    release_send.send(()).unwrap();
++    blocker.await.unwrap().unwrap();
++}
++
++#[tokio::test]
++async fn sqlite_wal_pressure_rejects_before_effects_and_recovers() {
++    let (directory, adapter) = fresh();
++    adapter.set("seed", "a", json!(1)).await.unwrap();
++    let external = rusqlite::Connection::open(directory.path().join("synthetic.sqlite3")).unwrap();
++    external
++        .execute_batch("BEGIN; SELECT value FROM state_rows;")
++        .unwrap();
++    adapter
++        .run(4096, |connection| {
++            connection.pragma_update(None, "wal_autocheckpoint", 0)?;
++            let transaction = connection.unchecked_transaction()?;
++            let value = json!("x".repeat(1024 * 1024));
++            for i in 0..68 {
++                database::write(&transaction, "pressure", &i.to_string(), Some(&value))?;
++            }
++            transaction.commit()?;
++            connection.busy_timeout(std::time::Duration::from_millis(50))?;
++            Ok(())
++        })
++        .await
++        .unwrap();
++    assert_eq!(
++        code(adapter.set("s", "a", json!(1)).await.unwrap_err()),
++        "STATE_TX_LIMIT_EXCEEDED"
++    );
++    assert_eq!(version(&adapter, "s", "a", None).await["exists"], false);
++    external.execute_batch("ROLLBACK").unwrap();
++    adapter.set("s", "a", json!(1)).await.unwrap();
++    assert_eq!(version(&adapter, "s", "a", None).await["version"], "1");
++}
++
++#[tokio::test]
++async fn sqlite_native_plain_mutation_bypass_and_unrelated_callbacks() {
++    let (_directory, adapter) = fresh();
++    let scopes = [
++        "mem:graph:nodes",
++        "mem:graph:edges",
++        SNAPSHOT,
++        "mem:graph:name-index",
++        "mem:graph:edge-key",
++        "mem:graph:node-degree",
++        "mem:graph:edge-history",
++        JOBS,
++        WORKING,
++        "mem:graph:control",
++        "mem:graph:checkpoints",
++        "mem:graph:receipts",
++        "mem:graph:inputs:j",
++        "mem:graph:provider-results:j",
++        "mem:graph:deltas:j",
++        "mem:graph:prepared:j",
++        "mem:graph:remaps:j",
++    ];
++    for scope in scopes {
++        assert_eq!(
++            code(adapter.set(scope, "key", json!(1)).await.unwrap_err()),
++            "STATE_TX_FENCED"
++        );
++        assert_eq!(
++            code(adapter.delete(scope, "key").await.unwrap_err()),
++            "STATE_TX_FENCED"
++        );
++        assert_eq!(
++            code(adapter.update(scope, "key", vec![]).await.unwrap_err()),
++            "STATE_TX_FENCED"
++        );
++    }
++    for key in ["active:graph", "graph:receipt"] {
++        assert_eq!(
++            code(
++                adapter
++                    .set("mem:batch-callbacks", key, json!(1))
++                    .await
++                    .unwrap_err()
++            ),
++            "STATE_TX_FENCED"
++        );
++    }
++    adapter
++        .set("mem:batch-callbacks", "summary:receipt", json!(1))
++        .await
++        .unwrap();
++    assert_eq!(
++        adapter
++            .get("mem:batch-callbacks", "summary:receipt")
++            .await
++            .unwrap(),
++        Some(json!(1))
++    );
++}
++
++#[tokio::test]
++async fn sqlite_native_counter_precision_exhaustion_and_no_aba() {
++    let (_directory, adapter) = fresh();
++    let owner = guard(&adapter, "owner", "1").await;
++    adapter.mutate(4096,|connection| {
++        database::write(connection,"s","precise",Some(&json!(1)))?;
++        connection.execute("UPDATE state_rows SET version='9007199254740993' WHERE scope='s' AND key='precise'",[])?;
++        Ok(())
++    }).await.unwrap();
++    adapter.set("s", "precise", json!(2)).await.unwrap();
++    assert_eq!(
++        version(&adapter, "s", "precise", None).await["version"],
++        "9007199254740994"
++    );
++    adapter.run(4096,|connection|{connection.execute("UPDATE state_rows SET version='18446744073709551615' WHERE scope='s' AND key='precise'",[])?;Ok(())}).await.unwrap();
++    assert_eq!(
++        code(adapter.set("s", "precise", json!(3)).await.unwrap_err()),
++        "STATE_TX_LIMIT_EXCEEDED"
++    );
++    assert_eq!(adapter.get("s", "precise").await.unwrap(), Some(json!(2)));
++    let first = batch(
++        owner.clone(),
++        "job",
++        "delta",
++        0,
++        "0",
++        "applying",
++        vec![
++            op(JOBS, "job", "0", job("job", "1")),
++            op("mem:graph:nodes", "a", "0", json!(1)),
++        ],
++    );
++    adapter.commit_batch(first).await.unwrap();
++    adapter
++        .commit_batch(batch(
++            owner.clone(),
++            "job",
++            "delta",
++            1,
++            "1",
++            "applying",
++            vec![
++                json!({"type":"delete","scope":"mem:graph:nodes","key":"a","expected_version":"1"}),
++            ],
++        ))
++        .await
++        .unwrap();
++    assert_eq!(
++        version(&adapter, "mem:graph:nodes", "a", Some(owner.clone())).await,
++        json!({"exists":false,"value":null,"version":"2"})
++    );
++    assert_eq!(
++        code(
++            adapter
++                .commit_batch(batch(
++                    owner.clone(),
++                    "job",
++                    "delta",
++                    2,
++                    "2",
++                    "applying",
++                    vec![op("mem:graph:nodes", "a", "0", json!(2))]
++                ))
++                .await
++                .unwrap_err()
++        ),
++        "STATE_TX_CONFLICT"
++    );
++    adapter
++        .commit_batch(batch(
++            owner.clone(),
++            "job",
++            "delta",
++            2,
++            "2",
++            "applying",
++            vec![op("mem:graph:nodes", "a", "2", json!(2))],
++        ))
++        .await
++        .unwrap();
++    assert_eq!(
++        version(&adapter, "mem:graph:nodes", "a", Some(owner)).await["version"],
++        "3"
++    );
++}
++
++#[tokio::test]
++async fn sqlite_snapshot_postcondition_and_logical_delta_progression() {
++    let (_directory, adapter) = fresh();
++    let owner = guard(&adapter, "owner", "1").await;
++    let invalid = batch(
++        owner.clone(),
++        "job",
++        "delta",
++        0,
++        "0",
++        "complete",
++        vec![
++            op(JOBS, "job", "0", job("job", "1")),
++            op(
++                WORKING,
++                "job",
++                "0",
++                working("job", "1", "delta", Some(json!(1))),
++            ),
++            op(SNAPSHOT, "current", "0", json!(2)),
++        ],
++    );
++    assert_eq!(
++        code(adapter.commit_batch(invalid).await.unwrap_err()),
++        "STATE_TX_INVALID_REQUEST"
++    );
++    assert_eq!(
++        version(&adapter, JOBS, "job", Some(owner.clone())).await["exists"],
++        false
++    );
++    let first = batch(
++        owner.clone(),
++        "job",
++        "delta",
++        0,
++        "0",
++        "complete",
++        vec![
++            op(JOBS, "job", "0", job("job", "1")),
++            op(WORKING, "job", "0", working("job", "1", "delta", None)),
++            check(SNAPSHOT, "current", "0"),
++        ],
++    );
++    adapter.commit_batch(first).await.unwrap();
++    let mut second: Value = serde_json::from_str(
++        batch(
++            owner.clone(),
++            "job",
++            "delta2",
++            0,
++            "1",
++            "complete",
++            vec![
++                op(WORKING, "job", "1", working("job", "1", "delta2", None)),
++                check(SNAPSHOT, "current", "0"),
++            ],
++        )["payload_json"]
++            .as_str()
++            .unwrap(),
++    )
++    .unwrap();
++    assert_eq!(
++        code(
++            adapter
++                .commit_batch(prepared(owner.clone(), second.clone()))
++                .await
++                .unwrap_err()
++        ),
++        "STATE_TX_CHECKPOINT_CONFLICT"
++    );
++    second["checkpoint"]["delta_ordinal"] = json!(1);
++    adapter.commit_batch(prepared(owner, second)).await.unwrap();
++}
++
++#[tokio::test]
++async fn sqlite_envelope_oversized_exception_and_strict_wire_validation() {
++    let (_directory, adapter) = fresh();
++    let owner = guard(&adapter, "owner", "1").await;
++    let first = batch(
++        owner.clone(),
++        "job",
++        "delta",
++        0,
++        "0",
++        "staging",
++        vec![op(JOBS, "job", "0", job("job", "1"))],
++    );
++    adapter.commit_batch(first).await.unwrap();
++    let large = op(
++        "mem:graph:provider-results:job",
++        "one",
++        "0",
++        json!("x".repeat(4 * 1024 * 1024)),
++    );
++    let mut body: Value = serde_json::from_str(
++        batch(
++            owner.clone(),
++            "job",
++            "delta",
++            1,
++            "1",
++            "staging",
++            vec![large],
++        )["payload_json"]
++            .as_str()
++            .unwrap(),
++    )
++    .unwrap();
++    assert_eq!(
++        code(
++            adapter
++                .commit_batch(prepared(owner.clone(), body.clone()))
++                .await
++                .unwrap_err()
++        ),
++        "STATE_TX_LIMIT_EXCEEDED"
++    );
++    body["allow_oversized_record"] = json!(true);
++    adapter
++        .commit_batch(prepared(owner.clone(), body))
++        .await
++        .unwrap();
++    let mut request = batch(owner.clone(), "job", "delta", 2, "2", "staging", vec![]);
++    request["payload_json"] = json!(format!("{} ", request["payload_json"].as_str().unwrap()));
++    assert_eq!(
++        code(adapter.commit_batch(request).await.unwrap_err()),
++        "STATE_TX_INVALID_REQUEST"
++    );
++    assert_eq!(
++        code(
++            adapter
++                .get_versioned(json!({"scope":"s","key":"a","guard":null}))
++                .await
++                .unwrap_err()
++        ),
++        "STATE_TX_INVALID_REQUEST"
++    );
++    assert_eq!(
++        code(
++            adapter
++                .lease(
++                    json!({"action":"acquire","owner_id":"owner","generation":"01","ttl_ms":1000})
++                )
++                .await
++                .unwrap_err()
++        ),
++        "STATE_TX_INVALID_REQUEST"
++    );
++    assert_eq!(code(adapter.lease(json!({"action":"renew","owner_id":"owner","generation":"1","fence":owner["fence"],"ttl_ms":300001})).await.unwrap_err()),"STATE_TX_INVALID_REQUEST");
++}
+diff --git a/engine/src/workers/state/adapters/sqlite/tests.rs b/engine/src/workers/state/adapters/sqlite/tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..6533b085d08d224b7e9dd0f271a73b9bf53bc31d
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/tests.rs
+@@ -0,0 +1,435 @@
++use super::protocol::{JOBS, SNAPSHOT, WORKING};
++use super::*;
++use serde_json::{Value, json};
++use sha2::{Digest, Sha256};
++use std::sync::Arc;
++#[path = "crash_tests.rs"]
++mod crash_tests;
++#[path = "resource_tests.rs"]
++mod resource_tests;
++
++fn fresh() -> (tempfile::TempDir, Arc<SqliteAdapter>) {
++    let root =
++        std::env::var("III_SQLITE_TEST_ROOT").expect("isolated III_SQLITE_TEST_ROOT must be set");
++    let directory = tempfile::tempdir_in(root).unwrap();
++    let path = directory.path().join("synthetic.sqlite3");
++    assert!(!path.exists(), "test database must be fresh");
++    eprintln!("fresh synthetic database: {}", path.display());
++    let adapter = Arc::new(SqliteAdapter::new(Some(json!({"file_path":path}))).unwrap());
++    (directory, adapter)
++}
++async fn guard(adapter: &SqliteAdapter, owner: &str, generation: &str) -> Value {
++    let mut lease = adapter
++        .lease(json!({"action":"acquire","owner_id":owner,"generation":generation,"ttl_ms":300000}))
++        .await
++        .unwrap();
++    lease.as_object_mut().unwrap().remove("expires_at_ms");
++    lease
++}
++fn op(scope: &str, key: &str, version: &str, value: Value) -> Value {
++    json!({"type":"set","scope":scope,"key":key,"expected_version":version,"value":value})
++}
++fn check(scope: &str, key: &str, version: &str) -> Value {
++    json!({"type":"check","scope":scope,"key":key,"expected_version":version})
++}
++fn job(id: &str, generation: &str) -> Value {
++    json!({"version":1,"id":id,"generation":generation,"logicalDeltaCount":2,"state":"applying"})
++}
++fn working(id: &str, generation: &str, delta: &str, snapshot: Option<Value>) -> Value {
++    json!({"version":1,"generation":generation,"jobId":id,"logicalDeltaId":delta,"snapshotExists":snapshot.is_some(),"snapshot":snapshot})
++}
++fn batch(
++    guard: Value,
++    job: &str,
++    delta: &str,
++    chunk: u64,
++    checkpoint: &str,
++    visibility: &str,
++    operations: Vec<Value>,
++) -> Value {
++    let generation = guard["generation"].as_str().unwrap();
++    let body = json!({"identity":{"generation":generation,"job_id":job,"logical_delta_id":delta,"chunk_ordinal":chunk},
++        "expected_checkpoint_version":checkpoint,"checkpoint":{"generation":generation,"job_id":job,"logical_delta_id":delta,"delta_ordinal":0,"next_chunk_ordinal":chunk+1,"visibility":visibility},"operations":operations});
++    prepared(guard, body)
++}
++fn prepared(guard: Value, body: Value) -> Value {
++    let payload = serde_json::to_string(&body).unwrap();
++    json!({"guard":guard,"payload_digest":hex::encode(Sha256::digest(payload.as_bytes())),"payload_json":payload})
++}
++fn code(error: anyhow::Error) -> String {
++    error
++        .downcast_ref::<protocol::TxError>()
++        .map_or_else(|| error.to_string(), |e| e.0.to_owned())
++}
++
++#[test]
++fn sqlite_file_path_config_validation_preserves_defaults() {
++    let default = std::path::PathBuf::from("state_store.sqlite3");
++    assert_eq!(configured_path(None).unwrap(), default);
++    assert_eq!(configured_path(Some(&json!({}))).unwrap(), default);
++    assert_eq!(
++        configured_path(Some(&json!({"file_path":"custom.sqlite3"}))).unwrap(),
++        std::path::PathBuf::from("custom.sqlite3")
++    );
++    for config in [
++        json!({"file_path":null}),
++        json!({"file_path":42}),
++        json!({"file_path":[]}),
++        json!({"file_path":""}),
++    ] {
++        assert_eq!(
++            code(configured_path(Some(&config)).unwrap_err()),
++            "STATE_TX_INVALID_REQUEST"
++        );
++    }
++}
++
++async fn version(adapter: &SqliteAdapter, scope: &str, key: &str, guard: Option<Value>) -> Value {
++    let mut input = json!({"scope":scope,"key":key});
++    if let Some(guard) = guard {
++        input["guard"] = guard;
++    }
++    adapter.get_versioned(input).await.unwrap()
++}
++
++#[tokio::test]
++async fn sqlite_source_settings_and_fresh_schema() {
++    let (_directory, adapter) = fresh();
++    adapter.run(4096,|connection| {
++        assert_eq!(rusqlite::version(),"3.51.3");
++        let source:String=connection.query_row("SELECT sqlite_source_id()",[],|r|r.get(0))?;
++        assert_eq!(source,"2026-03-13 10:38:09 737ae4a34738ffa0c3ff7f9bb18df914dd1cad163f28fd6b6e114a344fe6d618");
++        for (name,expected) in [("cache_size",-65536),("synchronous",2),("mmap_size",0),("temp_store",1),("wal_autocheckpoint",1024),("journal_size_limit",67108864),("busy_timeout",5000)] {
++            let actual:i64=connection.pragma_query_value(None,name,|r|r.get(0))?; assert_eq!(actual,expected,"{name}");
++        }
++        let mode:String=connection.pragma_query_value(None,"journal_mode",|r|r.get(0))?; assert_eq!(mode,"wal");
++        let mut statement=connection.prepare("PRAGMA compile_options")?;
++        let options=statement.query_map([],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
++        let proof=json!({"version":rusqlite::version(),"source_id":source,"compile_options":options,
++            "journal_mode":mode,"cache_size":-65536,"synchronous":2,"mmap_size":0,"temp_store":1,
++            "wal_autocheckpoint":1024,"journal_size_limit":67108864,"busy_timeout_ms":5000});
++        let root=std::env::var("III_SQLITE_TEST_ROOT")?;
++        std::fs::write(std::path::Path::new(&root).parent().unwrap().join("sqlite-runtime-proof.json"),serde_json::to_vec_pretty(&proof)?)?;
++        Ok(())
++    }).await.unwrap();
++    assert_eq!(
++        version(&adapter, "scope", "missing", None).await,
++        json!({"exists":false,"value":null,"version":"0"})
++    );
++}
++
++#[tokio::test]
++async fn sqlite_point_updates_null_tombstones_and_insertion_order() {
++    let (_directory, adapter) = fresh();
++    adapter.set("s", "a", json!(null)).await.unwrap();
++    assert_eq!(
++        version(&adapter, "s", "a", None).await,
++        json!({"exists":true,"value":null,"version":"1"})
++    );
++    adapter.set("s", "b", json!(2)).await.unwrap();
++    adapter.set("s", "a", json!(3)).await.unwrap();
++    assert_eq!(adapter.list("s").await.unwrap(), vec![json!(3), json!(2)]);
++    adapter.delete("s", "a").await.unwrap();
++    assert_eq!(version(&adapter, "s", "a", None).await["version"], "3");
++    adapter.set("s", "a", json!({"n":1})).await.unwrap();
++    let operations =
++        serde_json::from_value(json!([{"type":"increment","path":"n","by":2}])).unwrap();
++    let updated = adapter.update("s", "a", operations).await.unwrap();
++    assert_eq!(updated.new_value, json!({"n":3}));
++    assert_eq!(
++        adapter.list("s").await.unwrap(),
++        vec![json!(2), json!({"n":3})]
++    );
++    assert_eq!(version(&adapter, "s", "a", None).await["version"], "5");
++}
++
++#[tokio::test]
++async fn sqlite_pages_bound_serialization_order_and_cursor_lifetime() {
++    let (directory, adapter) = fresh();
++    for i in 0..50 {
++        adapter
++            .set(
++                "s",
++                &i.to_string(),
++                json!({"i":i,"text":"quote \" slash \\ café 東京 😀"}),
++            )
++            .await
++            .unwrap();
++    }
++    let mut cursor = None;
++    let mut collected = vec![];
++    loop {
++        let page = adapter
++            .list_page("s", cursor.as_deref(), 7, 1024)
++            .await
++            .unwrap();
++        assert!(protocol::size(&page).unwrap() <= 1024);
++        collected.extend(page.items);
++        cursor = page.next_cursor;
++        if cursor.is_none() {
++            break;
++        }
++    }
++    assert_eq!(
++        collected
++            .iter()
++            .map(|v| v["i"].as_u64().unwrap())
++            .collect::<Vec<_>>(),
++        (0..50).collect::<Vec<_>>()
++    );
++    let cursor = adapter
++        .list_page("s", None, 1, 1024)
++        .await
++        .unwrap()
++        .next_cursor
++        .unwrap();
++    assert!(matches!(
++        adapter.list_page("other", Some(&cursor), 1, 1024).await,
++        Err(StatePageError::InvalidCursor)
++    ));
++    let reopened = SqliteAdapter::new(Some(
++        json!({"file_path":directory.path().join("synthetic.sqlite3")}),
++    ))
++    .unwrap();
++    assert!(matches!(
++        reopened.list_page("s", Some(&cursor), 1, 1024).await,
++        Err(StatePageError::StaleCursor)
++    ));
++    adapter.set("s", "0", json!(99)).await.unwrap();
++    assert!(matches!(
++        adapter.list_page("s", Some(&cursor), 1, 1024).await,
++        Err(StatePageError::StaleCursor)
++    ));
++    adapter
++        .set("big", "one", json!("x".repeat(1200)))
++        .await
++        .unwrap();
++    let page = adapter.list_page("big", None, 1, 1_048_576).await.unwrap();
++    let exact = protocol::size(&page).unwrap() as u32;
++    assert_eq!(
++        adapter
++            .list_page("big", None, 1, exact)
++            .await
++            .unwrap()
++            .items,
++        page.items
++    );
++    assert!(
++        matches!(adapter.list_page("big",None,1,exact-1).await,Err(StatePageError::RecordTooLarge{required_bytes}) if required_bytes==exact as usize)
++    );
++}
++
++#[tokio::test]
++async fn sqlite_atomic_replay_fencing_barrier_snapshot_and_restart() {
++    let (directory, adapter) = fresh();
++    let owner = guard(&adapter, "owner", "1").await;
++    let first = batch(
++        owner.clone(),
++        "job",
++        "delta",
++        0,
++        "0",
++        "applying",
++        vec![
++            op(JOBS, "job", "0", job("job", "1")),
++            op("mem:graph:nodes", "a", "0", json!({"weight":2})),
++        ],
++    );
++    let receipt = adapter.commit_batch(first.clone()).await.unwrap();
++    assert_eq!(adapter.commit_batch(first.clone()).await.unwrap(), receipt);
++    assert_eq!(
++        code(adapter.get("mem:graph:nodes", "a").await.unwrap_err()),
++        "STATE_GRAPH_RECOVERY_REQUIRED"
++    );
++    assert_eq!(
++        code(adapter.list("mem:graph:nodes").await.unwrap_err()),
++        "STATE_GRAPH_RECOVERY_REQUIRED"
++    );
++    assert!(matches!(
++        adapter.list_page("mem:graph:nodes", None, 1, 1024).await,
++        Err(StatePageError::RecoveryRequired)
++    ));
++    assert_eq!(
++        version(&adapter, "mem:graph:nodes", "a", Some(owner.clone())).await["version"],
++        "1"
++    );
++    assert_eq!(
++        code(
++            adapter
++                .commit_batch(batch(
++                    owner.clone(),
++                    "other",
++                    "delta",
++                    0,
++                    "0",
++                    "staging",
++                    vec![op(JOBS, "other", "0", job("other", "1"))]
++                ))
++                .await
++                .unwrap_err()
++        ),
++        "STATE_GRAPH_RECOVERY_REQUIRED"
++    );
++    let changed = batch(
++        owner.clone(),
++        "job",
++        "delta",
++        0,
++        "0",
++        "applying",
++        vec![
++            op(JOBS, "job", "0", job("job", "1")),
++            op("mem:graph:nodes", "a", "0", json!({"weight":3})),
++        ],
++    );
++    assert_eq!(
++        code(adapter.commit_batch(changed).await.unwrap_err()),
++        "STATE_TX_REPLAY_CONFLICT"
++    );
++    adapter
++        .lease(
++            json!({"action":"release","owner_id":"owner","generation":"1","fence":owner["fence"]}),
++        )
++        .await
++        .unwrap();
++    let reopened = SqliteAdapter::new(Some(
++        json!({"file_path":directory.path().join("synthetic.sqlite3")}),
++    ))
++    .unwrap();
++    let next = guard(&reopened, "recovery", "1").await;
++    assert_eq!(next["fence"], "2");
++    assert_eq!(
++        code(adapter.commit_batch(first.clone()).await.unwrap_err()),
++        "STATE_TX_FENCED"
++    );
++    let mut retry = first;
++    retry["guard"] = next.clone();
++    assert_eq!(reopened.commit_batch(retry).await.unwrap(), receipt);
++    let snapshot = json!({"version":1,"nodes":[],"edges":[]});
++    let complete = batch(
++        next,
++        "job",
++        "delta",
++        1,
++        "1",
++        "complete",
++        vec![
++            op(
++                WORKING,
++                "job",
++                "0",
++                working("job", "1", "delta", Some(snapshot.clone())),
++            ),
++            op(SNAPSHOT, "current", "0", snapshot.clone()),
++            check("mem:graph:nodes", "a", "1"),
++        ],
++    );
++    reopened.commit_batch(complete).await.unwrap();
++    assert_eq!(
++        reopened.get(SNAPSHOT, "current").await.unwrap(),
++        Some(snapshot)
++    );
++    assert_eq!(
++        reopened.get("mem:graph:nodes", "a").await.unwrap(),
++        Some(json!({"weight":2}))
++    );
++}
++
++#[tokio::test]
++async fn sqlite_sql_failure_rolls_back_effects_checkpoint_and_receipt() {
++    let (_directory, adapter) = fresh();
++    let owner = guard(&adapter, "owner", "1").await;
++    adapter.run(4096,|connection| { connection.execute_batch("CREATE TRIGGER fail_receipt BEFORE INSERT ON state_rows WHEN NEW.scope='mem:graph:receipts' BEGIN SELECT RAISE(ABORT,'synthetic fault'); END;")?; Ok(()) }).await.unwrap();
++    let request = batch(
++        owner.clone(),
++        "job",
++        "delta",
++        0,
++        "0",
++        "applying",
++        vec![
++            op(JOBS, "job", "0", job("job", "1")),
++            op("mem:graph:nodes", "a", "0", json!(1)),
++        ],
++    );
++    assert!(adapter.commit_batch(request.clone()).await.is_err());
++    assert_eq!(
++        version(&adapter, "mem:graph:nodes", "a", Some(owner.clone())).await["version"],
++        "0"
++    );
++    assert_eq!(
++        version(&adapter, database::CHECKPOINT_SCOPE, "job", None).await["exists"],
++        false
++    );
++    assert!(
++        adapter
++            .get(database::CONTROL_SCOPE, "current")
++            .await
++            .unwrap()
++            .unwrap()["recovery"]
++            .is_null()
++    );
++    adapter
++        .run(4096, |connection| {
++            connection.execute_batch("DROP TRIGGER fail_receipt")?;
++            Ok(())
++        })
++        .await
++        .unwrap();
++    adapter.commit_batch(request).await.unwrap();
++    assert_eq!(
++        version(&adapter, "mem:graph:nodes", "a", Some(owner)).await["version"],
++        "1"
++    );
++}
++
++#[tokio::test]
++async fn sqlite_generation_reset_historical_lost_ack_replay_and_absent_snapshot() {
++    let (_directory, adapter) = fresh();
++    let owner = guard(&adapter, "owner", "1").await;
++    let mut body: Value = serde_json::from_str(
++        batch(
++            owner.clone(),
++            "job",
++            "delta",
++            0,
++            "0",
++            "complete",
++            vec![
++                op(JOBS, "job", "0", job("job", "1")),
++                op(WORKING, "job", "0", working("job", "1", "delta", None)),
++                check(SNAPSHOT, "current", "0"),
++            ],
++        )["payload_json"]
++            .as_str()
++            .unwrap(),
++    )
++    .unwrap();
++    body["advance_generation"] = json!(true);
++    let request = prepared(owner.clone(), body.clone());
++    let receipt = adapter.commit_batch(request.clone()).await.unwrap();
++    assert_eq!(receipt["generation"], "2");
++    assert_eq!(
++        version(&adapter, SNAPSHOT, "current", None).await["exists"],
++        false
++    );
++    assert_eq!(
++        code(adapter.commit_batch(request.clone()).await.unwrap_err()),
++        "STATE_TX_GENERATION_STALE"
++    );
++    let current = guard(&adapter, "new", "2").await;
++    let mut retry = request;
++    retry["guard"] = current.clone();
++    assert_eq!(adapter.commit_batch(retry).await.unwrap(), receipt);
++    body["identity"]["chunk_ordinal"] = json!(1);
++    body["checkpoint"]["next_chunk_ordinal"] = json!(2);
++    assert_eq!(
++        code(
++            adapter
++                .commit_batch(prepared(current, body))
++                .await
++                .unwrap_err()
++        ),
++        "STATE_TX_GENERATION_STALE"
++    );
++}
+diff --git a/engine/src/workers/state/config.rs b/engine/src/workers/state/config.rs
+index 18d5af4791d7e842e5bc4c126699438af6f10ef6..75d3510a0b37dd6d52aa47dc82c764e895b171a4 100644
+--- a/engine/src/workers/state/config.rs
++++ b/engine/src/workers/state/config.rs
+@@ -127,6 +127,15 @@ pub struct RedisAdapterConfig {
+     pub redis_url: Option<String>,
+ }
+ 
++/// Per-record durable SQLite WAL state. Legacy directories require explicit migration.
++#[derive(Serialize, Deserialize, Debug, Clone, JsonSchema, PartialEq, Default)]
++#[serde(deny_unknown_fields)]
++pub struct SqliteAdapterConfig {
++    /// SQLite database file. Defaults to state_store.sqlite3. Cache and admission budgets are fixed.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub file_path: Option<String>,
++}
++
+ /// Configuration for the built-in `bridge` storage adapter.
+ #[derive(Serialize, Deserialize, Debug, Clone, JsonSchema, PartialEq, Default)]
+ #[serde(deny_unknown_fields)]
+@@ -147,6 +156,7 @@ pub struct BridgeAdapterConfig {
+ fn state_adapter_schema(generator: &mut SchemaGenerator) -> Schema {
+     let branches = vec![
+         adapter_branch("kv", generator.subschema_for::<KvAdapterConfig>()),
++        adapter_branch("sqlite", generator.subschema_for::<SqliteAdapterConfig>()),
+         adapter_branch("redis", generator.subschema_for::<RedisAdapterConfig>()),
+         adapter_branch("bridge", generator.subschema_for::<BridgeAdapterConfig>()),
+     ];
+@@ -265,7 +275,7 @@ mod tests {
+         let adapter = &props["adapter"];
+         assert!(adapter["description"].is_string());
+         let branches = adapter["oneOf"].as_array().expect("adapter oneOf");
+-        assert_eq!(branches.len(), 3);
++        assert_eq!(branches.len(), 4);
+         let mut names: Vec<&str> = branches
+             .iter()
+             .map(|b| {
+@@ -281,7 +291,7 @@ mod tests {
+             })
+             .collect();
+         names.sort_unstable();
+-        assert_eq!(names, vec!["bridge", "kv", "redis"]);
++        assert_eq!(names, vec!["bridge", "kv", "redis", "sqlite"]);
+ 
+         // Each adapter's concrete config fields land in definitions.
+         let defs = &schema["definitions"];
+diff --git a/engine/src/workers/state/mod.rs b/engine/src/workers/state/mod.rs
+index 495bc55caf1041cabe2a8391a2a8882a004566d1..c5922ab28f44e502f1403d49bca87ff5ae276e14 100644
+--- a/engine/src/workers/state/mod.rs
++++ b/engine/src/workers/state/mod.rs
+@@ -11,7 +11,7 @@ pub mod configuration;
+ mod state;
+ 
+ pub mod registry;
+-mod structs;
++pub(crate) mod structs;
+ mod trigger;
+ 
+ pub use self::config::StateModuleConfig;
+diff --git a/engine/src/workers/state/state.rs b/engine/src/workers/state/state.rs
+index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..7b4f3415fa3b0086f6cef385d5014e2743589116 100644
+--- a/engine/src/workers/state/state.rs
++++ b/engine/src/workers/state/state.rs
+@@ -24,13 +24,13 @@ use crate::{
+     trigger::TriggerType,
+     workers::{
+         state::{
+-            adapters::StateAdapter,
++            adapters::{StateAdapter, StatePageError, sqlite},
+             config::StateModuleConfig,
+             configuration,
+             structs::{
+-                StateDeleteInput, StateEventData, StateEventType, StateGetGroupInput,
+-                StateGetInput, StateListGroupsInput, StateListGroupsResult, StateSetInput,
+-                StateUpdateInput,
++                STATE_PAGE_MAX_CURSOR_BYTES, StateDeleteInput, StateEventData, StateEventType,
++                StateGetGroupInput, StateGetInput, StateListGroupsInput, StateListGroupsResult,
++                StateListPageInput, StateListPageResult, StateSetInput, StateUpdateInput,
+             },
+             trigger::{StateTrigger, StateTriggers, TRIGGER_TYPE},
+         },
+@@ -62,6 +62,13 @@ pub struct StateWorker {
+     apply_lock: Arc<tokio::sync::Mutex<()>>,
+ }
+ 
++fn strip_engine_caller_metadata(mut input: Value) -> Value {
++    if let Some(object) = input.as_object_mut() {
++        object.remove("_caller_worker_id");
++    }
++    input
++}
++
+ #[async_trait::async_trait]
+ impl Worker for StateWorker {
+     fn name(&self) -> &'static str {
+@@ -292,9 +299,11 @@ impl StateWorker {
+             .transpose()?
+             .unwrap_or_default();
+         let adapter_config = Self::adapter_config_from_config(&parsed);
+-        let adapter: Arc<dyn StateAdapter> = Arc::new(
+-            super::adapters::kv_store::BuiltinKvStoreAdapter::new(adapter_config),
+-        );
++        let adapter: Arc<dyn StateAdapter> = if parsed.adapter.as_ref().is_some_and(|entry| entry.name == "sqlite") {
++            Arc::new(sqlite::SqliteAdapter::new(adapter_config)?)
++        } else {
++            Arc::new(super::adapters::kv_store::BuiltinKvStoreAdapter::new(adapter_config))
++        };
+         Ok(Self::from_config(engine, parsed, adapter))
+     }
+ 
+@@ -572,8 +581,38 @@ impl StateWorker {
+ 
+ #[service(name = "state")]
+ impl StateWorker {
++    #[function(id = "state::get_versioned", description = "Get a versioned state row")]
++    pub async fn get_versioned(&self, input: Value) -> FunctionResult<Value, ErrorBody> {
++        match self
++            .adapter
++            .get_versioned(strip_engine_caller_metadata(input))
++            .await
++        {
++            Ok(value) => FunctionResult::Success(value),
++            Err(error) => FunctionResult::Failure(sqlite::error_body(&error, "STATE_TX_FAILED")),
++        }
++    }
++    #[function(id = "state::lease", description = "Manage the durable graph writer lease")]
++    pub async fn lease(&self, input: Value) -> FunctionResult<Value, ErrorBody> {
++        match self.adapter.lease(strip_engine_caller_metadata(input)).await {
++            Ok(value) => FunctionResult::Success(value),
++            Err(error) => FunctionResult::Failure(sqlite::error_body(&error, "STATE_TX_FAILED")),
++        }
++    }
++    #[function(id = "state::commit_batch", description = "Commit an atomic fenced graph batch")]
++    pub async fn commit_batch(&self, input: Value) -> FunctionResult<Value, ErrorBody> {
++        match self
++            .adapter
++            .commit_batch(strip_engine_caller_metadata(input))
++            .await
++        {
++            Ok(value) => FunctionResult::Success(value),
++            Err(error) => FunctionResult::Failure(sqlite::error_body(&error, "STATE_TX_FAILED")),
++        }
++    }
+     #[function(id = "state::set", description = "Set a value in state")]
+     pub async fn set(&self, input: StateSetInput) -> FunctionResult<StreamSetResult, ErrorBody> {
++        if let Err(error) = sqlite::plain_write(&input.scope, &input.key) { return FunctionResult::Failure(sqlite::error_body(&error, "STATE_TX_FENCED")); }
+         crate::workers::telemetry::collector::track_state_set();
+ 
+         // LIVE guard: reject oversized values before touching the adapter.
+@@ -621,11 +660,7 @@ impl StateWorker {
+ 
+                 FunctionResult::Success(value)
+             }
+-            Err(e) => FunctionResult::Failure(ErrorBody {
+-                message: format!("Failed to set value: {}", e),
+-                code: "SET_ERROR".to_string(),
+-                stacktrace: None,
+-            }),
++            Err(e) => FunctionResult::Failure(sqlite::error_body(&e, "SET_ERROR")),
+         }
+     }
+ 
+@@ -634,11 +669,7 @@ impl StateWorker {
+         crate::workers::telemetry::collector::track_state_get();
+         match self.adapter.get(&input.scope, &input.key).await {
+             Ok(value) => FunctionResult::Success(value),
+-            Err(e) => FunctionResult::Failure(ErrorBody {
+-                message: format!("Failed to get value: {}", e),
+-                code: "GET_ERROR".to_string(),
+-                stacktrace: None,
+-            }),
++            Err(e) => FunctionResult::Failure(sqlite::error_body(&e, "GET_ERROR")),
+         }
+     }
+ 
+@@ -647,6 +678,7 @@ impl StateWorker {
+         &self,
+         input: StateDeleteInput,
+     ) -> FunctionResult<Option<Value>, ErrorBody> {
++        if let Err(error) = sqlite::plain_write(&input.scope, &input.key) { return FunctionResult::Failure(sqlite::error_body(&error, "STATE_TX_FENCED")); }
+         let value = match self.adapter.get(&input.scope, &input.key).await {
+             Ok(v) => v,
+             Err(e) => {
+@@ -675,11 +707,7 @@ impl StateWorker {
+ 
+                 FunctionResult::Success(value)
+             }
+-            Err(e) => FunctionResult::Failure(ErrorBody {
+-                message: format!("Failed to delete value: {}", e),
+-                code: "DELETE_ERROR".to_string(),
+-                stacktrace: None,
+-            }),
++            Err(e) => FunctionResult::Failure(sqlite::error_body(&e, "DELETE_ERROR")),
+         }
+     }
+ 
+@@ -688,6 +716,7 @@ impl StateWorker {
+         &self,
+         input: StateUpdateInput,
+     ) -> FunctionResult<StreamUpdateResult, ErrorBody> {
++        if let Err(error) = sqlite::plain_write(&input.scope, &input.key) { return FunctionResult::Failure(sqlite::error_body(&error, "STATE_TX_FENCED")); }
+         crate::workers::telemetry::collector::track_state_update();
+         match self
+             .adapter
+@@ -715,11 +744,7 @@ impl StateWorker {
+ 
+                 FunctionResult::Success(value)
+             }
+-            Err(e) => FunctionResult::Failure(ErrorBody {
+-                message: format!("Failed to update value: {}", e),
+-                code: "UPDATE_ERROR".to_string(),
+-                stacktrace: None,
+-            }),
++            Err(e) => FunctionResult::Failure(sqlite::error_body(&e, "UPDATE_ERROR")),
+         }
+     }
+ 
+@@ -730,9 +755,90 @@ impl StateWorker {
+     ) -> FunctionResult<Option<Value>, ErrorBody> {
+         match self.adapter.list(&input.scope).await {
+             Ok(values) => FunctionResult::Success(serde_json::to_value(values).ok()),
+-            Err(e) => FunctionResult::Failure(ErrorBody {
+-                message: format!("Failed to list values: {}", e),
+-                code: "LIST_ERROR".to_string(),
++            Err(e) => FunctionResult::Failure(sqlite::error_body(&e, "LIST_ERROR")),
++        }
++    }
++
++    #[function(
++        id = "state::list_page",
++        description = "Get a byte-bounded page from state"
++    )]
++    pub async fn list_page_request(
++        &self,
++        input: Value,
++    ) -> FunctionResult<StateListPageResult, ErrorBody> {
++        match serde_json::from_value::<StateListPageInput>(input) {
++            Ok(input) => self.list_page(input).await,
++            Err(_) => FunctionResult::Failure(ErrorBody {
++                message: "invalid state pagination request".to_string(),
++                code: "STATE_PAGE_INVALID_REQUEST".to_string(),
++                stacktrace: None,
++            }),
++        }
++    }
++
++    pub async fn list_page(
++        &self,
++        input: StateListPageInput,
++    ) -> FunctionResult<StateListPageResult, ErrorBody> {
++        if !(1..=1024).contains(&input.limit) || !(1024..=1_048_576).contains(&input.max_bytes) {
++            return FunctionResult::Failure(ErrorBody {
++                message: "limit must be 1..=1024 and max_bytes must be 1024..=1048576".to_string(),
++                code: "STATE_PAGE_INVALID_REQUEST".to_string(),
++                stacktrace: None,
++            });
++        }
++
++        if input
++            .cursor
++            .as_ref()
++            .is_some_and(|cursor| cursor.len() > STATE_PAGE_MAX_CURSOR_BYTES)
++        {
++            return FunctionResult::Failure(ErrorBody {
++                message: "cursor exceeds the maximum size of 4096 bytes".to_string(),
++                code: "STATE_PAGE_CURSOR_INVALID".to_string(),
++                stacktrace: None,
++            });
++        }
++
++        let limit = input.limit as u32;
++        let max_bytes = input.max_bytes as u32;
++        match self
++            .adapter
++            .list_page(&input.scope, input.cursor.as_deref(), limit, max_bytes)
++            .await
++        {
++            Ok(page) => FunctionResult::Success(page),
++            Err(StatePageError::Unsupported) => FunctionResult::Failure(ErrorBody {
++                message: "the configured state adapter does not support bounded pagination"
++                    .to_string(),
++                code: "STATE_PAGE_UNSUPPORTED".to_string(),
++                stacktrace: None,
++            }),
++            Err(StatePageError::InvalidCursor) => FunctionResult::Failure(ErrorBody {
++                message: "cursor is malformed or belongs to a different scope".to_string(),
++                code: "STATE_PAGE_CURSOR_INVALID".to_string(),
++                stacktrace: None,
++            }),
++            Err(StatePageError::StaleCursor) => FunctionResult::Failure(ErrorBody {
++                message: "state changed after this cursor was issued; restart pagination"
++                    .to_string(),
++                code: "STATE_PAGE_CURSOR_STALE".to_string(),
++                stacktrace: None,
++            }),
++            Err(StatePageError::RecordTooLarge { required_bytes }) => {
++                FunctionResult::Failure(ErrorBody {
++                    message: format!(
++                        "a single state record requires {required_bytes} serialized JSON bytes, exceeding max_bytes {max_bytes}"
++                    ),
++                    code: "STATE_RECORD_TOO_LARGE".to_string(),
++                    stacktrace: None,
++                })
++            }
++            Err(StatePageError::RecoveryRequired) => FunctionResult::Failure(ErrorBody { code: "STATE_GRAPH_RECOVERY_REQUIRED".into(), message: "STATE_GRAPH_RECOVERY_REQUIRED: incomplete graph delta must be recovered".into(), stacktrace: None }),
++            Err(StatePageError::Internal) => FunctionResult::Failure(ErrorBody {
++                message: "failed to serialize bounded state page".to_string(),
++                code: "STATE_PAGE_ERROR".to_string(),
+                 stacktrace: None,
+             }),
+         }
+@@ -830,6 +936,27 @@ mod tests {
+         ));
+     }
+ 
++    #[test]
++    fn transaction_boundary_strips_only_engine_caller_metadata() {
++        let input = serde_json::json!({
++            "scope": "mem:graph:jobs",
++            "key": "job-1",
++            "guard": null,
++            "client_field": true,
++            "_caller_worker_id": "engine-worker"
++        });
++
++        assert_eq!(
++            strip_engine_caller_metadata(input),
++            serde_json::json!({
++                "scope": "mem:graph:jobs",
++                "key": "job-1",
++                "guard": null,
++                "client_field": true
++            })
++        );
++    }
++
+     struct FakeStateAdapter {
+         set_error: Option<&'static str>,
+         get_error: Option<&'static str>,
+@@ -1031,6 +1158,127 @@ mod tests {
+         assert!(matches!(small, FunctionResult::Success(_)));
+     }
+ 
++    #[tokio::test]
++    async fn state_page_request_defaults_and_malformed_values() {
++        let (_engine, worker) = setup();
++        assert!(matches!(
++            worker
++                .list_page_request(serde_json::json!({"scope": "scope"}))
++                .await,
++            FunctionResult::Success(_)
++        ));
++        for input in [
++            serde_json::json!(null),
++            serde_json::json!({"scope": 3}),
++            serde_json::json!({"scope": "scope", "limit": -1}),
++            serde_json::json!({"scope": "scope", "limit": 1.5}),
++            serde_json::json!({"scope": "scope", "limit": "1"}),
++            serde_json::json!({"scope": "scope", "max_bytes": null}),
++            serde_json::json!({"scope": "scope", "cursor": 5}),
++        ] {
++            match worker.list_page_request(input).await {
++                FunctionResult::Failure(error) => {
++                    assert_eq!(error.code, "STATE_PAGE_INVALID_REQUEST")
++                }
++                _ => panic!("expected invalid request"),
++            }
++        }
++    }
++
++    #[tokio::test]
++    async fn list_page_rejects_invalid_limits_with_a_stable_error_code() {
++        let (_engine, worker) = setup();
++
++        let response = worker
++            .list_page(StateListPageInput {
++                scope: "scope".to_string(),
++                cursor: None,
++                limit: 0,
++                max_bytes: 1024,
++            })
++            .await;
++
++        match response {
++            FunctionResult::Failure(error) => {
++                assert_eq!(error.code, "STATE_PAGE_INVALID_REQUEST");
++            }
++            _ => panic!("expected invalid page request failure"),
++        }
++    }
++
++    #[tokio::test]
++    async fn list_page_reports_unsupported_adapters_without_falling_back_to_list() {
++        let (_engine, worker) = setup_with_adapter(Arc::new(FakeStateAdapter::default()));
++
++        let response = worker
++            .list_page(StateListPageInput {
++                scope: "scope".to_string(),
++                cursor: None,
++                limit: 256,
++                max_bytes: 1024,
++            })
++            .await;
++
++        match response {
++            FunctionResult::Failure(error) => {
++                assert_eq!(error.code, "STATE_PAGE_UNSUPPORTED");
++            }
++            _ => panic!("expected unsupported pagination failure"),
++        }
++    }
++
++    #[tokio::test]
++    async fn list_page_surfaces_stale_cursor_error_code() {
++        let (_engine, worker) = setup();
++        for (key, value) in [("one", 1), ("two", 2)] {
++            let response = worker
++                .set(StateSetInput {
++                    scope: "scope".to_string(),
++                    key: key.to_string(),
++                    value: serde_json::json!(value),
++                })
++                .await;
++            assert!(matches!(response, FunctionResult::Success(_)));
++        }
++
++        let first_page = worker
++            .list_page(StateListPageInput {
++                scope: "scope".to_string(),
++                cursor: None,
++                limit: 1,
++                max_bytes: 1024,
++            })
++            .await;
++        let cursor = match first_page {
++            FunctionResult::Success(page) => page.next_cursor.unwrap(),
++            _ => panic!("expected first state page"),
++        };
++
++        let mutation = worker
++            .set(StateSetInput {
++                scope: "scope".to_string(),
++                key: "three".to_string(),
++                value: serde_json::json!(3),
++            })
++            .await;
++        assert!(matches!(mutation, FunctionResult::Success(_)));
++
++        let response = worker
++            .list_page(StateListPageInput {
++                scope: "scope".to_string(),
++                cursor: Some(cursor),
++                limit: 1,
++                max_bytes: 1024,
++            })
++            .await;
++        match response {
++            FunctionResult::Failure(error) => {
++                assert_eq!(error.code, "STATE_PAGE_CURSOR_STALE");
++            }
++            _ => panic!("expected stale cursor failure"),
++        }
++    }
++
+     #[tokio::test]
+     async fn is_active_reflects_worker_shutdown_rx() {
+         let (_engine, module) = setup();
+diff --git a/engine/src/workers/state/structs.rs b/engine/src/workers/state/structs.rs
+index b7dbf09f04d9cc08fd3764670189563d371142a8..854454ccf3937e3d4b5ef3204e0e2505e8975325 100644
+--- a/engine/src/workers/state/structs.rs
++++ b/engine/src/workers/state/structs.rs
+@@ -60,6 +60,33 @@ pub struct StateListGroupsResult {
+     pub groups: Vec<String>,
+ }
+ 
++#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
++pub struct StateListPageInput {
++    pub scope: String,
++    #[serde(default)]
++    pub cursor: Option<String>,
++    #[serde(default = "default_state_page_limit")]
++    pub limit: u64,
++    #[serde(default = "default_state_page_max_bytes")]
++    pub max_bytes: u64,
++}
++
++fn default_state_page_limit() -> u64 {
++    256
++}
++
++fn default_state_page_max_bytes() -> u64 {
++    1_048_576
++}
++
++#[derive(Debug, Clone, Serialize, JsonSchema)]
++pub struct StateListPageResult {
++    pub items: Vec<Value>,
++    pub next_cursor: Option<String>,
++}
++
++pub const STATE_PAGE_MAX_CURSOR_BYTES: usize = 4096;
++
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ pub enum StateEventType {
+     #[serde(rename = "state:created")]
+@@ -86,6 +113,20 @@ mod tests {
+     use super::*;
+     use serde_json::json;
+ 
++    #[test]
++    fn state_page_input_defaults_and_explicit_values() {
++        let input: StateListPageInput = serde_json::from_value(json!({"scope": "s"})).unwrap();
++        assert_eq!(input.limit, 256);
++        assert_eq!(input.max_bytes, 1_048_576);
++        assert_eq!(input.cursor, None);
++        let explicit: StateListPageInput = serde_json::from_value(json!({
++            "scope": "s", "limit": 1, "max_bytes": 1024
++        }))
++        .unwrap();
++        assert_eq!(explicit.limit, 1);
++        assert_eq!(explicit.max_bytes, 1024);
++    }
++
+     #[test]
+     fn state_set_input_data_alias() {
+         let json = json!({"scope": "s", "key": "k", "data": "hello"});
+diff --git a/engine/tests/worker_trigger_e2e.rs b/engine/tests/worker_trigger_e2e.rs
+index b9ea545ceb2c1cac752fd3d60178848682f07e15..fc6d864cb63ce372aac6173d0d0eb38b828df559 100644
+--- a/engine/tests/worker_trigger_e2e.rs
++++ b/engine/tests/worker_trigger_e2e.rs
+@@ -19,6 +19,8 @@
+ //! never downloads a real artifact. `III_API_URL` is pointed at a dead
+ //! address so the best-effort telemetry ping fails fast.
+ 
++#![cfg(unix)]
++
+ use std::path::PathBuf;
+ use std::time::Duration;
+ 

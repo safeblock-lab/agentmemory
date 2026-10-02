@@ -1,5 +1,5 @@
 import { TriggerAction, type IIIClient } from "iii-sdk";
-import type { CompressedObservation, HookPayload, Memory, Session } from "../types.js";
+import type { HookPayload, Memory, Session } from "../types.js";
 import { KV, STREAM } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { isReflectEnabled } from "../functions/slots.js";
@@ -139,20 +139,7 @@ export function registerEventTriggers(sdk: IIIClient, kv: StateKV): void {
         fireVoid("mem::slot-reflect", { sessionId: data.sessionId, deferred: true });
       }
       // Unconditional: mem::graph-extract gates its LLM pass internally.
-      try {
-        const observations = await kv.list<CompressedObservation>(
-          KV.observations(data.sessionId),
-        );
-        const compressed = observations.filter((o) => o.title);
-        if (compressed.length > 0) {
-          fireVoid("mem::graph-extract", { observations: compressed, deferred: true });
-        }
-      } catch {
-        logger.warn("graph-extract dispatch failed", {
-          sessionId: data.sessionId,
-          reason: "observation_lookup_failed",
-        });
-      }
+      fireVoid("mem::graph-extract", { sessionId: data.sessionId, deferred: true });
     // Crystals + lessons consolidation. The stop lifecycle is the single
     // source of truth: event::session::stopped fires for ALL agents (the
     // client-side session-end hook no longer drives consolidation directly).

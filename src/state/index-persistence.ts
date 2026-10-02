@@ -366,9 +366,8 @@ export class IndexPersistence {
     const bucketCounts = new Map<number, number>();
     const bucketIds = Array.from({ length: bucketCount }, (_, bucket) => bucket);
     const failures = await inBatches(bucketIds, LOAD_CONCURRENCY, async (bucket) => {
-      const rows = await this.kv.list<unknown>(vectorBucketScope(bucket));
       let count = 0;
-      for (const row of rows) {
+      for await (const row of this.kv.values<unknown>(vectorBucketScope(bucket))) {
         if (!isPersistedVector(row)) continue;
         try {
           loaded.loadPersisted(row.id, row.s, base64ToFloat32(row.e));

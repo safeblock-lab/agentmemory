@@ -21,6 +21,9 @@ function mockKV() {
       store.get(scope)?.delete(key);
     },
     list: async <T>(scope: string): Promise<T[]> => Array.from(store.get(scope)?.values() ?? []) as T[],
+    async *values<T>(scope: string): AsyncGenerator<T> {
+      for (const value of store.get(scope)?.values() ?? []) yield value as T;
+    },
   };
 }
 

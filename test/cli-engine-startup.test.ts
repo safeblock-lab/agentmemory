@@ -80,13 +80,19 @@ describe("fresh native engine startup", () => {
     });
   });
 
-  it("checks every Unix engine installer prerequisite before downloading", () => {
+  it("installs only the bundled engine after checksum, version, and capability checks", () => {
     const installerStart = source.indexOf("async function runIiiInstaller");
     const installerEnd = source.indexOf("type StartupFailure", installerStart);
     const installerBody = source.slice(installerStart, installerEnd);
-    expect(installerBody).toContain('whichBinary("sh")');
-    expect(installerBody).toContain('whichBinary("curl")');
-    expect(installerBody).toContain('whichBinary("tar")');
+    expect(installerBody).toContain("resolveBundledEngineArtifact(");
+    expect(installerBody).toContain("iiiBinVersion(temporaryPath) !== IIPINNED_VERSION");
+    expect(installerBody).toContain("iiiHasRequiredStateCapabilities(temporaryPath)");
+    expect(installerBody).toContain("renameSync(temporaryPath, binPath)");
+    expect(installerBody).not.toContain("curl");
+    expect(installerBody).not.toContain("install.sh");
+
+    expect(source).not.toContain("iiiReleaseUrl");
+    expect(source).not.toContain("IIIENGINE_INSTALL_CMD");
   });
 
   it("lets the CLI own one bundled worker and reuses a live worker", () => {
@@ -106,17 +112,21 @@ describe("fresh native engine startup", () => {
     expect(workerBody).toContain("waitForConfiguredWorker");
     expect(workerBody).toContain('await import("./index.js")');
 
-    expect(source.match(/await startWorkerForEngineState\(\)/g)).toHaveLength(4);
+    expect(source.match(/await startWorkerForEngineState\(\)/g)).toHaveLength(3);
     expect(source).toContain("agentmemory worker did not become ready within 15 minutes");
   });
 
-  it("stores lifecycle metadata per resolved instance and scopes Docker", () => {
+  it("stores lifecycle metadata per instance and scopes Docker ownership checks", () => {
     expect(source).toContain('runtimeMetadataPath("iii.pid")');
     expect(source).toContain('runtimeMetadataPath("engine-state.json")');
     expect(source).toContain('runtimeMetadataPath("worker.pid")');
     expect(source).toContain('process.env["AGENTMEMORY_RUNTIME_DIR"] = selectedInstance > 0');
-    expect(source).toContain("dockerProjectName(getRestPort())");
-    expect(source).toContain("dockerComposeArgs(");
+
+    const dockerStart = source.indexOf("function inspectOwnedDockerEngine");
+    const dockerEnd = source.indexOf("function ", dockerStart + 1);
+    const dockerOwnershipBody = source.slice(dockerStart, dockerEnd);
+    expect(dockerOwnershipBody).toContain("dockerProjectName(ownerPort)");
+    expect(dockerOwnershipBody).toContain("dockerComposeArgs(");
   });
 
   it("keeps AGENTMEMORY_URL client-only and lets local port flags win", () => {
@@ -126,21 +136,78 @@ describe("fresh native engine startup", () => {
     expect(source).toContain('process.env["III_REST_PORT"] = String(base)');
   });
 
-  it("recovers the host worker for a validated Docker engine", () => {
-    expect(source).toContain("function inspectOwnedDockerEngine");
-    expect(source).toMatch(/"ps",\s*"-q",\s*"--all",\s*"iii-engine"/);
-    expect(source).toContain('"com.docker.compose.service"');
-    expect(source).toContain('record.HostConfig?.PortBindings');
-    expect(source).toContain('mount.Destination === "/data"');
-    expect(source).toContain('["start", inspection.containerId]');
-    expect(source).toContain('["stop", "--time", "10", inspection.containerId]');
-
+  it("rejects an unverified persisted Docker engine before container inspection or startup", () => {
     const mainStart = source.indexOf("async function main()");
     const mainEnd = source.indexOf("async function apiFetch", mainStart);
     const mainBody = source.slice(mainStart, mainEnd);
     expect(mainBody).toContain("reconcilePersistedDockerEngine()");
     expect(mainBody.indexOf("reconcilePersistedDockerEngine()"))
       .toBeLessThan(mainBody.indexOf("if (await isEngineRunning())"));
+
+    const reconcileStart = source.indexOf("async function reconcilePersistedDockerEngine");
+    const reconcileEnd = source.indexOf("function installInstructions", reconcileStart);
+    const reconcileBody = source.slice(reconcileStart, reconcileEnd);
+    expect(reconcileBody).toContain("all required state capabilities");
+    expect(reconcileBody).toContain("process.exitCode = 1");
+    expect(reconcileBody).not.toContain("inspectOwnedDockerEngine");
+    expect(reconcileBody).not.toContain('["start", inspection.containerId]');
+  });
+
+  it("rejects Docker opt-in before attempting container startup", () => {
+    const start = source.indexOf("async function startEngine");
+    const dockerStart = source.indexOf("const dockerOptIn =", start);
+    const nativeStart = source.indexOf("const fallbacks =", dockerStart);
+    const dockerSelection = source.slice(dockerStart, nativeStart);
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(dockerStart).toBeGreaterThan(start);
+    expect(nativeStart).toBeGreaterThan(dockerStart);
+    expect(dockerSelection).toContain("Docker startup is unavailable until a patched image can be verified");
+    expect(dockerSelection).toContain("No Docker container was started.");
+    expect(dockerSelection).not.toContain("dockerComposeArgs(");
+    expect(dockerSelection).not.toContain("spawnSync(");
+  });
+
+  it("fails closed on legacy directories until a matching receipt and target identity exist", () => {
+    const mainStart = source.indexOf("async function main()");
+    const mainEnd = source.indexOf("async function apiFetch", mainStart);
+    const mainBody = source.slice(mainStart, mainEnd);
+    expect(mainBody.indexOf("assertLegacyStateMigrationReady();"))
+      .toBeLessThan(mainBody.indexOf("await assertRuntimePortOwnership();"));
+
+    const gateStart = source.indexOf("function legacyStateStoreGateError()");
+    const gateEnd = source.indexOf("function assertLegacyStateMigrationReady", gateStart);
+    const gate = source.slice(gateStart, gateEnd);
+    expect(gate).toContain("hasValidStateMigrationReceipt(");
+    expect(gate).toContain("stateMigrationTargetIdentity(target)");
+    expect(gate).toContain('pendingStatus === "missing"');
+    expect(gate).toContain('sourceInspection.status !== "directory"');
+
+    const prepareStart = source.indexOf("function prepareEngineLaunch");
+    const prepareEnd = source.indexOf("function startIiiBin", prepareStart);
+    const prepare = source.slice(prepareStart, prepareEnd);
+    expect(prepare).toContain("assertLegacyStateMigrationReady();");
+    expect(prepare).toContain('if (basename(m.from) === "state_store.db") continue;');
+    expect(prepare).toContain("Runtime engine config could not be made safe");
+  });
+
+  it("requires explicit paths and budget for the checksum-verified native migration command", () => {
+    const migrateStart = source.indexOf("async function runStateMigrationCmd()");
+    const migrateEnd = source.indexOf("async function main()", migrateStart);
+    const migrate = source.slice(migrateStart, migrateEnd);
+    expect(migrate).toContain("resolveBundledEngineArtifact(");
+    expect(migrate).toContain("hasRequiredEngineCapabilitiesOutput(capabilityOutput)");
+    expect(migrate).toContain('["state-migrate", "--source", source, "--target", target, "--disk-budget-bytes", diskBudgetBytes]');
+    expect(migrate).toContain("createStateMigrationReceipt(");
+    expect(migrate).toContain("stateMigrationTargetIdentity(target)");
+    expect(migrate).toContain("source retained at");
+    expect(source).toContain('"state-migrate": runStateMigrationCmd');
+
+    const parserStart = source.indexOf("function parseStateMigrationArgs");
+    const parserEnd = source.indexOf("async function runStateMigrationCmd", parserStart);
+    const parser = source.slice(parserStart, parserEnd);
+    expect(parser).toContain('"--source", "--target", "--disk-budget-bytes"');
+    expect(parser).toContain("may be supplied only once");
+    expect(parser).toContain("positive unsigned 64-bit integer");
   });
 
   it("keeps canonical compatibility and rejects Docker ownership on another port", () => {
@@ -266,10 +333,13 @@ describe("fresh native engine startup", () => {
     const mainEnd = source.indexOf("async function apiFetch", mainStart);
     const running = source.slice(mainStart, mainEnd);
     const branch = running.indexOf("if (await isEngineRunning())");
-    const adoption = running.indexOf("adoptRunningEngine()", branch);
+    const adoption = running.indexOf("adoptRunningEngine(attachedBin", branch);
     const verification = running.indexOf("windowsListenerBelongsToOwnedEngine", branch);
+    const capabilityCheck = running.indexOf("iiiHasRequiredStateCapabilities(attachedBin)", branch);
     expect(verification).toBeGreaterThan(branch);
     expect(verification).toBeLessThan(adoption);
+    expect(capabilityCheck).toBeGreaterThan(branch);
+    expect(capabilityCheck).toBeLessThan(adoption);
     expect(running.slice(branch, adoption)).toContain("process.exit(1)");
 
     const start = source.indexOf("function windowsListenerBelongsToOwnedEngine(");

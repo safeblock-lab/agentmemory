@@ -1,12 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 import { effectHarness } from "./batch-effects-harness.js";
-import { batchEffectKey, effectMetadata, runBatchCallback } from "../src/state/batch-effects.js";
+import { batchEffectKey, createGraphBatchCallbackPreflight, effectMetadata, runBatchCallback } from "../src/state/batch-effects.js";
+import { graphKV, runGraphJob } from "../src/functions/graph-jobs.js";
 import { KV, fingerprintId } from "../src/state/schema.js";
 import { registerLessonsFunctions } from "../src/functions/lessons.js";
 import { registerExportImportFunction } from "../src/functions/export-import.js";
 import { MetricsStore } from "../src/eval/metrics-store.js";
 import type { ExportData, Lesson } from "../src/types.js";
 import { recordAudit } from "../src/functions/audit.js";
+import { StateTransactionError } from "../src/state/state-transactions.js";
 
 vi.mock("../src/logger.js", () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
 
@@ -99,16 +101,155 @@ describe("durable batch effects", () => {
   it("rejects invalid keys before mutation and blocks replacement while a callback is partial", async () => {
     const h = effectHarness();
     const run = vi.fn(async () => ({ success: true }));
+    const lease = vi.spyOn(h.kv, "lease");
+    const getVersioned = vi.spyOn(h.kv, "getVersioned");
+    const commitBatch = vi.spyOn(h.kv, "commitBatch");
+    const set = vi.spyOn(h.kv, "set");
     await expect(runBatchCallback(h.kv, "graph", "bad", run)).rejects.toThrow("Invalid");
     expect(run).not.toHaveBeenCalled();
+    expect(lease).not.toHaveBeenCalled();
+    expect(getVersioned).not.toHaveBeenCalled();
+    expect(commitBatch).not.toHaveBeenCalled();
+    expect(set).not.toHaveBeenCalled();
+    expect(h.store.size).toBe(0);
+
+    expect(() => createGraphBatchCallbackPreflight("bad", () => ({ success: true }))).toThrow("Invalid batch effect key");
+    const graphState = graphKV(h.kv);
+    const inGraphJob = (durableId: string, key: string, callback: () => Promise<unknown>) => runGraphJob(
+      graphState,
+      "batch_callback",
+      { batchEffectKey: key },
+      callback,
+      durableId,
+      createGraphBatchCallbackPreflight(key, (state) => state === "stale" ? { success: true, stale: true } : { success: true }),
+    );
     const key = batchEffectKey("partial");
-    await runBatchCallback(h.kv, "graph", key, async (_resuming, admit) => { await admit(); return { success: false }; });
-    await expect(runBatchCallback(h.kv, "graph", batchEffectKey("new"), run)).rejects.toThrow("recovered");
+    const partialJobId = "partial-callback-attempt";
+    await inGraphJob(partialJobId, key, () => runBatchCallback(graphState, "graph", key, async (_resuming, admit) => { await admit(); return { success: false }; }));
+    const frozenRun = vi.fn(async () => runBatchCallback(graphState, "graph", key, run));
+    await expect(inGraphJob(partialJobId, key, frozenRun)).resolves.toEqual({ success: false });
+    expect(frozenRun).not.toHaveBeenCalled();
+
+    const admissionSnapshot = () => [...h.store.entries()]
+      .filter(([address]) => [
+        KV.graphJobs,
+        KV.graphCheckpoints,
+        KV.graphReceipts,
+        KV.graphWorkingSnapshots,
+        KV.graphInputs(""),
+        KV.graphProviderResults(""),
+        KV.graphDeltas(""),
+        KV.graphPrepared(""),
+        KV.graphRemaps(""),
+        KV.batchCallbacks,
+      ].some((scope) => address.startsWith(`${scope}:`)))
+      .sort(([left], [right]) => left.localeCompare(right));
+    const beforeCompetingAttempt = admissionSnapshot();
+    const competingKey = batchEffectKey("new");
+    await expect(inGraphJob("competing-callback-attempt", competingKey, () => runBatchCallback(graphState, "graph", competingKey, run))).rejects.toThrow("recovered");
+    expect(admissionSnapshot()).toEqual(beforeCompetingAttempt);
+    expect(h.store.get(`${KV.batchCallbacks}:graph:${key}`)).toMatchObject({ state: "started" });
+    expect(h.store.get(`${KV.batchCallbacks}:active:graph`)).toMatchObject({ state: "started", activeKey: key });
+    expect(h.store.has(`${KV.graphJobs}:competing-callback-attempt`)).toBe(false);
+    expect(h.store.has(`${KV.graphInputs("competing-callback-attempt")}:0`)).toBe(false);
+    expect(h.store.has(`${KV.graphDeltas("competing-callback-attempt")}:manifest:1`)).toBe(false);
     registerExportImportFunction(h.sdk as never, h.kv);
     await expect(h.call("mem::import", { exportData: { version: "0.9.42", sessions: [], observations: {}, memories: [], summaries: [] } })).rejects.toThrow("recovered");
-    await runBatchCallback(h.kv, "graph", key, run);
-    await runBatchCallback(h.kv, "graph", batchEffectKey("new"), run);
+    await inGraphJob("partial-callback-repair-attempt", key, () => runBatchCallback(graphState, "graph", key, run));
+    await inGraphJob("next-callback-attempt", competingKey, () => runBatchCallback(graphState, "graph", competingKey, run));
     expect(run).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["completed", { success: true }, { success: true }],
+    ["stale", { success: true, stale: true }, { success: true, stale: true }],
+  ] as const)("preflights a %s receipt before a new caller attempt is captured", async (_state, callbackResult, preflightResult) => {
+    const h = effectHarness();
+    const graphState = graphKV(h.kv);
+    const key = batchEffectKey(`terminal-${_state}`);
+    const runAttempt = (id: string, callback: () => Promise<unknown>) => runGraphJob(
+      graphState,
+      "batch_callback",
+      { batchEffectKey: key },
+      callback,
+      id,
+      createGraphBatchCallbackPreflight(key, (state) => state === "stale" ? { success: true, stale: true } : { success: true }),
+    );
+    await expect(runAttempt(`terminal-${_state}-original`, () => runBatchCallback(graphState, "graph", key, async () => callbackResult))).resolves.toEqual(callbackResult);
+    const beforePreflight = [...h.store.entries()]
+      .filter(([address]) => [KV.graphJobs, KV.graphCheckpoints, KV.graphReceipts, KV.graphWorkingSnapshots, KV.graphInputs(""), KV.graphProviderResults(""), KV.graphDeltas(""), KV.graphPrepared(""), KV.graphRemaps(""), KV.batchCallbacks].some((scope) => address.startsWith(`${scope}:`)))
+      .sort(([left], [right]) => left.localeCompare(right));
+    const shouldNotRun = vi.fn(async () => ({ success: true }));
+    await expect(runAttempt(`terminal-${_state}-duplicate-caller`, shouldNotRun)).resolves.toEqual(preflightResult);
+    expect(shouldNotRun).not.toHaveBeenCalled();
+    const afterPreflight = [...h.store.entries()]
+      .filter(([address]) => [KV.graphJobs, KV.graphCheckpoints, KV.graphReceipts, KV.graphWorkingSnapshots, KV.graphInputs(""), KV.graphProviderResults(""), KV.graphDeltas(""), KV.graphPrepared(""), KV.graphRemaps(""), KV.batchCallbacks].some((scope) => address.startsWith(`${scope}:`)))
+      .sort(([left], [right]) => left.localeCompare(right));
+    expect(afterPreflight).toEqual(beforePreflight);
+    expect(h.store.has(`${KV.graphJobs}:terminal-${_state}-duplicate-caller`)).toBe(false);
+    expect(h.store.has(`${KV.graphInputs(`terminal-${_state}-duplicate-caller`)}:0`)).toBe(false);
+  });
+
+  it("rejects malformed durable receipts before capturing a graph job", async () => {
+    const h = effectHarness();
+    const graphState = graphKV(h.kv);
+    const key = batchEffectKey("malformed-receipt");
+    h.store.set(`${KV.batchCallbacks}:graph:${key}`, { state: "invalid" });
+    const before = [...h.store.entries()]
+      .filter(([address]) => [KV.graphJobs, KV.graphCheckpoints, KV.graphReceipts, KV.graphWorkingSnapshots, KV.graphInputs(""), KV.graphProviderResults(""), KV.graphDeltas(""), KV.graphPrepared(""), KV.graphRemaps(""), KV.batchCallbacks].some((scope) => address.startsWith(`${scope}:`)))
+      .sort(([left], [right]) => left.localeCompare(right));
+    await expect(runGraphJob(
+      graphState,
+      "batch_callback",
+      { batchEffectKey: key },
+      async () => ({ success: true }),
+      "malformed-receipt-attempt",
+      createGraphBatchCallbackPreflight(key, () => ({ success: true })),
+    )).rejects.toThrow("Ambiguous batch callback receipt state");
+    const after = [...h.store.entries()]
+      .filter(([address]) => [KV.graphJobs, KV.graphCheckpoints, KV.graphReceipts, KV.graphWorkingSnapshots, KV.graphInputs(""), KV.graphProviderResults(""), KV.graphDeltas(""), KV.graphPrepared(""), KV.graphRemaps(""), KV.batchCallbacks].some((scope) => address.startsWith(`${scope}:`)))
+      .sort(([left], [right]) => left.localeCompare(right));
+    expect(after).toEqual(before);
+    expect(h.store.has(`${KV.graphJobs}:malformed-receipt-attempt`)).toBe(false);
+  });
+
+  it("replays an admitted job when a completed callback receipt outlives job finalization", async () => {
+    const h = effectHarness();
+    const graphState = graphKV(h.kv);
+    const key = batchEffectKey("lost-job-finalization-ack");
+    const durableId = "lost-job-finalization-attempt";
+    const input = { batchEffectKey: key };
+    const runAttempt = (run: () => Promise<unknown>) => runGraphJob(
+      graphState,
+      "batch_callback",
+      input,
+      run,
+      durableId,
+      createGraphBatchCallbackPreflight(key, (state) => state === "stale" ? { success: true, stale: true } : { success: true }),
+    );
+    const effect = vi.fn(async () => ({ success: true }));
+    const commitBatch = h.kv.commitBatch.bind(h.kv);
+    let injectedFailures = 0;
+    const failingCommit = vi.spyOn(h.kv, "commitBatch").mockImplementation(async (guard, prepared) => {
+      const receipt = h.store.get(`${KV.batchCallbacks}:graph:${key}`) as { state?: string } | undefined;
+      if (receipt?.state === "completed" && injectedFailures < 2) {
+        injectedFailures++;
+        throw new StateTransactionError("STATE_TX_FAILED");
+      }
+      return commitBatch(guard, prepared);
+    });
+    try {
+      await expect(runAttempt(() => runBatchCallback(graphState, "graph", key, effect))).rejects.toThrow("STATE_TX_FAILED");
+    } finally {
+      failingCommit.mockRestore();
+    }
+    expect(injectedFailures).toBe(2);
+    expect(h.store.get(`${KV.batchCallbacks}:graph:${key}`)).toMatchObject({ state: "completed" });
+    expect(h.store.get(`${KV.graphJobs}:${durableId}`)).toMatchObject({ state: "staging", captureComplete: true });
+
+    await expect(runAttempt(() => runBatchCallback(graphState, "graph", key, effect))).resolves.toEqual({ success: true });
+    expect(effect).toHaveBeenCalledTimes(1);
+    expect(h.store.get(`${KV.graphJobs}:${durableId}`)).toMatchObject({ state: "completed" });
   });
 
   it("repairs an acknowledged-lost audit without a second entry", async () => {

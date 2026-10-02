@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { IndexPersistence, vectorBucketScope } from "../src/state/index-persistence.js";
 import { SearchIndex } from "../src/state/search-index.js";
-import { VectorIndex } from "../src/state/vector-index.js";
+import { VectorIndex, float32ToBase64 } from "../src/state/vector-index.js";
+import { StateKV } from "../src/state/kv.js";
 import type { CompressedObservation } from "../src/types.js";
 
 const INDEX_SCOPE = "mem:index:bm25";
@@ -28,6 +29,9 @@ function mockKV() {
       ops.push({ op: "list", scope });
       return Array.from(store.get(scope)?.values() ?? []) as T[];
     },
+    async *values<T>(scope: string): AsyncGenerator<T> {
+      for (const value of store.get(scope)?.values() ?? []) yield value as T;
+    },
   };
 }
 
@@ -35,6 +39,10 @@ type MockKV = ReturnType<typeof mockKV>;
 
 function vec(values: number[]): Float32Array {
   return new Float32Array(values);
+}
+
+function persistedVector(id: string, sessionId: string, values: number[]) {
+  return { id, s: sessionId, e: float32ToBase64(vec(values)) };
 }
 
 function vectorWith(entries: Array<[string, number[]]>): VectorIndex {
@@ -295,6 +303,123 @@ describe("IndexPersistence bucketed vector storage", () => {
     expect(loaded.vector!.size).toBe(2);
     expect(loaded.expectedCount).toBe(4);
     expect(persistence.status().vectorCountShortfall).toEqual({ expected: 4, loaded: 2 });
+  });
+
+  it("loads vector buckets across pages and skips invalid records", async () => {
+    const scope0 = vectorBucketScope(0);
+    const scope1 = vectorBucketScope(1);
+    const pages = new Map<string, unknown[][]>([
+      [scope0, [[persistedVector("obs_a", "ses_a", [1, 2, 3]), null], [{ id: "obs_bad", s: 7, e: "AA==" }, persistedVector("obs_b", "ses_b", [4, 5, 6])]]],
+      [scope1, [[persistedVector("obs_c", "ses_c", [7, 8, 9])]]],
+    ]);
+    const trigger = vi.fn(async (request: {
+      function_id: string;
+      payload: { scope: string; cursor?: string; limit: number; max_bytes: number };
+    }) => {
+      const pageIndex = request.payload.cursor === undefined ? 0 : Number(request.payload.cursor);
+      const bucketPages = pages.get(request.payload.scope) ?? [];
+      return {
+        items: bucketPages[pageIndex] ?? [],
+        next_cursor: pageIndex + 1 < bucketPages.length ? String(pageIndex + 1) : null,
+      };
+    });
+    const pageKV = new StateKV({ trigger } as never);
+    const list = vi.fn(() => {
+      throw new Error("vector loading must not materialize state::list");
+    });
+    const pagedKV = {
+      ...kv,
+      list,
+      values: <T>(scope: string) => pageKV.values<T>(scope),
+    };
+    const savedAt = "2026-09-30T12:00:00.000Z";
+    await kv.set(INDEX_SCOPE, META_KEY, { v: 3, bucketCount: 2, savedAt, count: 3 });
+    kv.ops.length = 0;
+
+    const loaded = await new IndexPersistence(pagedKV as never, new VectorIndex(), { bucketSize: 16 }).load();
+
+    expect(loaded.state).toBe("buckets");
+    expect(loaded.savedAt).toBe(savedAt);
+    expect(loaded.expectedCount).toBe(3);
+    expect(loaded.vector?.size).toBe(3);
+    expect(loaded.vector?.has("obs_bad")).toBe(false);
+    expect(loaded.vector?.pendingChanges).toBe(0);
+    expect(list).not.toHaveBeenCalled();
+    expect(trigger.mock.calls.filter(([request]) => request.payload.scope === scope0).map(([request]) => request.payload.cursor)).toEqual([
+      undefined,
+      "1",
+    ]);
+    expect(trigger.mock.calls.filter(([request]) => request.payload.scope === scope1).map(([request]) => request.payload.cursor)).toEqual([
+      undefined,
+    ]);
+    expect(kv.ops.filter((operation) => operation.op === "set" || operation.op === "delete")).toEqual([]);
+  });
+
+  it("keeps bucket state unpublished when a later page fails with a stale cursor", async () => {
+    const staleCause = Object.assign(new Error("private engine diagnostic"), { code: "STATE_PAGE_CURSOR_STALE" });
+    const trigger = vi.fn(async (request: {
+      function_id: string;
+      payload: { scope: string; cursor?: string; limit: number; max_bytes: number };
+    }) => {
+      if (request.payload.cursor === undefined) {
+        return { items: [persistedVector("obs_partial", "ses_partial", [1, 2, 3])], next_cursor: "next" };
+      }
+      throw staleCause;
+    });
+    const pageKV = new StateKV({ trigger } as never);
+    const pagedKV = {
+      ...kv,
+      values: <T>(scope: string) => pageKV.values<T>(scope),
+    };
+    await kv.set(INDEX_SCOPE, META_KEY, {
+      v: 3,
+      bucketCount: 1,
+      savedAt: "2026-09-30T12:00:00.000Z",
+      count: 1,
+    });
+    await kv.set(INDEX_SCOPE, "vectors", "legacy snapshot");
+    kv.ops.length = 0;
+    const persistence = new IndexPersistence(pagedKV as never, new VectorIndex(), { bucketSize: 16 });
+
+    const loaded = await persistence.load();
+
+    expect(loaded).toEqual({ vector: null, state: "unavailable", savedAt: null });
+    expect(persistence.status().buckets).toBe(0);
+    expect(trigger).toHaveBeenCalledTimes(2);
+    expect(await kv.get(INDEX_SCOPE, "vectors")).toBe("legacy snapshot");
+    expect(kv.ops.filter((operation) => operation.op === "set" || operation.op === "delete")).toEqual([]);
+  });
+
+  it("loads buckets concurrently within the limit and checks the saved vector count", async () => {
+    const bucketCount = 9;
+    const savedAt = "2026-09-30T12:00:00.000Z";
+    await kv.set(INDEX_SCOPE, META_KEY, { v: 3, bucketCount, savedAt, count: bucketCount });
+    let active = 0;
+    let maxActive = 0;
+    const concurrentKV = {
+      ...kv,
+      async *values<T>(scope: string): AsyncGenerator<T> {
+        active++;
+        maxActive = Math.max(maxActive, active);
+        try {
+          await Promise.resolve();
+          const bucket = Number(scope.slice(-4));
+          yield persistedVector(`obs_${bucket}`, `ses_${bucket}`, [bucket, 1, 2]) as T;
+        } finally {
+          active--;
+        }
+      },
+    };
+
+    const persistence = new IndexPersistence(concurrentKV as never, new VectorIndex(), { bucketSize: 16 });
+    const loaded = await persistence.load();
+
+    expect(loaded.state).toBe("buckets");
+    expect(loaded.savedAt).toBe(savedAt);
+    expect(loaded.expectedCount).toBe(bucketCount);
+    expect(loaded.vector?.size).toBe(bucketCount);
+    expect(maxActive).toBe(8);
+    expect(persistence.status().vectorCountShortfall).toBeNull();
   });
 
   it("reports storage as unavailable when the metadata read fails", async () => {

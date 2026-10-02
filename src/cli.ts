@@ -6,19 +6,34 @@ import {
   spawnSync,
   type ChildProcess,
 } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
+  chmodSync,
   cpSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   readdirSync,
   readFileSync,
   readlinkSync,
+  realpathSync,
+  lstatSync,
   rmSync,
+  renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join, dirname, resolve, delimiter as PATH_DELIMITER } from "node:path";
+import {
+  basename,
+  delimiter as PATH_DELIMITER,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, platform } from "node:os";
 import * as p from "@clack/prompts";
@@ -70,11 +85,21 @@ import { runtimeMetadataPath } from "./runtime-paths.js";
 import { createStartupStderrCapture } from "./cli/startup-stderr.js";
 import {
   clearPersistedBuiltinConfig,
+  inspectLegacyStateStore,
   renderEngineConfig,
+  stateMigrationReceiptPath,
 } from "./cli/engine-config.js";
 import { SHUTDOWN_HARD_EXIT_MS } from "./shutdown.js";
 import { consoleArgs, defaultConsolePort, parseConsoleArgs } from "./cli/console.js";
 import { processStatIsRunning } from "./cli/process-state.js";
+import {
+  createStateMigrationReceipt,
+  hasRequiredEngineCapabilitiesOutput,
+  hasValidStateMigrationReceipt,
+  REQUIRED_ENGINE_CAPABILITIES,
+  resolveBundledEngineArtifact,
+  stateMigrationTargetIdentity,
+} from "./cli/engine-artifacts.js";
 import { renderSplash } from "./cli/splash.js";
 import { isFirstRun, readPrefs, resetPrefs, writePrefs } from "./cli/preferences.js";
 import { runOnboarding } from "./cli/onboarding.js";
@@ -120,8 +145,8 @@ if (args.includes("--version") || args.includes("-V")) {
 }
 
 // Pinned iii-engine version. The engine, the iii-sdk and the @iii-dev/helpers
-// packages in package.json must stay on the same release: the worker speaks
-// that engine's wire protocol and the unpinned installer tracks `latest`.
+// packages in package.json must stay on the same release because the worker
+// speaks that engine's wire protocol.
 // 0.22.x is the last line before 0.23 removes the config.yaml worker
 // lifecycle this CLI relies on; it keeps HTTP routes owned by the
 // reconnecting worker (no REST 404s after an engine reconnect). The engine
@@ -134,37 +159,6 @@ if (args.includes("--version") || args.includes("-V")) {
 const IIPINNED_DEFAULT_VERSION = III_PINNED_VERSION;
 const IIPINNED_VERSION =
   process.env["AGENTMEMORY_III_VERSION"] || IIPINNED_DEFAULT_VERSION;
-const IIIENGINE_INSTALL_CMD = `curl -fsSL https://install.iii.dev/iii/main/install.sh | VERSION=${IIPINNED_VERSION} sh`;
-
-// Map Node platform/arch → the asset name iii-hq/iii ships under
-// https://github.com/iii-hq/iii/releases/download/iii/v<version>/<asset>
-function iiiReleaseAsset(): string | null {
-  const p = platform();
-  const a = process.arch;
-  if (p === "darwin" && a === "arm64")
-    return "iii-aarch64-apple-darwin.tar.gz";
-  if (p === "darwin" && a === "x64")
-    return "iii-x86_64-apple-darwin.tar.gz";
-  if (p === "linux" && a === "x64")
-    return "iii-x86_64-unknown-linux-gnu.tar.gz";
-  if (p === "linux" && a === "arm64")
-    return "iii-aarch64-unknown-linux-gnu.tar.gz";
-  if (p === "linux" && a === "arm")
-    return "iii-armv7-unknown-linux-gnueabihf.tar.gz";
-  if (p === "win32" && a === "x64")
-    return "iii-x86_64-pc-windows-msvc.zip";
-  if (p === "win32" && a === "arm64")
-    return "iii-aarch64-pc-windows-msvc.zip";
-  return null;
-}
-
-function iiiReleaseUrl(): string | null {
-  const asset = iiiReleaseAsset();
-  if (!asset) return null;
-  // Tag name is monorepo-prefixed: `iii/v0.22.1`. Slash is URL-encoded
-  // by GitHub when serving the download path, hence `iii/v...` not `iii%2Fv...`.
-  return `https://github.com/iii-hq/iii/releases/download/iii/v${IIPINNED_VERSION}/${asset}`;
-}
 
 function vlog(msg: string): void {
   if (IS_VERBOSE) p.log.info(`[verbose] ${msg}`);
@@ -202,6 +196,8 @@ Commands:
   status             Show connection status, memory count, flags, and health
   console            Launch the iii web console for this engine (workers, functions,
                      triggers, queues, traces). --console-port N, default viewer+1
+  state-migrate      Build a native SQLite shadow from a frozen legacy state directory.
+                     Requires --source, --target and --disk-budget-bytes explicitly.
   doctor             Interactive diagnostic + fixer. [F]ix · [S]kip · [?]more · [Q]uit
                      --all: apply every fix without prompting (CI)
                      --dry-run: show what each fix would do, don't execute
@@ -239,15 +235,15 @@ Environment:
   AGENTMEMORY_URL              Full REST base URL (e.g. http://localhost:3111).
                                Honored by status, doctor, and MCP shim commands.
   AGENTMEMORY_DATA_DIR         State directory fallback when --data-dir is not set.
-  AGENTMEMORY_USE_DOCKER=1     Prefer the bundled docker-compose path over the
-                               native iii-engine binary on first run.
+  AGENTMEMORY_USE_DOCKER=1     Docker startup is unavailable for pagination;
+                               use a verified patched native engine package.
   AGENTMEMORY_III_VERSION      Override pinned iii-engine version (default ${IIPINNED_VERSION}).
   AGENTMEMORY_FOLLOWUP_WINDOW_SECONDS
                                Window (seconds) for the smart-search follow-up diagnostic
                                (default 30). Long values overcount, short values undercount.
 
 Quick start:
-  agentmemory          # start with local iii-engine or Docker
+  agentmemory          # start with a verified local iii-engine
   agentmemory demo     # see semantic recall in 30 seconds
   agentmemory doctor   # diagnose config + feature flags
   agentmemory status   # health + memory count + flags
@@ -593,32 +589,48 @@ function iiiBinVersion(binPath: string): string | null {
   }
 }
 
-// Resolve a compatible iii binary for the pinned engine version.
-//
-// Soft-warn lets the worker boot against a mismatched engine and crash at
-// runtime (the SDK and engine wire protocol move together; 0.20+ renamed the
-// SDK surface entirely). Hard-pin without a fallback leaves the user stuck — they
-// either downgrade their global iii (breaking other consumers) or set
-// AGENTMEMORY_III_VERSION and hope it works.
-//
-// Instead: when the candidate iii on PATH is the wrong version, prefer
-// the private install under ~/.agentmemory/bin/iii. If the private copy
-// is missing or also mismatched, the caller installs the pinned version
-// there before retrying. AGENTMEMORY_III_VERSION still overrides
-// IIPINNED_VERSION upstream so users who knowingly want a different
-// engine can opt in.
+function iiiHasRequiredStateCapabilities(binPath: string): boolean {
+  try {
+    const output = execFileSync(binPath, ["--capabilities"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 3000,
+      windowsHide: true,
+    });
+    return hasRequiredEngineCapabilitiesOutput(output);
+  } catch {
+    return false;
+  }
+}
+
+// Select only a binary that matches the configured version and advertises
+// every required state capability. Prefer the verified private artifact over an incompatible
+// PATH entry; if neither qualifies, the caller can install only the bundled,
+// checksum-verified artifact.
 function resolveCompatibleIii(iiiBinPath: string | null | undefined): string | null {
   if (!iiiBinPath) return null;
   const detected = iiiBinVersion(iiiBinPath);
-  if (detected && detected === IIPINNED_VERSION) return iiiBinPath;
+  if (
+    detected === IIPINNED_VERSION &&
+    iiiHasRequiredStateCapabilities(iiiBinPath)
+  ) {
+    return iiiBinPath;
+  }
 
   const privatePath = privateIiiPath();
   if (iiiBinPath !== privatePath && existsSync(privatePath)) {
     const privateVersion = iiiBinVersion(privatePath);
-    if (privateVersion === IIPINNED_VERSION) {
-      const reason = detected ? `v${detected} mismatches pin` : "probe failed";
+    if (
+      privateVersion === IIPINNED_VERSION &&
+      iiiHasRequiredStateCapabilities(privatePath)
+    ) {
+      const reason = detected === IIPINNED_VERSION
+        ? "the binary does not advertise all required state capabilities"
+        : detected
+          ? `v${detected} mismatches pin`
+          : "probe failed";
       vlog(
-        `iii at ${iiiBinPath} ${reason} v${IIPINNED_VERSION}; using private install at ${privatePath}.`,
+        `iii at ${iiiBinPath} ${reason}; using private install at ${privatePath}.`,
       );
       return privatePath;
     }
@@ -1225,22 +1237,6 @@ async function assertRuntimePortOwnership(): Promise<void> {
   clearEngineState();
 }
 
-function configureDockerHostUser(): void {
-  if (typeof process.getuid !== "function" || typeof process.getgid !== "function") {
-    return;
-  }
-  const hostUid = String(process.getuid());
-  const hostGid = String(process.getgid());
-  process.env["AGENTMEMORY_DOCKER_UID"] ??= hostUid;
-  process.env["AGENTMEMORY_DOCKER_GID"] ??= hostGid;
-  if (
-    process.env["AGENTMEMORY_DOCKER_UID"] === hostUid &&
-    process.env["AGENTMEMORY_DOCKER_GID"] === hostGid
-  ) {
-    process.env["AGENTMEMORY_DOCKER_SKIP_CHOWN"] ??= "1";
-  }
-}
-
 function isInvokedViaNpx(): boolean {
   if (process.env["npm_lifecycle_event"] === "npx") return true;
   const argv1 = process.argv[1] ?? "";
@@ -1265,7 +1261,7 @@ async function maybeOfferGlobalInstall(): Promise<void> {
   writePrefs({ skipGlobalInstall: true });
 }
 
-function adoptRunningEngine(): void {
+function adoptRunningEngine(verifiedBinPath?: string): void {
   try {
     const existingState = readEngineState();
     const existingPid = readEnginePidfile();
@@ -1292,6 +1288,7 @@ function adoptRunningEngine(): void {
       writeEngineState({
         kind: "native",
         configPath: findIiiConfig() || "",
+        ...(verifiedBinPath ? { binPath: verifiedBinPath } : {}),
         attached: true,
       });
     }
@@ -1304,56 +1301,45 @@ function adoptRunningEngine(): void {
 }
 
 async function runIiiInstaller(): Promise<{ ok: boolean; binPath: string | null }> {
-  const releaseUrl = iiiReleaseUrl();
-  const asset = iiiReleaseAsset();
-  const isZipAsset = asset?.endsWith(".zip") === true;
-
-  if (!releaseUrl) {
+  const artifact = resolveBundledEngineArtifact(
+    join(__dirname, "engine"),
+    platform(),
+    process.arch,
+    IIPINNED_VERSION,
+  );
+  if (!artifact.ok) {
     p.log.warn(
-      `iii-engine binary not available for ${platform()}/${process.arch}. Use Docker (\`docker pull iiidev/iii:${IIPINNED_VERSION}\`) or download manually from https://github.com/iii-hq/iii/releases/tag/iii%2Fv${IIPINNED_VERSION}.`,
+      `${artifact.message} Install a release that contains the patched engine or build it from source with \`npm run build:engine\`.`,
     );
-    return { ok: false, binPath: null };
-  }
-
-  if (IS_WINDOWS || isZipAsset) {
-    p.log.info(
-      `Auto-install unavailable on ${platform()} — ${asset} isn't tar-compatible. Install manually:\n` +
-        `  1. Download ${releaseUrl}\n` +
-        `  2. Extract iii.exe and place it on PATH (e.g. %USERPROFILE%\\.local\\bin)\n` +
-        `Or use Docker: docker pull iiidev/iii:${IIPINNED_VERSION}`,
-    );
-    return { ok: false, binPath: null };
-  }
-
-  const shBin = whichBinary("sh");
-  const curlBin = whichBinary("curl");
-  const tarBin = whichBinary("tar");
-  if (!shBin || !curlBin || !tarBin) {
-    const missing = [!shBin && "sh", !curlBin && "curl", !tarBin && "tar"]
-      .filter(Boolean)
-      .join(", ");
-    p.log.warn(`${missing} not found. Cannot auto-install iii-engine.`);
     return { ok: false, binPath: null };
   }
 
   const binDir = agentmemoryBinDir();
   const binPath = privateIiiPath();
-  const installCmd = [
-    `mkdir -p "${binDir}"`,
-    `curl -fsSL "${releaseUrl}" | tar -xz -C "${binDir}"`,
-    `chmod +x "${binPath}"`,
-  ].join(" && ");
-  const installerOk = runCommand(shBin, ["-c", installCmd], {
-    label: `Installing iii-engine v${IIPINNED_VERSION} (pinned)`,
-    optional: true,
-  });
-  if (!installerOk) {
+  const temporaryPath = `${binPath}.agentmemory-${process.pid}${IS_WINDOWS ? ".exe" : ""}`;
+  try {
+    mkdirSync(binDir, { recursive: true });
+    copyFileSync(artifact.binaryPath, temporaryPath);
+    if (!IS_WINDOWS) chmodSync(temporaryPath, 0o755);
+    const copiedSha256 = createHash("sha256")
+      .update(readFileSync(temporaryPath))
+      .digest("hex");
+    if (
+      copiedSha256 !== artifact.sha256 ||
+      iiiBinVersion(temporaryPath) !== IIPINNED_VERSION ||
+      !iiiHasRequiredStateCapabilities(temporaryPath)
+    ) {
+      throw new Error("The copied binary failed its checksum, version, or required state capability probe.");
+    }
+    renameSync(temporaryPath, binPath);
+    return { ok: true, binPath };
+  } catch (error) {
+    rmSync(temporaryPath, { force: true });
     p.log.warn(
-      `iii-engine installer failed. Fallbacks: Docker (\`docker pull iiidev/iii:${IIPINNED_VERSION}\`) or download manually from https://github.com/iii-hq/iii/releases/tag/iii%2Fv${IIPINNED_VERSION}.`,
+      `Could not install the bundled patched iii-engine to ${binPath}: ${error instanceof Error ? error.message : String(error)}`,
     );
     return { ok: false, binPath: null };
   }
-  return { ok: true, binPath };
 }
 
 type StartupFailure = {
@@ -1462,6 +1448,7 @@ function prepareEngineLaunch(configPath: string): {
   configPath: string;
   cwd: string;
 } {
+  assertLegacyStateMigrationReady();
   const home = homedir();
   const bundledConfig = isBundledConfig(configPath, __dirname);
   const cwd = resolveEngineCwd(
@@ -1472,8 +1459,9 @@ function prepareEngineLaunch(configPath: string): {
   );
   try {
     mkdirSync(cwd, { recursive: true });
-  } catch {
-    return { configPath, cwd: process.cwd() };
+  } catch (error) {
+    p.log.error(`Could not create the engine working directory: ${String(error)}`);
+    process.exit(1);
   }
   try {
     const rawConfig = readFileSync(configPath, "utf-8");
@@ -1517,6 +1505,7 @@ function prepareEngineLaunch(configPath: string): {
         home,
         dataDirResolution.dataDir,
       )) {
+        if (basename(m.from) === "state_store.db") continue;
         if (existsSync(m.from) && !existsSync(m.to)) {
           try {
             mkdirSync(dirname(m.to), { recursive: true });
@@ -1533,8 +1522,8 @@ function prepareEngineLaunch(configPath: string): {
       cwd,
     };
   } catch (err) {
-    vlog(`runtime config generation failed, using bundled config verbatim: ${String(err)}`);
-    return { configPath, cwd };
+    p.log.error(`Runtime engine config could not be made safe: ${String(err)}`);
+    process.exit(1);
   }
 }
 
@@ -1601,11 +1590,9 @@ async function startIiiBinOnce(iiiBin: string, configPath: string): Promise<bool
   }
 }
 
-// Find a pinned-compatible iii path from a list of candidates. Returns
-// the first candidate whose --version matches the pin, OR returns the
-// private install path if it exists and matches, OR null if no candidate
-// is compatible. Caller (startEngine) auto-installs the pin to the
-// private path when this returns null.
+// Find the first candidate matching the version pin and pagination capability,
+// or the verified private artifact. The caller installs only the bundled
+// artifact when no candidate qualifies.
 function pickCompatibleIii(candidates: Array<string | null | undefined>): string | null {
   for (const c of candidates) {
     if (!c) continue;
@@ -1616,6 +1603,7 @@ function pickCompatibleIii(candidates: Array<string | null | undefined>): string
 }
 
 async function startEngine(): Promise<boolean> {
+  assertLegacyStateMigrationReady();
   await assertRuntimePortOwnership();
   expectedEnginePid = null;
   const startingPid = liveOwnedNativeEnginePid();
@@ -1630,41 +1618,27 @@ async function startEngine(): Promise<boolean> {
   }
   const persistedState = readEngineState();
   if (persistedState?.kind === "docker") {
-    const inspection = inspectOwnedDockerEngine(persistedState);
-    if (inspection.status === "unavailable" || inspection.status === "missing") {
-      const detail = inspection.status === "unavailable"
-        ? inspection.reason
-        : "container is missing";
-      p.log.error(
-        `A saved Docker engine owns this lifecycle state, but it cannot be resumed safely (${detail}). Run \`agentmemory stop\` to reconcile that project before starting another engine.`,
-      );
-      return false;
-    }
-    persistDockerInspection(persistedState, inspection);
-    if (inspection.status === "running") return true;
-    const dockerBin = whichBinary("docker");
-    return Boolean(
-      dockerBin &&
-      runCommand(dockerBin, ["start", inspection.containerId], {
-        label: `Restarting owned Docker container ${inspection.containerId}`,
-      }),
+    p.log.error(
+      `The saved Docker engine cannot be used because all required state capabilities have not been verified. No Docker container was started. Use a verified patched native engine package instead.`,
     );
+    return false;
   }
   const configPath = findIiiConfig();
   warnIfRelocatedDataDir();
   const pathIii = whichBinary("iii");
   vlog(`iii binary: ${pathIii ?? "(not on PATH)"}, config: ${configPath || "(not found)"}`);
 
-  const dockerBin = whichBinary("docker");
-  const dockerComposeCandidates = [
-    join(__dirname, "..", "docker-compose.yml"),
-    join(__dirname, "docker-compose.yml"),
-    join(process.cwd(), "docker-compose.yml"),
-  ];
-  const composeFile = dockerComposeCandidates.find((c) => existsSync(c));
   const dockerOptIn =
     process.env["AGENTMEMORY_USE_DOCKER"] === "1" ||
     process.env["AGENTMEMORY_USE_DOCKER"] === "true";
+
+  if (dockerOptIn) {
+    p.log.error(
+      `Docker startup is unavailable until a patched image can be verified to provide all required state capabilities. No Docker container was started. Use a verified patched native engine package instead.`,
+    );
+    startupFailure = { kind: "no-engine" };
+    return false;
+  }
 
   const fallbacks = fallbackIiiPaths().filter((p) => existsSync(p));
   for (const f of fallbacks) {
@@ -1674,7 +1648,7 @@ async function startEngine(): Promise<boolean> {
 
   let iiiBin = pickCompatibleIii([pathIii, ...fallbacks]);
 
-  if (iiiBin && configPath && !(dockerOptIn && dockerBin && composeFile)) {
+  if (iiiBin && configPath) {
     if (iiiBin !== pathIii) {
       p.log.info(`Using iii at: ${c.dim(iiiBin)} (v${c.accent(IIPINNED_VERSION)})`);
       process.env["PATH"] = `${dirname(iiiBin)}${PATH_DELIMITER}${process.env["PATH"] ?? ""}`;
@@ -1684,9 +1658,11 @@ async function startEngine(): Promise<boolean> {
 
   if (pathIii && !iiiBin) {
     const detected = iiiBinVersion(pathIii);
+    const mismatch = detected === IIPINNED_VERSION
+      ? "one or more required state capabilities are missing"
+      : `version ${detected ?? "unknown"} does not match the pin`;
     vlog(
-      `iii on PATH is v${detected ?? "unknown"}, pin is v${IIPINNED_VERSION}. ` +
-        `Will install pinned engine to ${privateIiiPath()}.`,
+      `iii on PATH ${mismatch}; will install the verified patched engine to ${privateIiiPath()}.`,
     );
   }
 
@@ -1695,12 +1671,10 @@ async function startEngine(): Promise<boolean> {
     return false;
   }
 
-  vlog(`docker binary: ${dockerBin ?? "(not on PATH)"}`);
   mkdirSync(dataDirResolution.dataDir, { recursive: true });
-  vlog(`docker-compose.yml: ${composeFile ?? "(not found)"}`);
   const interactive = !!process.stdin.isTTY && !process.env["CI"];
 
-  type Choice = "install" | "docker" | "manual";
+  type Choice = "install" | "manual";
   let choice: Choice;
 
   // Wrong-version iii on PATH is a configuration trap: any prompt would
@@ -1708,31 +1682,26 @@ async function startEngine(): Promise<boolean> {
   // prompt and auto-install pinned engine to the private location.
   const pathIiiMismatch = pathIii !== null && resolveCompatibleIii(pathIii) === null;
 
-  if (dockerOptIn && dockerBin && composeFile) {
-    choice = "docker";
-  } else if (pathIiiMismatch) {
+  if (pathIiiMismatch) {
     choice = "install";
     const detected = iiiBinVersion(pathIii!);
     p.log.info(
       `iii on PATH is v${detected ?? "unknown"} but agentmemory pins v${IIPINNED_VERSION}. ` +
-        `Installing pinned engine to ~/.agentmemory/bin (leaves your existing iii untouched).`,
+      `Installing the bundled patched engine to ~/.agentmemory/bin (leaves your existing iii untouched).`,
     );
   } else if (!interactive) {
     choice = "install";
-    p.log.info("Non-interactive environment detected — auto-installing iii-engine.");
+    p.log.info("Non-interactive environment detected — installing the bundled patched iii-engine.");
   } else {
-    p.log.warn(`iii-engine binary not found locally.`);
+    p.log.warn(`A compatible patched iii-engine binary was not found locally.`);
     const options: { value: Choice; label: string; hint?: string }[] = [
       {
         value: "install",
-        label: `Install iii v${IIPINNED_VERSION} to ~/.agentmemory/bin (~6MB, ~5s)`,
+        label: `Install patched iii v${IIPINNED_VERSION} from this package to ~/.agentmemory/bin`,
         hint: "recommended",
       },
     ];
-    if (dockerBin && composeFile) {
-      options.push({ value: "docker", label: "Use Docker compose", hint: "advanced" });
-    }
-    options.push({ value: "manual", label: "Show manual install steps and exit" });
+    options.push({ value: "manual", label: "Show patched engine requirements and exit" });
 
     const picked = await p.select<Choice>({
       message: "How would you like to start iii-engine?",
@@ -1758,51 +1727,11 @@ async function startEngine(): Promise<boolean> {
       iiiBin = result.binPath;
       return startIiiBinOnce(iiiBin, configPath);
     }
-    if (dockerBin && composeFile && interactive) {
-      const fallback = await p.confirm({
-        message: "Auto-install failed. Try Docker compose instead?",
-        initialValue: true,
-      });
-      if (p.isCancel(fallback) || fallback !== true) {
-        startupFailure = { kind: "no-engine" };
-        return false;
-      }
-      choice = "docker";
-    } else {
-      startupFailure = { kind: "no-engine" };
-      return false;
-    }
-  }
-
-  if (choice === "docker" && dockerBin && composeFile) {
-    const s = p.spinner();
-    s.start("Starting iii-engine via Docker...");
-    configureDockerHostUser();
-    const projectName = dockerProjectName(getRestPort());
-    writeEngineState({
-      kind: "docker",
-      schemaVersion: 2,
-      composeFile,
-      projectName,
-      engineVersion: IIPINNED_VERSION,
-      dataMountType: "bind",
-      dataMountSource: dataDirResolution.dataDir,
-      preserveContainer: false,
-    });
-    spawnEngineBackground(
-      dockerBin,
-      dockerComposeArgs(composeFile, projectName, ["up", "-d"]),
-      "iii-engine via Docker",
-    );
-    s.stop("Docker compose started");
-    return true;
-  }
-
-  if (!composeFile && dockerBin) {
-    startupFailure = { kind: "no-docker-compose" };
-  } else {
     startupFailure = { kind: "no-engine" };
+    return false;
   }
+
+  startupFailure = { kind: "no-engine" };
   return false;
 }
 
@@ -1824,84 +1753,34 @@ async function waitForEngine(timeoutMs: number): Promise<boolean> {
 async function reconcilePersistedDockerEngine(): Promise<boolean> {
   const state = readEngineState();
   if (state?.kind !== "docker") return false;
-  const inspection = inspectOwnedDockerEngine(state);
-  if (inspection.status === "unavailable") {
-    p.log.error(
-      `The saved Docker engine cannot be verified: ${inspection.reason}. Refusing to overwrite its lifecycle state. Run \`agentmemory stop\` after restoring Docker/compose access.`,
-    );
-    process.exit(1);
-  }
-  if (inspection.status === "missing") {
-    p.log.error(
-      "The saved Docker project no longer has an iii-engine container. Run `agentmemory stop` to remove its stale project state, then start agentmemory again.",
-    );
-    process.exit(1);
-  }
-  persistDockerInspection(state, inspection);
-  if (inspection.status === "stopped") {
-    const dockerBin = whichBinary("docker");
-    if (
-      !dockerBin ||
-      !runCommand(dockerBin, ["start", inspection.containerId], {
-        label: `Restarting owned Docker container ${inspection.containerId}`,
-      })
-    ) {
-      p.log.error("The owned Docker container could not be restarted; lifecycle state was preserved.");
-      process.exit(1);
-    }
-  }
-  if (!(await waitForEngine(5000))) {
-    printDockerStartupLogs();
-    p.log.error(
-      `The owned Docker container is running, but its REST API on port ${getRestPort()} is unhealthy. The saved project was preserved; inspect the Docker logs above or run \`agentmemory stop\`.`,
-    );
-    process.exit(1);
-  }
-  await startWorkerForEngineState();
-  if (!(await waitForAgentmemoryReady(WORKER_READINESS_TIMEOUT_MS))) {
-    p.log.error("agentmemory worker did not become ready within 15 minutes.");
-    process.exit(1);
-  }
-  await maybeOfferGlobalInstall();
-  printReadyHint();
+  p.log.error(
+    "The saved Docker engine cannot be used because all required state capabilities have not been verified. No Docker container was inspected or started. Use a verified patched native engine package instead.",
+  );
+  process.exitCode = 1;
   return true;
 }
 
 function installInstructions(): string[] {
-  const releaseUrl = iiiReleaseUrl();
-  if (IS_WINDOWS) {
-    return [
-      `agentmemory needs iii-engine v${IIPINNED_VERSION}. Pick one:`,
-      "",
-      "  A) Download the prebuilt Windows binary:",
-      `     1. Open https://github.com/iii-hq/iii/releases/tag/iii%2Fv${IIPINNED_VERSION}`,
-      `     2. Download iii-x86_64-pc-windows-msvc.zip (or iii-aarch64-pc-windows-msvc.zip on ARM)`,
-      "     3. Extract iii.exe to %USERPROFILE%\\.local\\bin\\iii.exe (or add to PATH)",
-      "     4. Re-run: agentmemory",
-      "",
-      `  B) Docker: docker pull iiidev/iii:${IIPINNED_VERSION}`,
-      "     Re-run with AGENTMEMORY_USE_DOCKER=1 agentmemory",
-      "",
-      "Or skip the engine entirely (standalone MCP):  agentmemory mcp",
-      "",
-      "Docs: https://iii.dev/docs",
-    ];
-  }
-  const linuxInstall = releaseUrl
-    ? `  A) mkdir -p ~/.agentmemory/bin && curl -fsSL "${releaseUrl}" | tar -xz -C ~/.agentmemory/bin && chmod +x ~/.agentmemory/bin/iii`
-    : `  A) Manual download: https://github.com/iii-hq/iii/releases/tag/iii%2Fv${IIPINNED_VERSION}`;
+  const artifact = resolveBundledEngineArtifact(
+    join(__dirname, "engine"),
+    platform(),
+    process.arch,
+    IIPINNED_VERSION,
+  );
+  const installStatus = artifact.ok
+    ? `The bundled artifact could not be installed to ${privateIiiPath()}.`
+    : artifact.message;
   return [
-    `agentmemory needs iii-engine v${IIPINNED_VERSION}. Pick one:`,
+    `agentmemory needs patched iii-engine v${IIPINNED_VERSION} with all required state capabilities.`,
     "",
-    linuxInstall,
-    "     Then re-run: agentmemory",
-    "",
-    `  B) Docker: docker pull iiidev/iii:${IIPINNED_VERSION}`,
-    "     Re-run with AGENTMEMORY_USE_DOCKER=1 agentmemory",
+    installStatus,
+    "Install a release that bundles a verified artifact for this platform, or build one",
+    "from the agentmemory source with `npm run build:engine` and its pinned native inputs.",
+    `An engine must advertise all required capabilities: ${REQUIRED_ENGINE_CAPABILITIES.join(", ")}.`,
     "",
     "Or skip the engine entirely (standalone MCP):  agentmemory mcp",
     "",
-    "Docs: https://iii.dev/docs",
+    "Docs: docs/operations/state-pagination.md",
   ];
 }
 
@@ -1972,7 +1851,238 @@ function printReadyHint(): void {
   process.stdout.write(`\n${c.dim("Try:")} ${c.cmd(demoCommand)}\n`);
 }
 
+function sameCliPath(left: string, right: string): boolean {
+  const normalizedLeft = resolve(left);
+  const normalizedRight = resolve(right);
+  return IS_WINDOWS
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
+}
+
+function canonicalStateDatabasePath(): string {
+  const dataDir = resolve(dataDirResolution.dataDir);
+  try {
+    return join(realpathSync(dataDir), "state_store.sqlite3");
+  } catch {
+    return join(dataDir, "state_store.sqlite3");
+  }
+}
+
+function legacyStateStoreCandidates(): string[] {
+  const candidates = [join(dataDirResolution.dataDir, "state_store.db")];
+  if (selectedInstance === 0 && dataDirResolution.source === "default") {
+    candidates.push(
+      ...legacyDataMigrations(process.cwd(), homedir(), dataDirResolution.dataDir)
+        .filter((migration) => basename(migration.from) === "state_store.db")
+        .map((migration) => migration.from),
+    );
+  }
+  return [...new Set(candidates.map((path) => resolve(path)))];
+}
+
+function legacyStateStoreGateError(): string | null {
+  const existing = legacyStateStoreCandidates().flatMap((path) => {
+    const inspection = inspectLegacyStateStore(path);
+    return inspection.status === "missing" ? [] : [{ path, inspection }];
+  });
+  if (existing.length === 0) return null;
+  const target = canonicalStateDatabasePath();
+  if (existing.length !== 1) {
+    return `Multiple legacy iii-state stores were found (${existing.map(({ path }) => path).join(", ")}); choose the exact source before starting.`;
+  }
+
+  const sourceInspection = existing[0]!.inspection;
+  if (sourceInspection.status !== "directory") {
+    return `Legacy iii-state path ${existing[0]!.path} is ${sourceInspection.status}, not a regular legacy store directory.`;
+  }
+  let source: string;
+  try {
+    source = realpathSync(existing[0]!.path);
+  } catch {
+    return `Legacy iii-state source ${existing[0]!.path} cannot be resolved safely.`;
+  }
+
+  const targetIdentity = stateMigrationTargetIdentity(target);
+  const pendingStatus = inspectLegacyStateStore(`${target}.migration-pending`).status;
+  const receiptPath = stateMigrationReceiptPath(target);
+  let receiptValid = false;
+  try {
+    const receipt = lstatSync(receiptPath);
+    if (!receipt.isSymbolicLink() && receipt.isFile() && receipt.size <= 64 * 1024 && targetIdentity) {
+      receiptValid = hasValidStateMigrationReceipt(
+        readFileSync(receiptPath, "utf8"),
+        source,
+        target,
+        targetIdentity,
+      );
+    }
+  } catch {
+    receiptValid = false;
+  }
+  if (targetIdentity && pendingStatus === "missing" && receiptValid) return null;
+
+  return `Legacy iii-state data remains at ${source}. Startup is blocked until an explicit, completed migration to ${target} has a matching receipt and unchanged target file identity. Stop all writers, confirm disk space, then run: agentmemory state-migrate --source "${source}" --target "${target}" --disk-budget-bytes <bytes>`;
+}
+
+function assertLegacyStateMigrationReady(): void {
+  const error = legacyStateStoreGateError();
+  if (!error) return;
+  p.log.error(error);
+  process.exit(1);
+}
+
+function parseStateMigrationArgs(rawArgs: string[]): {
+  source: string;
+  target: string;
+  diskBudgetBytes: string;
+} {
+  const values = new Map<string, string>();
+  const allowed = new Set(["--source", "--target", "--disk-budget-bytes"]);
+  for (let index = 0; index < rawArgs.length; index += 1) {
+    const argument = rawArgs[index]!;
+    const separator = argument.indexOf("=");
+    const name = separator < 0 ? argument : argument.slice(0, separator);
+    if (!allowed.has(name)) throw new Error(`Unknown state-migrate argument: ${name}`);
+    const value = separator < 0 ? rawArgs[++index] : argument.slice(separator + 1);
+    if (!value?.trim() || value.includes("\0")) throw new Error(`${name} requires a value.`);
+    if (values.has(name)) throw new Error(`${name} may be supplied only once.`);
+    values.set(name, value);
+  }
+
+  const source = values.get("--source");
+  const target = values.get("--target");
+  const diskBudgetBytes = values.get("--disk-budget-bytes");
+  if (!source || !target || !diskBudgetBytes) {
+    throw new Error(
+      'Usage: agentmemory state-migrate --source <legacy-state-directory> --target <data-dir\\state_store.sqlite3> --disk-budget-bytes <bytes>',
+    );
+  }
+  if (
+    !/^[1-9]\d*$/.test(diskBudgetBytes) ||
+    diskBudgetBytes.length > 20 ||
+    BigInt(diskBudgetBytes) > 18_446_744_073_709_551_615n
+  ) {
+    throw new Error("--disk-budget-bytes must be a positive unsigned 64-bit integer.");
+  }
+  return { source, target, diskBudgetBytes };
+}
+
+async function runStateMigrationCmd(): Promise<void> {
+  const { source: sourceArgument, target: targetArgument, diskBudgetBytes } =
+    parseStateMigrationArgs(args.slice(1));
+  if (!isAbsolute(sourceArgument) || !isAbsolute(targetArgument)) {
+    throw new Error("--source and --target must be absolute paths.");
+  }
+
+  const sourceEntry = inspectLegacyStateStore(sourceArgument);
+  if (sourceEntry.status !== "directory") {
+    throw new Error(`--source must be an existing regular legacy directory; found ${sourceEntry.status}.`);
+  }
+  const source = realpathSync(sourceArgument);
+  const dataDir = resolve(dataDirResolution.dataDir);
+  if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
+  const dataDirEntry = lstatSync(dataDir);
+  if (dataDirEntry.isSymbolicLink() || !dataDirEntry.isDirectory()) {
+    throw new Error("The resolved AgentMemory data directory must be a real directory.");
+  }
+  const target = join(realpathSync(dataDir), "state_store.sqlite3");
+  if (!sameCliPath(sourceArgument, source)) {
+    throw new Error("--source must name the canonical directory path, without symbolic-link aliases.");
+  }
+  if (!sameCliPath(targetArgument, target)) {
+    throw new Error(`--target must be the exact resolved AgentMemory database path: ${target}`);
+  }
+  const sourceToTarget = relative(source, target);
+  if (
+    sourceToTarget === "" ||
+    (sourceToTarget !== ".." && !sourceToTarget.startsWith(`..${sep}`) && !isAbsolute(sourceToTarget))
+  ) {
+    throw new Error("The SQLite shadow target must be outside the legacy source directory.");
+  }
+  const targetEntry = inspectLegacyStateStore(target);
+  if (targetEntry.status !== "missing" && targetEntry.status !== "file") {
+    throw new Error(`The SQLite shadow target must be missing or a regular file; found ${targetEntry.status}.`);
+  }
+
+  let localEngineResponded = false;
+  try {
+    await fetch(`http://127.0.0.1:${getRestPort()}/`, { signal: AbortSignal.timeout(1200) });
+    localEngineResponded = true;
+  } catch {
+    // A refused local connection confirms there is no writer on this REST port.
+  }
+  if (localEngineResponded) {
+    throw new Error("An engine is responding on the local REST port. Stop all writers before migration.");
+  }
+
+  const artifact = resolveBundledEngineArtifact(
+    join(__dirname, "engine"),
+    platform(),
+    process.arch,
+    IIPINNED_VERSION,
+  );
+  if (!artifact.ok) throw new Error(artifact.message);
+  if (iiiBinVersion(artifact.binaryPath) !== IIPINNED_VERSION) {
+    throw new Error("The checksum-verified bundled engine does not match the pinned version.");
+  }
+  let capabilityOutput: string;
+  try {
+    capabilityOutput = execFileSync(artifact.binaryPath, ["--capabilities"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 3000,
+      windowsHide: true,
+    });
+  } catch {
+    throw new Error("The checksum-verified bundled engine capability probe failed.");
+  }
+  if (!hasRequiredEngineCapabilitiesOutput(capabilityOutput)) {
+    throw new Error("The bundled engine does not advertise all six required state capabilities.");
+  }
+
+  const receiptPath = stateMigrationReceiptPath(target);
+  const receiptEntry = inspectLegacyStateStore(receiptPath);
+  if (receiptEntry.status !== "missing") {
+    if (receiptEntry.status !== "file" || lstatSync(receiptPath).size > 64 * 1024) {
+      throw new Error("An existing migration receipt is not a small regular file; refusing to replace it.");
+    }
+    unlinkSync(receiptPath);
+  }
+
+  const output = execFileSync(
+    artifact.binaryPath,
+    ["state-migrate", "--source", source, "--target", target, "--disk-budget-bytes", diskBudgetBytes],
+    { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"], maxBuffer: 64 * 1024, windowsHide: true },
+  );
+  if (inspectLegacyStateStore(source).status !== "directory") {
+    throw new Error("The native importer did not retain the legacy source directory.");
+  }
+  if (inspectLegacyStateStore(`${target}.migration-pending`).status !== "missing") {
+    throw new Error("The native importer has not cleared its pending marker; no READY receipt was written.");
+  }
+  const targetIdentity = stateMigrationTargetIdentity(target);
+  if (!targetIdentity) {
+    throw new Error("The native importer did not leave a regular target with a reliable file identity.");
+  }
+  const receipt = createStateMigrationReceipt(
+    output,
+    source,
+    target,
+    diskBudgetBytes,
+    targetIdentity,
+  );
+  const temporaryReceipt = `${receiptPath}.tmp-${process.pid}-${generateId("state-migration-receipt")}`;
+  try {
+    writeFileSync(temporaryReceipt, `${JSON.stringify(receipt, null, 2)}\n`, { flag: "wx" });
+    renameSync(temporaryReceipt, receiptPath);
+  } finally {
+    rmSync(temporaryReceipt, { force: true });
+  }
+  p.log.success(`Native shadow is READY at ${target}; source retained at ${source}. Restart AgentMemory when ready.`);
+}
+
 async function main() {
+  assertLegacyStateMigrationReady();
   await assertRuntimePortOwnership();
   // Booting a second instance next to a live daemon registers a duplicate
   // worker on the running engine, and before iii 0.19.2 the second instance's
@@ -2050,6 +2160,8 @@ async function main() {
       fallbackIiiPaths().find((p) => existsSync(p)) ??
       null;
     const detected = attachedBin ? iiiBinVersion(attachedBin) : null;
+    const hasPagination =
+      attachedBin !== null && iiiHasRequiredStateCapabilities(attachedBin);
 
     // Fail closed: only adopt the running engine when we can positively
     // confirm it is the pinned version. An unknown version (detected === null,
@@ -2057,8 +2169,8 @@ async function main() {
     // adopting a foreign or unverifiable engine hangs the worker in a
     // WebSocket reconnect loop. Worst case here is a re-run that reinstalls
     // the pinned engine, never a silent loop.
-    if (detected === IIPINNED_VERSION) {
-      adoptRunningEngine();
+    if (detected === IIPINNED_VERSION && hasPagination) {
+      adoptRunningEngine(attachedBin ?? undefined);
       await startWorkerForEngineState();
       if (!(await waitForAgentmemoryReady(WORKER_READINESS_TIMEOUT_MS))) {
         p.log.error("agentmemory worker did not become ready within 15 minutes.");
@@ -2069,7 +2181,9 @@ async function main() {
       return;
     }
 
-    const detectedLabel = detected ? `v${detected}` : "an unverified version";
+    const detectedLabel = detected
+      ? `v${detected}${detected === IIPINNED_VERSION && !hasPagination ? " without required state capabilities" : ""}`
+      : "an unverified version";
 
     // An incompatible engine owns the port. Adopting it hangs the worker in a
     // WebSocket reconnect loop (it can't speak that engine's protocol), so stop
@@ -2079,11 +2193,11 @@ async function main() {
     // engine version: agentmemory only supports v${IIPINNED_VERSION}.
     const base = "agentmemory";
     p.log.error(
-      `Another iii-engine (${detectedLabel}) is running on port ${getEnginePort()}, and agentmemory needs its own pinned v${IIPINNED_VERSION}.`,
+      `Another iii-engine (${detectedLabel}) is running on port ${getEnginePort()}, and agentmemory needs v${IIPINNED_VERSION} with all required state capabilities.`,
     );
     p.note(
       [
-        `agentmemory only supports iii-engine v${IIPINNED_VERSION}. It will not adopt or change the running engine (${detectedLabel}).`,
+        `agentmemory only supports iii-engine v${IIPINNED_VERSION} with all required state capabilities. It will not adopt or change the running engine (${detectedLabel}).`,
         "",
         c.label("Switch to the pinned engine in two steps:"),
         "",
@@ -2091,13 +2205,11 @@ async function main() {
         `       ${c.cmd(`${base} stop --force`)}`,
         `     ${c.dim(`(or stop your own iii however you started it — agentmemory leaves your global iii untouched)`)}`,
         "",
-        `  2. Start agentmemory. It downloads and runs the pinned`,
-        `     v${IIPINNED_VERSION} into ~/.agentmemory/bin automatically:`,
+        `  2. Start agentmemory. It installs the verified patched`,
+        `     v${IIPINNED_VERSION} bundled with the package:`,
         `       ${c.cmd(base)}`,
         "",
-        c.dim(`Step 2 needs no manual install. To install iii v${IIPINNED_VERSION} yourself (replaces your global iii), curl:`),
-        `     ${c.cmd(IIIENGINE_INSTALL_CMD)}`,
-        `     ${c.dim("or download the release:")} ${c.url(`https://github.com/iii-hq/iii/releases/tag/iii%2Fv${IIPINNED_VERSION}`)}`,
+        c.dim(`Required capabilities: ${REQUIRED_ENGINE_CAPABILITIES.join(", ")}.`),
       ].join("\n"),
       "engine conflict",
     );
@@ -4102,6 +4214,7 @@ const commands: Record<string, () => Promise<void>> = {
   remove: runRemove,
   mcp: runMcp,
   "import-jsonl": runImportJsonl,
+  "state-migrate": runStateMigrationCmd,
 };
 
 const first = args[0] ?? "";

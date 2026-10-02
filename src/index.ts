@@ -69,6 +69,7 @@ import { registerExportImportFunction } from "./functions/export-import.js";
 import { registerEnrichFunction } from "./functions/enrich.js";
 import { registerClaudeBridgeFunction } from "./functions/claude-bridge.js";
 import { registerGraphFunction } from "./functions/graph.js";
+import { registerGraphJobRecovery } from "./functions/graph-jobs.js";
 import { registerGraphImportFunction } from "./functions/graph-import.js";
 import { registerConsolidationPipelineFunction } from "./functions/consolidation-pipeline.js";
 import { registerTeamFunction } from "./functions/team.js";
@@ -582,6 +583,7 @@ async function main() {
     typeSafeDecisionProvider,
   );
   registerGraphImportFunction(sdk, kv);
+  registerGraphJobRecovery(sdk, kv);
   bootLog(`Knowledge graph: structural extraction on (LLM relations ${isGraphExtractionEnabled() ? "enabled" : "off"})`);
 
   registerConsolidationPipelineFunction(
@@ -874,6 +876,22 @@ async function main() {
   summaryRecoveryTimer.unref();
   const summaryReconcileTimer = setInterval(() => void recoverSummaryQueue("mem::summary-reconcile"), 30 * 1000);
   summaryReconcileTimer.unref();
+
+  let graphRecoveryRunning = false;
+  const recoverGraphJobs = async () => {
+    if (graphRecoveryRunning) return;
+    graphRecoveryRunning = true;
+    try {
+      await sdk.trigger({ function_id: "mem::graph-recover", payload: {} });
+    } catch {
+      console.warn("[agentmemory] Graph recovery paused; durable inputs retained");
+    } finally {
+      graphRecoveryRunning = false;
+    }
+  };
+  void recoverGraphJobs();
+  const graphRecoveryTimer = setInterval(() => void recoverGraphJobs(), 30_000);
+  graphRecoveryTimer.unref();
 
   if (process.env.AUTO_FORGET_ENABLED !== "false") {
     const autoForgetTimer = setInterval(async () => {

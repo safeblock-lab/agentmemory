@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FireworksBatchCoordinator } from "../src/functions/fireworks-batch.js";
 import { StateKV } from "../src/state/kv.js";
+import type { StatePageRequest } from "../src/state/state-pages.js";
 import { KV } from "../src/state/schema.js";
+import { statePageFixture } from "./state-page-fixture.js";
 import type { FireworksBatchConfig, FireworksBatchWorkItem } from "../src/types.js";
 import { FireworksBatchClient, FireworksBatchError, type FireworksBatchTransport } from "../src/providers/fireworks-batch.js";
 
@@ -11,8 +13,20 @@ function createKv(options: {
 } = {}): StateKV {
   const store = new Map<string, unknown>();
   const sdk = {
-    async trigger(input: { function_id: string; payload: { scope: string; key?: string; value?: unknown } }) {
+    async trigger(input: {
+      function_id: string;
+      payload: { scope: string; key?: string; value?: unknown; cursor?: string; limit?: number; max_bytes?: number };
+    }) {
       const { scope, key, value } = input.payload;
+      const rejectHistoricalList = () => {
+        if (options.rejectHistoricalLists && (
+          scope === KV.fireworksBatchWorkItems
+          || scope === KV.fireworksBatchJobs
+          || scope === KV.fireworksBatchFingerprints
+        )) {
+          throw new Error("historical state listing disabled");
+        }
+      };
       if (input.function_id === "state::get") return store.get(`${scope}:${key}`) ?? null;
       if (input.function_id === "state::set") {
         options.onSet?.(scope, key, value, store);
@@ -24,16 +38,14 @@ function createKv(options: {
         return undefined;
       }
       if (input.function_id === "state::list") {
-        if (options.rejectHistoricalLists && (
-          scope === KV.fireworksBatchWorkItems
-          || scope === KV.fireworksBatchJobs
-          || scope === KV.fireworksBatchFingerprints
-        )) {
-          throw new Error("historical state listing disabled");
-        }
+        rejectHistoricalList();
         return [...store.entries()]
           .filter(([storedKey]) => storedKey.startsWith(`${scope}:`))
           .map(([, storedValue]) => storedValue);
+      }
+      if (input.function_id === "state::list_page") {
+        rejectHistoricalList();
+        return statePageFixture(store.entries(), input.payload as StatePageRequest);
       }
       throw new Error(`unexpected function ${input.function_id}`);
     },

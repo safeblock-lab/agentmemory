@@ -1,3 +1,7 @@
+import type {
+  StateCounter, StateGraphLease, StateCommitIdentity, StateGraphCheckpoint, StateBatchReceipt,
+} from "./state/state-transactions.js";
+
 export interface Session {
   id: string;
   project: string;
@@ -574,7 +578,7 @@ export interface ExportPagination {
 }
 
 export interface ExportData {
-  version: "0.3.0" | "0.4.0" | "0.5.0" | "0.6.0" | "0.6.1" | "0.7.0" | "0.7.2" | "0.7.3" | "0.7.4" | "0.7.5" | "0.7.6" | "0.7.7" | "0.7.9" | "0.8.0" | "0.8.1" | "0.8.2" | "0.8.3" | "0.8.4" | "0.8.5" | "0.8.6" | "0.8.7" | "0.8.8" | "0.8.9" | "0.8.10" | "0.8.11" | "0.8.12" | "0.8.13" | "0.9.0" | "0.9.1" | "0.9.2" | "0.9.3" | "0.9.4" | "0.9.5" | "0.9.6" | "0.9.7" | "0.9.8" | "0.9.9" | "0.9.10" | "0.9.11" | "0.9.12" | "0.9.13" | "0.9.14" | "0.9.15" | "0.9.16" | "0.9.17" | "0.9.18" | "0.9.19" | "0.9.20" | "0.9.21" | "0.9.22" | "0.9.23" | "0.9.24" | "0.9.25" | "0.9.26" | "0.9.27" | "0.9.28" | "0.9.29" | "0.9.30" | "0.9.31" | "0.9.32" | "0.9.33" | "0.9.34" | "0.9.35" | "0.9.36" | "0.9.37" | "0.9.38" | "0.9.39" | "0.9.40" | "0.9.41" | "0.9.42" | "0.9.43" | "0.9.44" | "0.9.45" | "0.9.46" | "0.9.47" | "0.9.48" | "0.9.49" | "0.9.50" | "0.9.51" | "0.9.52" | "0.9.53" | "0.9.54" | "0.9.55" | "0.9.56" | "0.9.57" | "0.9.58" | "0.9.59" | "0.9.60" | "0.9.61" | "0.9.62" | "0.9.63" | "0.9.64" | "0.9.65" | "0.9.66" | "0.9.67" | "0.9.68" | "0.9.69" | "0.9.70" | "0.9.71" | "0.9.72" | "0.9.73" | "0.9.74" | "0.9.75" | "0.9.76" | "0.9.77" | "0.9.78" | "0.9.79";
+  version: "0.3.0" | "0.4.0" | "0.5.0" | "0.6.0" | "0.6.1" | "0.7.0" | "0.7.2" | "0.7.3" | "0.7.4" | "0.7.5" | "0.7.6" | "0.7.7" | "0.7.9" | "0.8.0" | "0.8.1" | "0.8.2" | "0.8.3" | "0.8.4" | "0.8.5" | "0.8.6" | "0.8.7" | "0.8.8" | "0.8.9" | "0.8.10" | "0.8.11" | "0.8.12" | "0.8.13" | "0.9.0" | "0.9.1" | "0.9.2" | "0.9.3" | "0.9.4" | "0.9.5" | "0.9.6" | "0.9.7" | "0.9.8" | "0.9.9" | "0.9.10" | "0.9.11" | "0.9.12" | "0.9.13" | "0.9.14" | "0.9.15" | "0.9.16" | "0.9.17" | "0.9.18" | "0.9.19" | "0.9.20" | "0.9.21" | "0.9.22" | "0.9.23" | "0.9.24" | "0.9.25" | "0.9.26" | "0.9.27" | "0.9.28" | "0.9.29" | "0.9.30" | "0.9.31" | "0.9.32" | "0.9.33" | "0.9.34" | "0.9.35" | "0.9.36" | "0.9.37" | "0.9.38" | "0.9.39" | "0.9.40" | "0.9.41" | "0.9.42" | "0.9.43" | "0.9.44" | "0.9.45" | "0.9.46" | "0.9.47" | "0.9.48" | "0.9.49" | "0.9.50" | "0.9.51" | "0.9.52" | "0.9.53" | "0.9.54" | "0.9.55" | "0.9.56" | "0.9.57" | "0.9.58" | "0.9.59" | "0.9.60" | "0.9.61" | "0.9.62" | "0.9.63" | "0.9.64" | "0.9.65" | "0.9.66" | "0.9.67" | "0.9.68" | "0.9.69" | "0.9.70" | "0.9.71" | "0.9.72" | "0.9.73" | "0.9.74" | "0.9.75" | "0.9.76" | "0.9.77" | "0.9.78" | "0.9.79" | "0.9.80";
   exportedAt: string;
   sessions: Session[];
   observations: Record<string, CompressedObservation[]>;
@@ -758,6 +762,93 @@ export interface GraphSnapshot extends BatchEffectMetadata {
   // Absent / 1970 epoch = no reset has run.
   resetAt?: string;
 }
+
+export interface GraphControlState {
+  version: 1;
+  generation: StateCounter;
+  fence: StateCounter;
+  lease: StateGraphLease | null;
+  recovery: StateGraphCheckpoint | null;
+}
+
+export type GraphJobState = "queued" | "staging" | "applying" | "completed" | "failed" | "invalidated";
+export type GraphDeltaAlgorithm = "persist_graph_delta" | "apply_batch_graph" | "maintenance";
+
+export interface GraphExtractionJob {
+  version: 1;
+  id: string;
+  generation: StateCounter;
+  kind: "extraction" | "batch_callback" | "cascade" | "import" | "reset" | "replace" | "rebuild" | "restore" | "mesh" | "temporal";
+  state: GraphJobState;
+  createdAt: string;
+  updatedAt: string;
+  inputCount: number;
+  logicalDeltaCount: number;
+  callbackIdentity?: { destination: "graph"; effectKey: string; correlationId: string; customId: string };
+  failureCode?: string;
+}
+
+export interface GraphExtractionInput {
+  version: 1;
+  jobId: string;
+  generation: StateCounter;
+  logicalDeltaId: string;
+  ordinal: number;
+  kind: "heuristic" | "provider" | "batch_callback";
+  observations: CompressedObservation[];
+  sourceObservationIds: string[];
+  systemPrompt?: string;
+  userPrompt?: string;
+}
+
+export interface GraphProviderResult {
+  version: 1;
+  jobId: string;
+  generation: StateCounter;
+  logicalDeltaId: string;
+  content: string;
+  receivedAt: string;
+}
+
+export interface GraphLogicalDelta {
+  version: 1;
+  jobId: string;
+  generation: StateCounter;
+  id: string;
+  ordinal: number;
+  algorithm: GraphDeltaAlgorithm;
+  capturedAt: string;
+  sourceObservationIds: string[];
+  preparedChunkCount: number;
+  state: "captured" | "prepared" | "applying" | "completed";
+  batchEffectKey?: string;
+}
+
+export interface GraphPreparedChunk {
+  version: 1;
+  identity: StateCommitIdentity;
+  payload_json: string;
+  payload_digest: string;
+}
+
+export interface GraphNodeRemap {
+  version: 1;
+  logicalDeltaId: string;
+  sourceNodeId: string;
+  resultingNodeId: string;
+}
+
+export interface GraphWorkingSnapshot {
+  version: 1;
+  generation: StateCounter;
+  jobId: string;
+  logicalDeltaId: string;
+  snapshotExists: boolean;
+  snapshot: GraphSnapshot | null;
+}
+
+export type GraphExtractionCheckpoint = StateGraphCheckpoint;
+export type GraphCommitReceipt = StateBatchReceipt;
 
 export type ConsolidationTier =
   | "working"

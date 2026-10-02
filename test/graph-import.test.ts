@@ -11,6 +11,7 @@ vi.mock("../src/logger.js", () => ({
 import { parseGraphifyGraph, registerGraphImportFunction } from "../src/functions/graph-import.js";
 import { KV } from "../src/state/schema.js";
 import type { GraphNode, GraphEdge } from "../src/types.js";
+import { installGraphStateWire } from "./helpers/graph-state-harness.js";
 
 // graphify's clustered graph.json is NetworkX node_link: nodes carry
 // label/source_file/community/file_type, links carry
@@ -136,6 +137,7 @@ describe("mem::graph::import-graphify", () => {
     writeFileSync(join(tmp, "graphify-out", "graph.json"), JSON.stringify(FIXTURE));
     kv = mockKV();
     sdk = mockSdk();
+    installGraphStateWire(sdk as never, kv as never);
     registerGraphImportFunction(sdk, kv as never);
   });
 

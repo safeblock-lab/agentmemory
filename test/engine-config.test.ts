@@ -21,8 +21,25 @@ const customDirConfig = [
   "        config:",
   "          directory: ./custom-cfg",
   "  - name: iii-state",
-  "    config: {}",
+  "    config:",
+  "      adapter:",
+  "        name: kv",
+  "        config:",
+  "          file_path: ./data/state_store.db",
 ].join("\n");
+
+const builtinStateWorker = [
+  "  - name: iii-state",
+  "    config:",
+  "      adapter:",
+  "        name: kv",
+  "        config:",
+  "          file_path: ./data/state_store.db",
+];
+
+function withBuiltinStateWorker(lines: string[]): string {
+  return [...lines, ...builtinStateWorker].join("\n");
+}
 
 describe("renderEngineConfig", () => {
   it("stores engine state in the resolved data directory", () => {
@@ -34,8 +51,9 @@ describe("renderEngineConfig", () => {
 
     const rendered = renderEngineConfig(source, { dataDir });
 
+    expect(rendered).toContain("        name: sqlite");
     expect(rendered).toContain(
-      `file_path: '${join(dataDir, "state_store.db")}'`,
+      `file_path: '${resolve(dataDir, "state_store.sqlite3")}'`,
     );
     expect(rendered).toContain(
       `file_path: '${join(dataDir, "stream_store")}'`,
@@ -45,16 +63,17 @@ describe("renderEngineConfig", () => {
     );
     expect(rendered).toContain("store_method: file_based");
     expect(rendered).not.toContain("./data/");
+    expect(rendered).not.toContain("state_store.db");
   });
 
   it("migrates a legacy builtin queue adapter to the persistent data directory", () => {
-    const legacy = [
+    const legacy = withBuiltinStateWorker([
       "workers:",
       "  - name: iii-queue",
       "    config:",
       "      adapter:",
       "        name: builtin",
-    ].join("\n");
+    ]);
     const dataDir = join("/var", "lib", "agentmemory");
 
     const rendered = renderEngineConfig(legacy, { dataDir });
@@ -64,7 +83,7 @@ describe("renderEngineConfig", () => {
   });
 
   it("preserves custom builtin adapter fields when adding the persistent queue store", () => {
-    const legacy = [
+    const legacy = withBuiltinStateWorker([
       "workers:",
       "  - name: iii-queue",
       "    config:",
@@ -72,7 +91,7 @@ describe("renderEngineConfig", () => {
       "        name: builtin",
       "        config:",
       "          retention: 17",
-    ].join("\n");
+    ]);
 
     const dataDir = join("/var", "lib", "agentmemory");
     const rendered = renderEngineConfig(legacy, { dataDir });
@@ -83,7 +102,7 @@ describe("renderEngineConfig", () => {
   });
 
   it("forces explicit in-memory builtin queue storage to the persistent data directory", () => {
-    const explicitInMemory = [
+    const explicitInMemory = withBuiltinStateWorker([
       "workers:",
       "  - name: iii-queue",
       "    config:",
@@ -91,7 +110,7 @@ describe("renderEngineConfig", () => {
       "        name: builtin",
       "        config:",
       "          store_method: in_memory",
-    ].join("\n");
+    ]);
 
     const rendered = renderEngineConfig(explicitInMemory, {
       dataDir: "/var/lib/agentmemory",
@@ -103,13 +122,13 @@ describe("renderEngineConfig", () => {
   });
 
   it.skipIf(process.platform !== "win32")("writes an absolute Windows queue path with spaces", () => {
-    const legacy = [
+    const legacy = withBuiltinStateWorker([
       "workers:",
       "  - name: iii-queue",
       "    config:",
       "      adapter:",
       "        name: builtin",
-    ].join("\n");
+    ]);
     const dataDir = "C:\\Users\\Agent Memory\\.agentmemory\\data";
 
     const rendered = renderEngineConfig(legacy, { dataDir });
@@ -118,17 +137,17 @@ describe("renderEngineConfig", () => {
   });
 
   it("leaves non-builtin queue adapters untouched", () => {
-    const customAdapter = [
+    const customAdapter = withBuiltinStateWorker([
       "workers:",
       "  - name: iii-queue",
       "    config:",
       "      adapter:",
       "        name: redis",
-    ].join("\n");
+    ]);
 
-    expect(renderEngineConfig(customAdapter, { dataDir: "/var/lib/agentmemory" })).toBe(
-      customAdapter,
-    );
+    const rendered = renderEngineConfig(customAdapter, { dataDir: "/var/lib/agentmemory" });
+    expect(rendered).toContain("        name: redis");
+    expect(rendered).toContain(`file_path: '${resolve("/var/lib/agentmemory", "state_store.sqlite3")}'`);
   });
 
   it("keeps the Docker queue store under the mounted data directory", () => {

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import type { GraphNode, GraphEdge, MemoryProvider } from "../src/types.js";
+import { installGraphStateWire } from "./helpers/graph-state-harness.js";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -68,6 +69,7 @@ describe("TemporalGraph", () => {
     );
     const sdk = mockSdk();
     const kv = mockKV();
+    installGraphStateWire(sdk as never, kv as never);
     const provider: MemoryProvider = {
       name: "test",
       compress: vi.fn().mockResolvedValue(""),
@@ -110,6 +112,7 @@ describe("TemporalGraph", () => {
 
     const sdk = mockSdk();
     const kv = mockKV();
+    installGraphStateWire(sdk as never, kv as never);
     registerTemporalGraphFunctions(sdk as never, kv as never, provider);
 
     const result = (await sdk.trigger("mem::temporal-graph-extract", {
@@ -201,6 +204,7 @@ describe("TemporalGraph", () => {
 
     const sdk = mockSdk();
     const kv = mockKV([existingNode, existingNode2], [existingEdge]);
+    installGraphStateWire(sdk as never, kv as never);
     registerTemporalGraphFunctions(sdk as never, kv as never, provider);
 
     const result = (await sdk.trigger("mem::temporal-graph-extract", {
@@ -275,6 +279,7 @@ describe("TemporalGraph", () => {
 
     const sdk = mockSdk();
     const kv = mockKV([node], [edge1, edge2]);
+    installGraphStateWire(sdk as never, kv as never);
     const provider: MemoryProvider = {
       name: "test",
       compress: vi.fn(),
@@ -335,6 +340,7 @@ describe("TemporalGraph", () => {
 
     const sdk = mockSdk();
     const kv = mockKV([node], [edge1, edge2]);
+    installGraphStateWire(sdk as never, kv as never);
     const provider: MemoryProvider = {
       name: "test",
       compress: vi.fn(),
@@ -358,6 +364,7 @@ describe("TemporalGraph", () => {
     );
     const sdk = mockSdk();
     const kv = mockKV();
+    installGraphStateWire(sdk as never, kv as never);
     const provider: MemoryProvider = {
       name: "test",
       compress: vi.fn(),

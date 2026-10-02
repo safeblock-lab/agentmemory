@@ -14,6 +14,7 @@ import type {
 } from "../src/types.js";
 import { KV } from "../src/state/schema.js";
 import { persistGraphDelta } from "../src/functions/graph.js";
+import { installGraphStateWire } from "./helpers/graph-state-harness.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -101,6 +102,7 @@ describe("Graph Functions", () => {
   beforeEach(() => {
     sdk = mockSdk();
     kv = mockKV();
+    installGraphStateWire(sdk as never, kv as never);
     vi.clearAllMocks();
     process.env["GRAPH_EXTRACTION_ENABLED"] = "true";
     registerGraphFunction(sdk as never, kv as never, mockProvider as never);
@@ -339,9 +341,11 @@ describe("Graph Functions", () => {
         }),
       };
       const localSdk = mockSdk();
+      const localKv = mockKV();
+      installGraphStateWire(localSdk as never, localKv as never);
       registerGraphFunction(
         localSdk as never,
-        mockKV() as never,
+        localKv as never,
         primary as never,
         undefined,
         batchQueue as never,
@@ -387,9 +391,11 @@ describe("Graph Functions", () => {
         }),
       };
       const localSdk = mockSdk();
+      const localKv = mockKV();
+      installGraphStateWire(localSdk as never, localKv as never);
       registerGraphFunction(
         localSdk as never,
-        mockKV() as never,
+        localKv as never,
         mockProvider as never,
         undefined,
         batchQueue as never,
@@ -425,9 +431,11 @@ describe("Graph Functions", () => {
       enqueue: vi.fn().mockResolvedValue({ queued: false, reason: "Batch queue is full" }),
     };
     const localSdk = mockSdk();
+    const localKv = mockKV();
+    installGraphStateWire(localSdk as never, localKv as never);
     registerGraphFunction(
       localSdk as never,
-      mockKV() as never,
+      localKv as never,
       primary as never,
       undefined,
       batchQueue as never,
@@ -717,6 +725,7 @@ describe("Graph Functions", () => {
           return kv.get<T>(scope, key);
         },
       };
+      installGraphStateWire(undefined, timeoutKV as never);
 
       await expect(
         persistGraphDelta(
@@ -725,10 +734,11 @@ describe("Graph Functions", () => {
           [],
           ["obs_new"],
         ),
-      ).rejects.toThrow("Graph snapshot read failed");
+      ).rejects.toMatchObject({ code: "STATE_TX_FAILED" });
 
       expect(await kv.get(KV.graphSnapshot, "current")).toEqual(priorSnapshot);
       expect(await kv.list(KV.graphNodes)).toEqual([existing]);
+      expect(await kv.list(KV.graphEdges)).toEqual([]);
     });
 
     it("refuses graph writes when the stored snapshot is malformed", async () => {
@@ -848,6 +858,7 @@ describe("Graph Functions", () => {
         },
       };
       const localSdk = mockSdk();
+      installGraphStateWire(localSdk as never, recordingKV as never);
       registerGraphFunction(localSdk as never, recordingKV as never, mockProvider as never);
 
       const result = await localSdk.trigger("mem::graph-extract", {
@@ -859,10 +870,10 @@ describe("Graph Functions", () => {
       });
 
       expect(result).toMatchObject({ success: true });
-      expect(writes).toHaveLength(2);
-      expect(writes[0].batchInProgress).toBe(key);
-      expect(writes[1].batchInProgress).toBeUndefined();
-      expect(writes[1].appliedBatchEffects).toContain(key);
+      expect(writes).toHaveLength(1);
+      expect(writes[0].batchInProgress).toBeUndefined();
+      expect(writes[0].appliedBatchEffects).toContain(key);
+      expect(await kv.get<GraphSnapshot>(KV.graphSnapshot, "current")).toEqual(writes[0]);
       for (const snapshot of writes) {
         expect(snapshot.topNodes.every((node) => node.sourceObservationIds.length <= 64)).toBe(true);
         expect(snapshot.topEdges.every((edge) => edge.sourceObservationIds.length <= 64)).toBe(true);
@@ -921,19 +932,24 @@ describe("Graph Functions", () => {
           }
           return kv.get<T>(scope, key);
         },
+        list: async <T>(scope: string): Promise<T[]> => {
+          if (scope === KV.graphNodes || scope === KV.graphEdges) graphCorpusEnumerations.push(scope);
+          return kv.list<T>(scope);
+        },
       };
       const localSdk = mockSdk();
+      const graphCorpusEnumerations: string[] = [];
+      installGraphStateWire(localSdk as never, timeoutKV as never);
       registerGraphFunction(localSdk as never, timeoutKV as never, mockProvider as never);
-      const listSpy = vi.spyOn(kv, "list");
 
-      const result = (await localSdk.trigger("mem::graph-snapshot-rebuild", {
+      await expect(localSdk.trigger("mem::graph-snapshot-rebuild", {
         force: true,
-      })) as { success: boolean; error?: string };
+      })).rejects.toMatchObject({ code: "STATE_TX_FAILED" });
 
-      expect(result.success).toBe(false);
-      expect(result.error).toMatch(/Graph snapshot read failed/);
-      expect(listSpy).not.toHaveBeenCalled();
+      expect(graphCorpusEnumerations).toEqual([]);
       expect(await kv.get(KV.graphSnapshot, "current")).toEqual(priorSnapshot);
+      expect(await kv.list(KV.graphNodes)).toEqual([existing]);
+      expect(await kv.list(KV.graphEdges)).toEqual([]);
     });
 
     it("snapshot-rebuild persists top-degree subgraph + aggregate stats", async () => {
@@ -1184,6 +1200,7 @@ describe("Graph Functions", () => {
       await Promise.all(sets);
 
       const localSdk = mockSdk();
+      installGraphStateWire(localSdk as never, localKv as never);
       registerGraphFunction(localSdk as never, localKv as never, mockProvider as never);
 
       const result = (await localSdk.trigger(
@@ -1211,6 +1228,7 @@ describe("Graph Functions", () => {
         stale: false,
       });
       const localSdk = mockSdk();
+      installGraphStateWire(localSdk as never, localKv as never);
       registerGraphFunction(localSdk as never, localKv as never, mockProvider as never);
 
       const result = (await localSdk.trigger(
@@ -1222,24 +1240,23 @@ describe("Graph Functions", () => {
       expect(result.error).toMatch(/graph\/reset|force/);
     });
 
-    it("graph-reset is enumeration-free (does not call kv.list)", async () => {
-      // Wrap the mock kv.list with a counter; assert it stays at 0
-      // across a full reset cycle.
+    it("does not enumerate graph nodes or edges during graph reset", async () => {
       const localKv = mockKV();
-      let listCalls = 0;
+      const graphCorpusEnumerations: string[] = [];
       const baseList = localKv.list;
       localKv.list = async <T,>(scope: string): Promise<T[]> => {
-        listCalls += 1;
+        if (scope === KV.graphNodes || scope === KV.graphEdges) graphCorpusEnumerations.push(scope);
         return baseList.call(localKv, scope) as Promise<T[]>;
       };
       const localSdk = mockSdk();
+      installGraphStateWire(localSdk as never, localKv as never);
       registerGraphFunction(localSdk as never, localKv as never, mockProvider as never);
 
       const result = (await localSdk.trigger("mem::graph-reset", {})) as {
         success: boolean;
       };
       expect(result.success).toBe(true);
-      expect(listCalls).toBe(0);
+      expect(graphCorpusEnumerations).toEqual([]);
     });
   });
 });

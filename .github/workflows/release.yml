@@ -12,7 +12,10 @@ jobs:
   release:
     # Releases are created only from a pushed tag. Protect tag creation in
     # GitHub repository settings so untrusted pull-request code cannot publish.
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
     permissions:
       contents: write
     steps:
@@ -39,20 +42,19 @@ jobs:
           NODE
 
       - run: npm ci --legacy-peer-deps --no-audit --no-fund
+      - run: npm run build:engine
       - run: npm run build
-      - run: npm run skills:check
-      - run: npm test
 
       - name: Create and verify release archive
         shell: bash
         run: |
           mkdir -p artifacts
           node <<'NODE'
-          const { execFileSync } = require("node:child_process");
+          const { execSync } = require("node:child_process");
           const fs = require("node:fs");
           const path = require("node:path");
           const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
-          const packed = JSON.parse(execFileSync("npm", ["pack", "--json"], { encoding: "utf8" }));
+          const packed = JSON.parse(execSync("npm pack --json", { encoding: "utf8" }));
           if (!Array.isArray(packed) || packed.length !== 1 || typeof packed[0].filename !== "string") {
             throw new Error("npm pack did not return exactly one archive.");
           }

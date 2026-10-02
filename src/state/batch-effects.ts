@@ -3,6 +3,7 @@ import type { BatchEffectMetadata, BatchCallbackReceipt } from "../types.js";
 import type { StateKV } from "./kv.js";
 import { KV } from "./schema.js";
 import { withKeyedLock } from "./keyed-mutex.js";
+import { withGraphDelta, type GraphJobPreflight } from "../functions/graph-jobs.js";
 
 const MAX_EFFECTS_PER_RECORD = 4096;
 const destinations = ["consolidation", "crystallize", "graph", "lessons", "reflect"];
@@ -51,6 +52,50 @@ export function withBatchWriterLocks<T>(kv: StateKV, families: string[], run: ()
 
 export function batchEffectKey(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+type BatchCallbackReader = { get<T>(scope: string, key: string): Promise<T | null> };
+
+interface BatchCallbackAdmission {
+  receipt: BatchCallbackReceipt | null;
+  activeKeyToClear?: string;
+  terminal?: "completed" | "stale";
+}
+
+export function assertBatchCallbackKey(destination: string, key: string | undefined): void {
+  if (destination === "graph" && key !== undefined && !/^[a-f0-9]{64}$/.test(key)) throw new Error("Invalid batch effect key");
+}
+
+async function inspectBatchCallbackAdmission(reader: BatchCallbackReader, destination: string, key: string | undefined): Promise<BatchCallbackAdmission> {
+  if (destination === "graph" && !key) return { receipt: null };
+  const activeId = `active:${destination}`;
+  const active = await reader.get<BatchCallbackReceipt>(KV.batchCallbacks, activeId);
+  if (active && !active.activeKey) throw new Error("Ambiguous batch callback admission state");
+  let activeKeyToClear: string | undefined;
+  if (active?.activeKey) {
+    const previous = await reader.get<BatchCallbackReceipt>(KV.batchCallbacks, `${destination}:${active.activeKey}`);
+    if (previous?.state === "completed" || previous?.state === "stale") activeKeyToClear = active.activeKey;
+    else if (active.activeKey !== key) throw new Error("A batch callback must be recovered first");
+  }
+  if (!key) return { receipt: null, activeKeyToClear };
+  const receipt = await reader.get<BatchCallbackReceipt>(KV.batchCallbacks, `${destination}:${key}`);
+  if (receipt && !["started", "completed", "stale"].includes(receipt.state)) throw new Error("Ambiguous batch callback receipt state");
+  return {
+    receipt,
+    activeKeyToClear,
+    ...(receipt?.state === "completed" || receipt?.state === "stale" ? { terminal: receipt.state } : {}),
+  };
+}
+
+export function createGraphBatchCallbackPreflight<T>(
+  key: string,
+  resultForTerminal: (state: "completed" | "stale") => T,
+): GraphJobPreflight<T> {
+  assertBatchCallbackKey("graph", key);
+  return async (reader) => {
+    const admission = await inspectBatchCallbackAdmission(reader, "graph", key);
+    return admission.terminal ? resultForTerminal(admission.terminal) : null;
+  };
 }
 
 export function effectMetadata(value: BatchEffectMetadata | null, key?: string): BatchEffectMetadata {
@@ -115,22 +160,17 @@ export async function runBatchCallback<T extends { success: boolean; stale?: boo
   run: (resuming: boolean, admit: (metadata?: Pick<BatchCallbackReceipt, "semanticSourceIds" | "semanticCheckpoint" | "resultHash" | "effectTimestamp">) => Promise<void>, receipt?: BatchCallbackReceipt | null) => Promise<T>,
   repairAudit?: () => Promise<unknown>,
 ): Promise<T | { success: true; stale?: boolean }> {
-  return withAdmission(() => withKeyedLock(`batch-callback:${destination}`, async () => {
+  assertBatchCallbackKey(destination, key);
+  const execute = () => withAdmission(() => withKeyedLock(`batch-callback:${destination}`, async () => {
     const activeId = `active:${destination}`;
-    const active = await kv.get<BatchCallbackReceipt>(KV.batchCallbacks, activeId);
-    if (active && !active.activeKey) throw new Error("Ambiguous batch callback admission state");
-    if (active?.activeKey) {
-      const previous = await kv.get<BatchCallbackReceipt>(KV.batchCallbacks, `${destination}:${active.activeKey}`);
-      if (previous?.state === "completed" || previous?.state === "stale") await kv.delete(KV.batchCallbacks, activeId);
-      else if (active.activeKey !== key) throw new Error("A batch callback must be recovered first");
-    }
+    if (destination === "graph" && !key) return run(false, async () => {});
+    const admission = await inspectBatchCallbackAdmission(kv, destination, key);
+    if (admission.activeKeyToClear) await kv.delete(KV.batchCallbacks, activeId);
     if (!key) return run(false, async () => { });
-    if (!/^[a-f0-9]{64}$/.test(key)) throw new Error("Invalid batch effect key");
+    if (admission.terminal === "completed") return { success: true as const };
+    if (admission.terminal === "stale") return { success: true as const, stale: true };
     const receiptId = `${destination}:${key}`;
-    const receipt = await kv.get<BatchCallbackReceipt>(KV.batchCallbacks, receiptId);
-    if (receipt && !["started", "completed", "stale"].includes(receipt.state)) throw new Error("Ambiguous batch callback receipt state");
-    if (receipt?.state === "completed") return { success: true as const };
-    if (receipt?.state === "stale") return { success: true as const, stale: true };
+    const receipt = admission.receipt;
     let admittedReceipt = receipt;
     // Admission precedes effects; retry must bypass source-staleness checks
     // because an earlier partial application may itself have changed the source.
@@ -151,6 +191,7 @@ export async function runBatchCallback<T extends { success: boolean; stale?: boo
     if (result.success && key && repairAudit) await repairAudit().catch(() => { });
     return result;
   });
+  return destination === "graph" && key ? withGraphDelta(kv, execute) : execute();
 }
 
 export function withBatchMutationLocks<T>(kv: StateKV, run: () => Promise<T>): Promise<T> {

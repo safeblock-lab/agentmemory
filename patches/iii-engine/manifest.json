@@ -1,0 +1,104 @@
+{
+  "schemaVersion": 1,
+  "engineVersion": "0.22.1",
+  "sourceRepository": "https://github.com/iii-hq/iii.git",
+  "sourceCommit": "e7de3820d1e558f3762edf95e4440552444d48d3",
+  "patchPath": "patches/iii-engine/0.22.1-state-pagination.patch",
+  "patchSha256": "c9288a750daab1a38c8a6cce85de26b0443447e966b28c86649a058ed004ea9d",
+  "artifactSha256": "8289dbdfee90aa8afbccc8db661c38b08c0dd968d36d8a63958eaa88b253b559",
+  "artifactBytes": 32028160,
+  "buildTarget": "x86_64-pc-windows-msvc",
+  "verifiedPlatform": "win32-x64",
+  "capabilities": [
+    "state::list_page",
+    "state::get_versioned",
+    "state::lease",
+    "state::commit_batch",
+    "state::sqlite_wal_v1",
+    "state::shadow_migration_v1"
+  ],
+  "buildProfile": {
+    "name": "release",
+    "optimized": true,
+    "optLevel": "s",
+    "strip": true,
+    "lto": false,
+    "codegenUnits": 16,
+    "jobs": 1,
+    "incremental": false,
+    "locked": true,
+    "offline": true
+  },
+  "rustToolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "builtAt": "2026-10-01T06:31:45.5988422Z",
+  "validation": {
+    "sdkAttempt03": {
+      "status": "passed",
+      "binarySha256": "8289dbdfee90aa8afbccc8db661c38b08c0dd968d36d8a63958eaa88b253b559",
+      "sourcePins": 15,
+      "evidencePath": ".native-pagination-build/graph-native-wire-repair/native-caller-wire-activation-attempt-03.json",
+      "evidenceSha256": "ee9b62f9383750871a46aefc86952f0504c6fa85241cc93e8f8ccb1ff05a1d6d",
+      "acceptancePath": ".native-pagination-build/graph-native-wire-repair/native-sdk-main-acceptance.json",
+      "graphRuntimeAccepted": false
+    },
+    "normalizedSourceMatches": 24,
+    "normalizedSourceManifestSha256": "4a9fea1a712746366c474c03b20713408e918ee9b0d9a71d88699e08bf9464e3",
+    "capabilities": [
+      "state::list_page",
+      "state::get_versioned",
+      "state::lease",
+      "state::commit_batch",
+      "state::sqlite_wal_v1",
+      "state::shadow_migration_v1"
+    ],
+    "releaseBuildLog": ".native-pagination-build/graph-native-wire-repair/cargo-release-caller-boundary-attempt-02.stderr.log",
+    "artifactCopyHashMatched": true,
+    "patchChangedPaths": 24,
+    "version": "0.22.1",
+    "nativeChecks": [
+      {
+        "ignored": 0,
+        "failed": 0,
+        "passed": 12,
+        "log": ".native-pagination-build/graph-native/migration-tests-04.log",
+        "reusedAcceptedCheck": true,
+        "name": "migration"
+      },
+      {
+        "ignored": 1,
+        "failed": 0,
+        "passed": 16,
+        "log": ".native-pagination-build/graph-native/migration-native-sqlite.log",
+        "reusedAcceptedCheck": true,
+        "name": "sqlite-crash-config-repair"
+      },
+      {
+        "ignored": 0,
+        "failed": 0,
+        "passed": 15,
+        "log": ".native-pagination-build/graph-native/migration-native-page.log",
+        "reusedAcceptedCheck": true,
+        "name": "native-paging"
+      }
+    ],
+    "historicalMigrationCliProof": {
+      "path": ".native-pagination-build/graph-native/migration-cli-proof.json",
+      "sha256": "5ed5b566514e6f57919b20105e2489eb3f2aa33bc0a313f769f6b34f209dfb8a",
+      "binarySha256": "9b7e1f55e0e6e903fde39e18010a1a1573898788ad8590d5228022cd0f9f5ce4",
+      "preserved": true
+    },
+    "cliCompileLog": ".native-pagination-build/graph-native/migration-cli-check.stderr.log",
+    "migrationCliRepeatExitCode": 0,
+    "patchApplyReverseProof": ".native-pagination-build/graph-native/migration-patch-proof-final.log",
+    "migrationCliResumeExitCode": 0,
+    "migrationCliProof": ".native-pagination-build/graph-native/migration-cli-current-hash-proof.json",
+    "releaseBuildExitCode": 0
+  },
+  "limitations": [
+    "Only win32-x64 artifact verified.",
+    "No production migration or service cutover performed.",
+    "SQLite isolated crash probe is intentionally ignored in the parent suite; subprocess crash coverage is included in the 16 passing tests.",
+    "Default upstream LTO=true/codegen-units=1 release profile previously exhausted memory; this artifact uses the bounded optimized release profile.",
+    "Legacy source must remain frozen; available disk space must be checked independently before migration."
+  ]
+}

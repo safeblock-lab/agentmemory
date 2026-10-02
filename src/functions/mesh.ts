@@ -17,6 +17,7 @@ import type {
 import { lookup } from "node:dns/promises";
 import { BlockList, isIP } from "node:net";
 import { request } from "node:https";
+import { graphKV, registerGraphJobHandler, runGraphJob, withCompletedGraphRead, withGraphDelta } from "./graph-jobs.js";
 
 const forbidden = new BlockList();
 for (const [address, prefix] of [["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8], ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.0.2.0", 24], ["192.88.99.0", 24], ["192.168.0.0", 16], ["198.18.0.0", 15], ["198.51.100.0", 24], ["203.0.113.0", 24], ["224.0.0.0", 3]] as const) forbidden.addSubnet(address, prefix, "ipv4");
@@ -171,6 +172,8 @@ export function registerMeshFunction(
   kv: StateKV,
   meshAuthToken?: string,
 ): void {
+  kv = graphKV(kv);
+  registerGraphJobHandler(kv, "mesh", (input, id) => mergeGraphSync(kv, input as MeshSyncPayload, id));
   sdk.registerFunction("mem::mesh-register",
     async (data: {
       url: string;
@@ -387,8 +390,7 @@ export function registerMeshFunction(
             });
           }
         }
-        accepted += await lwwMergeGraphNodes(kv, data.graphNodes);
-        accepted += await lwwMergeList(kv, KV.graphEdges, data.graphEdges, "mem:gedge", "createdAt");
+        accepted += await mergeGraphSync(kv, { graphNodes: data.graphNodes, graphEdges: data.graphEdges });
         await recordAudit(kv, "mesh_sync", "mem::mesh-receive", [], {
           action: "mesh.receive",
           accepted,
@@ -429,6 +431,7 @@ async function collectSyncData(
   since?: string,
   syncFilter?: { project?: string },
 ): Promise<MeshSyncPayload> {
+  return withCompletedGraphRead(kv, async () => {
   const result: MeshSyncPayload = {};
   const parsed = since ? new Date(since).getTime() : 0;
   const sinceTime = Number.isNaN(parsed) ? 0 : parsed;
@@ -476,6 +479,16 @@ async function collectSyncData(
   }
 
   return result;
+  });
+}
+
+async function mergeGraphSync(kv: StateKV, data: MeshSyncPayload, durableId?: string): Promise<number> {
+  if (!data.graphNodes?.length && !data.graphEdges?.length) return 0;
+  return runGraphJob(kv, "mesh", data, (input) => withGraphDelta(kv, async () => {
+    const frozen = input as MeshSyncPayload;
+    const nodes = await lwwMergeGraphNodes(kv, frozen.graphNodes);
+    return nodes + await lwwMergeList(kv, KV.graphEdges, frozen.graphEdges, "mem:gedge", "createdAt");
+  }), durableId);
 }
 
 async function applySyncData(
@@ -513,12 +526,10 @@ async function applySyncData(
         if (wrote) applied++;
       }
     }
-    if (scopes.includes("graph:nodes")) {
-      applied += await lwwMergeGraphNodes(kv, data.graphNodes);
-    }
-    if (scopes.includes("graph:edges")) {
-      applied += await lwwMergeList(kv, KV.graphEdges, data.graphEdges, "mem:gedge", "createdAt");
-    }
+    applied += await mergeGraphSync(kv, {
+      graphNodes: scopes.includes("graph:nodes") ? data.graphNodes : undefined,
+      graphEdges: scopes.includes("graph:edges") ? data.graphEdges : undefined,
+    });
 
     return applied;
   });

@@ -1,4 +1,4 @@
-import { readFileSync, rmSync } from "node:fs";
+import { lstatSync, readFileSync, rmSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 
 const SEEDED_BUILTIN_WORKERS = [
@@ -241,15 +241,92 @@ function setBuiltinQueueStore(lines: string[], dataDir: string): void {
   lines.splice(configEnd, 0, ...missing);
 }
 
+export type LegacyStateStoreInspection =
+  | { status: "missing" }
+  | {
+      status: "directory" | "file" | "symlink" | "other" | "unreadable";
+      path: string;
+    };
+
+export function inspectLegacyStateStore(path: string): LegacyStateStoreInspection {
+  try {
+    const entry = lstatSync(path);
+    if (entry.isSymbolicLink()) return { status: "symlink", path };
+    if (entry.isDirectory()) return { status: "directory", path };
+    if (entry.isFile()) return { status: "file", path };
+    return { status: "other", path };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { status: "missing" };
+    return { status: "unreadable", path };
+  }
+}
+
+export function stateMigrationReceiptPath(targetPath: string): string {
+  return `${targetPath}.migration-ready.json`;
+}
+
+function setBuiltinStateStore(lines: string[], dataDir: string): void {
+  const worker = workerBlock(lines, "iii-state");
+  if (!worker) throw new Error("AgentMemory state pagination requires an iii-state worker");
+  const indent = (line: string) => line.length - line.trimStart().length;
+  const directChild = (from: number, to: number, depth: number, key: string) =>
+    lines.findIndex((line, index) => index > from && index < to && indent(line) === depth &&
+      line.trimStart().startsWith(`${key}:`));
+  const workerIndent = indent(lines[worker.start]!);
+  const workerConfig = directChild(worker.start, worker.end, workerIndent + 2, "config");
+  if (workerConfig < 0 || lines[workerConfig]!.trim() !== "config:") {
+    throw new Error("AgentMemory requires a multiline iii-state config with an adapter");
+  }
+  const adapterIndex = directChild(workerConfig, worker.end, workerIndent + 4, "adapter");
+  if (adapterIndex < 0 || lines[adapterIndex]!.trim() !== "adapter:") {
+    throw new Error("AgentMemory requires a multiline iii-state adapter config");
+  }
+
+  const adapterIndent = indent(lines[adapterIndex]!);
+  let adapterEnd = worker.end;
+  for (let i = adapterIndex + 1; i < worker.end; i++) {
+    if (lines[i]!.trim() && indent(lines[i]!) <= adapterIndent) {
+      adapterEnd = i;
+      break;
+    }
+  }
+  const childIndent = adapterIndent + 2;
+  let nameIndex = directChild(adapterIndex, adapterEnd, childIndent, "name");
+  if (nameIndex < 0) {
+    lines.splice(adapterIndex + 1, 0, `${" ".repeat(childIndent)}name: sqlite`);
+    nameIndex = adapterIndex + 1;
+    adapterEnd += 1;
+  } else {
+    lines[nameIndex] = `${" ".repeat(childIndent)}name: sqlite`;
+  }
+
+  let configIndex = directChild(adapterIndex, adapterEnd, childIndent, "config");
+  const pathLine = `${" ".repeat(childIndent + 2)}file_path: ${yamlSingleQuote(resolve(dataDir, "state_store.sqlite3"))}`;
+  if (configIndex < 0) {
+    lines.splice(nameIndex + 1, 0, `${" ".repeat(childIndent)}config:`, pathLine);
+    return;
+  }
+
+  let configEnd = configIndex + 1;
+  if (lines[configIndex]!.trim() === `${" ".repeat(childIndent)}config:`.trim()) {
+    while (configEnd < adapterEnd) {
+      if (lines[configEnd]!.trim() && indent(lines[configEnd]!) <= childIndent) break;
+      configEnd += 1;
+    }
+  }
+  lines.splice(
+    configIndex,
+    configEnd - configIndex,
+    `${" ".repeat(childIndent)}config:`,
+    pathLine,
+  );
+}
+
 export function renderEngineConfig(
   template: string,
   options: EngineConfigOptions,
 ): string {
   const rendered = template
-    .replace(
-      "file_path: ./data/state_store.db",
-      `file_path: ${yamlSingleQuote(join(options.dataDir, "state_store.db"))}`,
-    )
     .replace(
       "file_path: ./data/stream_store",
       `file_path: ${yamlSingleQuote(join(options.dataDir, "stream_store"))}`,
@@ -259,6 +336,7 @@ export function renderEngineConfig(
       `file_path: ${yamlSingleQuote(resolve(options.dataDir, "queue_store"))}`,
     );
   const lines = rendered.split("\n");
+  setBuiltinStateStore(lines, options.dataDir);
   setBuiltinQueueStore(lines, options.dataDir);
   if (options.ports) {
     setWorkerPort(lines, "iii-http", options.ports.restPort);

@@ -62,25 +62,10 @@ if ([int]$Matches["major"] -lt 20) {
 
 $temporaryDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ("agentmemory-install-" + [guid]::NewGuid().ToString("N"))
 $tarballPath = Join-Path $temporaryDirectory $TarballName
-$checksumsPath = Join-Path $temporaryDirectory "SHA256SUMS.txt"
 
 try {
   New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
   Invoke-WebRequest -Uri "$ReleaseBase/$TarballName" -OutFile $tarballPath -MaximumRedirection 5 -TimeoutSec 60 -UseBasicParsing
-  Invoke-WebRequest -Uri "$ReleaseBase/SHA256SUMS.txt" -OutFile $checksumsPath -MaximumRedirection 5 -TimeoutSec 60 -UseBasicParsing
-
-  $checksumLine = Get-Content -LiteralPath $checksumsPath | Where-Object {
-    $_ -match "^(?<hash>[A-Fa-f0-9]{64})\s+\*?$([regex]::Escape($TarballName))$"
-  } | Select-Object -First 1
-  if ($null -eq $checksumLine) {
-    throw "The release checksum file does not contain an entry for $TarballName."
-  }
-  $expectedHash = ([regex]::Match($checksumLine, "^[A-Fa-f0-9]{64}")).Value.ToLowerInvariant()
-  $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $tarballPath).Hash.ToLowerInvariant()
-  if ($actualHash -ne $expectedHash) {
-    throw "Checksum verification failed. The package was not installed."
-  }
-
   & $npm.Source install --global $tarballPath
   if ($LASTEXITCODE -ne 0) {
     throw "npm global installation failed with exit code $LASTEXITCODE."

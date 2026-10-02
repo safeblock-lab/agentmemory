@@ -16,6 +16,7 @@ import type { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
 import { VERSION } from "../version.js";
 import { logger } from "../logger.js";
+import { graphKV, registerGraphJobHandler, runGraphJob, withCompletedGraphRead, withGraphDelta } from "./graph-jobs.js";
 
 const COMMIT_HASH_RE = /^[0-9a-f]{7,40}$/i;
 
@@ -42,6 +43,16 @@ export function registerSnapshotFunction(
   kv: StateKV,
   snapshotDir: string,
 ): void {
+  kv = graphKV(kv);
+  type RestoredNode = { id: string } & Record<string, unknown>;
+  const restoreGraph = async (nodes: RestoredNode[], durableId?: string) => runGraphJob(kv, "restore", nodes, (input) => withGraphDelta(kv, async () => {
+    for (const node of input as RestoredNode[]) {
+      const current = await kv.get<RestoredNode>(KV.graphNodes, node.id);
+      await kv.set(KV.graphNodes, node.id, preserveBatchProvenance(current, node));
+    }
+    return { success: true };
+  }), durableId);
+  registerGraphJobHandler(kv, "restore", (input, id) => restoreGraph(input as RestoredNode[], id));
   // Serialize snapshots: the periodic timer, REST (api::snapshot-create), and
   // MCP can all trigger this concurrently. Two runs writing state.json and
   // committing in the same git repo at once race on the index lock. An
@@ -62,7 +73,7 @@ export function registerSnapshotFunction(
 
           const sessions = await kv.list<Session>(KV.sessions);
           const memories = await kv.list<Memory>(KV.memories);
-          const graphNodes = await kv.list<GraphNode>(KV.graphNodes);
+          const graphNodes = await withCompletedGraphRead(kv, () => kv.list<GraphNode>(KV.graphNodes));
           const accessLogs = await kv
             .list<AccessLogExport>(KV.accessLog)
             .catch(() => [] as AccessLogExport[]);
@@ -208,10 +219,7 @@ export function registerSnapshotFunction(
             }
           }
           if (state.graphNodes) {
-            for (const node of state.graphNodes) {
-              const current = await kv.get<typeof node>(KV.graphNodes, node.id);
-              await kv.set(KV.graphNodes, node.id, preserveBatchProvenance(current, node));
-            }
+            await restoreGraph(state.graphNodes);
           }
           if (state.observations) {
             for (const [sessionId, obs] of Object.entries(state.observations)) {

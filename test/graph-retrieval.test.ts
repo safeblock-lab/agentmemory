@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { GraphRetrieval } from "../src/functions/graph-retrieval.js";
 import type { GraphNode, GraphEdge } from "../src/types.js";
+import { installGraphStateWire } from "./helpers/graph-state-harness.js";
 
 function mockKV(
   nodes: GraphNode[] = [],
@@ -15,7 +16,7 @@ function mockKV(
   for (const e of edges) edgesMap.set(e.id, e);
   store.set("mem:graph:edges", edgesMap);
 
-  return {
+  const kv = {
     get: async <T>(scope: string, key: string): Promise<T | null> => {
       return (store.get(scope)?.get(key) as T) ?? null;
     },
@@ -32,6 +33,7 @@ function mockKV(
       return entries ? (Array.from(entries.values()) as T[]) : [];
     },
   };
+  return installGraphStateWire(undefined, kv as never).kv;
 }
 
 function makeNode(
