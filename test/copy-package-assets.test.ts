@@ -23,6 +23,7 @@ describe("copyPackageAssets", () => {
       ".env.example",
       "src/viewer/index.html",
       "src/viewer/favicon.svg",
+      "scripts/qwen-reranker.py",
     ];
     for (const path of assets) {
       const target = join(root, path);
@@ -35,5 +36,7 @@ describe("copyPackageAssets", () => {
     expect(readFileSync(join(root, "dist", "viewer", "index.html"), "utf8")).toBe("src/viewer/index.html");
     expect(existsSync(join(root, "dist", "viewer", "favicon.svg"))).toBe(true);
     expect(existsSync(join(root, "dist", "iii-config.yaml"))).toBe(true);
+    expect(readFileSync(join(root, "dist", "qwen-reranker.py"), "utf8"))
+      .toBe("scripts/qwen-reranker.py");
   });
 });

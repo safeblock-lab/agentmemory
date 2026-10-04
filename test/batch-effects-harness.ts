@@ -1,4 +1,5 @@
 import { StateKV } from "../src/state/kv.js";
+import type { StateJsonValue } from "../src/state/state-transactions.js";
 import type { StatePageRequest } from "../src/state/state-pages.js";
 import { installGraphStateWire } from "./helpers/graph-state-harness.js";
 import { statePageFixture } from "./state-page-fixture.js";
@@ -60,7 +61,16 @@ export function effectHarness(options: { nativeGraphWire?: boolean } = {}) {
   }
   return {
     kv, sdk, store,
+    get scopedCommitFailures() { return graphWire?.scopedCommitFailures ?? 0; },
+    seed(scope: string, key: string, value: unknown) {
+      if (graphWire) graphWire.seed(scope, key, value as StateJsonValue);
+      else store.set(`${scope}:${key}`, structuredClone(value));
+    },
     crash(scope: string, after = false, remaining = 1) { crash = { scope, after, remaining }; },
+    crashGraphCommit(scope: string, afterApply = false, matchingCommitOrdinal = 1) {
+      if (!graphWire) throw new Error("Native graph wire is not installed");
+      graphWire.failCommitForScope(scope, afterApply, matchingCommitOrdinal);
+    },
     failNextCommitBeforeApply() {
       if (!graphWire) throw new Error("Native graph wire is not installed");
       graphWire.failCommitBeforeApply();

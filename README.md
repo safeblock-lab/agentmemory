@@ -78,8 +78,8 @@
 Requirements:
 
 - Node.js 20 or newer with npm and npx (`node -v`, `npm -v`, and `npx -v`).
-- macOS/Linux automatic iii-engine installation also needs `curl`, a POSIX `sh`, and `tar`. Minimal images such as `node:20-slim` may not include them.
-- Native Windows requires the pinned iii-engine v0.22.1 `iii.exe` to be installed manually. WSL2 or Docker Desktop are the other supported paths.
+- Local engine startup requires a package containing a verified patched iii-engine artifact for the host platform. The CLI checks its version and `state::list_page` capability before installing it in `~/.agentmemory/bin`.
+- The native handoff currently verifies `win32-x64`; other platforms remain unsupported until their patched binaries are built, probed, and included in the package. Upstream iii binaries and Docker images without `state::list_page` cannot serve paged state requests.
 
 Install this fork from its matching [GitHub Release](https://github.com/safeblock-lab/agentmemory/releases). On Windows, download `Install-AgentMemory.ps1` and run:
 
@@ -137,14 +137,14 @@ Then, inside Codex or Claude Code:
 
 The plugin installs skills and hooks and launches MCP through the locally installed `agentmemory mcp` command. This global install replaces any existing global `@agentmemory/agentmemory` installation.
 
-Already running your own `iii` engine? agentmemory pins iii-engine v0.22.1 and won't attach to a different version (the worker can't speak another engine's protocol). Stop the other engine, then run the installed `agentmemory` command.
+Already running your own `iii` engine? agentmemory uses an engine only when its version matches the package pin and it advertises `state::list_page`. It leaves other engines untouched and installs a verified bundled engine in its private directory when one is available. See [state pagination and engine delivery](docs/operations/state-pagination.md).
 
 </details>
 
 <details>
 <summary><strong>Already running your own iii engine</strong></summary>
 
-agentmemory pins iii-engine v0.22.1 and won't attach to a different version (the worker can't speak another engine's protocol). Stop the other engine, then run `agentmemory`. It installs and runs the pinned v0.22.1 in `~/.agentmemory/bin`, leaving your own `iii` untouched.
+agentmemory pins iii-engine v0.22.1 and requires the patched `state::list_page` capability. It uses a compatible engine already on `PATH` or installs a checksum-verified engine bundled with the package in `~/.agentmemory/bin`; it does not download an upstream engine as a fallback.
 
 </details>
 
@@ -824,57 +824,23 @@ Worked example: [`examples/python/`](examples/python/) (quickstart + observation
 
 ```bash
 git clone https://github.com/safeblock-lab/agentmemory.git && cd agentmemory
-npm install && npm run build && npm start
+npm install
+npm run build:engine
+npm run build
+npm start
 ```
 
-This starts agentmemory with a local `iii-engine` if the pinned binary is already installed, or uses Docker Compose when selected. REST, streams, and the viewer bind to `127.0.0.1` by default. The automatic macOS/Linux binary path requires `curl`, a POSIX `sh`, and `tar`.
+After the native handoff provides its manifest and pinned patch, `npm run build:engine` builds the patched iii-engine for the current host and validates its version and capability. It needs Git and a Rust/Cargo toolchain. To stage the supplied Windows x64 binary, pass its path and target explicitly: `npm run build:engine -- --binary .native-pagination-build/iii-engine-patched.exe --platform win32 --arch x64`. `npm run build` requires staged, checksum-verified engine artifacts. See [state pagination and patched engine delivery](docs/operations/state-pagination.md).
 
-Install `iii-engine` manually. **agentmemory currently pins `iii-engine` to `v0.22.1`**, the same release as its `iii-sdk` dependency; the worker speaks that engine's wire protocol, and 0.20.0 reorganized the SDK surface, so the two move together in agentmemory releases. Override with `AGENTMEMORY_III_VERSION=<version>` if you run your own engine and know it matches.
-
-- **macOS arm64:** `mkdir -p ~/.local/bin && curl -fsSL https://github.com/iii-hq/iii/releases/download/iii/v0.22.1/iii-aarch64-apple-darwin.tar.gz | tar -xz -C ~/.local/bin && chmod +x ~/.local/bin/iii`
-- **macOS x64:** swap `aarch64-apple-darwin` for `x86_64-apple-darwin`
-- **Linux x64:** swap for `x86_64-unknown-linux-gnu`
-- **Linux arm64:** swap for `aarch64-unknown-linux-gnu`
-- **Windows:** download `iii-x86_64-pc-windows-msvc.zip` from [iii-hq/iii releases v0.22.1](https://github.com/iii-hq/iii/releases/tag/iii%2Fv0.22.1) and extract `iii.exe` to `%USERPROFILE%\.agentmemory\bin\iii.exe`
-
-Or use Docker (the bundled `docker-compose.yml` pulls `iiidev/iii:0.22.1`). Full docs: [iii.dev/docs](https://iii.dev/docs).
+The worker and engine use the same pinned v0.22.1 protocol. `AGENTMEMORY_III_VERSION` can select an existing engine only when it still provides the required capability; the bundled patched artifact remains tied to the package pin. Upstream v0.22.1 releases and Docker images do not include the pagination patch.
 
 ### Windows
 
-agentmemory runs on Windows 10/11, but the Node.js package alone isn't enough; you also need the pinned iii-engine v0.22.1 runtime as a background process. The CLI does not auto-extract the Windows ZIP, so native Windows users must install `iii.exe` manually, use WSL2, or choose Docker Desktop.
+agentmemory runs on Windows 10/11 when its package includes the verified patched engine for the host architecture. The CLI checks the manifest, checksum, version, and `state::list_page` capability before installing the bundled `iii.exe` in its private engine directory. The native build handoff verifies x64 only; ARM64 Windows remains unsupported until a patched artifact is built and verified.
 
 Native Windows automated MCP wiring supports only `agentmemory connect copilot-cli`. For Claude Code, Codex, Cursor, and every other native Windows agent, copy the manual MCP block from [Other agents](#other-agents) into that agent's Windows config. Running `connect` in WSL is appropriate only when the target agent is also installed in the same WSL environment; it does not edit a Windows-host agent's configuration.
 
-**Option A: prebuilt Windows binary (recommended)**
-
-```powershell
-# 1. Open https://github.com/iii-hq/iii/releases/tag/iii%2Fv0.22.1 in your browser
-#    (agentmemory pins the engine to the same release as its iii-sdk;
-#     v0.22.1 is the current pair)
-# 2. Download iii-x86_64-pc-windows-msvc.zip
-#    (or iii-aarch64-pc-windows-msvc.zip if you're on an ARM machine)
-# 3. Extract iii.exe to agentmemory's private engine directory:
-New-Item -ItemType Directory -Force "$HOME\.agentmemory\bin"
-# Copy iii.exe to $HOME\.agentmemory\bin\iii.exe
-# 4. Verify:
-& "$HOME\.agentmemory\bin\iii.exe" --version
-# Should print: 0.22.1
-
-# 5. Then run agentmemory as usual:
-agentmemory
-```
-
-**Option B: Docker Desktop**
-
-```powershell
-# 1. Install Docker Desktop for Windows
-# 2. Start Docker Desktop and make sure the engine is running
-# 3. Select Docker explicitly and run agentmemory:
-$env:AGENTMEMORY_USE_DOCKER = "1"
-agentmemory
-```
-
-**Option C: standalone MCP only (no engine).** If you only need the MCP tools for your agent and don't need the REST API, viewer, or cron jobs, skip the engine entirely:
+If the package does not include an artifact for the current Windows architecture, install a release with a verified patched engine or build one from the pinned agentmemory source. The upstream Windows ZIP and Docker image lack `state::list_page` and are not compatible. Standalone MCP mode does not start the engine:
 
 ```powershell
 agentmemory mcp
@@ -885,20 +851,20 @@ agentmemory mcp
 | Symptom | Fix |
 |---|---|
 | `The engine process started but the REST API never responded.` | Confirm all four derived ports are free, verify the pinned `iii.exe` stayed alive, then re-run with `--verbose` and inspect the captured engine stderr |
-| `Could not start iii-engine` | Neither `iii.exe` nor Docker is installed. See Option A or B above |
+| `Could not start iii-engine` | The package may lack a verified artifact for this platform. Install a release with the patched engine or build it from the pinned source |
 | Port conflict | `netstat -ano \| findstr :3111` to see what's bound, then kill it or use `--port <N>` |
-| Docker fallback skipped even though Docker is installed | Make sure Docker Desktop is actually running (system tray icon) |
+| `state::list_page` capability missing | Replace the upstream engine with a package's verified patched artifact |
 
-> Note: the iii **engine** is a prebuilt binary, not a cargo crate, so don't try to `cargo install` it. (The iii **SDKs** are published on crates.io, npm, and PyPI, but agentmemory doesn't need them.) Supported engine install methods are all pinned to v0.22.1: the prebuilt binary above, agentmemory's macOS/Linux auto-install path (`curl`, POSIX `sh`, and `tar` required), and the Docker image `iiidev/iii:0.22.1`. A bare upstream `install.sh | sh` installs the latest engine, which agentmemory does not support. Use `agentmemory`; on macOS/Linux it fetches the pinned engine into `~/.agentmemory/bin`.
+> Engine delivery is documented in [state pagination and patched engine delivery](docs/operations/state-pagination.md). A version match alone is insufficient: the engine must advertise `state::list_page` so clients never fall back to an unbounded state list.
 
 ---
 
 <h2 id="deploy">Deploy</h2>
 
-One-click templates for managed hosts. Each one ships a self-contained
-Dockerfile that pulls `@agentmemory/agentmemory` from npm and copies
-the iii engine binary in from the official `iiidev/iii` Docker Hub
-image; no pre-built agentmemory image required. Persistent storage
+One-click templates for managed hosts. Their current Dockerfiles copy the
+upstream `iiidev/iii` engine image, which does not provide `state::list_page`;
+those templates cannot serve paged state scans until they include a verified
+patched engine artifact. Persistent storage
 mounts at `/data`; the first-boot entrypoint overwrites the
 npm-bundled iii config (which binds `127.0.0.1`) with a deploy-tuned
 one that binds `0.0.0.0` and uses absolute `/data` paths, generates
@@ -1050,6 +1016,8 @@ Triple-stream retrieval combining three signals:
 | **Graph** | Knowledge graph traversal via entity matching | Entities detected in query |
 
 Fused with Reciprocal Rank Fusion (RRF, k=60) and session-diversified (max 3 results per session).
+
+The current indexed retrieval path can use the local multilingual Qwen3 reranker after bounded candidate retrieval. Its GGUF model and CPU runtime are separately provisioned; CUDA runtime DLLs are acquired directly from the pinned upstream releases rather than redistributed. See the [local reranking guide](docs/graph/local-reranking.md) for setup, measured resource use, and quality limits.
 
 When a vector index is populated, `mem::search` (behind `memory_recall`) uses the hybrid BM25 + vector ranker. Without embeddings it uses BM25. `smart-search` can additionally fuse structural graph matches when graph data exists, including in keyless mode. Lesson recall runs on a dedicated in-memory BM25 index instead of scanning the whole corpus per query. Superseded memory versions are excluded from every recall path; the version chain keeps their history.
 
@@ -1800,7 +1768,7 @@ npm test                  # 1,674 tests
 npm run test:integration  # API tests (requires running services)
 ```
 
-**Prerequisites:** Node.js >= 20 with npm/npx; [iii-engine](https://iii.dev/docs) v0.22.1 or Docker. The macOS/Linux automatic engine install also requires `curl`, a POSIX `sh`, and `tar`; native Windows uses the manual pinned `iii.exe`, WSL2, or Docker Desktop.
+**Prerequisites:** Node.js >= 20 with npm/npx; a verified patched iii-engine artifact for native local startup. Source builds also need Git and Cargo. The package reports unsupported platforms when their patched artifact is absent. See [state pagination and patched engine delivery](docs/operations/state-pagination.md).
 
 <h2 id="license"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-license.svg"><img src="assets/tags/section-license.svg" alt="License" height="32" /></picture></h2>
 

@@ -20,6 +20,12 @@ export type { StateGraphGuard, StateGraphLease, StateLeaseRequest, StatePrepared
 export class StateKV {
   constructor(private sdk: IIIClient) {}
 
+  indexedRetrieval = process.env.AGENTMEMORY_RETRIEVAL_MODE !== 'legacy';
+
+  retrieval<T>(payload: Record<string, unknown>): Promise<T> {
+    return this.sdk.trigger<Record<string, unknown>, T>({ function_id: 'state::retrieval', payload });
+  }
+
   private transactionTrigger: StateTransactionTrigger = (functionId, payload) =>
     this.sdk.trigger<unknown, unknown>({ function_id: functionId, payload })
 

@@ -13,6 +13,7 @@ const testHome = mkdtempSync(join(tmpdir(), "agentmemory-test-home-"));
 
 export default defineConfig({
   test: {
+    include: ["test/**/*.test.ts"],
     env: {
       HOME: testHome,
       USERPROFILE: testHome,

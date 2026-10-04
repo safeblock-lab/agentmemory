@@ -5,6 +5,8 @@ import { KV, fingerprintId } from "../src/state/schema.js";
 import { registerTemporalGraphFunctions } from "../src/functions/temporal-graph.js";
 import { registerSkillExtractFunctions } from "../src/functions/skill-extract.js";
 import { registerCascadeFunction } from "../src/functions/cascade.js";
+import { graphKV, runGraphJob } from "../src/functions/graph-jobs.js";
+import { StateKV } from "../src/state/kv.js";
 import type { GraphEdge, MemoryProvider } from "../src/types.js";
 
 vi.mock("../src/logger.js", () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
@@ -34,10 +36,10 @@ describe("single-worker writer coordination", () => {
 
   it("rejects pending and ambiguous admissions without running maintenance or competitors", async () => {
     const h = effectHarness(); const run = vi.fn(async () => true);
-    await h.kv.set(KV.batchCallbacks, "active:graph", { state: "started", activeKey: batchEffectKey("pending") });
+    h.seed(KV.batchCallbacks, "active:graph", { state: "started", activeKey: batchEffectKey("pending") });
     await expect(withBatchMutationLocks(h.kv, run)).rejects.toThrow("recovered");
     await expect(withBatchWriterLocks(h.kv, ["graph"], run)).rejects.toThrow("recovered");
-    await h.kv.set(KV.batchCallbacks, "active:graph", { state: "started" });
+    h.seed(KV.batchCallbacks, "active:graph", { state: "started" });
     await expect(withBatchMutationLocks(h.kv, run)).rejects.toThrow("Ambiguous");
     expect(run).not.toHaveBeenCalled();
   });
@@ -109,18 +111,50 @@ describe("single-worker writer coordination", () => {
   });
 
   it("cascade rereads graph records after a concurrent callback", async () => {
-    const h = effectHarness(); registerCascadeFunction(h.sdk as never, h.kv);
+    const h = effectHarness(); const graph = graphKV(h.kv as never); registerCascadeFunction(h.sdk as never, h.kv as never);
     await h.kv.set(KV.memories, "m", { sourceObservationIds: ["old"] });
     const entered = deferred(), finish = deferred();
-    const callback = runBatchCallback(h.kv, "graph", batchEffectKey("graph-batch"), async (_, admit) => {
-      await admit(); entered.resolve(); await finish.promise;
-      await h.kv.set(KV.graphNodes, "n", { id: "n", sourceObservationIds: ["old", "batch"], properties: { preserved: true } });
-      return { success: true };
-    });
+    const callback = runGraphJob(graph as never, "batch_callback", { id: "graph-batch" }, async () =>
+      runBatchCallback(graph as never, "graph", batchEffectKey("graph-batch"), async (_, admit) => {
+        await admit(); entered.resolve(); await finish.promise;
+        await graph.set(KV.graphNodes, "n", { id: "n", sourceObservationIds: ["old", "batch"], properties: { preserved: true } });
+        return { success: true };
+      }), "cascade-concurrent-callback");
     await entered.promise;
     const cascade = h.call("mem::cascade-update", { supersededMemoryId: "m" });
     finish.resolve(); await Promise.all([callback, cascade]);
     expect(await h.kv.get(KV.graphNodes, "n")).toMatchObject({ stale: true, sourceObservationIds: ["old", "batch"], properties: { preserved: true } });
+  });
+
+  it("releases the local graph queue after preflight failure and bypasses it for nested jobs", async () => {
+    const h = effectHarness(), graph = graphKV(h.kv as never);
+    const callback = vi.fn(async () => ({ success: true }));
+    const failed = runGraphJob(graph as never, "batch_callback", { id: "failed" }, callback, "queue-failed-job", async () => { throw new DOMException("cancelled", "AbortError"); });
+    const recovered = runGraphJob(graph as never, "batch_callback", { id: "recovered" }, async () => ({ success: true }), "queue-after-failure");
+    await expect(failed).rejects.toMatchObject({ name: "AbortError" });
+    expect(callback).not.toHaveBeenCalled();
+    expect(await h.kv.get(KV.graphJobs, "queue-failed-job")).toBeNull();
+    await expect(recovered).resolves.toMatchObject({ success: true });
+
+    const nested = vi.fn(async () => ({ success: true }));
+    await expect(runGraphJob(graph as never, "batch_callback", { id: "parent" }, async () =>
+      runGraphJob(graph as never, "batch_callback", { id: "child" }, nested, "nested-child"), "nested-parent"))
+      .resolves.toMatchObject({ success: true });
+    expect(nested).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the native lease as a fence across distinct StateKV instances", async () => {
+    const h = effectHarness(), firstGraph = graphKV(h.kv as never);
+    const secondGraph = graphKV(new StateKV(h.sdk as never));
+    const entered = deferred(), finish = deferred();
+    const first = runGraphJob(firstGraph as never, "batch_callback", { id: "first" }, async () => {
+      entered.resolve(); await finish.promise; return { success: true };
+    }, "first-instance-job");
+    await entered.promise;
+    await expect(runGraphJob(secondGraph as never, "batch_callback", { id: "second" }, async () => ({ success: true }), "second-instance-job"))
+      .rejects.toMatchObject({ code: "STATE_TX_LEASE_BUSY" });
+    finish.resolve();
+    await expect(first).resolves.toMatchObject({ success: true });
   });
 });
 
@@ -129,13 +163,15 @@ const payload = { observations: [{ id: "obs", title: "Use TypeScript", narrative
 describe("temporal retry convergence", () => {
   it.each([KV.graphNodes, KV.graphEdges, KV.graphEdgeHistory, KV.batchCallbacks].flatMap((scope) => [false, true].map((after) => ({ scope, after }))))("converges after failure at $scope, after=$after", async ({ scope, after }) => {
     const h = effectHarness();
-    await h.kv.set(KV.graphNodes, "alice", { id: "alice", type: "person", name: "Alice", properties: {}, sourceObservationIds: ["old"], createdAt: "2024-01-01" });
-    await h.kv.set(KV.graphNodes, "ts", { id: "ts", type: "technology", name: "TypeScript", properties: {}, sourceObservationIds: ["old"], createdAt: "2024-01-01" });
-    await h.kv.set(KV.graphEdges, "old", { id: "old", sourceNodeId: "alice", targetNodeId: "ts", type: "uses", version: 1, isLatest: true });
+    h.seed(KV.graphNodes, "alice", { id: "alice", type: "person", name: "Alice", properties: {}, sourceObservationIds: ["old"], createdAt: "2024-01-01" });
+    h.seed(KV.graphNodes, "ts", { id: "ts", type: "technology", name: "TypeScript", properties: {}, sourceObservationIds: ["old"], createdAt: "2024-01-01" });
+    h.seed(KV.graphEdges, "old", { id: "old", sourceNodeId: "alice", targetNodeId: "ts", type: "uses", version: 1, isLatest: true });
     const provider = { compress: vi.fn(async () => xml) } as unknown as MemoryProvider;
     registerTemporalGraphFunctions(h.sdk as never, h.kv, provider);
-    h.crash(scope, after);
-    expect(await h.call("mem::temporal-graph-extract", payload)).toMatchObject({ success: false });
+    h.crashGraphCommit(scope, after);
+    const first = await h.call("mem::temporal-graph-extract", payload);
+    expect(h.scopedCommitFailures).toBe(1);
+    expect(first).toMatchObject({ success: true });
     expect(await h.call("mem::temporal-graph-extract", payload)).toMatchObject({ success: true });
     expect(await h.call("mem::temporal-graph-extract", payload)).toMatchObject({ success: true });
     const edges = await h.kv.list<GraphEdge>(KV.graphEdges);
@@ -145,22 +181,26 @@ describe("temporal retry convergence", () => {
     expect(await h.kv.list(KV.graphEdgeHistory)).toHaveLength(1);
   });
 
-  it("fails closed if a partial retry produces different model output", async () => {
+  it("keeps committed graph effects after a graph commit acknowledgement is lost", async () => {
     const h = effectHarness(); const compress = vi.fn(async () => xml);
     registerTemporalGraphFunctions(h.sdk as never, h.kv, { compress } as unknown as MemoryProvider);
-    h.crash(KV.graphNodes, true);
-    expect(await h.call("mem::temporal-graph-extract", payload)).toMatchObject({ success: false });
+    h.crashGraphCommit(KV.graphNodes, true);
+    expect(await h.call("mem::temporal-graph-extract", payload)).toMatchObject({ success: true });
     compress.mockResolvedValue(xml.replace("0.8", "0.9"));
-    expect(await h.call("mem::temporal-graph-extract", payload)).toMatchObject({ success: false, error: "Temporal extraction result changed during recovery" });
-    expect(await h.kv.list(KV.graphEdges)).toHaveLength(0);
+    expect(await h.call("mem::temporal-graph-extract", payload)).toMatchObject({ success: true });
+    expect(h.scopedCommitFailures).toBe(1);
+    expect(compress).toHaveBeenCalledTimes(2);
+    expect(await h.kv.list(KV.graphEdges)).toHaveLength(1);
+    expect(await h.kv.list<GraphEdge>(KV.graphEdges)).toMatchObject([{ weight: 0.8 }]);
   });
 
   it("does not create a temporal cycle when replaying multiple versions from one result", async () => {
     const h = effectHarness();
     const response = xml + '<relationship type="uses" source="Alice" target="TypeScript" weight="0.9"></relationship>';
     registerTemporalGraphFunctions(h.sdk as never, h.kv, { compress: async () => response } as unknown as MemoryProvider);
-    h.crash(KV.batchCallbacks, false, 3);
-    expect(await h.call("mem::temporal-graph-extract", payload)).toMatchObject({ success: false });
+    h.crashGraphCommit(KV.batchCallbacks, true);
+    expect(await h.call("mem::temporal-graph-extract", payload)).toMatchObject({ success: true });
+    expect(h.scopedCommitFailures).toBe(1);
     expect(await h.call("mem::temporal-graph-extract", payload)).toMatchObject({ success: true });
     const edges = await h.kv.list<GraphEdge>(KV.graphEdges);
     expect(edges).toHaveLength(2);

@@ -12,7 +12,9 @@ function setup() { const h = effectHarness(); registerExportImportFunction(h.sdk
 describe("import preserves durable batch state", () => {
   it.each(destinations)("merges legacy %s records without erasing receipts, provenance, or counters", async (scope, field) => {
     const h = setup(), key = batchEffectKey("local");
-    await h.kv.set(scope, "id", { id: "id", sourceSessionIds: ["local"], sourceObservationIds: ["observation"], accessCount: 3, reinforcements: 4, frequency: 5, appliedBatchEffects: [key] });
+    const existing = { id: "id", sourceSessionIds: ["local"], sourceObservationIds: ["observation"], accessCount: 3, reinforcements: 4, frequency: 5, appliedBatchEffects: [key] };
+    if (scope === KV.graphNodes || scope === KV.graphEdges) h.seed(scope, "id", existing);
+    else await h.kv.set(scope, "id", existing);
     const result = await h.call("mem::import", { exportData: { ...empty, [field]: [{ id: "id", sourceSessionIds: ["remote"], accessCount: 1, reinforcements: 1, frequency: 1 }] } });
     expect(result).toMatchObject({ success: true });
     expect(await h.kv.get(scope, "id")).toMatchObject({ sourceSessionIds: ["local", "remote"], sourceObservationIds: ["observation"], accessCount: 3, reinforcements: 4, frequency: 5, appliedBatchEffects: [key] });
@@ -64,8 +66,9 @@ describe("import preserves durable batch state", () => {
   it.each(["metadata", "callback-receipt", "snapshot-metadata"])("refuses replace when %s is protected", async (protection) => {
     const h = setup();
     await h.kv.set(KV.sessions, "keep", { id: "keep" });
-    if (protection === "callback-receipt") await h.kv.set(KV.batchCallbacks, `graph:${batchEffectKey("effect")}`, { state: "completed" });
-    else await h.kv.set(protection === "metadata" ? KV.lessons : KV.graphSnapshot, "current", { appliedBatchEffects: [batchEffectKey("effect")] });
+    if (protection === "callback-receipt") h.seed(KV.batchCallbacks, `graph:${batchEffectKey("effect")}`, { state: "completed" });
+    else if (protection === "metadata") await h.kv.set(KV.lessons, "current", { appliedBatchEffects: [batchEffectKey("effect")] });
+    else h.seed(KV.graphSnapshot, "current", { appliedBatchEffects: [batchEffectKey("effect")] });
     const before = structuredClone([...h.store]);
     expect(await h.call("mem::import", { strategy: "replace", exportData: empty })).toMatchObject({ success: false, error: expect.stringContaining("Replace blocked") });
     expect([...h.store]).toEqual(before);

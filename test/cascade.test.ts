@@ -6,15 +6,14 @@ vi.mock("../src/logger.js", () => ({
 
 import { registerCascadeFunction } from "../src/functions/cascade.js";
 import type { Memory, GraphNode, GraphEdge } from "../src/types.js";
-import { mockKV, mockSdk } from "./helpers/mocks.js";
+import { graphStateHarness } from "./helpers/graph-state-harness.js";
 
 describe("Cascade Update Function", () => {
-  let sdk: ReturnType<typeof mockSdk>;
-  let kv: ReturnType<typeof mockKV>;
+  let sdk: ReturnType<typeof graphStateHarness>["sdk"];
+  let kv: ReturnType<typeof graphStateHarness>["kv"];
 
   beforeEach(() => {
-    sdk = mockSdk();
-    kv = mockKV();
+    ({ sdk, kv } = graphStateHarness());
     vi.clearAllMocks();
     registerCascadeFunction(sdk as never, kv as never);
   });

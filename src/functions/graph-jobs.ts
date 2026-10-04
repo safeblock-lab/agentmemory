@@ -29,7 +29,22 @@ type CaptureReader = Pick<GraphJobStorage, "get">;
 const execution = new AsyncLocalStorage<GraphExecution>();
 const originals = new WeakMap<StateKV, StateKV>();
 const handlers = new WeakMap<StateKV, Map<GraphExtractionJob["kind"], GraphHandler>>();
+const graphJobQueues = new WeakMap<StateKV, Promise<void>>();
 const baseKV = (kv: StateKV): StateKV => originals.get(kv) ?? kv;
+
+async function withGraphJobQueue<T>(kv: StateKV, run: () => Promise<T>): Promise<T> {
+  const previous = graphJobQueues.get(kv);
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  graphJobQueues.set(kv, current);
+  if (previous) await previous;
+  try {
+    return await run();
+  } finally {
+    release();
+    if (graphJobQueues.get(kv) === current) graphJobQueues.delete(kv);
+  }
+}
 
 export function graphCapturedAt(): string { return execution.getStore()?.delta?.capturedAt ?? new Date().toISOString(); }
 export function graphJobId(): string | undefined { return execution.getStore()?.job.id; }
@@ -299,76 +314,78 @@ async function discoverJob(storage: GraphJobStorage, control: GraphControlState)
 export async function runGraphJob<T>(kv: StateKV, kind: GraphExtractionJob["kind"], input: unknown, run: (frozen: unknown) => Promise<T>, durableId?: string, preflight?: GraphJobPreflight<T>): Promise<T> {
   const base = baseKV(kv), nested = execution.getStore();
   if (nested?.storage.kv === base) return run(input);
-  let control = (await base.getVersioned<GraphControlState>(KV.graphControl, "current")).value;
-  if (!control) throw new StateTransactionError("STATE_TX_UNSUPPORTED");
-  const lease = await base.lease({ action: "acquire", owner_id: randomUUID(), generation: control.generation, ttl_ms: LEASE_TTL_MS }) as StateGraphLease;
-  const storage = new GraphJobStorage(base, { owner_id: lease.owner_id, generation: lease.generation, fence: lease.fence }, durableId ?? generateId("graphjob"));
-  const heartbeat = setInterval(() => {
-    const renewing = { ...storage.guard };
-    void base.lease({ action: "renew", ...renewing, ttl_ms: LEASE_TTL_MS }).catch((error) => { storage.failLease(error, renewing); logger.error("Graph job lease renewal failed", { jobId: storage.jobId, code: error instanceof StateTransactionError ? error.code : "STATE_TX_FAILED" }); });
-  }, LEASE_TTL_MS / 3);
-  heartbeat.unref();
-  try {
-    control = await leasedControl(storage);
-    const pending = await discoverJob(storage, control);
-    if (pending && pending.id !== storage.jobId) throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
-    const existing = await storage.get<DurableGraphJob>(KV.graphJobs, storage.jobId);
-    if (existing && existing.kind !== kind) throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
-    if (existing?.state === "invalidated") throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
-    if (existing && graphRecordDigest(JSON.stringify(input)) !== existing.captureDigest) throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
-    if (existing?.state === "completed") return graphResult<T>(existing.result);
-    if (existing && existing.generation !== control.generation) throw new StateTransactionError("STATE_TX_GENERATION_STALE");
-    if (control.recovery && control.recovery.job_id !== storage.jobId) throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
-    if (preflight && !existing) {
-      const result = await preflight(storage);
-      if (result !== null) return result;
-    }
-    await storage.restore();
-    const now = new Date().toISOString();
-    const job: DurableGraphJob = existing ?? { version: 1, id: storage.jobId, generation: control.generation, kind, state: "staging", createdAt: now, updatedAt: now, inputCount: 1, captureParts: 0, captureDigest: "", captureComplete: false };
-    if (!job.captureComplete) {
+  return withGraphJobQueue(base, async () => {
+    let control = (await base.getVersioned<GraphControlState>(KV.graphControl, "current")).value;
+    if (!control) throw new StateTransactionError("STATE_TX_UNSUPPORTED");
+    const lease = await base.lease({ action: "acquire", owner_id: randomUUID(), generation: control.generation, ttl_ms: LEASE_TTL_MS }) as StateGraphLease;
+    const storage = new GraphJobStorage(base, { owner_id: lease.owner_id, generation: lease.generation, fence: lease.fence }, durableId ?? generateId("graphjob"));
+    const heartbeat = setInterval(() => {
+      const renewing = { ...storage.guard };
+      void base.lease({ action: "renew", ...renewing, ttl_ms: LEASE_TTL_MS }).catch((error) => { storage.failLease(error, renewing); logger.error("Graph job lease renewal failed", { jobId: storage.jobId, code: error instanceof StateTransactionError ? error.code : "STATE_TX_FAILED" }); });
+    }, LEASE_TTL_MS / 3);
+    heartbeat.unref();
+    try {
+      control = await leasedControl(storage);
+      const pending = await discoverJob(storage, control);
+      if (pending && pending.id !== storage.jobId) throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
+      const existing = await storage.get<DurableGraphJob>(KV.graphJobs, storage.jobId);
+      if (existing && existing.kind !== kind) throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
+      if (existing?.state === "invalidated") throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
       if (existing && graphRecordDigest(JSON.stringify(input)) !== existing.captureDigest) throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
-      await capture(storage, job, input);
-    }
-    if (storage.checkpoint?.logical_delta_id === "capture" && storage.checkpoint.visibility !== "complete") {
-      await storage.completeStaging({ id: "capture", ordinal: 0, capturedAt: job.createdAt, attempt: "capture", phase: "preparing" });
-    }
-    const frozen = await readCapture(storage, job);
-    const context: GraphExecution = { storage, job, cursor: 1 };
-    const result = await execution.run(context, () => run(frozen));
-    const latestControl = (await base.getVersioned<GraphControlState>(KV.graphControl, "current")).value;
-    if (latestControl?.generation !== job.generation) return result;
-    storage.assertLease();
-    await execution.run(context, () => withGraphDelta(kv, async () => {
-      const active = execution.getStore();
-      if (!active?.delta) throw new StateTransactionError("STATE_TX_INVALID_REQUEST");
-      await storage.facade(active.delta).set(KV.graphJobs, job.id, { ...job, state: "completed", logicalDeltaCount: context.cursor, updatedAt: active.delta.capturedAt, result: graphJson({ value: result }) });
-      return result;
-    }));
-    return result;
-  } catch (error) {
-    const checkpoint = storage.checkpoint;
-    const descriptor = typeof input === "object" && input !== null ? input as { sessionId?: unknown; observations?: unknown } : null;
-    if (error instanceof StatePageError && error.code === "STATE_PAGE_CURSOR_STALE" && kind === "extraction" && typeof descriptor?.sessionId === "string" && descriptor.observations === undefined && checkpoint?.logical_delta_id === "delta:1" && checkpoint.delta_ordinal === 1 && checkpoint.visibility === "staging") {
-      const current = (await base.getVersioned<GraphControlState>(KV.graphControl, "current")).value;
-      const admitted = await storage.get<DurableGraphJob>(KV.graphJobs, storage.jobId);
-      if (!current?.recovery && admitted) {
-        // Cursor epochs change on native restart. An unfinished initial source
-        // capture has no graph effects and cannot adopt a changed source.
-        const delta: GraphDeltaPreparation = { id: checkpoint.logical_delta_id, ordinal: checkpoint.delta_ordinal, capturedAt: admitted.createdAt, attempt: "capture-abort", phase: "preparing" };
-        await storage.stage(KV.graphJobs, storage.jobId, { ...admitted, state: "invalidated", failureCode: error.code }, delta);
-        await storage.completeStaging(delta);
-        logger.warn("Initial graph source capture invalidated; retry with a fresh complete request", { jobId: storage.jobId, code: error.code });
+      if (existing?.state === "completed") return graphResult<T>(existing.result);
+      if (existing && existing.generation !== control.generation) throw new StateTransactionError("STATE_TX_GENERATION_STALE");
+      if (control.recovery && control.recovery.job_id !== storage.jobId) throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
+      if (preflight && !existing) {
+        const result = await preflight(storage);
+        if (result !== null) return result;
       }
+      await storage.restore();
+      const now = new Date().toISOString();
+      const job: DurableGraphJob = existing ?? { version: 1, id: storage.jobId, generation: control.generation, kind, state: "staging", createdAt: now, updatedAt: now, inputCount: 1, captureParts: 0, captureDigest: "", captureComplete: false };
+      if (!job.captureComplete) {
+        if (existing && graphRecordDigest(JSON.stringify(input)) !== existing.captureDigest) throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
+        await capture(storage, job, input);
+      }
+      if (storage.checkpoint?.logical_delta_id === "capture" && storage.checkpoint.visibility !== "complete") {
+        await storage.completeStaging({ id: "capture", ordinal: 0, capturedAt: job.createdAt, attempt: "capture", phase: "preparing" });
+      }
+      const frozen = await readCapture(storage, job);
+      const context: GraphExecution = { storage, job, cursor: 1 };
+      const result = await execution.run(context, () => run(frozen));
+      const latestControl = (await base.getVersioned<GraphControlState>(KV.graphControl, "current")).value;
+      if (latestControl?.generation !== job.generation) return result;
+      storage.assertLease();
+      await execution.run(context, () => withGraphDelta(kv, async () => {
+        const active = execution.getStore();
+        if (!active?.delta) throw new StateTransactionError("STATE_TX_INVALID_REQUEST");
+        await storage.facade(active.delta).set(KV.graphJobs, job.id, { ...job, state: "completed", logicalDeltaCount: context.cursor, updatedAt: active.delta.capturedAt, result: graphJson({ value: result }) });
+        return result;
+      }));
+      return result;
+    } catch (error) {
+      const checkpoint = storage.checkpoint;
+      const descriptor = typeof input === "object" && input !== null ? input as { sessionId?: unknown; observations?: unknown } : null;
+      if (error instanceof StatePageError && error.code === "STATE_PAGE_CURSOR_STALE" && kind === "extraction" && typeof descriptor?.sessionId === "string" && descriptor.observations === undefined && checkpoint?.logical_delta_id === "delta:1" && checkpoint.delta_ordinal === 1 && checkpoint.visibility === "staging") {
+        const current = (await base.getVersioned<GraphControlState>(KV.graphControl, "current")).value;
+        const admitted = await storage.get<DurableGraphJob>(KV.graphJobs, storage.jobId);
+        if (!current?.recovery && admitted) {
+          // Cursor epochs change on native restart. An unfinished initial source
+          // capture has no graph effects and cannot adopt a changed source.
+          const delta: GraphDeltaPreparation = { id: checkpoint.logical_delta_id, ordinal: checkpoint.delta_ordinal, capturedAt: admitted.createdAt, attempt: "capture-abort", phase: "preparing" };
+          await storage.stage(KV.graphJobs, storage.jobId, { ...admitted, state: "invalidated", failureCode: error.code }, delta);
+          await storage.completeStaging(delta);
+          logger.warn("Initial graph source capture invalidated; retry with a fresh complete request", { jobId: storage.jobId, code: error.code });
+        }
+      }
+      logger.error("Graph job paused for recovery", { jobId: storage.jobId, code: error instanceof StateTransactionError ? error.code : "STATE_TX_FAILED" });
+      throw error;
+    } finally {
+      clearInterval(heartbeat);
+      await base.lease({ action: "release", ...storage.guard }).catch((error) => {
+        if (!(error instanceof StateTransactionError) || !["STATE_TX_FENCED", "STATE_TX_GENERATION_STALE"].includes(error.code)) logger.warn("Graph job lease release failed", { jobId: storage.jobId });
+      });
     }
-    logger.error("Graph job paused for recovery", { jobId: storage.jobId, code: error instanceof StateTransactionError ? error.code : "STATE_TX_FAILED" });
-    throw error;
-  } finally {
-    clearInterval(heartbeat);
-    await base.lease({ action: "release", ...storage.guard }).catch((error) => {
-      if (!(error instanceof StateTransactionError) || !["STATE_TX_FENCED", "STATE_TX_GENERATION_STALE"].includes(error.code)) logger.warn("Graph job lease release failed", { jobId: storage.jobId });
-    });
-  }
+  });
 }
 
 export function registerGraphJobHandler(kv: StateKV, kind: GraphExtractionJob["kind"], handler: GraphHandler): void {

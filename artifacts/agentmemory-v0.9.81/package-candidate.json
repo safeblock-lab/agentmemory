@@ -1,0 +1,265 @@
+{
+  "schemaVersion": 1,
+  "packageVersion": "0.9.81",
+  "publishable": true,
+  "distributionDecision": "Public assets exclude NVIDIA CUDA DLLs; the combined CPU/CUDA ZIP is private and separately retained outside this directory. This interprets check 4's required combined ZIP as local-only while check 9 explicitly forbids publication; Main authorized this addendum.",
+  "cpuRuntime": {
+    "archive": "agentmemory-qwen-cpu-runtime-b11371-win-x64.zip",
+    "sha256": "b4c49b21511af2c514438403a4ec4b2db6af7a14e2a92bc5ec26a75d5913b876",
+    "zipEntryCount": 32,
+    "includesCudaDlls": false,
+    "files": [
+      {
+        "path": "cpu/ggml-base.dll",
+        "sizeBytes": 803328,
+        "sha256": "dd24a913db7211acb09add6274f5220da361ec69abba19f6ec763ecdea5eee9c"
+      },
+      {
+        "path": "cpu/ggml-cpu-alderlake.dll",
+        "sizeBytes": 1430016,
+        "sha256": "2e379d5d43a8ac1989abf808abfe9ee7e54ddba38d72c67183195971d64e32b1"
+      },
+      {
+        "path": "cpu/ggml-cpu-cannonlake.dll",
+        "sizeBytes": 1656320,
+        "sha256": "11a6b6b863158219c4f24fd066b9d9e076697d22c383645571e4830ec2e51169"
+      },
+      {
+        "path": "cpu/ggml-cpu-cascadelake.dll",
+        "sizeBytes": 1640960,
+        "sha256": "f95ba42bb3ebf835b05a38c44be5a35fb89e3ef994df3f3bd25941b31d88d033"
+      },
+      {
+        "path": "cpu/ggml-cpu-cooperlake.dll",
+        "sizeBytes": 1641984,
+        "sha256": "4dbd6dcdb655bd88c8509a1f4ca8d1c09219f62e25a0ad491972e0708ce7edf8"
+      },
+      {
+        "path": "cpu/ggml-cpu-haswell.dll",
+        "sizeBytes": 1434624,
+        "sha256": "bbfab2bd4f6fad1cfc5d89eccb8ca190ca6ab7f5c234b5a096bfea51eb4be1d3"
+      },
+      {
+        "path": "cpu/ggml-cpu-icelake.dll",
+        "sizeBytes": 1647616,
+        "sha256": "67f777d9d7f2c92e0c81acafb9ad8f19fe0eebf4539c1a4063b5ce02e490a037"
+      },
+      {
+        "path": "cpu/ggml-cpu-ivybridge.dll",
+        "sizeBytes": 1305088,
+        "sha256": "c9228df6a9ae56b8d1e7e19cd0a1beddb8c2234579948ac2082070d21962e982"
+      },
+      {
+        "path": "cpu/ggml-cpu-piledriver.dll",
+        "sizeBytes": 1308672,
+        "sha256": "c514c24ab5767748fc903aa7cb575e505fed8646d314e5ded42206c5822ae3c3"
+      },
+      {
+        "path": "cpu/ggml-cpu-sandybridge.dll",
+        "sizeBytes": 1285120,
+        "sha256": "1b2383f3b7a04d362652fb01504d032533a11cd81702b9f37545747eb3c0dabc"
+      },
+      {
+        "path": "cpu/ggml-cpu-sapphirerapids.dll",
+        "sizeBytes": 1918464,
+        "sha256": "88c0133527aa14c5aac188d2c198b4bb4cd0fbac52fc1937d854ab80aec60687"
+      },
+      {
+        "path": "cpu/ggml-cpu-skylakex.dll",
+        "sizeBytes": 1649664,
+        "sha256": "ff60e77ced73955cacbf8a1e5a7fb4f25af24827ad7fa22f637573f3f726e256"
+      },
+      {
+        "path": "cpu/ggml-cpu-sse42.dll",
+        "sizeBytes": 915456,
+        "sha256": "aab2399e6a9603b16d40890c5b2fe7f24a149a65cd28ba5f7cf5f2e74921b8ca"
+      },
+      {
+        "path": "cpu/ggml-cpu-x64.dll",
+        "sizeBytes": 908288,
+        "sha256": "95aec4af76daf0ed38c0ec581d92669b9e9c91a72f639a26dcc2d51c2e4caa6e"
+      },
+      {
+        "path": "cpu/ggml-cpu-zen4.dll",
+        "sizeBytes": 1648128,
+        "sha256": "26afcd3a6a74af0a17bc7757d135dcfb2a0e87326fd52194b668dc47644c3179"
+      },
+      {
+        "path": "cpu/ggml-rpc.dll",
+        "sizeBytes": 168960,
+        "sha256": "9373f4271776e181b8a07286f5d24125a9180f4409415f6cd675c8199845f400"
+      },
+      {
+        "path": "cpu/ggml.dll",
+        "sizeBytes": 79872,
+        "sha256": "3caff9e726ee24af097e789ef84635b1c99bd1d39c2030a520f9c32632f9faf6"
+      },
+      {
+        "path": "cpu/libomp.dll",
+        "sizeBytes": 768000,
+        "sha256": "a12116ba72d1d6820407cf30be23da04ce79d6bb8a71a5ee71759c5a1faa6f1c"
+      },
+      {
+        "path": "cpu/llama-batched-bench-impl.dll",
+        "sizeBytes": 61952,
+        "sha256": "24578925deaeb5b153ad9fdfb1bf858ae94b7b3bf29a9b27f8211286f98e1a3d"
+      },
+      {
+        "path": "cpu/llama-bench-impl.dll",
+        "sizeBytes": 404480,
+        "sha256": "3a1b09adb1abf98dbde9c1c6361cecac2c229d22f572e367d7922f88976dcb2a"
+      },
+      {
+        "path": "cpu/llama-cli-impl.dll",
+        "sizeBytes": 3302912,
+        "sha256": "0fe9b58301ff869a7cb58fa85b4a9ebe9df8fdecb9936e3e447f8a61fb3c2143"
+      },
+      {
+        "path": "cpu/llama-common.dll",
+        "sizeBytes": 7912960,
+        "sha256": "d58b1a5a592385c497268586d6201db8d7552b49a27975321eeb4707641ec4b4"
+      },
+      {
+        "path": "cpu/llama-completion-impl.dll",
+        "sizeBytes": 136192,
+        "sha256": "3dba849be50012254efb443c1ff8170cc6cf305611913e4b7c8ce6a944bb1a55"
+      },
+      {
+        "path": "cpu/llama-fit-params-impl.dll",
+        "sizeBytes": 43008,
+        "sha256": "1bec0f3b282115d7a80308fd9ea91ded80b270086008945fafccfc182529e915"
+      },
+      {
+        "path": "cpu/llama-perplexity-impl.dll",
+        "sizeBytes": 197632,
+        "sha256": "8244f0f3bfcb5ec627b0d0d3df0f15b108daeb4bd711f28807b0a50e9fa348d9"
+      },
+      {
+        "path": "cpu/llama-quantize-impl.dll",
+        "sizeBytes": 137216,
+        "sha256": "103fc9bbcd599953935d8c5fd500696ad1f0065b25b2ab590d83bd33170cc82c"
+      },
+      {
+        "path": "cpu/llama-server-impl.dll",
+        "sizeBytes": 9137152,
+        "sha256": "b57f82cc87ae216689465550d8ede72e9c96d540c71b1e43ea8e42c8e516b0f3"
+      },
+      {
+        "path": "cpu/llama.dll",
+        "sizeBytes": 3303424,
+        "sha256": "99af99d95b3b22dc7d9a827a82f6e5b8870437aafaa764bbd107a2b99a5e285f"
+      },
+      {
+        "path": "cpu/mtmd.dll",
+        "sizeBytes": 1795072,
+        "sha256": "87278d295c073198204932e1816b91c2d43ac32647b0b95ad74cd96f629876d9"
+      },
+      {
+        "path": "notices/llama.cpp-b11371-LICENSE.txt",
+        "sizeBytes": 1078,
+        "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d"
+      },
+      {
+        "path": "notices/LLVM-OpenMP-LICENSE.txt",
+        "sizeBytes": 19741,
+        "sha256": "fdad1758a9e1f9d5a81e18879b3406772115edc92c24bfa36b70c654f325e8e4"
+      },
+      {
+        "path": "runtime-manifest.json",
+        "sizeBytes": 5227,
+        "sha256": "12b408ecf7a375c0ea7564977948b06c3b77187faa91cc7276ab5ac2560d62a0"
+      }
+    ]
+  },
+  "cuda": {
+    "upstreamManifest": "qwen-gpu-upstream-assets.json",
+    "publishedBinaryCount": 0
+  },
+  "model": {
+    "file": "qwen3-reranker-0.6b-q8_0.gguf",
+    "bytes": 639153184,
+    "sha256": "22c9979ce4fbcdc5acdc310c6641c32797eff1aa980b8f7a2db8a8ea23429a48"
+  },
+  "package": {
+    "file": "agentmemory-agentmemory-0.9.81.tgz",
+    "bytes": 12789921,
+    "sha256": "a5a7f2d2b09b538c13506d1519b4fb33d5dc830e628df89118a8e2a271367f73",
+    "scorerSha256": "a96d30e6c64b58a5fc8ef807287d6b3315d50d00c8018e6e289ce14fa7db2e76",
+    "scorerTarEntry": "package/dist/qwen-reranker.py",
+    "extractedScorerExact": true
+  },
+  "native": {
+    "bytes": 28849152,
+    "sha256": "bd3126c4549b04c0fb31ce8fd9b298e21dcf20c60b40ee8b0b4105ad7bd5a91d"
+  },
+  "pythonBits": 64,
+  "packagedCpuSmoke": {
+    "device": "cpu",
+    "scores": [
+      0.990734000454682,
+      0.00020283373402409932
+    ],
+    "childPid": 57988,
+    "childExitCode": 0,
+    "childSignal": null,
+    "childClosed": true,
+    "cleanupResolved": true
+  },
+  "publicAssets": [
+    {
+      "file": "agentmemory-agentmemory-0.9.81.tgz",
+      "sizeBytes": 12789921,
+      "sha256": "a5a7f2d2b09b538c13506d1519b4fb33d5dc830e628df89118a8e2a271367f73"
+    },
+    {
+      "file": "qwen3-reranker-0.6b-q8_0.gguf",
+      "sizeBytes": 639153184,
+      "sha256": "22c9979ce4fbcdc5acdc310c6641c32797eff1aa980b8f7a2db8a8ea23429a48"
+    },
+    {
+      "file": "agentmemory-qwen-cpu-runtime-b11371-win-x64.zip",
+      "sizeBytes": 19512706,
+      "sha256": "b4c49b21511af2c514438403a4ec4b2db6af7a14e2a92bc5ec26a75d5913b876"
+    },
+    {
+      "file": "qwen-gpu-upstream-assets.json",
+      "sizeBytes": 1560,
+      "sha256": "df841642f3bbab55a1e96f023d49123b8e7cd58ec39c95d4fbbdf47e949e8430"
+    },
+    {
+      "file": "qwen-model-notice.md",
+      "sizeBytes": 961,
+      "sha256": "40d5743b7cfd5b59f8fb7e296187f294f366a7dbca9083273c7e28ad40f48644"
+    },
+    {
+      "file": "Apache-2.0.txt",
+      "sizeBytes": 11358,
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "file": "README.txt",
+      "sizeBytes": 424,
+      "sha256": "75e3834533b2d48ac5ff1f6eee36d732e5282b4479cd16048a86b51250955fd2"
+    }
+  ],
+  "excludedFromPublicWhitelist": [
+    "artifacts/private/qwen-runtime",
+    "private-manifest.json",
+    "private CUDA DLLs",
+    "private corpus",
+    "credentials",
+    "evaluation logs"
+  ],
+  "checks": {
+    "pinnedInputs": true,
+    "cpuNotices": true,
+    "noCudaInPublicZip": true,
+    "cpuManifestMatchesExtraction": true,
+    "tarballExtracts": true,
+    "scorerExact": true,
+    "modelSeparate": true,
+    "forcedCpuControls": true,
+    "privateManifestMatchesExtraction": true,
+    "childPidCleaned": true
+  }
+}

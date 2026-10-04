@@ -5,6 +5,7 @@ import { batchEffectKey, runBatchCallback, applyBatchEffect, withBatchMutationLo
 import { MetricsStore } from "../src/eval/metrics-store.js";
 import { FireworksBatchClient } from "../src/providers/fireworks-batch.js";
 import { registerGraphFunction } from "../src/functions/graph.js";
+import { graphKV, runGraphJob } from "../src/functions/graph-jobs.js";
 import { KV } from "../src/state/schema.js";
 import type { BatchEffectMetadata, FireworksBatchConfig, FireworksBatchJob, FireworksBatchWorkItem } from "../src/types.js";
 
@@ -170,7 +171,7 @@ describe("parser failure recovery", () => {
 
   it.each([false, 0, "", {}, { state: "started" }, { state: "completed" }])("blocks present or ambiguous receipts: %j", async (receipt) => {
     const s = await seed(1, true);
-    await s.h.kv.set(KV.batchCallbacks, `graph:${batchEffectKey(s.item.id)}`, receipt);
+    s.h.seed(KV.batchCallbacks, `graph:${batchEffectKey(s.item.id)}`, receipt);
     await s.create().process();
     expect(s.transport.downloadResults).not.toHaveBeenCalled();
     expect(s.transport.submitJob).not.toHaveBeenCalled();
@@ -181,8 +182,8 @@ describe("parser failure recovery", () => {
 
   it.each(["receipt", "active", "intent", "result", "identity", "different-error", "legacy", "already-recovered", "missing-remote", "foreign-remote", "foreign-output", "foreign-account", "foreign-name", "foreign-request"])("blocks unsafe recovery: %s", async (reason) => {
     const s = await seed();
-    if (reason === "receipt") await s.h.kv.set(KV.batchCallbacks, `graph:${batchEffectKey(s.item.id)}`, { state: "started" });
-    if (reason === "active") await s.h.kv.set(KV.batchCallbacks, "active:graph", { activeKey: batchEffectKey(s.item.id) });
+    if (reason === "receipt") s.h.seed(KV.batchCallbacks, `graph:${batchEffectKey(s.item.id)}`, { state: "started" });
+    if (reason === "active") s.h.seed(KV.batchCallbacks, "active:graph", { activeKey: batchEffectKey(s.item.id) });
     if (reason === "intent") s.item.completionIntent = { key: batchEffectKey(s.item.id), resultHash: "hash" };
     if (reason === "result") s.item.result = { customId: "row", content: "prior", receivedAt: s.item.createdAt };
     if (reason === "identity") s.item.batchJobId = "another-job";
@@ -286,18 +287,20 @@ describe("bounded callback recovery and job publication", () => {
     downloadResults: vi.fn(async () => JSON.stringify({ custom_id: "row", response: { body: { choices: [{ message: { content: "result" } }], usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 } } } })),
   });
   it.each([false, true])("bounds success:false across restart and preserves partial receipts, terminalFailure=%s", async (terminalFailure) => {
-    const h = effectHarness(), transport = makeTransport(), metrics = new MetricsStore(h.kv);
+    const h = effectHarness(), graph = graphKV(h.kv as never), transport = makeTransport(), metrics = new MetricsStore(h.kv);
     let calls = 0;
     const create = () => new FireworksBatchCoordinator(h.kv, config, transport, async (item) => {
       calls++;
-      expect((await h.kv.list<FireworksBatchJob>(KV.fireworksBatchJobs))[0].callbackAttempts).toBe(calls);
-      await runBatchCallback(h.kv, "graph", batchEffectKey(item.id), async (_, admit) => {
-        await admit();
-        await applyBatchEffect<BatchEffectMetadata & { count: number }>(h.kv, "effect", "counter", batchEffectKey(item.id), (current) => ({ count: (current?.count ?? 0) + 1 }));
-        return { success: false };
-      });
-      if (terminalFailure && calls === config.maxAttempts) h.crash(KV.fireworksBatchWorkItems);
-      return { success: false as const, error: "retryable receiver failure" };
+      return runGraphJob(graph as never, "batch_callback", { workItemId: item.id, attempt: calls }, async () => {
+        expect((await h.kv.list<FireworksBatchJob>(KV.fireworksBatchJobs))[0].callbackAttempts).toBe(calls);
+        await runBatchCallback(graph as never, "graph", batchEffectKey(item.id), async (_, admit) => {
+          await admit();
+          await applyBatchEffect<BatchEffectMetadata & { count: number }>(graph as never, "effect", "counter", batchEffectKey(item.id), (current) => ({ count: (current?.count ?? 0) + 1 }));
+          return { success: false };
+        });
+        if (terminalFailure && calls === config.maxAttempts) h.crash(KV.fireworksBatchWorkItems);
+        return { success: false as const, error: "retryable receiver failure" };
+      }, `job:${item.id}:callback:${calls}`);
     }, (item, usage) => metrics.recordLlmUsage("reflection", "fireworks-batch", item.model, usage, batchEffectKey(item.id)));
     await create().enqueue({ correlationId: "row", task: "reflection", systemPrompt: "system", userPrompt: "user" });
     for (let i = 0; i < 5; i++) {

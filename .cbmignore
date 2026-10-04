@@ -1,0 +1,12 @@
+# Generated graph/state data and recovery copies.
+/data/
+/data-*/
+/agentmemory-debug/
+/.graph-recovery*/
+.codebase-memory/
+graph.db
+graph.db.*
+
+# Temporary native builds include downloaded dependencies and source copies.
+/.native-pagination-build/
+/.iii-engine-build/

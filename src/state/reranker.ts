@@ -1,74 +1,109 @@
 import type { HybridSearchResult } from "../types.js";
+import { loadReranker, isRerankerLoaded } from "./reranker-runtime.js";
 
-let pipeline: any = null;
-let pipelineLoading: Promise<any> | null = null;
-let pipelineUnavailable = false;
+const MAX_CANDIDATES = 50;
+const MAX_PENDING_BATCHES = 8;
+const MAX_QUERY_CHARACTERS = 256;
+const MAX_DOCUMENT_CHARACTERS = 8192;
+let busy = false;
+const waiters: Array<() => void> = [];
 
-async function loadPipeline(): Promise<any> {
-  if (pipelineUnavailable) return null;
-  if (pipeline) return pipeline;
-  if (pipelineLoading) return pipelineLoading;
+function rerankingCancelled(): Error {
+  const error = new Error("Local reranking cancelled.");
+  error.name = "AbortError";
+  return error;
+}
 
-  pipelineLoading = (async () => {
-    try {
-      const { pipeline: createPipeline } = await import(
-        "@huggingface/transformers"
-      );
-      pipeline = await createPipeline(
-        "text-classification",
-        "Xenova/ms-marco-MiniLM-L-6-v2",
-        { dtype: "q8" },
-      );
-      return pipeline;
-    } catch {
-      pipeline = null;
-      pipelineUnavailable = true;
-      return null;
-    } finally {
-      pipelineLoading = null;
-    }
-  })();
-  return pipelineLoading;
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  throw rerankingCancelled();
+}
+
+async function acquire(signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  if (!busy) {
+    busy = true;
+    return;
+  }
+  if (waiters.length >= MAX_PENDING_BATCHES) throw new Error("Local reranker queue is full.");
+  return new Promise<void>((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout>;
+    const cleanup = () => { clearTimeout(timer); signal?.removeEventListener("abort", cancel); };
+    const remove = () => {
+      const index = waiters.indexOf(grant);
+      if (index >= 0) waiters.splice(index, 1);
+    };
+    const grant = () => { cleanup(); resolve(); };
+    const cancel = () => {
+      remove();
+      cleanup();
+      reject(rerankingCancelled());
+    };
+    timer = setTimeout(() => {
+      remove();
+      cleanup();
+      reject(new Error("Local reranker queue timed out."));
+    }, 60_000);
+    waiters.push(grant);
+    signal?.addEventListener("abort", cancel, { once: true });
+    if (signal?.aborted) cancel();
+  });
+}
+
+function release(): void {
+  const next = waiters.shift();
+  if (next) next();
+  else busy = false;
 }
 
 export async function rerank(
   query: string,
   results: HybridSearchResult[],
   topK = 20,
+  signal?: AbortSignal,
 ): Promise<HybridSearchResult[]> {
-  if (results.length <= 1) return results;
+  throwIfAborted(signal);
+  if (results.length <= 1 || !query.trim() || !Number.isFinite(topK) || topK < 1) return results;
 
-  const reranker = await loadPipeline();
-  if (!reranker) return results;
-
-  const candidates = results.slice(0, Math.min(results.length, topK));
-
-  const pairs = candidates.map((r) => ({
-    text: `${query} [SEP] ${r.observation.title || ""} ${r.observation.narrative || ""}`.slice(0, 512),
-    result: r,
-  }));
-
-  const scores: Array<{ result: HybridSearchResult; rerankScore: number }> = [];
-
-  for (const pair of pairs) {
-    try {
-      const output = await reranker(pair.text);
-      const score = Array.isArray(output) ? output[0]?.score ?? 0 : 0;
-      scores.push({ result: pair.result, rerankScore: score });
-    } catch {
-      scores.push({ result: pair.result, rerankScore: pair.result.combinedScore });
+  await acquire(signal);
+  try {
+    const runtime = await loadReranker();
+    throwIfAborted(signal);
+    if (!runtime) return results;
+    const count = Math.min(results.length, Math.floor(topK), MAX_CANDIDATES);
+    const scores: Array<{ result: HybridSearchResult; score: number; index: number }> = [];
+    const boundedQuery = runtime.strictBounds ? query : query.slice(0, MAX_QUERY_CHARACTERS);
+    const documents = results.slice(0, count).map((result) => {
+      const title = result.observation.title || "";
+      const narrative = result.observation.narrative || "";
+      return runtime.strictBounds ? `${title}\n${narrative}`
+        : `${title.slice(0, MAX_DOCUMENT_CHARACTERS)}\n${narrative.slice(0, MAX_DOCUMENT_CHARACTERS)}`.slice(0, MAX_DOCUMENT_CHARACTERS);
+    });
+    const batchScores = runtime.scoreBatch ? await runtime.scoreBatch(boundedQuery, documents, signal) : undefined;
+    throwIfAborted(signal);
+    if (batchScores && (batchScores.length !== count || batchScores.some((score) => !Number.isFinite(score)))) {
+      throw new Error("Local reranker returned an invalid score batch.");
     }
+    for (let index = 0; index < count; index++) {
+      const result = results[index];
+      throwIfAborted(signal);
+      const score = batchScores ? batchScores[index] : await runtime.score(boundedQuery, documents[index]);
+      throwIfAborted(signal);
+      if (!Number.isFinite(score)) throw new Error("Local reranker returned a non-finite score.");
+      scores.push({ result, score, index });
+    }
+    scores.sort((a, b) => b.score - a.score || a.index - b.index);
+    return scores.map(({ result, score }, index) => ({
+      ...result,
+      combinedScore: score,
+      rerankPosition: index + 1,
+    }));
+  } finally {
+    release();
   }
-
-  scores.sort((a, b) => b.rerankScore - a.rerankScore);
-
-  return scores.map((s, i) => ({
-    ...s.result,
-    combinedScore: s.rerankScore,
-    rerankPosition: i + 1,
-  }));
 }
 
 export function isRerankerAvailable(): boolean {
-  return pipeline !== null;
+  return isRerankerLoaded();
 }

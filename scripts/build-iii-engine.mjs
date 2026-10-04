@@ -140,13 +140,15 @@ function readNativeManifest(patchPath) {
     fail("Native patch manifest must bind the verified binary hash, size, and target.");
   }
   if (!hasRequiredCapabilities(value.capabilities)) {
-    fail("Native patch manifest must declare all six required state capabilities.");
+    fail(`Native patch manifest must declare all ${REQUIRED_CAPABILITIES.length} required state capabilities.`);
   }
   return {
     patchSha256: patchHash.toLowerCase(),
     artifactSha256: value.artifactSha256.toLowerCase(),
     artifactBytes: value.artifactBytes,
     buildTarget: value.buildTarget,
+    deploymentReady: value.deploymentReady !== false,
+    artifactProfile: value.buildProfile?.name ?? null,
   };
 }
 
@@ -182,7 +184,7 @@ export function validateStagedEngineArtifacts(artifactRoot, expectedPatchSha256 
     !manifest.artifacts || typeof manifest.artifacts !== "object" ||
     Object.keys(manifest.artifacts).length === 0
   ) {
-    fail("Staged engine manifest does not describe the pinned six-capability state build.");
+    fail("Staged engine manifest does not describe the pinned indexed state build.");
   }
   if (
     expectedPatchSha256 !== null &&
@@ -311,8 +313,13 @@ function buildBinary(target, sourceDir, buildDir) {
     CARGO_NET_RETRY: "2",
     CARGO_HTTP_TIMEOUT: "30",
     CARGO_INCREMENTAL: "0",
+    CARGO_PROFILE_RELEASE_OPT_LEVEL: "s",
+    CARGO_PROFILE_RELEASE_STRIP: "true",
+    CARGO_PROFILE_RELEASE_DEBUG: "0",
+    CARGO_PROFILE_RELEASE_LTO: "false",
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16",
   };
-  run("cargo", ["build", "--locked", "--release", "--package", "iii", "--bin", "iii", "--target", target.triple], {
+  run("cargo", ["build", "--locked", "--release", "--no-default-features", "--jobs", "1", "--package", "iii", "--bin", "iii", "--target", target.triple], {
     cwd: sourceDir,
     env,
     inherit: true,
@@ -398,6 +405,9 @@ export function buildIiiEngine({ binary = null, platform = process.platform, arc
   const patchPath = join(ROOT, PATCH_RELATIVE_PATH);
   if (!existsSync(patchPath)) fail(`Missing engine pagination patch: ${PATCH_RELATIVE_PATH}`);
   const nativeManifest = readNativeManifest(patchPath);
+  if (binary && (!nativeManifest.deploymentReady || nativeManifest.artifactProfile === "debug")) {
+    fail("The pinned native executable is a measurement-only debug build and cannot be staged for distribution.");
+  }
   const binaryPath = binary
     ? resolve(ROOT, binary)
     : buildBinary(target, prepareSource(buildDir, patchPath), buildDir);

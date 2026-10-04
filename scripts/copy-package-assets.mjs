@@ -21,6 +21,7 @@ const ASSETS = [
   "src/viewer/index.html",
   "src/viewer/favicon.svg",
 ];
+const DIRECT_ASSETS = [["scripts/qwen-reranker.py", "dist/qwen-reranker.py"]];
 
 function isWithinPath(root, candidate) {
   const pathFromRoot = relative(root, candidate);
@@ -79,6 +80,20 @@ export function copyPackageAssets(rootDir, { requireEngineArtifact = false } = {
     const target = assertPackagePath(
       rootDir,
       join(rootDir, "dist", targetRelativePath),
+      "Package asset destination",
+    );
+    mkdirSync(dirname(target), { recursive: true });
+    copyFileSync(source, target);
+  }
+  for (const [sourceRelativePath, targetRelativePath] of DIRECT_ASSETS) {
+    const source = assertPackagePath(
+      rootDir,
+      join(rootDir, sourceRelativePath),
+      "Package asset source",
+    );
+    const target = assertPackagePath(
+      rootDir,
+      join(rootDir, targetRelativePath),
       "Package asset destination",
     );
     mkdirSync(dirname(target), { recursive: true });

@@ -1,5 +1,7 @@
 node_modules/
 dist/
+.iii-engine-build/
+.native-pagination-build/
 *.tsbuildinfo
 
 .env

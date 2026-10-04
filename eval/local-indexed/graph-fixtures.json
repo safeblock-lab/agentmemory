@@ -1,0 +1,192 @@
+[
+  {
+    "split": "calibration",
+    "projectName": "Project Quartz",
+    "foreignName": "Project Willow",
+    "asOfBefore": "2026-01-15T00:00:00.000Z",
+    "asOfAfter": "2026-10-01T00:00:00.000Z",
+    "nodes": [
+      {
+        "id": "fixture-cal-project",
+        "type": "project",
+        "name": "Project Quartz",
+        "properties": {},
+        "sourceObservationIds": [
+          "en-graph-cal-01",
+          "en-graph-cal-02"
+        ],
+        "createdAt": "2025-11-01T00:00:00.000Z"
+      },
+      {
+        "id": "fixture-cal-store",
+        "type": "concept",
+        "name": "Search storage",
+        "properties": {},
+        "sourceObservationIds": [
+          "en-graph-cal-02"
+        ],
+        "createdAt": "2025-11-01T00:00:00.000Z"
+      },
+      {
+        "id": "fixture-cal-foreign-project",
+        "type": "project",
+        "name": "Project Willow",
+        "properties": {},
+        "sourceObservationIds": [
+          "en-storage-cal-01"
+        ],
+        "createdAt": "2025-11-01T00:00:00.000Z"
+      },
+      {
+        "id": "fixture-cal-foreign-store",
+        "type": "concept",
+        "name": "Foreign storage",
+        "properties": {},
+        "sourceObservationIds": [
+          "en-storage-cal-02"
+        ],
+        "createdAt": "2025-11-01T00:00:00.000Z"
+      }
+    ],
+    "edges": [
+      {
+        "id": "fixture-cal-edge-old",
+        "type": "uses",
+        "sourceNodeId": "fixture-cal-project",
+        "targetNodeId": "fixture-cal-store",
+        "weight": 1,
+        "sourceObservationIds": [
+          "en-graph-cal-01"
+        ],
+        "createdAt": "2025-11-01T00:00:00.000Z",
+        "tcommit": "2025-11-01T00:00:00.000Z",
+        "tvalid": "2025-11-01T00:00:00.000Z",
+        "tvalidEnd": "2026-02-01T00:00:00.000Z",
+        "isLatest": false
+      },
+      {
+        "id": "fixture-cal-edge-current",
+        "type": "uses",
+        "sourceNodeId": "fixture-cal-project",
+        "targetNodeId": "fixture-cal-store",
+        "weight": 1,
+        "sourceObservationIds": [
+          "en-graph-cal-02"
+        ],
+        "createdAt": "2026-02-01T00:00:00.000Z",
+        "tcommit": "2026-02-01T00:00:00.000Z",
+        "tvalid": "2026-02-01T00:00:00.000Z",
+        "isLatest": true
+      },
+      {
+        "id": "fixture-cal-edge-foreign",
+        "type": "uses",
+        "sourceNodeId": "fixture-cal-foreign-project",
+        "targetNodeId": "fixture-cal-foreign-store",
+        "weight": 1,
+        "sourceObservationIds": [
+          "en-storage-cal-01"
+        ],
+        "createdAt": "2025-11-01T00:00:00.000Z",
+        "tcommit": "2025-11-01T00:00:00.000Z",
+        "tvalid": "2025-11-01T00:00:00.000Z",
+        "isLatest": true
+      }
+    ]
+  },
+  {
+    "split": "heldout",
+    "projectName": "Project Cobalt",
+    "foreignName": "Project Juniper",
+    "asOfBefore": "2026-01-15T00:00:00.000Z",
+    "asOfAfter": "2026-10-01T00:00:00.000Z",
+    "nodes": [
+      {
+        "id": "fixture-hold-project",
+        "type": "project",
+        "name": "Project Cobalt",
+        "properties": {},
+        "sourceObservationIds": [
+          "en-graph-hold-01",
+          "en-graph-hold-02"
+        ],
+        "createdAt": "2025-11-01T00:00:00.000Z"
+      },
+      {
+        "id": "fixture-hold-store",
+        "type": "concept",
+        "name": "Search storage",
+        "properties": {},
+        "sourceObservationIds": [
+          "en-graph-hold-02"
+        ],
+        "createdAt": "2025-11-01T00:00:00.000Z"
+      },
+      {
+        "id": "fixture-hold-foreign-project",
+        "type": "project",
+        "name": "Project Juniper",
+        "properties": {},
+        "sourceObservationIds": [
+          "en-storage-hold-01"
+        ],
+        "createdAt": "2025-11-01T00:00:00.000Z"
+      },
+      {
+        "id": "fixture-hold-foreign-store",
+        "type": "concept",
+        "name": "Foreign storage",
+        "properties": {},
+        "sourceObservationIds": [
+          "en-storage-hold-02"
+        ],
+        "createdAt": "2025-11-01T00:00:00.000Z"
+      }
+    ],
+    "edges": [
+      {
+        "id": "fixture-hold-edge-old",
+        "type": "uses",
+        "sourceNodeId": "fixture-hold-project",
+        "targetNodeId": "fixture-hold-store",
+        "weight": 1,
+        "sourceObservationIds": [
+          "en-graph-hold-01"
+        ],
+        "createdAt": "2025-11-01T00:00:00.000Z",
+        "tcommit": "2025-11-01T00:00:00.000Z",
+        "tvalid": "2025-11-01T00:00:00.000Z",
+        "tvalidEnd": "2026-02-01T00:00:00.000Z",
+        "isLatest": false
+      },
+      {
+        "id": "fixture-hold-edge-current",
+        "type": "uses",
+        "sourceNodeId": "fixture-hold-project",
+        "targetNodeId": "fixture-hold-store",
+        "weight": 1,
+        "sourceObservationIds": [
+          "en-graph-hold-02"
+        ],
+        "createdAt": "2026-02-01T00:00:00.000Z",
+        "tcommit": "2026-02-01T00:00:00.000Z",
+        "tvalid": "2026-02-01T00:00:00.000Z",
+        "isLatest": true
+      },
+      {
+        "id": "fixture-hold-edge-foreign",
+        "type": "uses",
+        "sourceNodeId": "fixture-hold-foreign-project",
+        "targetNodeId": "fixture-hold-foreign-store",
+        "weight": 1,
+        "sourceObservationIds": [
+          "en-storage-hold-01"
+        ],
+        "createdAt": "2025-11-01T00:00:00.000Z",
+        "tcommit": "2025-11-01T00:00:00.000Z",
+        "tvalid": "2025-11-01T00:00:00.000Z",
+        "isLatest": true
+      }
+    ]
+  }
+]

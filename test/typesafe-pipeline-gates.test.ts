@@ -6,6 +6,7 @@ import { registerReflectFunctions } from "../src/functions/reflect.js";
 import { registerSkillExtractFunctions } from "../src/functions/skill-extract.js";
 import { KV } from "../src/state/schema.js";
 import type { CompressedObservation, SessionSummary } from "../src/types.js";
+import { installGraphStateWire } from "./helpers/graph-state-harness.js";
 import { mockKV } from "./helpers/mocks.js";
 
 type FunctionHandler = (data: unknown) => Promise<unknown>;
@@ -23,7 +24,8 @@ function harness() {
       return handler ? handler(payload) : null;
     },
   };
-  return { sdk, kv: mockKV() };
+  const kv = mockKV();
+  return installGraphStateWire(sdk as never, kv as never);
 }
 
 function choice(choice: string, confidence = 0.99) {

@@ -29,6 +29,8 @@ import { StateKV } from "./state/kv.js";
 import { batchEffectKey } from "./state/batch-effects.js";
 import { KV } from "./state/schema.js";
 import { VectorIndex } from "./state/vector-index.js";
+import { getIndexedVector } from './state/indexed-vector.js';
+import { IndexedLocalEmbedding } from './state/indexed-embedding.js';
 import { HybridSearch } from "./state/hybrid-search.js";
 import { IndexPersistence } from "./state/index-persistence.js";
 import { SHUTDOWN_FLUSH_TIMEOUT_MS, SHUTDOWN_HARD_EXIT_MS, settleWithin } from "./shutdown.js";
@@ -45,6 +47,7 @@ import {
   rebuildKeywordIndex,
   getSearchIndex,
   setVectorIndex,
+  setIndexedVector,
   setEmbeddingProvider,
   setIndexPersistence,
   setHybridRanker,
@@ -445,7 +448,8 @@ async function main() {
   });
   const taskRouter = llmRouter;
 
-  const embeddingProvider = createEmbeddingProvider();
+  const indexedRetrieval = process.env.AGENTMEMORY_RETRIEVAL_MODE !== 'legacy';
+  const embeddingProvider = indexedRetrieval ? new IndexedLocalEmbedding() : createEmbeddingProvider();
   const imageEmbeddingProvider = createImageEmbeddingProvider();
 
   bootLog(`Starting worker v${VERSION}...`);
@@ -524,7 +528,9 @@ async function main() {
   const secret = getEnvVar("AGENTMEMORY_SECRET");
   const dedupMap = new DedupMap();
 
-  const vectorIndex = embeddingProvider ? new VectorIndex() : null;
+  const vectorIndex = !indexedRetrieval && embeddingProvider ? new VectorIndex() : null;
+  const indexedVector = indexedRetrieval && embeddingProvider ? getIndexedVector(kv, embeddingProvider) : null;
+  setIndexedVector(indexedVector);
 
   setVectorIndex(vectorIndex);
   setEmbeddingProvider(embeddingProvider);
@@ -730,7 +736,7 @@ async function main() {
   const indexPersistence = new IndexPersistence(kv, vectorIndex);
   setIndexPersistence(indexPersistence);
 
-  const loaded = await indexPersistence.load().catch((err) => {
+  const loaded = indexedRetrieval ? null : await indexPersistence.load().catch((err) => {
     console.warn(`[agentmemory] Failed to load persisted vector index:`, err);
     return null;
   });
@@ -800,6 +806,10 @@ async function main() {
         ? null
         : loaded.savedAt;
   const keywordStart = Date.now();
+  if (indexedRetrieval) {
+    await indexedVector!.ready();
+    bootLog('Indexed local semantic + lexical + graph retrieval ready; no resident corpus restored.');
+  } else {
   try {
     const keyword = await rebuildKeywordIndex(kv, vectorBackfillSince);
     bootLog(
@@ -825,6 +835,7 @@ async function main() {
     }
   } catch (err) {
     console.warn(`[agentmemory] Failed to rebuild the BM25 index:`, err);
+  }
   }
 
   // Ready / Endpoints lines are emitted via `bootLog` so they're

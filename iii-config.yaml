@@ -10,10 +10,9 @@ workers:
   - name: iii-state
     config:
       adapter:
-        name: kv
+        name: sqlite
         config:
-          store_method: file_based
-          file_path: ./data/state_store.db
+          file_path: ./data/state_store.sqlite3
   - name: iii-queue
     config:
       adapter:
@@ -43,6 +42,7 @@ workers:
       enabled: true
       service_name: agentmemory
       exporter: memory
+      memory_max_spans: 1000
       # 0.1 instead of 1.0: at full sampling under sustained load the
       # log subscriber falls behind, the worker emits a "Log trigger
       # subscriber lagged" WARN, and that WARN re-enters the same

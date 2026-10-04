@@ -53,7 +53,7 @@ describe("isolated graph native-wire harness", () => {
     const harness = effectHarness({ nativeGraphWire: true });
     const guard = await harness.kv.lease({ action: "acquire", owner_id: "writer", generation: "1", ttl_ms: 10_000 }) as StateGraphGuard;
     const applying = prepareStateCommitBatch(batch());
-    harness.failNextCommitBeforeApply();
+    harness.crashGraphCommit(KV.graphNodes, false);
     await expect(harness.kv.commitBatch(guard, applying)).rejects.toMatchObject({ code: "STATE_TX_FAILED" });
     await expect(harness.kv.get(KV.graphNodes, "node-a")).resolves.toBeNull();
 
@@ -68,7 +68,7 @@ describe("isolated graph native-wire harness", () => {
       operations: [{ type: "set", scope: KV.graphSnapshot, key: "current", expected_version: "0", value: { complete: true } }],
     });
     const complete = prepareStateCommitBatch(completeInput);
-    harness.loseNextCommitAcknowledgment();
+    harness.crashGraphCommit(KV.graphSnapshot, true);
     await expect(harness.kv.commitBatch(guard, complete)).rejects.toMatchObject({ code: "STATE_TX_FAILED" });
     const committed = await harness.kv.getVersioned(KV.graphSnapshot, "current");
     expect(committed).toEqual({ exists: true, value: { complete: true }, version: "1" });

@@ -50,10 +50,16 @@ describe("native campaign UUID isolation", () => {
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const RESOURCE_ROOT = resolve(HERE, "../.native-pagination-build/graph-resource");
+const ACCEPTED_NATIVE = JSON.parse(
+  readFileSync(resolve(HERE, "../.native-pagination-build/local-indexed-verification/native-accepted.json"), "utf8"),
+) as { accepted: boolean; executable: string; sha256: string };
+const ACCEPTED_NATIVE_MANIFEST = JSON.parse(
+  readFileSync(resolve(HERE, "../.native-pagination-build/release-native-current/manifest-verification.json"), "utf8"),
+) as { manifestPath: string; manifestSha256: string; artifactSha256: string };
 const pins = JSON.parse(readFileSync(resolve(RESOURCE_ROOT, "pins.json"), "utf8")) as {
   oracle: { gitRef: string; files: Array<{ path: string; sha256: string }> };
   candidate: { acceptedForRuntime: boolean; sourcePinsMustBeRefreshedAfterMainCorrection: boolean };
-  native: { proofPath: string; proofSha256: string; artifactPath: string; binarySha256: string; patchManifestPath: string; patchManifestSha256: string; resourceConfigTemplatePath: string; resourceConfigTemplateSha256: string };
+  native: { proofPath: string; proofSha256: string; resourceConfigTemplatePath: string; resourceConfigTemplateSha256: string };
 };
 const scenario = JSON.parse(readFileSync(resolve(RESOURCE_ROOT, "scenarios.json"), "utf8")) as {
   identity: { captureIds: string[]; batchEffectKey: string };
@@ -148,9 +154,13 @@ describe("frozen pre-transaction graph oracle", () => {
       expect(createHash("sha256").update(bytes).digest("hex"), file.path).toBe(file.sha256);
     }
     expect(pins.candidate).toMatchObject({ acceptedForRuntime: false, sourcePinsMustBeRefreshedAfterMainCorrection: true });
+    expect(ACCEPTED_NATIVE.accepted).toBe(true);
+    expect(ACCEPTED_NATIVE.sha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(await sha256File(ACCEPTED_NATIVE.executable)).toBe(ACCEPTED_NATIVE.sha256);
+    expect(ACCEPTED_NATIVE_MANIFEST.manifestPath).toBe("patches/iii-engine/manifest.json");
+    expect(ACCEPTED_NATIVE_MANIFEST.artifactSha256).toBe(ACCEPTED_NATIVE.sha256);
+    expect(await sha256File(resolve(HERE, "..", ACCEPTED_NATIVE_MANIFEST.manifestPath))).toBe(ACCEPTED_NATIVE_MANIFEST.manifestSha256);
     expect(await sha256File(resolve(RESOURCE_ROOT, "..", "..", pins.native.proofPath))).toBe(pins.native.proofSha256);
-    expect(await sha256File(resolve(RESOURCE_ROOT, "..", "..", pins.native.artifactPath))).toBe(pins.native.binarySha256);
-    expect(await sha256File(resolve(RESOURCE_ROOT, "..", "..", pins.native.patchManifestPath))).toBe(pins.native.patchManifestSha256);
     expect(await sha256File(resolve(RESOURCE_ROOT, pins.native.resourceConfigTemplatePath))).toBe(pins.native.resourceConfigTemplateSha256);
   });
 

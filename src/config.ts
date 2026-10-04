@@ -938,6 +938,26 @@ export function loadEmbeddingConfig(): EmbeddingConfig {
   };
 }
 
+export function loadLocalRerankerConfig(): {
+  provider: "minilm" | "qwen";
+  assetRoot?: string;
+  python?: string;
+  script?: string;
+  device: "auto" | "cpu";
+} {
+  const env = getMergedEnv();
+  const provider = env["RERANK_PROVIDER"] || "minilm";
+  const device = env["AGENTMEMORY_QWEN_DEVICE"] || "auto";
+  if (provider !== "minilm" && provider !== "qwen") throw new Error("RERANK_PROVIDER must be minilm or qwen.");
+  if (device !== "auto" && device !== "cpu") throw new Error("AGENTMEMORY_QWEN_DEVICE must be auto or cpu.");
+  return {
+    provider, device,
+    assetRoot: env["AGENTMEMORY_QWEN_ASSET_ROOT"] || undefined,
+    python: env["AGENTMEMORY_QWEN_PYTHON"] || undefined,
+    script: env["AGENTMEMORY_QWEN_SCRIPT"] || undefined,
+  };
+}
+
 export function detectEmbeddingProvider(
   env?: Record<string, string>,
 ): string | null {

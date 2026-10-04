@@ -165,7 +165,7 @@ describe("bundled iii-engine artifacts", () => {
       JSON.stringify(capabilityManifest),
     );
     expect(() => validateStagedEngineArtifacts(badCapability.root)).toThrow(
-      "pinned six-capability state build",
+      "Staged engine manifest does not describe the pinned indexed state build.",
     );
 
     const escaped = createBundle();

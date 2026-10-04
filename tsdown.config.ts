@@ -61,6 +61,13 @@ export default defineConfig([
     sourcemap: false,
   },
   {
+    entry: ["src/state/qwen-reranker.ts"],
+    outDir: "dist",
+    ...shared,
+    clean: false,
+    sourcemap: false,
+  },
+  {
     entry: ["src/mcp/standalone.ts"],
     outDir: "dist",
     ...shared,

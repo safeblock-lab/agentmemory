@@ -1,85 +1,130 @@
-name: Build release
+name: Verify frozen release assets
 
 on:
   push:
     tags:
       - "v*"
 
+# Restrict version-tag creation to trusted maintainers in repository settings.
 permissions:
   contents: read
 
+concurrency:
+  group: frozen-release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  release:
-    # Releases are created only from a pushed tag. Protect tag creation in
-    # GitHub repository settings so untrusted pull-request code cannot publish.
-    runs-on: windows-latest
-    defaults:
-      run:
-        shell: bash
+  publish:
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+          fetch-depth: 1
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
 
-      - name: Validate tag and package version
-        shell: bash
-        run: |
-          node <<'NODE'
-          const fs = require("node:fs");
-          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
-          const tag = process.env.GITHUB_REF_NAME;
-          const version = pkg.version;
-          const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
-          if (typeof version !== "string" || !semver.test(version) || tag !== `v${version}`) {
-            throw new Error(`Release tag must exactly match package.json version (expected v${version}, got ${tag}).`);
-          }
-          fs.appendFileSync(process.env.GITHUB_ENV, `VERSION=${version}\n`);
-          NODE
-
-      - run: npm ci --legacy-peer-deps --no-audit --no-fund
-      - run: npm run build:engine
-      - run: npm run build
-
-      - name: Create and verify release archive
-        shell: bash
-        run: |
-          mkdir -p artifacts
-          node <<'NODE'
-          const { execSync } = require("node:child_process");
-          const fs = require("node:fs");
-          const path = require("node:path");
-          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
-          const packed = JSON.parse(execSync("npm pack --json", { encoding: "utf8" }));
-          if (!Array.isArray(packed) || packed.length !== 1 || typeof packed[0].filename !== "string") {
-            throw new Error("npm pack did not return exactly one archive.");
-          }
-          const source = packed[0].filename;
-          const target = path.join("artifacts", `agentmemory-v${pkg.version}.tgz`);
-          fs.renameSync(source, target);
-          NODE
-          TARBALL="artifacts/agentmemory-v${VERSION}.tgz"
-          test -f "$TARBALL"
-          tar -tzf "$TARBALL" > artifacts/archive-contents.txt
-          grep -Fxq "package/dist/index.mjs" artifacts/archive-contents.txt
-          grep -Fxq "package/dist/cli.mjs" artifacts/archive-contents.txt
-          if grep -Eq '(^|/)\.env($|/)' artifacts/archive-contents.txt ; then
-            echo "Release archive must not contain an env file." >&2
-            exit 1
-          fi
-          sha256sum "$TARBALL" | sed 's#  artifacts/#  #' > artifacts/SHA256SUMS.txt
-          cp scripts/Install-AgentMemory.ps1 artifacts/Install-AgentMemory.ps1
-
-      - name: Create GitHub Release
+      - name: Verify frozen draft assets
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            "artifacts/agentmemory-v${VERSION}.tgz" \
-            artifacts/SHA256SUMS.txt \
-            artifacts/Install-AgentMemory.ps1 \
-            --generate-notes
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          if [[ "$RELEASE_TAG" != "v$VERSION" ]]; then
+            echo "Tag $RELEASE_TAG does not match package version $VERSION." >&2
+            exit 1
+          fi
+
+          TAG_COMMIT="$(git rev-parse "${RELEASE_TAG}^{commit}")"
+          if [[ "$TAG_COMMIT" != "$RELEASE_COMMIT" ]]; then
+            echo "The release tag does not resolve to the workflow commit." >&2
+            exit 1
+          fi
+
+          RELEASE_JSON="$RUNNER_TEMP/release.json"
+          RELEASE_LOOKUP_JSON="$RUNNER_TEMP/release-lookup.json"
+          RELEASE_ASSETS="$RUNNER_TEMP/release-assets"
+          mkdir -p "$RELEASE_ASSETS"
+          gh release view "$RELEASE_TAG" \
+            --repo "$RELEASE_REPOSITORY" \
+            --json databaseId,isDraft,tagName > "$RELEASE_LOOKUP_JSON"
+          RELEASE_ID="$(node - "$RELEASE_LOOKUP_JSON" "$RELEASE_TAG" <<'NODE'
+          const fs = require("node:fs");
+
+          let release;
+          try {
+            release = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          } catch {
+            console.error("Could not parse the draft-aware release lookup.");
+            process.exit(1);
+          }
+
+          if (release === null || typeof release !== "object" || Array.isArray(release)) {
+            console.error("The draft-aware release lookup returned invalid metadata.");
+            process.exit(1);
+          }
+          if (release.tagName !== process.argv[3]) {
+            console.error("The draft-aware release lookup returned a different tag.");
+            process.exit(1);
+          }
+          if (release.isDraft !== true) {
+            console.error("The exact-tag release is not a draft.");
+            process.exit(1);
+          }
+          if (!Number.isSafeInteger(release.databaseId) || release.databaseId < 1) {
+            console.error("The exact-tag draft returned an invalid release ID.");
+            process.exit(1);
+          }
+
+          process.stdout.write(String(release.databaseId));
+          NODE
+          )"
+          gh api "repos/${RELEASE_REPOSITORY}/releases/${RELEASE_ID}" > "$RELEASE_JSON"
+          gh release download "$RELEASE_TAG" \
+            --repo "$RELEASE_REPOSITORY" \
+            --dir "$RELEASE_ASSETS" \
+            --pattern "agentmemory-agentmemory-${VERSION}.tgz" \
+            --pattern "qwen3-reranker-0.6b-q8_0.gguf" \
+            --pattern "agentmemory-qwen-cpu-runtime-b11371-win-x64.zip" \
+            --pattern "qwen-gpu-upstream-assets.json" \
+            --pattern "qwen-model-notice.md" \
+            --pattern "Apache-2.0.txt" \
+            --pattern "README.txt" \
+            --pattern "package-candidate.json" \
+            --pattern "SHA256SUMS"
+
+          node scripts/verify-release-assets.mjs \
+            --assets-dir "$RELEASE_ASSETS" \
+            --manifest "artifacts/agentmemory-v${VERSION}/package-candidate.json" \
+            --checksums "artifacts/agentmemory-v${VERSION}/SHA256SUMS" \
+            --release "$RELEASE_JSON" \
+            --tag "$RELEASE_TAG" \
+            --version "$VERSION" \
+            --tag-commit "$TAG_COMMIT" \
+            --expected-commit "$RELEASE_COMMIT"
+
+      - name: Publish the verified draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: gh release edit "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --draft=false
+
+      - name: Confirm the release is published
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          DRAFT="$(gh api "repos/${RELEASE_REPOSITORY}/releases/tags/${RELEASE_TAG}" --jq .draft)"
+          if [[ "$DRAFT" != "false" ]]; then
+            echo "The verified draft was not published." >&2
+            exit 1
+          fi

@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Acquisition pins for optional Windows x64 CUDA 12.4 runtime files.",
+  "agentmemoryReleaseIncludesCudaBinaries": false,
+  "upstream": {
+    "repository": "ggml-org/llama.cpp",
+    "tag": "b11371",
+    "releaseUrl": "https://github.com/ggml-org/llama.cpp/releases/tag/b11371",
+    "assets": [
+      {
+        "file": "llama-b11371-bin-win-cuda-12.4-x64.zip",
+        "downloadUrl": "https://github.com/ggml-org/llama.cpp/releases/download/b11371/llama-b11371-bin-win-cuda-12.4-x64.zip",
+        "sizeBytes": 263486696,
+        "sha256": "72cd63b7daea25bcf9e638e144588c1b53351127c2ad9e1810ee9188d3d82abf",
+        "extractDllsTo": "<asset-root>/cuda/",
+        "agentmemoryReleaseIncluded": false
+      },
+      {
+        "file": "cudart-llama-bin-win-cuda-12.4-x64.zip",
+        "downloadUrl": "https://github.com/ggml-org/llama.cpp/releases/download/b11371/cudart-llama-bin-win-cuda-12.4-x64.zip",
+        "sizeBytes": 391443627,
+        "sha256": "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6",
+        "extractDllsTo": "<asset-root>/cuda/",
+        "agentmemoryReleaseIncluded": false
+      }
+    ]
+  },
+  "licenseReference": {
+    "name": "NVIDIA CUDA Toolkit EULA, Release 12.4",
+    "url": "https://docs.nvidia.com/cuda/archive/12.4.1/pdf/EULA.pdf",
+    "sectionsToReview": ["1.1.2", "1.2.2", "2.2", "2.6"],
+    "distributionNote": "Acquire CUDA files from the official upstream release and follow the applicable NVIDIA license terms. AgentMemory does not redistribute these CUDA binaries."
+  }
+}

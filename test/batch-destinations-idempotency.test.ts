@@ -22,12 +22,14 @@ const graphXml = '<entity type="concept" name="A"/><entity type="concept" name="
 const observation = { id: "obs", title: "title", narrative: "body", facts: [], concepts: [], files: [], type: "discovery" };
 
 describe("batch destination crash recovery", () => {
-  it.each([KV.graphNodes, KV.graphNameIndex, KV.graphEdges, KV.graphEdgeKey, KV.graphNodeDegree, KV.graphSnapshot, KV.batchCallbacks])("dedupes graph across committed %s write loss", async (scope) => {
+  it.each([KV.graphNodes, KV.graphNameIndex, KV.graphEdges, KV.graphEdgeKey, KV.graphNodeDegree, KV.graphSnapshot, KV.batchCallbacks])("replays a lost %s commit acknowledgement without duplicating graph effects", async (scope) => {
     const h = effectHarness();
     registerGraphFunction(h.sdk as never, h.kv, {} as never);
     const payload = { observations: [observation], batchResponse: graphXml, batchEffectKey: batchEffectKey("graph") };
-    h.crash(scope, true, scope === KV.batchCallbacks ? 3 : 1);
-    await expect(h.call("mem::graph-extract", payload)).rejects.toThrow();
+    h.crashGraphCommit(scope, true);
+    const firstAttempt = await h.call("mem::graph-extract", payload);
+    expect(firstAttempt).toMatchObject({ success: true });
+    expect(h.scopedCommitFailures).toBe(1);
     await h.call("mem::graph-extract", payload);
     await h.call("mem::graph-extract", payload);
     expect(await h.kv.list(KV.graphNodes)).toHaveLength(2);
@@ -50,7 +52,7 @@ describe("batch destination crash recovery", () => {
   });
 
   it.each(["", "<entities/><relationships/>"])(
-    "keeps empty graph callback %j retryable before applying a later valid result",
+    "pins empty graph callback %j input and requires a new job key for changed output",
     async (batchResponse) => {
     const h = effectHarness();
     const provider = { compress: vi.fn().mockResolvedValue(graphXml) };
@@ -78,11 +80,16 @@ describe("batch destination crash recovery", () => {
     expect(provider.compress).not.toHaveBeenCalled();
 
     const validPayload = { ...payload, batchResponse: graphXml };
-    expect(await h.call("mem::graph-extract", validPayload)).toMatchObject({ success: true });
+    await expect(h.call("mem::graph-extract", validPayload)).rejects.toMatchObject({ code: "STATE_TX_REPLAY_CONFLICT" });
+    expect(await h.kv.list(KV.graphNodes)).toHaveLength(0);
+    expect(await h.kv.list(KV.graphEdges)).toHaveLength(0);
+
+    const replacementPayload = { ...validPayload, batchEffectKey: batchEffectKey("empty-then-valid-graph-replacement") };
+    expect(await h.call("mem::graph-extract", replacementPayload)).toMatchObject({ success: true });
     const firstSnapshot = await h.kv.get<GraphSnapshot>(KV.graphSnapshot, "current");
     expect(firstSnapshot?.stats).toMatchObject({ totalNodes: 2, totalEdges: 1 });
 
-    expect(await h.call("mem::graph-extract", validPayload)).toMatchObject({ success: true });
+    expect(await h.call("mem::graph-extract", replacementPayload)).toMatchObject({ success: true });
     const secondSnapshot = await h.kv.get<GraphSnapshot>(KV.graphSnapshot, "current");
     expect(secondSnapshot?.stats).toMatchObject({ totalNodes: 2, totalEdges: 1 });
     expect(await h.kv.list(KV.graphNodes)).toHaveLength(2);

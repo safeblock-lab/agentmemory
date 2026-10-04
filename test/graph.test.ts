@@ -489,9 +489,23 @@ describe("Graph Functions", () => {
       await kv.set("mem:graph:edges", edge.id, edge);
     }
 
-    // Post-#814 the empty-body path reads the snapshot exclusively.
-    // Backfill the snapshot from the seeded data first.
-    await sdk.trigger("mem::graph-snapshot-rebuild", { force: true });
+    // Query coverage uses a ready snapshot; dedicated rebuild cases cover
+    // backfilling indexes through the transaction harness.
+    const topNodes = (await kv.list<GraphNode>(KV.graphNodes)).slice(0, 500);
+    await kv.set(KV.graphSnapshot, "current", {
+      version: 1,
+      topNodes,
+      topEdges: await kv.list<GraphEdge>(KV.graphEdges),
+      topDegrees: Object.fromEntries(topNodes.map((node, index) => [node.id, index < 50 ? 2 : 0])),
+      stats: {
+        totalNodes: NODE_COUNT,
+        totalEdges: 50,
+        nodesByType: { concept: NODE_COUNT },
+        edgesByType: { related_to: 50 },
+      },
+      updatedAt: "2026-01-01T00:00:00Z",
+      dirty: false,
+    } satisfies GraphSnapshot);
 
     const unbounded = (await sdk.trigger(
       "mem::graph-query",

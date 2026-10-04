@@ -2,9 +2,14 @@ import type {
   GraphNode,
   GraphEdge,
 } from "../types.js";
-import { KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
-import { withCompletedGraphRead } from "./graph-jobs.js";
+import {
+  GraphRetrievalReader,
+  type GraphRetrievalSubgraph,
+  type RetrievalEdge,
+  type RetrievalNode,
+  withSerializedGraphRetrieval,
+} from "./graph-retrieval-read.js";
 
 export interface GraphRetrievalResult {
   obsId: string;
@@ -15,7 +20,7 @@ export interface GraphRetrievalResult {
 }
 
 function buildGraphContext(
-  path: Array<{ node: GraphNode; edge?: GraphEdge }>,
+  path: Array<{ node: RetrievalNode; edge?: RetrievalEdge }>,
 ): string {
   const parts: string[] = [];
   for (const step of path) {
@@ -40,13 +45,10 @@ function buildGraphContext(
 }
 
 export class GraphRetrieval {
-  constructor(private kv: StateKV) {}
+  private readonly reader: GraphRetrievalReader;
 
-  private async readGraph(): Promise<[GraphNode[], GraphEdge[]]> {
-    return withCompletedGraphRead(this.kv, () => Promise.all([
-      this.kv.list<GraphNode>(KV.graphNodes).then((rows) => rows.filter((row) => !row.stale)),
-      this.kv.list<GraphEdge>(KV.graphEdges).then((rows) => rows.filter((row) => !row.stale)),
-    ]));
+  constructor(private readonly kv: StateKV) {
+    this.reader = new GraphRetrievalReader(kv);
   }
 
   async searchByEntities(
@@ -54,30 +56,67 @@ export class GraphRetrieval {
     maxDepth = 2,
     maxResults = 20,
   ): Promise<GraphRetrievalResult[]> {
-    const [allNodes, allEdges] = await this.readGraph();
+    const result = await this.searchByEntitiesAndChunks(
+      entityNames,
+      [],
+      maxDepth,
+      0,
+      maxResults,
+      0,
+    );
+    return result.entities;
+  }
 
-    const matchingNodes = allNodes.filter((n) => {
-      const nameLower = n.name.toLowerCase();
-      return entityNames.some(
-        (e) =>
-          nameLower.includes(e.toLowerCase()) ||
-          e.toLowerCase().includes(nameLower),
+  async expandFromChunks(
+    obsIds: string[],
+    maxDepth = 1,
+    maxResults = 10,
+  ): Promise<GraphRetrievalResult[]> {
+    const result = await this.searchByEntitiesAndChunks(
+      [],
+      obsIds,
+      0,
+      maxDepth,
+      0,
+      maxResults,
+    );
+    return result.chunks;
+  }
+
+  async searchByEntitiesAndChunks(
+    entityNames: string[],
+    observationIds: string[],
+    entityDepth = 2,
+    observationDepth = 1,
+    entityMaxResults = 20,
+    observationMaxResults = 10,
+    signal?: AbortSignal,
+  ): Promise<{ entities: GraphRetrievalResult[]; chunks: GraphRetrievalResult[] }> {
+    if (entityNames.length === 0 && observationIds.length === 0) {
+      return { entities: [], chunks: [] };
+    }
+    return withSerializedGraphRetrieval(this.kv, async () => {
+      const graph = await this.reader.readSubgraph(
+        { entityNames, observationIds, entityDepth, observationDepth },
+        signal,
       );
+      return {
+        entities: this.searchEntities(graph, entityDepth, entityMaxResults),
+        chunks: this.expandChunks(graph, observationIds, observationDepth, observationMaxResults),
+      };
     });
+  }
 
-    if (matchingNodes.length === 0) return [];
-
+  private searchEntities(
+    graph: GraphRetrievalSubgraph,
+    maxDepth: number,
+    maxResults: number,
+  ): GraphRetrievalResult[] {
     const results: GraphRetrievalResult[] = [];
     const visitedObs = new Set<string>();
 
-    for (const startNode of matchingNodes) {
-      const paths = this.dijkstraTraversal(
-        startNode,
-        allNodes,
-        allEdges,
-        maxDepth,
-      );
-
+    for (const startNode of graph.entityStarts) {
+      const paths = this.dijkstraTraversal(startNode, graph.nodes, graph.edges, maxDepth);
       for (const path of paths) {
         const lastNode = path[path.length - 1].node;
         for (const obsId of lastNode.sourceObservationIds) {
@@ -85,20 +124,17 @@ export class GraphRetrieval {
           visitedObs.add(obsId);
 
           const pathLength = path.length;
-          const edgeWeights = path
-            .filter((s) => s.edge)
-            .map((s) => s.edge!.weight);
-          const avgWeight =
-            edgeWeights.length > 0
-              ? edgeWeights.reduce((a, b) => a + b, 0) / edgeWeights.length
-              : 0.5;
-          const score = avgWeight * (1 / pathLength);
-
+          const edgeWeights = path.filter((step) => step.edge).map((step) => step.edge!.weight);
+          const avgWeight = edgeWeights.length > 0
+            ? edgeWeights.reduce((sum, weight) => sum + weight, 0) / edgeWeights.length
+            : 0.5;
+          const graphContext = buildGraphContext(path);
+          graph.budget.retainResult(obsId, graphContext);
           results.push({
             obsId,
             sessionId: "",
-            score,
-            graphContext: buildGraphContext(path),
+            score: avgWeight * (1 / pathLength),
+            graphContext,
             pathLength,
           });
         }
@@ -107,107 +143,94 @@ export class GraphRetrieval {
       for (const obsId of startNode.sourceObservationIds) {
         if (visitedObs.has(obsId)) continue;
         visitedObs.add(obsId);
-        results.push({
-          obsId,
-          sessionId: "",
-          score: 1.0,
-          graphContext: `[${startNode.type}] ${startNode.name}`,
-          pathLength: 0,
-        });
+        const graphContext = `[${startNode.type}] ${startNode.name}`;
+        graph.budget.retainResult(obsId, graphContext);
+        results.push({ obsId, sessionId: "", score: 1.0, graphContext, pathLength: 0 });
       }
     }
 
-    results.sort((a, b) => b.score - a.score);
+    results.sort((left, right) => right.score - left.score);
     return results.slice(0, maxResults);
   }
 
-  async expandFromChunks(
-    obsIds: string[],
-    maxDepth = 1,
-    maxResults = 10,
-  ): Promise<GraphRetrievalResult[]> {
-    const [allNodes, allEdges] = await this.readGraph();
-
-    const linkedNodes = allNodes.filter((n) =>
-      n.sourceObservationIds.some((id) => obsIds.includes(id)),
-    );
-
+  private expandChunks(
+    graph: GraphRetrievalSubgraph,
+    observationIds: string[],
+    maxDepth: number,
+    maxResults: number,
+  ): GraphRetrievalResult[] {
     const results: GraphRetrievalResult[] = [];
-    const visitedObs = new Set<string>(obsIds);
+    const visitedObs = new Set<string>(observationIds);
 
-    for (const node of linkedNodes) {
-      const paths = this.dijkstraTraversal(node, allNodes, allEdges, maxDepth);
+    for (const node of graph.observationStarts) {
+      const paths = this.dijkstraTraversal(node, graph.nodes, graph.edges, maxDepth);
       for (const path of paths) {
         const lastNode = path[path.length - 1].node;
         for (const obsId of lastNode.sourceObservationIds) {
           if (visitedObs.has(obsId)) continue;
           visitedObs.add(obsId);
-
-          const pathLength = path.length;
-          const score = 0.5 * (1 / (pathLength + 1));
-
+          const graphContext = buildGraphContext(path);
+          graph.budget.retainResult(obsId, graphContext);
           results.push({
             obsId,
             sessionId: "",
-            score,
-            graphContext: buildGraphContext(path),
-            pathLength,
+            score: 0.5 * (1 / (path.length + 1)),
+            graphContext,
+            pathLength: path.length,
           });
         }
       }
     }
 
-    results.sort((a, b) => b.score - a.score);
+    results.sort((left, right) => right.score - left.score);
     return results.slice(0, maxResults);
   }
 
   async temporalQuery(
     entityName: string,
     asOf?: string,
+    signal?: AbortSignal,
   ): Promise<{
     entity: GraphNode | null;
     currentState: GraphEdge[];
     history: GraphEdge[];
   }> {
-    const [allNodes, allEdges] = await this.readGraph();
-
-    const entity = allNodes.find(
-      (n) => n.name.toLowerCase() === entityName.toLowerCase(),
-    );
-    if (!entity) return { entity: null, currentState: [], history: [] };
-
-    const relatedEdges = allEdges.filter(
-      (e) => e.sourceNodeId === entity.id || e.targetNodeId === entity.id,
-    );
-
-    if (!asOf) {
-      const latestEdges = this.getLatestEdges(relatedEdges);
-      const historicalEdges = relatedEdges.filter(
-        (e) => !latestEdges.some((le) => le.id === e.id),
+    return withSerializedGraphRetrieval(this.kv, async () => {
+      const { entity, edges: relatedEdges } = await this.reader.readTemporalEntity(
+        entityName,
+        signal,
       );
-      return { entity, currentState: latestEdges, history: historicalEdges };
-    }
+      if (!entity) return { entity: null, currentState: [], history: [] };
 
-    const asOfDate = new Date(asOf).getTime();
-    const validEdges = relatedEdges.filter((e) => {
-      const commitDate = new Date(e.tcommit || e.createdAt).getTime();
-      if (commitDate > asOfDate) return false;
-      if (e.tvalid) {
-        const validDate = new Date(e.tvalid).getTime();
-        if (validDate > asOfDate) return false;
+      if (!asOf) {
+        const latestEdges = this.getLatestEdges(relatedEdges);
+        const historicalEdges = relatedEdges.filter(
+          (e) => !latestEdges.some((le) => le.id === e.id),
+        );
+        return { entity, currentState: latestEdges, history: historicalEdges };
       }
-      if (e.tvalidEnd) {
-        const endDate = new Date(e.tvalidEnd).getTime();
-        if (endDate < asOfDate) return false;
-      }
-      return true;
+
+      const asOfDate = new Date(asOf).getTime();
+      const validEdges = relatedEdges.filter((e) => {
+        const commitDate = new Date(e.tcommit || e.createdAt).getTime();
+        if (commitDate > asOfDate) return false;
+        if (e.tvalid) {
+          const validDate = new Date(e.tvalid).getTime();
+          if (validDate > asOfDate) return false;
+        }
+        if (e.tvalidEnd) {
+          const endDate = new Date(e.tvalidEnd).getTime();
+          if (endDate < asOfDate) return false;
+        }
+        return true;
+      });
+
+      return {
+        entity,
+        currentState: this.getLatestEdges(validEdges),
+        history: validEdges,
+      };
     });
-
-    return {
-      entity,
-      currentState: this.getLatestEdges(validEdges),
-      history: validEdges,
-    };
   }
 
   private getLatestEdges(edges: GraphEdge[]): GraphEdge[] {
@@ -244,15 +267,14 @@ export class GraphRetrieval {
   //     was O(n) — the dominant cost on graphs above ~200 nodes per
   //     the contributor's benchmark in #328).
   private dijkstraTraversal(
-    startNode: GraphNode,
-    allNodes: GraphNode[],
-    allEdges: GraphEdge[],
+    startNode: RetrievalNode,
+    allNodes: Map<string, RetrievalNode>,
+    allEdges: RetrievalEdge[],
     maxDepth: number,
-  ): Array<Array<{ node: GraphNode; edge?: GraphEdge }>> {
-    const nodeIndex = new Map<string, GraphNode>();
-    for (const n of allNodes) nodeIndex.set(n.id, n);
+  ): Array<Array<{ node: RetrievalNode; edge?: RetrievalEdge }>> {
+    const nodeIndex = new Map(allNodes);
 
-    const adjacency = new Map<string, Array<{ neighborId: string; edge: GraphEdge }>>();
+    const adjacency = new Map<string, Array<{ neighborId: string; edge: RetrievalEdge }>>();
     for (const edge of allEdges) {
       const a = edge.sourceNodeId;
       const b = edge.targetNodeId;
@@ -263,7 +285,7 @@ export class GraphRetrieval {
     }
 
     const dist = new Map<string, number>();
-    const pathTo = new Map<string, Array<{ node: GraphNode; edge?: GraphEdge }>>();
+    const pathTo = new Map<string, Array<{ node: RetrievalNode; edge?: RetrievalEdge }>>();
     dist.set(startNode.id, 0);
     pathTo.set(startNode.id, [{ node: startNode }]);
 

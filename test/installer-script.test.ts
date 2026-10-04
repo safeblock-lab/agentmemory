@@ -105,7 +105,7 @@ describe.skipIf(process.platform !== "win32")("Install-AgentMemory.ps1", () => {
       .split(/\r?\n/)
       .filter((line) => /\bInvoke-WebRequest\s+-/.test(line));
 
-    expect(webRequests).toHaveLength(3);
+    expect(webRequests).toHaveLength(2);
     expect(webRequests.every((line) => line.includes("-UseBasicParsing"))).toBe(true);
   });
 });

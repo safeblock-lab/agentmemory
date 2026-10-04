@@ -14,6 +14,7 @@ export type StatePageErrorCode =
   | 'STATE_PAGE_CURSOR_INVALID'
   | 'STATE_PAGE_CURSOR_STALE'
   | 'STATE_PAGE_UNSUPPORTED'
+  | 'STATE_PAGE_PROJECTION_UNSUPPORTED'
   | 'STATE_PAGE_INVALID_REQUEST'
   | 'STATE_PAGE_INVALID_RESPONSE'
   | 'STATE_PAGE_FAILED'
@@ -23,6 +24,7 @@ const ERROR_MESSAGES: Record<StatePageErrorCode, string> = {
   STATE_PAGE_CURSOR_INVALID: 'The state page cursor is invalid or did not advance',
   STATE_PAGE_CURSOR_STALE: 'The state page cursor is stale; restart the scan',
   STATE_PAGE_UNSUPPORTED: 'The configured iii-engine does not support state pagination',
+  STATE_PAGE_PROJECTION_UNSUPPORTED: 'The configured iii-engine does not support projected state pagination',
   STATE_PAGE_INVALID_REQUEST: 'The state page request is outside supported bounds',
   STATE_PAGE_INVALID_RESPONSE: 'The state page response does not match the pagination contract',
   STATE_PAGE_FAILED: 'The state page request failed',
@@ -44,6 +46,7 @@ export interface StatePageOptions {
   cursor?: string
   limit?: number
   maxBytes?: number
+  fields?: string[]
 }
 
 export interface StatePageRequest {
@@ -51,6 +54,7 @@ export interface StatePageRequest {
   cursor?: string
   limit: number
   max_bytes: number
+  fields?: string[]
 }
 
 type StatePageTrigger = (request: StatePageRequest) => Promise<unknown>
@@ -59,10 +63,29 @@ interface NormalizedOptions {
   cursor?: string
   limit: number
   maxBytes: number
+  fields?: string[]
 }
 
 function invalidRequest(): never {
   throw new StatePageError('STATE_PAGE_INVALID_REQUEST')
+}
+
+function normalizeFields(fields: string[] | undefined): string[] | undefined {
+  if (fields === undefined) return undefined
+  if (!Array.isArray(fields) || fields.length < 1 || fields.length > 16) invalidRequest()
+
+  let totalBytes = 0
+  for (const field of fields) {
+    if (typeof field !== 'string' || Buffer.byteLength(field, 'utf8') > 128) invalidRequest()
+    totalBytes += Buffer.byteLength(field, 'utf8')
+    if (totalBytes > 1_024) invalidRequest()
+  }
+
+  const canonical = [...fields].sort((left, right) =>
+    Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8')),
+  )
+  if (canonical.some((field, index) => index > 0 && field === canonical[index - 1])) invalidRequest()
+  return canonical
 }
 
 function normalizeOptions(options: StatePageOptions): NormalizedOptions {
@@ -76,7 +99,7 @@ function normalizeOptions(options: StatePageOptions): NormalizedOptions {
     invalidRequest()
   }
 
-  return { cursor, limit, maxBytes }
+  return { cursor, limit, maxBytes, fields: normalizeFields(options.fields) }
 }
 
 function getErrorCode(error: unknown): string | undefined {
@@ -108,6 +131,7 @@ function normalizeTriggerError(error: unknown): StatePageError {
     code === 'STATE_PAGE_CURSOR_INVALID' ||
     code === 'STATE_PAGE_CURSOR_STALE' ||
     code === 'STATE_PAGE_UNSUPPORTED' ||
+    code === 'STATE_PAGE_PROJECTION_UNSUPPORTED' ||
     code === 'STATE_PAGE_INVALID_REQUEST'
   ) {
     return new StatePageError(code, error)
@@ -145,6 +169,18 @@ function validatePage<T>(value: unknown, request: StatePageRequest): StatePage<T
     throw new StatePageError('STATE_PAGE_INVALID_RESPONSE')
   }
 
+  if (request.fields !== undefined) {
+    const requestedFields = new Set(request.fields)
+    for (const item of page.items) {
+      if (typeof item !== 'object' || item === null || Array.isArray(item)) {
+        throw new StatePageError('STATE_PAGE_INVALID_RESPONSE')
+      }
+      if (Object.keys(item).some((field) => !requestedFields.has(field))) {
+        throw new StatePageError('STATE_PAGE_PROJECTION_UNSUPPORTED')
+      }
+    }
+  }
+
   let responseBytes: number
   try {
     const serialized = JSON.stringify({ items: page.items, next_cursor: nextCursor })
@@ -179,6 +215,7 @@ export async function* iterateStatePages<T>(
       ...(cursor === undefined ? {} : { cursor }),
       limit: normalized.limit,
       max_bytes: normalized.maxBytes,
+      ...(normalized.fields === undefined ? {} : { fields: normalized.fields }),
     }
     let rawPage: unknown
     try {

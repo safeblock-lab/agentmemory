@@ -145,6 +145,7 @@ describe("HybridSearch", () => {
       await kv.set("mem:obs:ses_1", id, obs);
     }
     const stateKv = new StateKV(registerWorker("ws://unused.test"));
+    stateKv.indexedRetrieval = false;
     vi.spyOn(stateKv, "get").mockImplementation(kv.get);
     vi.spyOn(stateKv, "list").mockImplementation(kv.list);
     const hybrid = new HybridSearch(bm25, null, null, stateKv);

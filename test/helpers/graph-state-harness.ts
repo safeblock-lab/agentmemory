@@ -42,9 +42,11 @@ export interface GraphStateHarness {
   kv: KvLike;
   rows: Map<string, Row>;
   receipts: Map<string, StateBatchReceipt>;
+  scopedCommitFailures: number;
   seed(scope: string, key: string, value: StateJsonValue | null, exists?: boolean, version?: StateCounter): void;
   failCommitBeforeApply(): void;
   loseAcknowledgment(): void;
+  failCommitForScope(scope: string, afterApply: boolean, matchingCommitOrdinal?: number): void;
 }
 
 export function installGraphStateWire(sdk: SdkLike | undefined, kv: KvLike): GraphStateHarness {
@@ -74,6 +76,8 @@ export function installGraphStateWire(sdk: SdkLike | undefined, kv: KvLike): Gra
   let recovery: StateCommitBatchInput["checkpoint"] | null = null;
   let failBeforeApply = false;
   let loseAck = false;
+  let scopedCommitFailures = 0;
+  let scopedCommitFailure: { scope: string; afterApply: boolean; remaining: number } | undefined;
 
   async function row(scope: string, key: string): Promise<Row> {
     const id = address(scope, key);
@@ -137,6 +141,17 @@ export function installGraphStateWire(sdk: SdkLike | undefined, kv: KvLike): Gra
       if (prior.payload_digest !== request.payload_digest) fail("STATE_TX_REPLAY_CONFLICT");
       return copy(prior);
     }
+    let failThisCommit = false;
+    let failAfterApply = false;
+    if (scopedCommitFailure && body.operations.some((operation) => operation.scope === scopedCommitFailure!.scope)) {
+      scopedCommitFailure.remaining--;
+      if (scopedCommitFailure.remaining === 0) {
+        failThisCommit = true;
+        failAfterApply = scopedCommitFailure.afterApply;
+        scopedCommitFailure = undefined;
+        scopedCommitFailures++;
+      }
+    }
     if (id.generation !== generation) fail("STATE_TX_GENERATION_STALE");
     if (recovery && (recovery.job_id !== id.job_id || recovery.logical_delta_id !== id.logical_delta_id)) fail("STATE_GRAPH_RECOVERY_REQUIRED");
     const saved = checkpoints.get(id.job_id) ?? { version: "0", value: null };
@@ -161,7 +176,10 @@ export function installGraphStateWire(sdk: SdkLike | undefined, kv: KvLike): Gra
       checkpoint_version: next(body.expected_checkpoint_version),
       row_versions: rowVersions,
     };
-    if (failBeforeApply) { failBeforeApply = false; fail("STATE_TX_FAILED"); }
+    if (failBeforeApply || (failThisCommit && !failAfterApply)) {
+      failBeforeApply = false;
+      fail("STATE_TX_FAILED");
+    }
     const applied: Array<{ scope: string; key: string; row: Row }> = [];
     try {
       for (const [index, { op, row: current }] of before.entries()) {
@@ -192,7 +210,10 @@ export function installGraphStateWire(sdk: SdkLike | undefined, kv: KvLike): Gra
       if (lease) lease.generation = generation;
     }
     await saveControl({});
-    if (loseAck) { loseAck = false; throw new Error("lost commit acknowledgement"); }
+    if (loseAck || (failThisCommit && failAfterApply)) {
+      loseAck = false;
+      throw new Error("lost commit acknowledgement");
+    }
     return copy(response);
   }
 
@@ -230,6 +251,7 @@ export function installGraphStateWire(sdk: SdkLike | undefined, kv: KvLike): Gra
   });
   return {
     sdk: attachedSdk, kv, rows, receipts,
+    get scopedCommitFailures() { return scopedCommitFailures; },
     seed(scope, key, value, exists = true, version = "1") {
       rows.set(address(scope, key), { exists, value: exists ? copy(value) : null, version });
       if (exists) void rawSet(scope, key, copy(value)); else void rawDelete(scope, key);
@@ -241,6 +263,10 @@ export function installGraphStateWire(sdk: SdkLike | undefined, kv: KvLike): Gra
     },
     failCommitBeforeApply() { failBeforeApply = true; },
     loseAcknowledgment() { loseAck = true; },
+    failCommitForScope(scope, afterApply, matchingCommitOrdinal = 1) {
+      if (!scope || !Number.isSafeInteger(matchingCommitOrdinal) || matchingCommitOrdinal < 1) throw new Error("Invalid scoped commit failure");
+      scopedCommitFailure = { scope, afterApply, remaining: matchingCommitOrdinal };
+    },
   };
 }
 

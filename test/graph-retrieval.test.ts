@@ -17,6 +17,24 @@ function mockKV(
   store.set("mem:graph:edges", edgesMap);
 
   const kv = {
+    indexedRetrieval: true,
+    retrieval: async (payload: Record<string, unknown>) => {
+      if (payload.action === 'graph_seeds') {
+        const names = payload.entity_names as string[];
+        const observations = new Set(payload.observation_ids as string[]);
+        return { generation: '1', items: nodes.flatMap((node, position) => {
+          const name = node.name.toLowerCase();
+          const entity = names.some(query => payload.match === 'exact' ? name === query.toLowerCase() : name.includes(query.toLowerCase()) || query.toLowerCase().includes(name));
+          const observation = node.sourceObservationIds.some(id => observations.has(id));
+          return !node.stale && (entity || observation) ? [{ key: node.id, id: node.id, position: String(position), entity, observation }] : [];
+        }) };
+      }
+      if (payload.action === 'graph_edges') {
+        const ids = new Set(payload.node_ids as string[]);
+        return { generation: '1', items: edges.flatMap((value, position) => !value.stale && (ids.has(value.sourceNodeId) || ids.has(value.targetNodeId)) ? [{ key: value.id, position: String(position), value }] : []) };
+      }
+      throw new Error('Unexpected indexed request');
+    },
     get: async <T>(scope: string, key: string): Promise<T | null> => {
       return (store.get(scope)?.get(key) as T) ?? null;
     },

@@ -54,6 +54,7 @@ export const KV = {
   graphPrepared: (jobId: string) => `mem:graph:prepared:${jobId}`,
   graphRemaps: (jobId: string) => `mem:graph:remaps:${jobId}`,
   semantic: "mem:semantic",
+  semanticVectors: (indexId: string) => `mem:semantic:${indexId}`,
   procedural: "mem:procedural",
   teamShared: (teamId: string) => `mem:team:${teamId}:shared`,
   teamUsers: (teamId: string, userId: string) =>

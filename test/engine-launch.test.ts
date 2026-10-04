@@ -12,7 +12,7 @@ import {
   runtimeConfigPath,
 } from "../src/cli/engine-launch.js";
 
-const HOME = "/Users/test";
+const HOME = process.platform === "win32" ? "C:\\Users\\test" : "/Users/test";
 
 describe("engine-launch path resolution", () => {
   it("agentmemoryHome anchors config and runtimeConfigPath scopes instance state", () => {
@@ -86,7 +86,18 @@ describe("engine-launch path resolution", () => {
 
 describe("rewriteBundledConfig", () => {
   const SAMPLE = [
-    "          file_path: ./data/state_store.db",
+    "workers:",
+    "  - name: iii-state",
+    "    config:",
+    "      adapter:",
+    "        name: sqlite",
+    "        config:",
+    "          file_path: ./data/state_store.sqlite3",
+    "  - name: iii-stream",
+    "    config:",
+    "      adapter:",
+    "        name: kv",
+    "        config:",
     "          file_path: ./data/stream_store",
     "  - name: iii-queue",
     "    config:",
@@ -103,7 +114,7 @@ describe("rewriteBundledConfig", () => {
   it("substitutes data paths and removes bundled worker supervision", () => {
     const out = rewriteBundledConfig(SAMPLE, HOME, "/usr/bin/node", "/opt/pkg/dist/index.mjs");
     expect(out).toContain(
-      `file_path: '${join(HOME, ".agentmemory", "data", "state_store.db")}'`,
+      `file_path: '${join(HOME, ".agentmemory", "data", "state_store.sqlite3")}'`,
     );
     expect(out).toContain(
       `file_path: '${join(HOME, ".agentmemory", "data", "stream_store")}'`,
@@ -116,6 +127,12 @@ describe("rewriteBundledConfig", () => {
   it("preserves unrelated commands in the bundled iii-exec worker", () => {
     const bundled = [
       "workers:",
+      "  - name: iii-state",
+      "    config:",
+      "      adapter:",
+      "        name: sqlite",
+      "        config:",
+      "          file_path: ./data/state_store.sqlite3",
       "  - name: iii-queue",
       "    config:",
       "      adapter:",
@@ -155,7 +172,7 @@ describe("rewriteBundledConfig", () => {
     expect(out).not.toContain("src/**/*.ts");
     expect(out).not.toContain("- node dist/index.mjs");
     expect(out).not.toContain("- name: iii-exec");
-    expect(out).toContain(join(HOME, ".agentmemory", "data", "state_store.db"));
+    expect(out).toContain(join(HOME, ".agentmemory", "data", "state_store.sqlite3"));
     expect(out).toContain(join(HOME, ".agentmemory", "data", "stream_store"));
   });
 
@@ -178,7 +195,7 @@ describe("rewriteBundledConfig", () => {
       },
     );
 
-    expect(out).toContain(join(dataDir, "state_store.db"));
+    expect(out).toContain(join(dataDir, "state_store.sqlite3"));
     expect(out).toContain("port: 3211");
     expect(out).toContain("port: 3212");
     expect(out).toContain("port: 49234");

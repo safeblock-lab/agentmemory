@@ -1,5 +1,5 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 82af87a26a6012ae361fa36fab77f204637548fe..04844c2fd85614af9cbe6c7e363734973be3c0b8 100644
+index 82af87a..04844c2 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -1857,6 +1857,18 @@ dependencies = [
@@ -144,14 +144,14 @@ index 82af87a26a6012ae361fa36fab77f204637548fe..04844c2fd85614af9cbe6c7e36373497
  name = "version_check"
  version = "0.9.5"
 diff --git a/engine/Cargo.toml b/engine/Cargo.toml
-index 2bd88afe53fcd951c0b8bac50809a1333efe21ff..95efb934aa8c1acd4f28c9b5c1c8b146c5e9d48e 100644
+index 2bd88af..e510bdc 100644
 --- a/engine/Cargo.toml
 +++ b/engine/Cargo.toml
 @@ -154,6 +154,7 @@ winapi = { version = "0.3.9", features = ["minwindef", "wincon", "winbase", "con
  dirs = "6"
  machineid-rs = "1.2"
  sha2 = "0.10"
-+rusqlite = { version = "=0.39.0", features = ["bundled"] }
++rusqlite = { version = "=0.39.0", features = ["bundled", "hooks", "functions"] }
  iana-time-zone = "0.1"
  ring = "0.17.14"
  glob = "0.3.3"
@@ -162,7 +162,7 @@ index 2bd88afe53fcd951c0b8bac50809a1333efe21ff..95efb934aa8c1acd4f28c9b5c1c8b146
 +[target.'cfg(unix)'.dev-dependencies]
  iii-worker = { path = "../crates/iii-worker" }
 diff --git a/engine/src/builtins/kv.rs b/engine/src/builtins/kv.rs
-index f7c768236fe74391e407ebcadcdf921b54b2fa9d..66b7275d5de91aabe9ad31272e6551a1138a9dcf 100644
+index f7c7682..66b7275 100644
 --- a/engine/src/builtins/kv.rs
 +++ b/engine/src/builtins/kv.rs
 @@ -7,12 +7,15 @@
@@ -739,7 +739,7 @@ index f7c768236fe74391e407ebcadcdf921b54b2fa9d..66b7275d5de91aabe9ad31272e6551a1
      async fn test_file_based_load_set_delete() {
          let dir = temp_store_dir();
 diff --git a/engine/src/lib.rs b/engine/src/lib.rs
-index 0bedec343a198d97f159e6bef408dc8629b1c400..0c146dcbf52964f2444544cc6f6a560e7d46a649 100644
+index 0bedec3..0c146dc 100644
 --- a/engine/src/lib.rs
 +++ b/engine/src/lib.rs
 @@ -14,6 +14,7 @@ pub mod invocation;
@@ -751,7 +751,7 @@ index 0bedec343a198d97f159e6bef408dc8629b1c400..0c146dcbf52964f2444544cc6f6a560e
  pub mod trigger;
  pub mod trigger_formats;
 diff --git a/engine/src/main.rs b/engine/src/main.rs
-index f12d720dee49b9bb3c66ede0b8c606c997268d1c..2adb5ff65386b486b11eebb228050a8b2444e04b 100644
+index f12d720..2adb5ff 100644
 --- a/engine/src/main.rs
 +++ b/engine/src/main.rs
 @@ -109,6 +109,10 @@ struct Cli {
@@ -844,7 +844,7 @@ index f12d720dee49b9bb3c66ede0b8c606c997268d1c..2adb5ff65386b486b11eebb228050a8b
          // `--use-default-config` was removed: `iii` now creates config.yaml
 diff --git a/engine/src/state_migration/archive.rs b/engine/src/state_migration/archive.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..283881ad448341d59d56b8ab3dfff8994aa24667
+index 0000000..283881a
 --- /dev/null
 +++ b/engine/src/state_migration/archive.rs
 @@ -0,0 +1,176 @@
@@ -1026,7 +1026,7 @@ index 0000000000000000000000000000000000000000..283881ad448341d59d56b8ab3dfff899
 +}
 diff --git a/engine/src/state_migration/mod.rs b/engine/src/state_migration/mod.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..7b294918a23faf51dce33d33caea975a6b9c4081
+index 0000000..7b29491
 --- /dev/null
 +++ b/engine/src/state_migration/mod.rs
 @@ -0,0 +1,249 @@
@@ -1281,7 +1281,7 @@ index 0000000000000000000000000000000000000000..7b294918a23faf51dce33d33caea975a
 +}
 diff --git a/engine/src/state_migration/tests.rs b/engine/src/state_migration/tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..081a3681c3b731285f6494d92e9a6ea6babd73b1
+index 0000000..081a368
 --- /dev/null
 +++ b/engine/src/state_migration/tests.rs
 @@ -0,0 +1,271 @@
@@ -1558,7 +1558,7 @@ index 0000000000000000000000000000000000000000..081a3681c3b731285f6494d92e9a6ea6
 +}
 diff --git a/engine/src/state_migration/transfer.rs b/engine/src/state_migration/transfer.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..2f1d37d2c8a821cd2fe12f756932456f4fdfaf17
+index 0000000..2f1d37d
 --- /dev/null
 +++ b/engine/src/state_migration/transfer.rs
 @@ -0,0 +1,159 @@
@@ -1722,7 +1722,7 @@ index 0000000000000000000000000000000000000000..2f1d37d2c8a821cd2fe12f756932456f
 +    Ok(())
 +}
 diff --git a/engine/src/workers/state/adapters/kv_store.rs b/engine/src/workers/state/adapters/kv_store.rs
-index dd5648f27cce7b368dab5c65ef1b111801cb3461..a4515f9331e67b1184172f57969d7e418a4a14bc 100644
+index dd5648f..a4515f9 100644
 --- a/engine/src/workers/state/adapters/kv_store.rs
 +++ b/engine/src/workers/state/adapters/kv_store.rs
 @@ -15,8 +15,9 @@ use crate::{
@@ -1756,10 +1756,10 @@ index dd5648f27cce7b368dab5c65ef1b111801cb3461..a4515f9331e67b1184172f57969d7e41
          Ok(self.storage.list_groups().await)
      }
 diff --git a/engine/src/workers/state/adapters/mod.rs b/engine/src/workers/state/adapters/mod.rs
-index 29eafa68a884a899435ee0b4f3050fb89b6da398..587c16c8b55ec9814a57a2b5cf3c948673404745 100644
+index 29eafa6..53803b1 100644
 --- a/engine/src/workers/state/adapters/mod.rs
 +++ b/engine/src/workers/state/adapters/mod.rs
-@@ -7,13 +7,35 @@
+@@ -7,13 +7,40 @@
  pub mod bridge;
  pub mod kv_store;
  pub mod redis_adapter;
@@ -1776,6 +1776,8 @@ index 29eafa68a884a899435ee0b4f3050fb89b6da398..587c16c8b55ec9814a57a2b5cf3c9486
 +    Unsupported,
 +    InvalidCursor,
 +    StaleCursor,
++    InvalidProjection,
++    ProjectedRecordNotObject,
 +    RecordTooLarge { required_bytes: usize },
 +    Internal,
 +    RecoveryRequired,
@@ -1783,6 +1785,9 @@ index 29eafa68a884a899435ee0b4f3050fb89b6da398..587c16c8b55ec9814a57a2b5cf3c9486
 +
  #[async_trait]
  pub trait StateAdapter: Send + Sync {
++    async fn retrieval(&self, _input: Value) -> anyhow::Result<Value> {
++        Err(sqlite::protocol_error_unsupported())
++    }
 +    async fn get_versioned(&self, _input: Value) -> anyhow::Result<Value> {
 +        Err(sqlite::protocol_error_unsupported())
 +    }
@@ -1795,7 +1800,7 @@ index 29eafa68a884a899435ee0b4f3050fb89b6da398..587c16c8b55ec9814a57a2b5cf3c9486
      async fn set(&self, scope: &str, key: &str, value: Value) -> anyhow::Result<StreamSetResult>;
      async fn get(&self, scope: &str, key: &str) -> anyhow::Result<Option<Value>>;
      async fn delete(&self, scope: &str, key: &str) -> anyhow::Result<()>;
-@@ -24,6 +46,15 @@ pub trait StateAdapter: Send + Sync {
+@@ -24,6 +51,25 @@ pub trait StateAdapter: Send + Sync {
          ops: Vec<UpdateOp>,
      ) -> anyhow::Result<StreamUpdateResult>;
      async fn list(&self, scope: &str) -> anyhow::Result<Vec<Value>>;
@@ -1808,12 +1813,22 @@ index 29eafa68a884a899435ee0b4f3050fb89b6da398..587c16c8b55ec9814a57a2b5cf3c9486
 +    ) -> Result<StateListPageResult, StatePageError> {
 +        Err(StatePageError::Unsupported)
 +    }
++    async fn list_page_projected(
++        &self,
++        _scope: &str,
++        _cursor: Option<&str>,
++        _limit: u32,
++        _max_bytes: u32,
++        _fields: &[String],
++    ) -> Result<StateListPageResult, StatePageError> {
++        Err(StatePageError::Unsupported)
++    }
      async fn list_groups(&self) -> anyhow::Result<Vec<String>>;
      async fn destroy(&self) -> anyhow::Result<()>;
  
 diff --git a/engine/src/workers/state/adapters/sqlite/commit.rs b/engine/src/workers/state/adapters/sqlite/commit.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..cff155911263ba70f2a09929eee7d04550c2b5b3
+index 0000000..cff1559
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/commit.rs
 @@ -0,0 +1,311 @@
@@ -2130,7 +2145,7 @@ index 0000000000000000000000000000000000000000..cff155911263ba70f2a09929eee7d045
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/crash_tests.rs b/engine/src/workers/state/adapters/sqlite/crash_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..98a5d383dab350a3f2157ec3dca2282dfc49a587
+index 0000000..98a5d38
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/crash_tests.rs
 @@ -0,0 +1,242 @@
@@ -2378,10 +2393,10 @@ index 0000000000000000000000000000000000000000..98a5d383dab350a3f2157ec3dca2282d
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/database.rs b/engine/src/workers/state/adapters/sqlite/database.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..924cb5685d231d1d3ec80cbd214388916611d7d8
+index 0000000..4a784ce
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/database.rs
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,186 @@
 +use super::protocol;
 +use rusqlite::{Connection, OptionalExtension, params};
 +use serde_json::Value;
@@ -2441,6 +2456,11 @@ index 0000000000000000000000000000000000000000..924cb5685d231d1d3ec80cbd21438891
 +        CREATE INDEX IF NOT EXISTS state_rows_order ON state_rows(scope,position) WHERE value IS NOT NULL;")?;
 +    connection.pragma_update(None, "application_id", APPLICATION_ID)?;
 +    connection.pragma_update(None, "user_version", 1)?;
++    {
++        let transaction = connection.unchecked_transaction()?;
++        super::retrieval::initialize(&transaction)?;
++        transaction.commit()?;
++    }
 +    {
 +        let transaction = rusqlite::Transaction::new_unchecked(
 +            &connection,
@@ -2559,18 +2579,21 @@ index 0000000000000000000000000000000000000000..924cb5685d231d1d3ec80cbd21438891
 +        "UPDATE state_scopes SET revision=?2 WHERE scope=?1",
 +        params![scope, revision.to_string()],
 +    )?;
++    super::retrieval::maintain(connection, scope, key, value, position)?;
++    super::retrieval::source_changed(connection,scope,key,&old,value,version)?;
 +    Ok(version)
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/mod.rs b/engine/src/workers/state/adapters/sqlite/mod.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..554ae3af5685148000b89c07ec2a31e24fdead8f
+index 0000000..6f5e39b
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/mod.rs
-@@ -0,0 +1,279 @@
+@@ -0,0 +1,327 @@
 +mod commit;
 +pub(crate) mod database;
 +mod paging;
 +mod protocol;
++mod retrieval;
 +#[cfg(test)]
 +mod tests;
 +
@@ -2696,6 +2719,20 @@ index 0000000000000000000000000000000000000000..554ae3af5685148000b89c07ec2a31e2
 +
 +#[async_trait]
 +impl StateAdapter for SqliteAdapter {
++    async fn retrieval(&self, input: Value) -> anyhow::Result<Value> {
++        let bytes = protocol::size(&input)?;
++        let request = retrieval::request::parse(input)?;
++        if retrieval::read_only(&request) {
++            self.run(bytes, move |connection| {
++                let transaction = connection.unchecked_transaction()?;
++                let result = retrieval::bounded(&transaction, || retrieval::execute(&transaction, request))?;
++                transaction.commit()?;
++                Ok(result)
++            }).await
++        } else {
++            self.mutate(bytes, move |connection| retrieval::bounded(connection, || retrieval::execute(connection, request))).await
++        }
++    }
 +    async fn set(&self, scope: &str, key: &str, value: Value) -> anyhow::Result<StreamSetResult> {
 +        protocol::plain_write(scope, key)?;
 +        let bytes = protocol::size(&value)?.saturating_add(scope.len() + key.len() + 4096);
@@ -2786,6 +2823,39 @@ index 0000000000000000000000000000000000000000..554ae3af5685148000b89c07ec2a31e2
 +        .await
 +        .map_err(|_| StatePageError::Internal)?
 +    }
++    async fn list_page_projected(
++        &self,
++        scope: &str,
++        cursor: Option<&str>,
++        limit: u32,
++        max_bytes: u32,
++        fields: &[String],
++    ) -> Result<StateListPageResult, StatePageError> {
++        let (scope, cursor, fields, generation) = (
++            scope.to_owned(),
++            cursor.map(str::to_owned),
++            fields.to_vec(),
++            self.generation,
++        );
++        self.run(
++            scope.len()
++                + cursor.as_ref().map_or(0, String::len)
++                + fields.iter().map(String::len).sum::<usize>(),
++            move |connection| {
++                Ok(paging::page_projected(
++                    connection,
++                    &scope,
++                    cursor.as_deref(),
++                    limit,
++                    max_bytes,
++                    &fields,
++                    generation,
++                ))
++            },
++        )
++        .await
++        .map_err(|_| StatePageError::Internal)?
++    }
 +    async fn list_groups(&self) -> anyhow::Result<Vec<String>> {
 +        self.run(4096, |connection| {
 +            let bytes: i64 = connection.query_row(
@@ -2848,20 +2918,21 @@ index 0000000000000000000000000000000000000000..554ae3af5685148000b89c07ec2a31e2
 +crate::register_adapter!(<StateAdapterRegistration> name: "sqlite", make_adapter);
 diff --git a/engine/src/workers/state/adapters/sqlite/paging.rs b/engine/src/workers/state/adapters/sqlite/paging.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..fb301e2129e1f295bfd0923ffdcb539dd186b756
+index 0000000..029513c
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/paging.rs
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,337 @@
 +use super::{LEGACY_LIST_BYTES, commit, database, protocol};
 +use crate::workers::state::{
 +    adapters::StatePageError,
 +    structs::{STATE_PAGE_MAX_CURSOR_BYTES, StateListPageResult},
 +};
 +use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-+use rusqlite::{Connection, params};
-+use serde::{Deserialize, Serialize};
-+use serde_json::Value;
++use rusqlite::{Connection, OptionalExtension, params};
++use serde::{Deserialize, Serialize, de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor}};
++use serde_json::{Map, Value};
 +use sha2::{Digest, Sha256};
++use std::fmt;
 +
 +#[derive(Serialize, Deserialize)]
 +#[serde(deny_unknown_fields)]
@@ -2872,6 +2943,21 @@ index 0000000000000000000000000000000000000000..fb301e2129e1f295bfd0923ffdcb539d
 +    revision: String,
 +    after_position: i64,
 +}
++#[derive(Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct ProjectedCursor {
++    version: u8,
++    mode: String,
++    generation: uuid::Uuid,
++    scope_fingerprint: String,
++    revision: String,
++    after_position: i64,
++    fields: Vec<String>,
++}
++enum DecodedCursor {
++    Full(Cursor),
++    Projected(ProjectedCursor),
++}
 +fn encode(cursor: &Cursor) -> Result<String, StatePageError> {
 +    let encoded =
 +        URL_SAFE_NO_PAD.encode(serde_json::to_vec(cursor).map_err(|_| StatePageError::Internal)?);
@@ -2879,6 +2965,62 @@ index 0000000000000000000000000000000000000000..fb301e2129e1f295bfd0923ffdcb539d
 +        return Err(StatePageError::Internal);
 +    }
 +    Ok(encoded)
++}
++fn encode_projected(cursor: &ProjectedCursor) -> Result<String, StatePageError> {
++    let encoded =
++        URL_SAFE_NO_PAD.encode(serde_json::to_vec(cursor).map_err(|_| StatePageError::Internal)?);
++    if encoded.len() > STATE_PAGE_MAX_CURSOR_BYTES {
++        return Err(StatePageError::Internal);
++    }
++    Ok(encoded)
++}
++
++struct ProjectedSeed<'a>(&'a [String]);
++impl<'de> DeserializeSeed<'de> for ProjectedSeed<'_> {
++    type Value = Value;
++
++    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
++    where
++        D: serde::Deserializer<'de>,
++    {
++        deserializer.deserialize_map(ProjectedVisitor(self.0))
++    }
++}
++
++struct ProjectedVisitor<'a>(&'a [String]);
++impl<'de> Visitor<'de> for ProjectedVisitor<'_> {
++    type Value = Value;
++
++    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        formatter.write_str("a JSON object")
++    }
++
++    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
++    where
++        A: MapAccess<'de>,
++    {
++        let mut projected = Map::new();
++        while let Some(key) = object.next_key::<String>()? {
++            if self.0.binary_search(&key).is_ok() {
++                projected.insert(key, object.next_value()?);
++            } else {
++                object.next_value::<IgnoredAny>()?;
++            }
++        }
++        Ok(Value::Object(projected))
++    }
++}
++
++fn project_value(value: &str, fields: &[String]) -> Result<Value, StatePageError> {
++    if !value.trim_start().starts_with('{') {
++        return Err(StatePageError::ProjectedRecordNotObject);
++    }
++    let mut deserializer = serde_json::Deserializer::from_str(value);
++    let projected = ProjectedSeed(fields)
++        .deserialize(&mut deserializer)
++        .map_err(|_| StatePageError::Internal)?;
++    deserializer.end().map_err(|_| StatePageError::Internal)?;
++    Ok(projected)
 +}
 +pub fn list(connection: &Connection, scope: &str) -> anyhow::Result<Vec<Value>> {
 +    let transaction = connection.unchecked_transaction()?;
@@ -2905,7 +3047,7 @@ index 0000000000000000000000000000000000000000..fb301e2129e1f295bfd0923ffdcb539d
 +    max_bytes: u32,
 +    generation: uuid::Uuid,
 +) -> Result<StateListPageResult, StatePageError> {
-+    page_inner(connection, scope, cursor, limit, max_bytes, generation).map_err(|error| {
++    page_inner(connection, scope, cursor, limit, max_bytes, None, generation).map_err(|error| {
 +        if let Some(page) = error.downcast_ref::<PageFailure>() {
 +            return page.0.clone();
 +        }
@@ -2916,6 +3058,40 @@ index 0000000000000000000000000000000000000000..fb301e2129e1f295bfd0923ffdcb539d
 +            return StatePageError::RecoveryRequired;
 +        }
 +        tracing::warn!(error=?error,"SQLite state page failed");
++        StatePageError::Internal
++    })
++}
++pub fn page_projected(
++    connection: &Connection,
++    scope: &str,
++    cursor: Option<&str>,
++    limit: u32,
++    max_bytes: u32,
++    fields: &[String],
++    generation: uuid::Uuid,
++) -> Result<StateListPageResult, StatePageError> {
++    let fields = crate::workers::state::structs::canonical_state_page_fields(fields)
++        .ok_or(StatePageError::InvalidProjection)?;
++    page_inner(
++        connection,
++        scope,
++        cursor,
++        limit,
++        max_bytes,
++        Some(&fields),
++        generation,
++    )
++    .map_err(|error| {
++        if let Some(page) = error.downcast_ref::<PageFailure>() {
++            return page.0.clone();
++        }
++        if error
++            .downcast_ref::<protocol::TxError>()
++            .is_some_and(|e| e.0 == "STATE_GRAPH_RECOVERY_REQUIRED")
++        {
++            return StatePageError::RecoveryRequired;
++        }
++        tracing::warn!(error=?error,"SQLite projected state page failed");
 +        StatePageError::Internal
 +    })
 +}
@@ -2931,6 +3107,7 @@ index 0000000000000000000000000000000000000000..fb301e2129e1f295bfd0923ffdcb539d
 +    cursor: Option<&str>,
 +    limit: u32,
 +    max_bytes: u32,
++    fields: Option<&[String]>,
 +    generation: uuid::Uuid,
 +) -> anyhow::Result<StateListPageResult> {
 +    if limit == 0 || limit > 1024 || max_bytes == 0 || max_bytes > 1_048_576 {
@@ -2944,8 +3121,27 @@ index 0000000000000000000000000000000000000000..fb301e2129e1f295bfd0923ffdcb539d
 +            let bytes = URL_SAFE_NO_PAD
 +                .decode(cursor)
 +                .map_err(|_| reject(StatePageError::InvalidCursor))?;
-+            serde_json::from_slice::<Cursor>(&bytes)
-+                .map_err(|_| reject(StatePageError::InvalidCursor))
++            match fields {
++                Some(fields) => {
++                    let decoded = serde_json::from_slice::<ProjectedCursor>(&bytes)
++                        .map_err(|_| reject(StatePageError::InvalidCursor))?;
++                    if decoded.version != 3
++                        || decoded.mode != "projected"
++                        || decoded.fields.as_slice() != fields
++                    {
++                        return Err(reject(StatePageError::InvalidCursor));
++                    }
++                    Ok(DecodedCursor::Projected(decoded))
++                }
++                None => {
++                    let decoded = serde_json::from_slice::<Cursor>(&bytes)
++                        .map_err(|_| reject(StatePageError::InvalidCursor))?;
++                    if decoded.version != 2 {
++                        return Err(reject(StatePageError::InvalidCursor));
++                    }
++                    Ok(DecodedCursor::Full(decoded))
++                }
++            }
 +        })
 +        .transpose()?;
 +    let transaction = connection.unchecked_transaction()?;
@@ -2953,42 +3149,88 @@ index 0000000000000000000000000000000000000000..fb301e2129e1f295bfd0923ffdcb539d
 +    let fingerprint = URL_SAFE_NO_PAD.encode(Sha256::digest(scope.as_bytes()));
 +    let revision = database::revision(&transaction, scope)?.to_string();
 +    let start = if let Some(decoded) = decoded {
-+        if decoded.version != 2
-+            || decoded.scope_fingerprint != fingerprint
-+            || decoded.after_position < 0
-+        {
++        let (cursor_generation, cursor_scope, cursor_revision, after_position) = match decoded {
++            DecodedCursor::Full(decoded) => (
++                decoded.generation,
++                decoded.scope_fingerprint,
++                decoded.revision,
++                decoded.after_position,
++            ),
++            DecodedCursor::Projected(decoded) => (
++                decoded.generation,
++                decoded.scope_fingerprint,
++                decoded.revision,
++                decoded.after_position,
++            ),
++        };
++        if cursor_scope != fingerprint || after_position < 0 {
 +            return Err(reject(StatePageError::InvalidCursor));
 +        }
-+        if decoded.generation != generation || decoded.revision != revision {
++        if cursor_generation != generation || cursor_revision != revision {
 +            return Err(reject(StatePageError::StaleCursor));
 +        }
-+        let exists:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM state_rows WHERE scope=?1 AND position=?2 AND value IS NOT NULL)",params![scope,decoded.after_position],|r|r.get(0))?;
++        let exists: bool = transaction.query_row(
++            "SELECT EXISTS(SELECT 1 FROM state_rows INDEXED BY state_rows_order WHERE scope=?1 AND position=?2 AND value IS NOT NULL)",
++            params![scope, after_position],
++            |row| row.get(0),
++        )?;
 +        if !exists {
 +            return Err(reject(StatePageError::InvalidCursor));
 +        }
-+        decoded.after_position
++        after_position
 +    } else {
 +        -1
 +    };
-+    let mut statement=transaction.prepare("SELECT position,value,value_bytes FROM state_rows WHERE scope=?1 AND position>?2 AND value IS NOT NULL ORDER BY position LIMIT ?3")?;
++    let last_live_position: Option<i64> = transaction
++        .query_row(
++            "SELECT position FROM state_rows INDEXED BY state_rows_order WHERE scope=?1 AND value IS NOT NULL ORDER BY position DESC LIMIT 1",
++            [scope],
++            |row| row.get(0),
++        )
++        .optional()?;
++    let mut statement=transaction.prepare("SELECT position,value,value_bytes FROM state_rows INDEXED BY state_rows_order WHERE scope=?1 AND position>?2 AND value IS NOT NULL ORDER BY position LIMIT ?3")?;
 +    let mut rows = statement.query(params![scope, start, limit])?;
 +    let mut items = Vec::with_capacity(limit as usize);
 +    let mut next_cursor = None;
 +    let mut item_bytes = 0usize;
 +    while let Some(row) = rows.next()? {
 +        let position: i64 = row.get(0)?;
-+        let value_bytes = usize::try_from(row.get::<_, i64>(2)?)?;
-+        let more:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM state_rows WHERE scope=?1 AND position>?2 AND value IS NOT NULL)",params![scope,position],|r|r.get(0))?;
++        let value = if fields.is_some() {
++            Some(row.get::<_, String>(1)?)
++        } else {
++            None
++        };
++        let projected = match (fields, value.as_deref()) {
++            (Some(fields), Some(value)) => Some(project_value(value, fields).map_err(reject)?),
++            _ => None,
++        };
++        let value_bytes = match &projected {
++            Some(value) => protocol::size(value)?,
++            None => usize::try_from(row.get::<_, i64>(2)?)?,
++        };
++        let more = last_live_position.is_some_and(|last_position| position < last_position);
 +        let candidate_cursor = if more {
 +            Some(
-+                encode(&Cursor {
-+                    version: 2,
-+                    generation,
-+                    scope_fingerprint: fingerprint.clone(),
-+                    revision: revision.clone(),
-+                    after_position: position,
-+                })
-+                .map_err(reject)?,
++                match fields {
++                    Some(fields) => encode_projected(&ProjectedCursor {
++                        version: 3,
++                        mode: "projected".to_string(),
++                        generation,
++                        scope_fingerprint: fingerprint.clone(),
++                        revision: revision.clone(),
++                        after_position: position,
++                        fields: fields.to_vec(),
++                    })
++                    .map_err(reject)?,
++                    None => encode(&Cursor {
++                        version: 2,
++                        generation,
++                        scope_fingerprint: fingerprint.clone(),
++                        revision: revision.clone(),
++                        after_position: position,
++                    })
++                    .map_err(reject)?,
++                },
 +            )
 +        } else {
 +            None
@@ -3006,8 +3248,12 @@ index 0000000000000000000000000000000000000000..fb301e2129e1f295bfd0923ffdcb539d
 +            }
 +            break;
 +        }
-+        let value: String = row.get(1)?;
-+        items.push(serde_json::from_str(&value)?);
++        if let Some(projected) = projected {
++            items.push(projected);
++        } else {
++            let value: String = row.get(1)?;
++            items.push(serde_json::from_str(&value)?);
++        }
 +        item_bytes = candidate_bytes;
 +        next_cursor = candidate_cursor;
 +    }
@@ -3015,7 +3261,7 @@ index 0000000000000000000000000000000000000000..fb301e2129e1f295bfd0923ffdcb539d
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/protocol.rs b/engine/src/workers/state/adapters/sqlite/protocol.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..8b4e257e77030b0903d7cb761a7c46a68b5fda0c
+index 0000000..8b4e257
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/protocol.rs
 @@ -0,0 +1,460 @@
@@ -3481,7 +3727,7 @@ index 0000000000000000000000000000000000000000..8b4e257e77030b0903d7cb761a7c46a6
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/resource_tests.rs b/engine/src/workers/state/adapters/sqlite/resource_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..8546de48a613f3900de40636d24c4dd7a9562aa6
+index 0000000..8546de4
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/resource_tests.rs
 @@ -0,0 +1,506 @@
@@ -3991,9 +4237,3965 @@ index 0000000000000000000000000000000000000000..8546de48a613f3900de40636d24c4dd7
 +    );
 +    assert_eq!(code(adapter.lease(json!({"action":"renew","owner_id":"owner","generation":"1","fence":owner["fence"],"ttl_ms":300001})).await.unwrap_err()),"STATE_TX_INVALID_REQUEST");
 +}
+diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/dispatch.rs b/engine/src/workers/state/adapters/sqlite/retrieval/dispatch.rs
+new file mode 100644
+index 0000000..45678ea
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/dispatch.rs
+@@ -0,0 +1,115 @@
++use super::{graph_query, lexical, prepare, request::Request, semantic, semantic_query, source};
++use rusqlite::Connection;
++use serde_json::Value;
++
++pub fn execute(connection: &Connection, request: Request) -> anyhow::Result<Value> {
++    match request {
++        Request::IndexStatus {} => super::status(connection),
++        Request::IndexPrepare {
++            scope,
++            max_rows,
++            max_bytes,
++        } => prepare::prepare(connection, &scope, max_rows, max_bytes),
++        Request::GraphSeeds {
++            entity_names,
++            observation_ids,
++            r#match,
++            max_items,
++            max_bytes,
++        } => graph_query::seeds(
++            connection,
++            &entity_names,
++            &observation_ids,
++            r#match,
++            max_items,
++            max_bytes,
++        ),
++        Request::GraphEdges {
++            node_ids,
++            max_items,
++            max_bytes,
++        } => graph_query::edges(connection, &node_ids, max_items, max_bytes),
++        Request::SemanticConfigure {
++            index_id,
++            model,
++            dimensions,
++            generation,
++            source_kind,
++        } => semantic::configure(
++            connection,
++            &index_id,
++            &model,
++            dimensions,
++            &generation,
++            source_kind.as_deref(),
++        ),
++        Request::SourcePrepare {
++            index_id,
++            model,
++            dimensions,
++            generation,
++            max_rows,
++            max_bytes,
++        } => {
++            semantic::get(connection, &index_id)?.identity(&model, dimensions, &generation)?;
++            source::prepare(connection, &index_id, max_rows, max_bytes)
++        }
++        Request::SemanticUpsert {
++            index_id,
++            model,
++            dimensions,
++            generation,
++            items,
++        } => semantic::upsert(
++            connection,
++            &index_id,
++            &model,
++            dimensions,
++            &generation,
++            items,
++        ),
++        Request::SemanticDelete {
++            index_id,
++            model,
++            dimensions,
++            generation,
++            ids,
++        } => semantic::delete(connection, &index_id, &model, dimensions, &generation, &ids),
++        Request::SemanticSearch {
++            index_id,
++            model,
++            dimensions,
++            generation,
++            embedding,
++            limit,
++            max_candidates,
++            probes,
++        } => semantic_query::search(
++            connection,
++            &index_id,
++            &model,
++            dimensions,
++            &generation,
++            &embedding,
++            limit,
++            max_candidates,
++            probes,
++        ),
++        Request::KeywordSearch {
++            index_id,
++            model,
++            dimensions,
++            generation,
++            query,
++            limit,
++        } => lexical::search(
++            connection,
++            &index_id,
++            &model,
++            dimensions,
++            &generation,
++            &query,
++            limit,
++        ),
++    }
++}
+diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/eligibility.rs b/engine/src/workers/state/adapters/sqlite/retrieval/eligibility.rs
+new file mode 100644
+index 0000000..4316ccb
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/eligibility.rs
+@@ -0,0 +1,48 @@
++use rusqlite::{Connection, functions::FunctionFlags};
++use serde_json::Value;
++
++pub const SQL: &str = "retrieval_source_eligible(scope,json_extract(value,'$.title'),CASE WHEN scope='mem:memories' THEN json_extract(value,'$.content') ELSE json_extract(value,'$.narrative') END,json_type(value,'$.isLatest'))";
++
++fn has_content(value: Option<&str>) -> bool {
++    value.is_some_and(|value|value.chars().any(|c|!matches!(c,'\u{0009}'..='\u{000d}'|'\u{0020}'|'\u{00a0}'|'\u{1680}'|'\u{2000}'..='\u{200a}'|'\u{2028}'|'\u{2029}'|'\u{202f}'|'\u{205f}'|'\u{3000}'|'\u{feff}')))
++}
++
++fn eligible(scope: &str, title: Option<&str>, body: Option<&str>, latest: bool) -> bool {
++    (scope != "mem:memories" || latest) && has_content(title) && has_content(body)
++}
++
++pub fn value(scope: &str, value: Option<&Value>) -> bool {
++    let Some(value) = value else {
++        return false;
++    };
++    let body = if scope == "mem:memories" {
++        "content"
++    } else {
++        "narrative"
++    };
++    eligible(
++        scope,
++        value["title"].as_str(),
++        value[body].as_str(),
++        value.get("isLatest") != Some(&Value::Bool(false)),
++    )
++}
++
++pub fn register(connection: &Connection) -> anyhow::Result<()> {
++    connection.create_scalar_function(
++        "retrieval_source_eligible",
++        4,
++        FunctionFlags::SQLITE_UTF8
++            | FunctionFlags::SQLITE_DETERMINISTIC
++            | FunctionFlags::SQLITE_INNOCUOUS,
++        |context| {
++            Ok(eligible(
++                context.get_raw(0).as_str().unwrap_or(""),
++                context.get_raw(1).as_str().ok(),
++                context.get_raw(2).as_str().ok(),
++                context.get_raw(3).as_str().ok() != Some("false"),
++            ))
++        },
++    )?;
++    Ok(())
++}
+diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/graph.rs b/engine/src/workers/state/adapters/sqlite/retrieval/graph.rs
+new file mode 100644
+index 0000000..d7d07a7
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/graph.rs
+@@ -0,0 +1,139 @@
++use super::{metadata, request};
++use rusqlite::{Connection, params};
++use serde_json::Value;
++use std::collections::BTreeSet;
++
++pub const NODES: &str = "mem:graph:nodes";
++pub const EDGES: &str = "mem:graph:edges";
++
++pub fn schema(connection: &Connection) -> anyhow::Result<()> {
++    connection.execute_batch("CREATE TABLE IF NOT EXISTS retrieval_graph_meta(scope TEXT PRIMARY KEY,status TEXT NOT NULL,cursor INTEGER NOT NULL,revision TEXT NOT NULL,epoch INTEGER NOT NULL) WITHOUT ROWID;
++        CREATE TABLE IF NOT EXISTS retrieval_nodes(epoch INTEGER NOT NULL,key TEXT NOT NULL,id TEXT NOT NULL,name TEXT NOT NULL,prefix TEXT NOT NULL,position INTEGER NOT NULL,PRIMARY KEY(epoch,key)) WITHOUT ROWID;
++        CREATE INDEX IF NOT EXISTS retrieval_nodes_name ON retrieval_nodes(epoch,name,position);
++        CREATE INDEX IF NOT EXISTS retrieval_nodes_prefix ON retrieval_nodes(epoch,prefix,position);
++        CREATE TABLE IF NOT EXISTS retrieval_name_grams(epoch INTEGER NOT NULL,gram TEXT NOT NULL,key TEXT NOT NULL,position INTEGER NOT NULL,PRIMARY KEY(epoch,gram,key)) WITHOUT ROWID;
++        CREATE INDEX IF NOT EXISTS retrieval_name_grams_key ON retrieval_name_grams(epoch,key);
++        CREATE TABLE IF NOT EXISTS retrieval_membership(epoch INTEGER NOT NULL,observation TEXT NOT NULL,key TEXT NOT NULL,position INTEGER NOT NULL,PRIMARY KEY(epoch,observation,key)) WITHOUT ROWID;
++        CREATE INDEX IF NOT EXISTS retrieval_membership_key ON retrieval_membership(epoch,key);
++        CREATE TABLE IF NOT EXISTS retrieval_edges(epoch INTEGER NOT NULL,key TEXT NOT NULL,source TEXT NOT NULL,target TEXT NOT NULL,position INTEGER NOT NULL,PRIMARY KEY(epoch,key)) WITHOUT ROWID;
++        CREATE INDEX IF NOT EXISTS retrieval_edges_source ON retrieval_edges(epoch,source,position);
++        CREATE INDEX IF NOT EXISTS retrieval_edges_target ON retrieval_edges(epoch,target,position);")?;
++    for scope in [NODES, EDGES] {
++        metadata::initialize_graph(connection, scope)?;
++    }
++    Ok(())
++}
++
++pub fn grams(name: &str, width: usize) -> BTreeSet<String> {
++    let chars: Vec<char> = name.chars().collect();
++    if chars.len() < width {
++        return BTreeSet::new();
++    }
++    chars
++        .windows(width)
++        .map(|part| part.iter().collect())
++        .collect()
++}
++
++fn indexable(value: &Value, key: &str) -> anyhow::Result<bool> {
++    request::identifier(key)?;
++    super::super::protocol::require(value.is_object() && value["id"].as_str() == Some(key))?;
++    match value.get("stale") {
++        None | Some(Value::Bool(false)) => Ok(true),
++        Some(Value::Bool(true)) => Ok(false),
++        _ => Err(super::super::protocol::error("STATE_TX_INVALID_REQUEST")),
++    }
++}
++
++pub fn replace(
++    connection: &Connection,
++    scope: &str,
++    key: &str,
++    value: Option<&Value>,
++    position: Option<i64>,
++    epoch: i64,
++) -> anyhow::Result<()> {
++    if scope == NODES {
++        connection.execute(
++            "DELETE FROM retrieval_name_grams INDEXED BY retrieval_name_grams_key WHERE epoch=?1 AND key=?2",
++            params![epoch, key],
++        )?;
++        connection.execute(
++            "DELETE FROM retrieval_membership INDEXED BY retrieval_membership_key WHERE epoch=?1 AND key=?2",
++            params![epoch, key],
++        )?;
++        connection.execute(
++            "DELETE FROM retrieval_nodes WHERE epoch=?1 AND key=?2",
++            params![epoch, key],
++        )?;
++        let Some(value) = value.filter(|_| position.is_some()) else {
++            return Ok(());
++        };
++        if !indexable(value, key)? {
++            return Ok(());
++        }
++        let name = value["name"]
++            .as_str()
++            .ok_or_else(|| super::super::protocol::error("STATE_TX_INVALID_REQUEST"))?;
++        if name.len() > 16 * 1024 {
++            return Err(request::resource());
++        }
++        let name = name.to_lowercase();
++        let prefix: String = name.chars().take(3).collect();
++        let members = value["sourceObservationIds"]
++            .as_array()
++            .ok_or_else(|| super::super::protocol::error("STATE_TX_INVALID_REQUEST"))?;
++        if members.len() > request::MAX_ITEMS {
++            return Err(request::resource());
++        }
++        connection.execute(
++            "INSERT INTO retrieval_nodes VALUES(?1,?2,?2,?3,?4,?5)",
++            params![epoch, key, name, prefix, position],
++        )?;
++        let mut insert =
++            connection.prepare_cached("INSERT INTO retrieval_name_grams VALUES(?1,?2,?3,?4)")?;
++        for width in 1..=3 {
++            for gram in grams(&name, width) {
++                insert.execute(params![epoch, gram, key, position])?;
++            }
++        }
++        let mut insert = connection
++            .prepare_cached("INSERT OR IGNORE INTO retrieval_membership VALUES(?1,?2,?3,?4)")?;
++        let mut bytes = 0usize;
++        for member in members {
++            let member = member
++                .as_str()
++                .ok_or_else(|| super::super::protocol::error("STATE_TX_INVALID_REQUEST"))?;
++            request::identifier(member)?;
++            bytes = bytes.saturating_add(member.len());
++            if bytes > 2 * 1024 * 1024 {
++                return Err(request::resource());
++            }
++            insert.execute(params![epoch, member, key, position])?;
++        }
++    } else if scope == EDGES {
++        connection.execute(
++            "DELETE FROM retrieval_edges WHERE epoch=?1 AND key=?2",
++            params![epoch, key],
++        )?;
++        let Some(value) = value.filter(|_| position.is_some()) else {
++            return Ok(());
++        };
++        if !indexable(value, key)? {
++            return Ok(());
++        }
++        let source = value["sourceNodeId"]
++            .as_str()
++            .ok_or_else(|| super::super::protocol::error("STATE_TX_INVALID_REQUEST"))?;
++        let target = value["targetNodeId"]
++            .as_str()
++            .ok_or_else(|| super::super::protocol::error("STATE_TX_INVALID_REQUEST"))?;
++        request::identifier(source)?;
++        request::identifier(target)?;
++        connection.execute(
++            "INSERT INTO retrieval_edges VALUES(?1,?2,?3,?4,?5)",
++            params![epoch, key, source, target, position],
++        )?;
++    }
++    Ok(())
++}
+diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/graph_query.rs b/engine/src/workers/state/adapters/sqlite/retrieval/graph_query.rs
+new file mode 100644
+index 0000000..85261ea
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/graph_query.rs
+@@ -0,0 +1,242 @@
++use super::super::{commit, database, protocol};
++use super::{
++    graph, metadata,
++    request::{self, NameMatch},
++};
++use rusqlite::{Connection, params};
++use serde_json::{Value, json};
++
++const MAX_CANDIDATE_VISITS: usize = 131_072;
++
++fn begin(connection: &Connection, scope: &str) -> anyhow::Result<i64> {
++    commit::read_allowed(connection, scope, "", None)?;
++    let epoch = metadata::ready_graph(connection, scope)?;
++    connection.execute_batch("DELETE FROM retrieval_selected;")?;
++    Ok(epoch)
++}
++
++fn selected(
++    connection: &Connection,
++    key: &str,
++    position: i64,
++    entity: bool,
++    observation: bool,
++    max_items: usize,
++) -> anyhow::Result<()> {
++    connection.execute("INSERT INTO retrieval_selected VALUES(?1,?2,?3,?4) ON CONFLICT(key) DO UPDATE SET entity=MAX(entity,excluded.entity),observation=MAX(observation,excluded.observation)", params![key,position,entity,observation])?;
++    let count: i64 =
++        connection.query_row("SELECT count(*) FROM retrieval_selected", [], |r| r.get(0))?;
++    if count > max_items as i64 {
++        return Err(request::resource());
++    }
++    Ok(())
++}
++
++fn select_names(
++    connection: &Connection,
++    sql: &str,
++    epoch: i64,
++    term: &str,
++    query: &str,
++    mode: NameMatch,
++    visits: &mut usize,
++    max_items: usize,
++) -> anyhow::Result<()> {
++    let mut statement = connection.prepare_cached(sql)?;
++    let mut rows = statement.query(params![epoch, term])?;
++    while let Some(row) = rows.next()? {
++        *visits += 1;
++        if *visits > MAX_CANDIDATE_VISITS {
++            return Err(request::resource());
++        }
++        let name: String = row.get(1)?;
++        let matched = match mode {
++            NameMatch::Exact => name == query,
++            NameMatch::Substring => name.contains(query) || query.contains(&name),
++        };
++        if matched {
++            selected(
++                connection,
++                &row.get::<_, String>(0)?,
++                row.get(2)?,
++                true,
++                false,
++                max_items,
++            )?;
++        }
++    }
++    Ok(())
++}
++
++fn generation(connection: &Connection) -> anyhow::Result<Value> {
++    let control = database::row(connection, database::CONTROL_SCOPE, "current")?
++        .value
++        .ok_or_else(|| protocol::error("STATE_TX_FAILED"))?;
++    Ok(control["generation"].clone())
++}
++
++pub fn seeds(
++    connection: &Connection,
++    names: &[String],
++    observations: &[String],
++    mode: NameMatch,
++    max_items: usize,
++    max_bytes: usize,
++) -> anyhow::Result<Value> {
++    let epoch = begin(connection, graph::NODES)?;
++    let mut visits = 0;
++    for query in names {
++        let query = query.to_lowercase();
++        if mode == NameMatch::Exact {
++            select_names(
++                connection,
++                "SELECT key,name,position FROM retrieval_nodes INDEXED BY retrieval_nodes_name WHERE epoch=?1 AND name=?2",
++                epoch,
++                &query,
++                &query,
++                mode,
++                &mut visits,
++                max_items,
++            )?;
++            continue;
++        }
++        if query.is_empty() {
++            select_names(
++                connection,
++                "SELECT key,name,position FROM retrieval_nodes WHERE epoch=?1 AND ?2=''",
++                epoch,
++                "",
++                "",
++                mode,
++                &mut visits,
++                max_items,
++            )?;
++            continue;
++        }
++        let anchor: String = query.chars().take(3).collect();
++        select_names(
++            connection,
++            "SELECT n.key,n.name,n.position FROM retrieval_name_grams g CROSS JOIN retrieval_nodes n WHERE g.epoch=?1 AND g.gram=?2 AND n.epoch=g.epoch AND n.key=g.key",
++            epoch,
++            &anchor,
++            &query,
++            mode,
++            &mut visits,
++            max_items,
++        )?;
++        for width in 1..=3 {
++            for prefix in graph::grams(&query, width) {
++                select_names(
++                    connection,
++                    "SELECT key,name,position FROM retrieval_nodes INDEXED BY retrieval_nodes_prefix WHERE epoch=?1 AND prefix=?2",
++                    epoch,
++                    &prefix,
++                    &query,
++                    mode,
++                    &mut visits,
++                    max_items,
++                )?;
++            }
++        }
++        select_names(
++            connection,
++            "SELECT key,name,position FROM retrieval_nodes INDEXED BY retrieval_nodes_name WHERE epoch=?1 AND name=?2",
++            epoch,
++            "",
++            &query,
++            mode,
++            &mut visits,
++            max_items,
++        )?;
++    }
++    let mut statement = connection.prepare_cached(
++        "SELECT m.key,m.position FROM retrieval_membership m WHERE m.epoch=?1 AND m.observation=?2",
++    )?;
++    for observation in observations {
++        let mut rows = statement.query(params![epoch, observation])?;
++        while let Some(row) = rows.next()? {
++            visits += 1;
++            if visits > MAX_CANDIDATE_VISITS {
++                return Err(request::resource());
++            }
++            selected(
++                connection,
++                &row.get::<_, String>(0)?,
++                row.get(1)?,
++                false,
++                true,
++                max_items,
++            )?;
++        }
++    }
++    let mut output = Vec::new();
++    let mut bytes = 256;
++    let mut statement = connection.prepare(
++        "SELECT key,position,entity,observation FROM retrieval_selected ORDER BY position",
++    )?;
++    let mut rows = statement.query([])?;
++    while let Some(row) = rows.next()? {
++        let key: String = row.get(0)?;
++        let position: i64 = row.get(1)?;
++        let item = json!({"key":key,"id":key,"position":position.to_string(),"entity":row.get::<_,bool>(2)?,"observation":row.get::<_,bool>(3)?});
++        bytes += protocol::size(&item)? + 1;
++        if bytes > max_bytes {
++            return Err(request::resource());
++        }
++        output.push(item);
++    }
++    Ok(json!({"items":output,"generation":generation(connection)?}))
++}
++
++pub fn edges(
++    connection: &Connection,
++    node_ids: &[String],
++    max_items: usize,
++    max_bytes: usize,
++) -> anyhow::Result<Value> {
++    let epoch = begin(connection, graph::EDGES)?;
++    let mut visits = 0;
++    for node in node_ids {
++        for sql in [
++            "SELECT key,position FROM retrieval_edges INDEXED BY retrieval_edges_source WHERE epoch=?1 AND source=?2",
++            "SELECT key,position FROM retrieval_edges INDEXED BY retrieval_edges_target WHERE epoch=?1 AND target=?2",
++        ] {
++            let mut statement = connection.prepare_cached(sql)?;
++            let mut rows = statement.query(params![epoch, node])?;
++            while let Some(row) = rows.next()? {
++                visits += 1;
++                if visits > MAX_CANDIDATE_VISITS {
++                    return Err(request::resource());
++                }
++                selected(
++                    connection,
++                    &row.get::<_, String>(0)?,
++                    row.get(1)?,
++                    false,
++                    false,
++                    max_items,
++                )?;
++            }
++        }
++    }
++    let mut statement = connection.prepare("SELECT s.key,s.position,r.value,r.value_bytes FROM retrieval_selected s CROSS JOIN state_rows r WHERE r.scope=?1 AND r.key=s.key AND r.value IS NOT NULL ORDER BY s.position")?;
++    let mut rows = statement.query([graph::EDGES])?;
++    let mut output = Vec::new();
++    let mut bytes = 256;
++    while let Some(row) = rows.next()? {
++        let raw_bytes: i64 = row.get(3)?;
++        if raw_bytes < 0 || raw_bytes as usize > max_bytes.saturating_sub(bytes) {
++            return Err(request::resource());
++        }
++        let value: Value = serde_json::from_str(&row.get::<_, String>(2)?)?;
++        let position: i64 = row.get(1)?;
++        let item =
++            json!({"key":row.get::<_,String>(0)?,"position":position.to_string(),"value":value});
++        bytes += protocol::size(&item)? + 1;
++        if bytes > max_bytes {
++            return Err(request::resource());
++        }
++        output.push(item);
++    }
++    Ok(json!({"items":output,"generation":generation(connection)?}))
++}
+diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/lexical.rs b/engine/src/workers/state/adapters/sqlite/retrieval/lexical.rs
+new file mode 100644
+index 0000000..ceb4589
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/lexical.rs
+@@ -0,0 +1,112 @@
++use super::super::protocol;
++use super::{request, semantic, source};
++use rusqlite::{Connection, OptionalExtension, params};
++use serde_json::{Value, json};
++use std::collections::BTreeSet;
++
++pub fn schema(connection: &Connection) -> anyhow::Result<()> {
++    connection.execute_batch("CREATE VIRTUAL TABLE IF NOT EXISTS retrieval_lexical USING fts5(index_id UNINDEXED,epoch UNINDEXED,id UNINDEXED,text,tokenize='unicode61 tokenchars ''_''');
++        CREATE TABLE IF NOT EXISTS retrieval_lexical_links(index_id TEXT NOT NULL,epoch INTEGER NOT NULL,id TEXT NOT NULL,rowid INTEGER NOT NULL UNIQUE,PRIMARY KEY(index_id,epoch,id)) WITHOUT ROWID;")?;
++    Ok(())
++}
++
++pub fn replace(
++    connection: &Connection,
++    meta: &semantic::Meta,
++    key: &str,
++    value: Option<&Value>,
++) -> anyhow::Result<()> {
++    let rowid: Option<i64> = connection
++        .query_row(
++            "SELECT rowid FROM retrieval_lexical_links WHERE index_id=?1 AND epoch=?2 AND id=?3",
++            params![meta.index_id, meta.epoch, key],
++            |r| r.get(0),
++        )
++        .optional()?;
++    if let Some(rowid) = rowid {
++        connection.execute("DELETE FROM retrieval_lexical WHERE rowid=?1", [rowid])?;
++        connection.execute(
++            "DELETE FROM retrieval_lexical_links WHERE index_id=?1 AND epoch=?2 AND id=?3",
++            params![meta.index_id, meta.epoch, key],
++        )?;
++        connection.execute(
++            "UPDATE retrieval_semantic_meta SET lexical_count=lexical_count-1 WHERE index_id=?1",
++            [&meta.index_id],
++        )?;
++    }
++    let Some(value) = value else {
++        return Ok(());
++    };
++    let Some(text) = source::lexical_text(connection, &meta.index_id, value)? else {
++        return Ok(());
++    };
++    protocol::require(!text.trim().is_empty() && text.len() <= 1_048_576)?;
++    if source::kind(connection, &meta.index_id)?.is_none() {
++        protocol::require(text.len() <= 65_536)?;
++    }
++    connection.execute(
++        "INSERT INTO retrieval_lexical(index_id,epoch,id,text) VALUES(?1,?2,?3,?4)",
++        params![meta.index_id, meta.epoch, key, text],
++    )?;
++    let rowid = connection.last_insert_rowid();
++    connection.execute(
++        "INSERT INTO retrieval_lexical_links VALUES(?1,?2,?3,?4)",
++        params![meta.index_id, meta.epoch, key, rowid],
++    )?;
++    connection.execute(
++        "UPDATE retrieval_semantic_meta SET lexical_count=lexical_count+1 WHERE index_id=?1",
++        [&meta.index_id],
++    )?;
++    Ok(())
++}
++
++fn expression(query: &str) -> anyhow::Result<Option<String>> {
++    let terms: BTreeSet<String> = query
++        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
++        .filter(|v| !v.is_empty())
++        .map(str::to_lowercase)
++        .collect();
++    if terms.len() > 32 || terms.iter().any(|v| v.len() > 256) {
++        return Err(request::resource());
++    }
++    if terms.is_empty() {
++        return Ok(None);
++    }
++    Ok(Some(
++        terms
++            .into_iter()
++            .map(|v| format!("\"{v}\""))
++            .collect::<Vec<_>>()
++            .join(" OR "),
++    ))
++}
++
++pub fn search(
++    connection: &Connection,
++    id: &str,
++    model: &str,
++    dimensions: usize,
++    generation: &str,
++    query: &str,
++    limit: usize,
++) -> anyhow::Result<Value> {
++    let meta = semantic::get(connection, id)?;
++    meta.identity(model, dimensions, generation)?;
++    meta.ready(connection)?;
++    if meta.lexical_count != meta.count {
++        return Err(protocol::error("STATE_LEXICAL_INDEX_NOT_READY"));
++    }
++    let mut output = Vec::new();
++    if let Some(expression) = expression(query)? {
++        let mut statement=connection.prepare_cached("SELECT retrieval_lexical.id,v.session_id,bm25(retrieval_lexical) FROM retrieval_lexical CROSS JOIN retrieval_vectors v ON v.index_id=retrieval_lexical.index_id AND v.epoch=retrieval_lexical.epoch AND v.id=retrieval_lexical.id WHERE retrieval_lexical MATCH ?1 AND retrieval_lexical.index_id=?2 AND retrieval_lexical.epoch=?3 ORDER BY bm25(retrieval_lexical),retrieval_lexical.id LIMIT ?4")?;
++        let mut rows = statement.query(params![expression, id, meta.epoch, limit as i64])?;
++        while let Some(row) = rows.next()? {
++            let score: f64 = row.get(2)?;
++            if !score.is_finite() {
++                return Err(protocol::error("STATE_INDEX_NOT_READY"));
++            }
++            output.push(json!({"obsId":row.get::<_,String>(0)?,"sessionId":row.get::<_,String>(1)?,"score":-score}));
++        }
++    }
++    Ok(json!({"items":output,"model":model,"dimensions":dimensions,"generation":generation}))
++}
+diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/lsh.rs b/engine/src/workers/state/adapters/sqlite/retrieval/lsh.rs
+new file mode 100644
+index 0000000..363cff6
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/lsh.rs
+@@ -0,0 +1,139 @@
++use super::super::protocol::{error, require};
++use base64::{Engine, engine::general_purpose::STANDARD};
++
++pub const TABLES: usize = 12;
++const BITS: usize = 12;
++
++pub fn decode(encoded: &str, dimensions: usize) -> anyhow::Result<Vec<f32>> {
++    let bytes = dimensions
++        .checked_mul(4)
++        .ok_or_else(|| error("STATE_TX_INVALID_REQUEST"))?;
++    require(encoded.len() == bytes.div_ceil(3) * 4)?;
++    let raw = STANDARD
++        .decode(encoded)
++        .map_err(|_| error("STATE_TX_INVALID_REQUEST"))?;
++    require(raw.len() == bytes)?;
++    let vector: Vec<f32> = raw
++        .chunks_exact(4)
++        .map(|part| f32::from_le_bytes([part[0], part[1], part[2], part[3]]))
++        .collect();
++    normalize(vector)
++}
++
++fn normalize(mut vector: Vec<f32>) -> anyhow::Result<Vec<f32>> {
++    require(vector.iter().all(|v| v.is_finite()))?;
++    let norm = vector
++        .iter()
++        .map(|v| (*v as f64).powi(2))
++        .sum::<f64>()
++        .sqrt();
++    require(norm.is_finite() && norm > 0.0)?;
++    for value in &mut vector {
++        *value = (*value as f64 / norm) as f32;
++    }
++    Ok(vector)
++}
++
++pub fn blob(vector: &[f32]) -> Vec<u8> {
++    vector
++        .iter()
++        .flat_map(|value| value.to_le_bytes())
++        .collect()
++}
++pub fn from_blob(bytes: &[u8], dimensions: usize) -> anyhow::Result<Vec<f32>> {
++    if bytes.len() != dimensions * 4 {
++        return Err(error("STATE_INDEX_NOT_READY"));
++    }
++    let vector: Vec<f32> = bytes
++        .chunks_exact(4)
++        .map(|part| f32::from_le_bytes([part[0], part[1], part[2], part[3]]))
++        .collect();
++    if !vector.iter().all(|v| v.is_finite()) {
++        return Err(error("STATE_INDEX_NOT_READY"));
++    }
++    Ok(vector)
++}
++
++pub struct Signature {
++    pub bucket: u16,
++    margins: [f64; BITS],
++}
++
++fn random(state: &mut u64) -> u64 {
++    *state ^= *state << 13;
++    *state ^= *state >> 7;
++    *state ^= *state << 17;
++    *state
++}
++
++pub fn signatures(vector: &[f32]) -> Vec<Signature> {
++    (0..TABLES)
++        .map(|table| {
++            let mut signature = Signature {
++                bucket: 0,
++                margins: [0.0; BITS],
++            };
++            for bit in 0..BITS {
++                let mut seed =
++                    0x9e37_79b9_7f4a_7c15u64.wrapping_mul((table * BITS + bit + 1) as u64);
++                let mut dot = 0.0;
++                for value in vector {
++                    dot += if random(&mut seed) & 1 == 0 {
++                        *value as f64
++                    } else {
++                        -(*value as f64)
++                    };
++                }
++                if dot >= 0.0 {
++                    signature.bucket |= 1 << bit;
++                }
++                signature.margins[bit] = dot.abs();
++            }
++            signature
++        })
++        .collect()
++}
++
++pub fn buckets(signature: &Signature, probes: usize) -> Vec<u16> {
++    let mut masks = vec![(0.0, 0u16)];
++    for a in 0..BITS {
++        masks.push((signature.margins[a], 1 << a));
++        for b in (a + 1)..BITS {
++            masks.push((
++                signature.margins[a] + signature.margins[b],
++                (1 << a) | (1 << b),
++            ));
++            for c in (b + 1)..BITS {
++                masks.push((
++                    signature.margins[a] + signature.margins[b] + signature.margins[c],
++                    (1 << a) | (1 << b) | (1 << c),
++                ));
++            }
++        }
++    }
++    masks.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
++    masks
++        .into_iter()
++        .take(probes)
++        .map(|(_, mask)| signature.bucket ^ mask)
++        .collect()
++}
++
++pub fn cosine(query: &[f32], vector: &[f32]) -> f64 {
++    let dot: f64 = query
++        .iter()
++        .zip(vector)
++        .map(|(a, b)| *a as f64 * *b as f64)
++        .sum();
++    let q = query
++        .iter()
++        .map(|v| (*v as f64).powi(2))
++        .sum::<f64>()
++        .sqrt();
++    let v = vector
++        .iter()
++        .map(|v| (*v as f64).powi(2))
++        .sum::<f64>()
++        .sqrt();
++    (dot / (q * v)).clamp(-1.0, 1.0)
++}
+diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/metadata.rs b/engine/src/workers/state/adapters/sqlite/retrieval/metadata.rs
+new file mode 100644
+index 0000000..81974a9
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/metadata.rs
+@@ -0,0 +1,90 @@
++use super::super::{database, protocol};
++use rusqlite::{Connection, OptionalExtension, params};
++
++pub struct Meta {
++    pub status: String,
++    pub cursor: i64,
++    pub revision: String,
++    pub epoch: i64,
++}
++
++pub fn graph(connection: &Connection, scope: &str) -> anyhow::Result<Meta> {
++    connection
++        .query_row(
++            "SELECT status,cursor,revision,epoch FROM retrieval_graph_meta WHERE scope=?1",
++            [scope],
++            |r| {
++                Ok(Meta {
++                    status: r.get(0)?,
++                    cursor: r.get(1)?,
++                    revision: r.get(2)?,
++                    epoch: r.get(3)?,
++                })
++            },
++        )
++        .optional()?
++        .ok_or_else(|| protocol::error("STATE_TX_INVALID_REQUEST"))
++}
++
++pub fn initialize_graph(connection: &Connection, scope: &str) -> anyhow::Result<()> {
++    let revision = database::revision(connection, scope)?.to_string();
++    let exists: bool = connection.query_row(
++        "SELECT EXISTS(SELECT 1 FROM retrieval_graph_meta WHERE scope=?1)",
++        [scope],
++        |r| r.get(0),
++    )?;
++    if !exists {
++        let populated: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM state_rows INDEXED BY state_rows_order WHERE scope=?1 AND value IS NOT NULL)", [scope], |r| r.get(0))?;
++        connection.execute(
++            "INSERT INTO retrieval_graph_meta VALUES(?1,?2,-1,?3,1)",
++            params![scope, if populated { "pending" } else { "ready" }, revision],
++        )?;
++    } else {
++        let meta = graph(connection, scope)?;
++        if meta.revision != revision {
++            rebuild_graph(connection, scope, &revision, meta.epoch)?;
++        }
++    }
++    Ok(())
++}
++
++fn next_epoch(epoch: i64) -> anyhow::Result<i64> {
++    epoch
++        .checked_add(1)
++        .ok_or_else(|| protocol::error("STATE_TX_LIMIT_EXCEEDED"))
++}
++
++pub fn rebuild_graph(
++    connection: &Connection,
++    scope: &str,
++    revision: &str,
++    epoch: i64,
++) -> anyhow::Result<i64> {
++    let epoch = next_epoch(epoch)?;
++    connection.execute("UPDATE retrieval_graph_meta SET status='pending',cursor=-1,revision=?2,epoch=?3 WHERE scope=?1", params![scope,revision,epoch])?;
++    Ok(epoch)
++}
++
++pub fn graph_write_epoch(connection: &Connection, scope: &str) -> anyhow::Result<i64> {
++    let meta = graph(connection, scope)?;
++    let revision = database::revision(connection, scope)?;
++    let epoch = if protocol::counter(&meta.revision)?.checked_add(1) == Some(revision) {
++        meta.epoch
++    } else {
++        rebuild_graph(connection, scope, &revision.to_string(), meta.epoch)?
++    };
++    connection.execute(
++        "UPDATE retrieval_graph_meta SET revision=?2 WHERE scope=?1",
++        params![scope, revision.to_string()],
++    )?;
++    Ok(epoch)
++}
++
++pub fn ready_graph(connection: &Connection, scope: &str) -> anyhow::Result<i64> {
++    let meta = graph(connection, scope)?;
++    if meta.status != "ready" || meta.revision != database::revision(connection, scope)?.to_string()
++    {
++        return Err(protocol::error("STATE_INDEX_NOT_READY"));
++    }
++    Ok(meta.epoch)
++}
+diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/mod.rs b/engine/src/workers/state/adapters/sqlite/retrieval/mod.rs
+new file mode 100644
+index 0000000..b05c473
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/mod.rs
+@@ -0,0 +1,179 @@
++mod dispatch;
++mod eligibility;
++mod graph;
++mod graph_query;
++mod lexical;
++mod lsh;
++mod metadata;
++mod prepare;
++pub(super) mod request;
++mod request_validate;
++mod semantic;
++mod semantic_meta;
++mod semantic_query;
++mod source;
++mod source_lexical;
++mod source_prepare;
++mod source_write;
++#[cfg(test)]
++mod tests;
++
++use super::{database, protocol};
++use request::Request;
++use rusqlite::{Connection, params};
++use serde_json::{Value, json};
++
++pub const CAPABILITIES: [&str; 2] = ["state::indexed_graph_v1", "state::semantic_lsh_v1"];
++
++pub fn initialize(connection: &Connection) -> anyhow::Result<()> {
++    connection.execute_batch("CREATE TEMP TABLE IF NOT EXISTS retrieval_selected(key TEXT PRIMARY KEY,position INTEGER NOT NULL,entity INTEGER NOT NULL,observation INTEGER NOT NULL) WITHOUT ROWID;
++        CREATE INDEX IF NOT EXISTS retrieval_selected_position ON retrieval_selected(position);
++        CREATE TABLE IF NOT EXISTS retrieval_graph_invalid(scope TEXT NOT NULL,epoch INTEGER NOT NULL,key TEXT NOT NULL,PRIMARY KEY(scope,epoch,key)) WITHOUT ROWID;")?;
++    graph::schema(connection)?;
++    lexical::schema(connection)?;
++    semantic::schema(connection)?;
++    source::schema(connection)?;
++    Ok(())
++}
++
++pub fn maintain(
++    connection: &Connection,
++    scope: &str,
++    key: &str,
++    value: Option<&Value>,
++    position: Option<i64>,
++) -> anyhow::Result<()> {
++    if [graph::NODES, graph::EDGES].contains(&scope) {
++        let epoch = metadata::graph_write_epoch(connection, scope)?;
++        connection.execute_batch("SAVEPOINT retrieval_graph_row;")?;
++        match graph::replace(connection, scope, key, value, position, epoch) {
++            Ok(()) => {
++                connection.execute_batch("RELEASE retrieval_graph_row;")?;
++                connection.execute(
++                    "DELETE FROM retrieval_graph_invalid WHERE scope=?1 AND epoch=?2 AND key=?3",
++                    params![scope, epoch, key],
++                )?;
++            }
++            Err(cause)
++                if cause.downcast_ref::<protocol::TxError>().is_some_and(|e| {
++                    ["STATE_TX_INVALID_REQUEST", "STATE_RETRIEVAL_RESOURCE_LIMIT"].contains(&e.0)
++                }) =>
++            {
++                connection.execute_batch(
++                    "ROLLBACK TO retrieval_graph_row; RELEASE retrieval_graph_row;",
++                )?;
++                connection.execute(
++                    "INSERT OR IGNORE INTO retrieval_graph_invalid VALUES(?1,?2,?3)",
++                    params![scope, epoch, key],
++                )?;
++                connection.execute(
++                    "UPDATE retrieval_graph_meta SET status='pending',cursor=-1 WHERE scope=?1",
++                    [scope],
++                )?;
++            }
++            Err(cause) => {
++                connection.execute_batch(
++                    "ROLLBACK TO retrieval_graph_row; RELEASE retrieval_graph_row;",
++                )?;
++                return Err(cause);
++            }
++        }
++    } else if let Some(id) = scope.strip_prefix(semantic::PREFIX) {
++        let configured: bool = connection.query_row(
++            "SELECT EXISTS(SELECT 1 FROM retrieval_semantic_meta WHERE index_id=?1)",
++            [id],
++            |r| r.get(0),
++        )?;
++        if configured {
++            semantic::maintain(connection, id, key, value)?;
++        }
++    }
++    Ok(())
++}
++
++fn status(connection: &Connection) -> anyhow::Result<Value> {
++    let mut graph_status = Vec::new();
++    for scope in [graph::NODES, graph::EDGES] {
++        let meta = metadata::graph(connection, scope)?;
++        let status = if meta.revision == database::revision(connection, scope)?.to_string() {
++            meta.status.as_str()
++        } else {
++            "pending"
++        };
++        let invalid: i64 = connection.query_row(
++            "SELECT count(*) FROM retrieval_graph_invalid WHERE scope=?1 AND epoch=?2",
++            params![scope, meta.epoch],
++            |r| r.get(0),
++        )?;
++        graph_status.push(json!({"scope":scope,"status":status,"cursor":meta.cursor.to_string(),"revision":meta.revision,"invalid_records":invalid}));
++    }
++    let mut statement =
++        connection.prepare("SELECT index_id FROM retrieval_semantic_meta ORDER BY index_id")?;
++    let ids = statement
++        .query_map([], |r| r.get::<_, String>(0))?
++        .collect::<rusqlite::Result<Vec<_>>>()?;
++    let mut semantic_status = Vec::with_capacity(ids.len());
++    for id in ids {
++        let meta = semantic::get(connection, &id)?;
++        let mut value = meta.status_value();
++        if meta.revision != database::revision(connection, &meta.scope())?.to_string() {
++            value["status"] = json!("pending");
++            value["lexical_ready"] = json!(false);
++        }
++        semantic_status.push(source::decorate(connection, &id, value)?);
++    }
++    Ok(
++        json!({"version":1,"capabilities":CAPABILITIES,"graph":graph_status,"semantic":semantic_status}),
++    )
++}
++
++pub fn read_only(request: &Request) -> bool {
++    matches!(
++        request,
++        Request::IndexStatus {}
++            | Request::GraphSeeds { .. }
++            | Request::GraphEdges { .. }
++            | Request::SemanticSearch { .. }
++            | Request::KeywordSearch { .. }
++    )
++}
++
++pub fn source_changed(
++    connection: &Connection,
++    scope: &str,
++    key: &str,
++    old: &database::Row,
++    value: Option<&Value>,
++    version: u64,
++) -> anyhow::Result<()> {
++    source_write::changed(connection, scope, key, old, value, version)
++}
++
++pub fn bounded<T>(
++    connection: &Connection,
++    job: impl FnOnce() -> anyhow::Result<T>,
++) -> anyhow::Result<T> {
++    bounded_for(connection, std::time::Duration::from_secs(45), job)
++}
++
++fn bounded_for<T>(
++    connection: &Connection,
++    budget: std::time::Duration,
++    job: impl FnOnce() -> anyhow::Result<T>,
++) -> anyhow::Result<T> {
++    let start = std::time::Instant::now();
++    connection.progress_handler(10_000, Some(move || start.elapsed() >= budget))?;
++    let result = job();
++    connection.progress_handler(0, None::<fn() -> bool>)?;
++    if start.elapsed() >= budget {
++        return Err(request::resource());
++    }
++    if let Err(cause) = &result {
++        if cause.downcast_ref::<rusqlite::Error>().is_some_and(|e| matches!(e,rusqlite::Error::SqliteFailure(code,_) if code.code==rusqlite::ErrorCode::OperationInterrupted)) {
++            return Err(request::resource());
++        }
++    }
++    result
++}
++
++pub use dispatch::execute;
+diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/prepare.rs b/engine/src/workers/state/adapters/sqlite/retrieval/prepare.rs
+new file mode 100644
+index 0000000..3093579
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/prepare.rs
+@@ -0,0 +1,126 @@
++use super::super::{commit, database, protocol};
++use super::{graph, metadata, semantic};
++use rusqlite::{Connection, params};
++use serde_json::{Value, json};
++
++pub fn prepare(
++    connection: &Connection,
++    scope: &str,
++    max_rows: usize,
++    max_bytes: usize,
++) -> anyhow::Result<Value> {
++    let (mut status, mut cursor, mut epoch, table, column, id) =
++        if [graph::NODES, graph::EDGES].contains(&scope) {
++            commit::read_allowed(connection, scope, "", None)?;
++            metadata::initialize_graph(connection, scope)?;
++            let meta = metadata::graph(connection, scope)?;
++            (
++                meta.status,
++                meta.cursor,
++                meta.epoch,
++                "retrieval_graph_meta",
++                "scope",
++                scope.to_owned(),
++            )
++        } else if let Some(id) = scope.strip_prefix(semantic::PREFIX) {
++            let mut meta = semantic::get(connection, id)?;
++            let revision = database::revision(connection, scope)?.to_string();
++            if meta.revision != revision {
++                semantic::rebuild(connection, &meta, &revision)?;
++                meta = semantic::get(connection, id)?;
++            }
++            (
++                meta.status,
++                meta.cursor,
++                meta.epoch,
++                "retrieval_semantic_meta",
++                "index_id",
++                id.to_owned(),
++            )
++        } else {
++            return Err(protocol::error("STATE_TX_INVALID_REQUEST"));
++        };
++    if status == "ready" {
++        return Ok(
++            json!({"scope":scope,"status":status,"cursor":cursor.to_string(),"processed":0,"revision":database::revision(connection,scope)?.to_string()}),
++        );
++    }
++    let projection = if scope == graph::NODES {
++        "json_object('id',json_extract(value,'$.id'),'name',json_extract(value,'$.name'),'stale',COALESCE(json_extract(value,'$.stale'),json('false')),'sourceObservationIds',json_extract(value,'$.sourceObservationIds'))"
++    } else if scope == graph::EDGES {
++        "json_object('id',json_extract(value,'$.id'),'stale',COALESCE(json_extract(value,'$.stale'),json('false')),'sourceNodeId',json_extract(value,'$.sourceNodeId'),'targetNodeId',json_extract(value,'$.targetNodeId'))"
++    } else {
++        "value"
++    };
++    let sql = format!(
++        "SELECT key,position,{projection} FROM state_rows INDEXED BY state_rows_order WHERE scope=?1 AND value IS NOT NULL AND position>?2 ORDER BY position LIMIT ?3"
++    );
++    let mut statement = connection.prepare(&sql)?;
++    let mut rows = statement.query(params![scope, cursor, (max_rows + 1) as i64])?;
++    let mut processed = 0usize;
++    let mut bytes = 0usize;
++    let mut complete = true;
++    while let Some(row) = rows.next()? {
++        if processed == max_rows {
++            complete = false;
++            break;
++        }
++        let raw: String = row.get(2)?;
++        if bytes.saturating_add(raw.len()) > max_bytes {
++            if processed == 0 {
++                return Err(super::request::resource());
++            }
++            complete = false;
++            break;
++        }
++        let key: String = row.get(0)?;
++        let position: i64 = row.get(1)?;
++        let mut value: Value = serde_json::from_str(&raw)?;
++        if scope == graph::NODES || scope == graph::EDGES {
++            // SQLite JSON scalar projection represents booleans as integer 0/1.
++            if let Some(stale) = value.get("stale").and_then(Value::as_i64) {
++                if stale == 0 || stale == 1 {
++                    value["stale"] = Value::Bool(stale == 1);
++                }
++            }
++            graph::replace(connection, scope, &key, Some(&value), Some(position), epoch).map_err(
++                |cause| match cause.downcast_ref::<protocol::TxError>() {
++                    Some(protocol::TxError("STATE_TX_INVALID_REQUEST")) => {
++                        protocol::error("STATE_INDEX_RECORD_INVALID")
++                    }
++                    _ => cause,
++                },
++            )?;
++            connection.execute(
++                "DELETE FROM retrieval_graph_invalid WHERE scope=?1 AND epoch=?2 AND key=?3",
++                params![scope, epoch, key],
++            )?;
++        } else {
++            let meta = semantic::get(connection, &id)?;
++            epoch = meta.epoch;
++            semantic::replace(connection, &meta, &key, Some(&value))?;
++        }
++        cursor = position;
++        processed += 1;
++        bytes += raw.len();
++    }
++    if complete {
++        if scope == graph::NODES || scope == graph::EDGES {
++            let invalid: bool = connection.query_row(
++                "SELECT EXISTS(SELECT 1 FROM retrieval_graph_invalid WHERE scope=?1 AND epoch=?2)",
++                params![scope, epoch],
++                |r| r.get(0),
++            )?;
++            if invalid {
++                return Err(protocol::error("STATE_INDEX_RECORD_INVALID"));
++            }
++        }
++        status = "ready".into();
++    }
++    let revision = database::revision(connection, scope)?.to_string();
++    let update = format!("UPDATE {table} SET status=?2,cursor=?3,revision=?4 WHERE {column}=?1");
++    connection.execute(&update, params![id, status, cursor, revision])?;
++    Ok(
++        json!({"scope":scope,"status":status,"cursor":cursor.to_string(),"processed":processed,"revision":revision}),
++    )
++}
+diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/request.rs b/engine/src/workers/state/adapters/sqlite/retrieval/request.rs
+new file mode 100644
+index 0000000..f442056
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/request.rs
+@@ -0,0 +1,172 @@
++use super::super::protocol::{error, require};
++use serde::Deserialize;
++
++pub const MAX_INPUT_ITEMS: usize = 512;
++pub const MAX_ITEMS: usize = 16_384;
++pub const MAX_BYTES: usize = 8 * 1024 * 1024;
++
++fn items() -> usize {
++    4096
++}
++fn bytes() -> usize {
++    1_048_576
++}
++fn rows() -> usize {
++    256
++}
++fn limit() -> usize {
++    50
++}
++fn probes() -> usize {
++    32
++}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct VectorInput {
++    pub id: String,
++    pub session_id: String,
++    pub embedding: String,
++    #[serde(default)]
++    pub text: Option<String>,
++    #[serde(default)]
++    pub source_scope: Option<String>,
++    #[serde(default)]
++    pub source_version: Option<String>,
++}
++
++#[derive(Clone, Copy, Deserialize, PartialEq)]
++#[serde(rename_all = "lowercase")]
++pub enum NameMatch {
++    Substring,
++    Exact,
++}
++impl Default for NameMatch {
++    fn default() -> Self {
++        Self::Substring
++    }
++}
++
++#[derive(Deserialize)]
++#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
++pub enum Request {
++    IndexStatus {},
++    IndexPrepare {
++        scope: String,
++        #[serde(default = "rows")]
++        max_rows: usize,
++        #[serde(default = "bytes")]
++        max_bytes: usize,
++    },
++    GraphSeeds {
++        #[serde(default)]
++        entity_names: Vec<String>,
++        #[serde(default)]
++        observation_ids: Vec<String>,
++        #[serde(default)]
++        r#match: NameMatch,
++        #[serde(default = "items")]
++        max_items: usize,
++        #[serde(default = "bytes")]
++        max_bytes: usize,
++    },
++    GraphEdges {
++        node_ids: Vec<String>,
++        #[serde(default = "items")]
++        max_items: usize,
++        #[serde(default = "bytes")]
++        max_bytes: usize,
++    },
++    SemanticConfigure {
++        index_id: String,
++        model: String,
++        dimensions: usize,
++        generation: String,
++        #[serde(default)]
++        source_kind: Option<String>,
++    },
++    SourcePrepare {
++        index_id: String,
++        model: String,
++        dimensions: usize,
++        generation: String,
++        #[serde(default = "rows")]
++        max_rows: usize,
++        #[serde(default = "bytes")]
++        max_bytes: usize,
++    },
++    SemanticUpsert {
++        index_id: String,
++        model: String,
++        dimensions: usize,
++        generation: String,
++        items: Vec<VectorInput>,
++    },
++    SemanticDelete {
++        index_id: String,
++        model: String,
++        dimensions: usize,
++        generation: String,
++        ids: Vec<String>,
++    },
++    SemanticSearch {
++        index_id: String,
++        model: String,
++        dimensions: usize,
++        generation: String,
++        embedding: String,
++        #[serde(default = "limit")]
++        limit: usize,
++        #[serde(default = "items")]
++        max_candidates: usize,
++        #[serde(default = "probes")]
++        probes: usize,
++    },
++    KeywordSearch {
++        index_id: String,
++        model: String,
++        dimensions: usize,
++        generation: String,
++        query: String,
++        #[serde(default = "limit")]
++        limit: usize,
++    },
++}
++
++pub fn identifier(value: &str) -> anyhow::Result<()> {
++    require(!value.is_empty() && value.len() <= 4096)
++}
++pub fn identifiers(values: &[String], allow_empty: bool) -> anyhow::Result<()> {
++    require(values.len() <= MAX_INPUT_ITEMS)?;
++    let mut total = 0usize;
++    for value in values {
++        require((allow_empty || !value.is_empty()) && value.len() <= 4096)?;
++        total = total.saturating_add(value.len());
++    }
++    require(total <= 128 * 1024)
++}
++pub fn bounds(count: usize, size: usize) -> anyhow::Result<()> {
++    require((1..=MAX_ITEMS).contains(&count) && (1024..=MAX_BYTES).contains(&size))
++}
++pub fn identity(
++    index_id: &str,
++    model: &str,
++    dimensions: usize,
++    generation: &str,
++) -> anyhow::Result<()> {
++    require(
++        !index_id.is_empty()
++            && index_id.len() <= 128
++            && index_id
++                .bytes()
++                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
++    )?;
++    require(!model.is_empty() && model.len() <= 512 && (1..=4096).contains(&dimensions))?;
++    require(!generation.is_empty() && generation.len() <= 128)
++}
++
++pub fn resource() -> anyhow::Error {
++    error("STATE_RETRIEVAL_RESOURCE_LIMIT")
++}
++
++pub use super::request_validate::parse;
+diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/request_validate.rs b/engine/src/workers/state/adapters/sqlite/retrieval/request_validate.rs
+new file mode 100644
+index 0000000..717500e
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/request_validate.rs
+@@ -0,0 +1,128 @@
++use super::super::protocol::{decode, require};
++use super::request::*;
++use serde_json::Value;
++
++pub fn parse(value: Value) -> anyhow::Result<Request> {
++    let request: Request = decode(value)?;
++    match &request {
++        Request::IndexStatus {} => {}
++        Request::IndexPrepare {
++            scope,
++            max_rows,
++            max_bytes,
++        } => {
++            identifier(scope)?;
++            require((1..=1024).contains(max_rows))?;
++            bounds(*max_rows, *max_bytes)?;
++        }
++        Request::GraphSeeds {
++            entity_names,
++            observation_ids,
++            max_items,
++            max_bytes,
++            ..
++        } => {
++            identifiers(entity_names, true)?;
++            identifiers(observation_ids, false)?;
++            bounds(*max_items, *max_bytes)?;
++        }
++        Request::GraphEdges {
++            node_ids,
++            max_items,
++            max_bytes,
++        } => {
++            identifiers(node_ids, false)?;
++            bounds(*max_items, *max_bytes)?;
++        }
++        Request::SemanticConfigure {
++            index_id,
++            model,
++            dimensions,
++            generation,
++            source_kind,
++        } => {
++            identity(index_id, model, *dimensions, generation)?;
++            require(
++                source_kind
++                    .as_ref()
++                    .is_none_or(|kind| kind == "agentmemory"),
++            )?;
++        }
++        Request::SourcePrepare {
++            index_id,
++            model,
++            dimensions,
++            generation,
++            max_rows,
++            max_bytes,
++        } => {
++            identity(index_id, model, *dimensions, generation)?;
++            require((1..=1024).contains(max_rows))?;
++            bounds(*max_rows, *max_bytes)?;
++        }
++        Request::SemanticUpsert {
++            index_id,
++            model,
++            dimensions,
++            generation,
++            items,
++        } => {
++            identity(index_id, model, *dimensions, generation)?;
++            require(!items.is_empty() && items.len() <= 256)?;
++            for item in items {
++                identifier(&item.id)?;
++                identifier(&item.session_id)?;
++                if let Some(text) = &item.text {
++                    require(!text.trim().is_empty() && text.len() <= 65_536)?;
++                }
++                require(item.source_scope.is_some() == item.source_version.is_some())?;
++                if let Some(scope) = &item.source_scope {
++                    identifier(scope)?;
++                }
++                if let Some(version) = &item.source_version {
++                    super::super::protocol::counter(version)?;
++                }
++            }
++        }
++        Request::SemanticDelete {
++            index_id,
++            model,
++            dimensions,
++            generation,
++            ids,
++        } => {
++            identity(index_id, model, *dimensions, generation)?;
++            identifiers(ids, false)?;
++            require(!ids.is_empty() && ids.len() <= 256)?;
++        }
++        Request::SemanticSearch {
++            index_id,
++            model,
++            dimensions,
++            generation,
++            limit,
++            max_candidates,
++            probes,
++            ..
++        } => {
++            identity(index_id, model, *dimensions, generation)?;
++            require(
++                (1..=100).contains(limit)
++                    && (*limit..=MAX_ITEMS).contains(max_candidates)
++                    && (1..=256).contains(probes),
++            )?;
++        }
++        Request::KeywordSearch {
++            index_id,
++            model,
++            dimensions,
++            generation,
++            query,
++            limit,
++        } => {
++            identity(index_id, model, *dimensions, generation)?;
++            require(query.len() <= 4096 && (1..=100).contains(limit))?;
++        }
++    }
++    Ok(request)
++}
+diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/semantic.rs b/engine/src/workers/state/adapters/sqlite/retrieval/semantic.rs
+new file mode 100644
+index 0000000..1d5709b
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/semantic.rs
+@@ -0,0 +1,221 @@
++use super::super::{database, protocol};
++use super::{lexical, lsh, request, source};
++use rusqlite::{Connection, params};
++use serde_json::{Value, json};
++
++pub const PREFIX: &str = "mem:semantic:";
++pub fn rebuild(connection: &Connection, meta: &Meta, revision: &str) -> anyhow::Result<()> {
++    let epoch = meta
++        .epoch
++        .checked_add(1)
++        .ok_or_else(|| protocol::error("STATE_TX_LIMIT_EXCEEDED"))?;
++    connection.execute("UPDATE retrieval_semantic_meta SET status='pending',cursor=-1,revision=?2,epoch=?3,count=0,lexical_count=0 WHERE index_id=?1", params![meta.index_id,revision,epoch])?;
++    Ok(())
++}
++
++pub fn schema(connection: &Connection) -> anyhow::Result<()> {
++    connection.execute_batch("CREATE TABLE IF NOT EXISTS retrieval_semantic_meta(index_id TEXT PRIMARY KEY,model TEXT NOT NULL,dimensions INTEGER NOT NULL,generation TEXT NOT NULL,status TEXT NOT NULL,cursor INTEGER NOT NULL,revision TEXT NOT NULL,epoch INTEGER NOT NULL,count INTEGER NOT NULL,lexical_count INTEGER NOT NULL) WITHOUT ROWID;
++        CREATE TABLE IF NOT EXISTS retrieval_vectors(index_id TEXT NOT NULL,epoch INTEGER NOT NULL,id TEXT NOT NULL,session_id TEXT NOT NULL,embedding BLOB NOT NULL,PRIMARY KEY(index_id,epoch,id)) WITHOUT ROWID;
++        CREATE TABLE IF NOT EXISTS retrieval_vector_postings(index_id TEXT NOT NULL,epoch INTEGER NOT NULL,table_id INTEGER NOT NULL,bucket INTEGER NOT NULL,id TEXT NOT NULL,PRIMARY KEY(index_id,epoch,table_id,bucket,id)) WITHOUT ROWID;
++        CREATE INDEX IF NOT EXISTS retrieval_vector_postings_id ON retrieval_vector_postings(index_id,epoch,id);")?;
++    let mut statement = connection.prepare("SELECT index_id FROM retrieval_semantic_meta")?;
++    let ids = statement
++        .query_map([], |r| r.get::<_, String>(0))?
++        .collect::<rusqlite::Result<Vec<_>>>()?;
++    for id in ids {
++        let meta = get(connection, &id)?;
++        let revision = database::revision(connection, &meta.scope())?.to_string();
++        if meta.revision != revision {
++            rebuild(connection, &meta, &revision)?;
++        }
++    }
++    Ok(())
++}
++
++pub fn configure(
++    connection: &Connection,
++    id: &str,
++    model: &str,
++    dimensions: usize,
++    generation: &str,
++    source_kind: Option<&str>,
++) -> anyhow::Result<Value> {
++    let exists: bool = connection.query_row(
++        "SELECT EXISTS(SELECT 1 FROM retrieval_semantic_meta WHERE index_id=?1)",
++        [id],
++        |r| r.get(0),
++    )?;
++    if exists {
++        let meta = get(connection, id)?;
++        meta.identity(model, dimensions, generation)?;
++        source::configure(connection, id, source_kind, true)?;
++        return source::decorate(connection, id, meta.status_value());
++    }
++    let count: i64 =
++        connection.query_row("SELECT count(*) FROM retrieval_semantic_meta", [], |r| {
++            r.get(0)
++        })?;
++    if count >= 128 {
++        return Err(request::resource());
++    }
++    let scope = format!("{PREFIX}{id}");
++    let populated: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM state_rows INDEXED BY state_rows_order WHERE scope=?1 AND value IS NOT NULL)", [&scope], |r| r.get(0))?;
++    let revision = database::revision(connection, &scope)?.to_string();
++    connection.execute(
++        "INSERT INTO retrieval_semantic_meta VALUES(?1,?2,?3,?4,?5,-1,?6,1,0,0)",
++        params![
++            id,
++            model,
++            dimensions as i64,
++            generation,
++            if populated { "pending" } else { "ready" },
++            revision
++        ],
++    )?;
++    source::configure(connection, id, source_kind, false)?;
++    source::decorate(connection, id, get(connection, id)?.status_value())
++}
++
++pub fn replace(
++    connection: &Connection,
++    meta: &Meta,
++    key: &str,
++    value: Option<&Value>,
++) -> anyhow::Result<()> {
++    if let Some(value) = value {
++        source::validate(connection, &meta.index_id, key, value)?;
++    } else {
++        source::embedding_deleted(connection, &meta.index_id, key)?;
++    }
++    lexical::replace(connection, meta, key, value)?;
++    let exists: bool = connection.query_row(
++        "SELECT EXISTS(SELECT 1 FROM retrieval_vectors WHERE index_id=?1 AND epoch=?2 AND id=?3)",
++        params![meta.index_id, meta.epoch, key],
++        |r| r.get(0),
++    )?;
++    connection.execute(
++        "DELETE FROM retrieval_vector_postings WHERE index_id=?1 AND epoch=?2 AND id=?3",
++        params![meta.index_id, meta.epoch, key],
++    )?;
++    connection.execute(
++        "DELETE FROM retrieval_vectors WHERE index_id=?1 AND epoch=?2 AND id=?3",
++        params![meta.index_id, meta.epoch, key],
++    )?;
++    if exists {
++        connection.execute(
++            "UPDATE retrieval_semantic_meta SET count=count-1 WHERE index_id=?1",
++            [&meta.index_id],
++        )?;
++    }
++    let Some(value) = value else {
++        return Ok(());
++    };
++    protocol::require(value.is_object() && value["id"].as_str() == Some(key))?;
++    let model = value["model"]
++        .as_str()
++        .ok_or_else(|| protocol::error("STATE_TX_INVALID_REQUEST"))?;
++    let dimensions = value["dimensions"]
++        .as_u64()
++        .ok_or_else(|| protocol::error("STATE_TX_INVALID_REQUEST"))?;
++    let generation = value["generation"]
++        .as_str()
++        .ok_or_else(|| protocol::error("STATE_TX_INVALID_REQUEST"))?;
++    meta.identity(model, dimensions as usize, generation)?;
++    let session = value["sessionId"]
++        .as_str()
++        .ok_or_else(|| protocol::error("STATE_TX_INVALID_REQUEST"))?;
++    request::identifier(session)?;
++    request::identifier(key)?;
++    let encoded = value["embedding"]
++        .as_str()
++        .ok_or_else(|| protocol::error("STATE_TX_INVALID_REQUEST"))?;
++    let vector = lsh::decode(encoded, meta.dimensions)?;
++    connection.execute(
++        "INSERT INTO retrieval_vectors VALUES(?1,?2,?3,?4,?5)",
++        params![meta.index_id, meta.epoch, key, session, lsh::blob(&vector)],
++    )?;
++    let mut insert = connection
++        .prepare_cached("INSERT INTO retrieval_vector_postings VALUES(?1,?2,?3,?4,?5)")?;
++    for (table, signature) in lsh::signatures(&vector).iter().enumerate() {
++        insert.execute(params![
++            meta.index_id,
++            meta.epoch,
++            table as i64,
++            signature.bucket,
++            key
++        ])?;
++    }
++    connection.execute(
++        "UPDATE retrieval_semantic_meta SET count=count+1 WHERE index_id=?1",
++        [&meta.index_id],
++    )?;
++    Ok(())
++}
++
++pub fn maintain(
++    connection: &Connection,
++    id: &str,
++    key: &str,
++    value: Option<&Value>,
++) -> anyhow::Result<()> {
++    let mut meta = get(connection, id)?;
++    let revision = database::revision(connection, &meta.scope())?;
++    if protocol::counter(&meta.revision)?.checked_add(1) != Some(revision) {
++        rebuild(connection, &meta, &revision.to_string())?;
++        meta = get(connection, id)?;
++    }
++    replace(connection, &meta, key, value)?;
++    connection.execute(
++        "UPDATE retrieval_semantic_meta SET revision=?2 WHERE index_id=?1",
++        params![id, revision.to_string()],
++    )?;
++    Ok(())
++}
++
++pub fn upsert(
++    connection: &Connection,
++    id: &str,
++    model: &str,
++    dimensions: usize,
++    generation: &str,
++    items: Vec<request::VectorInput>,
++) -> anyhow::Result<Value> {
++    let meta = get(connection, id)?;
++    meta.identity(model, dimensions, generation)?;
++    let mut ids = std::collections::HashSet::new();
++    for item in &items {
++        protocol::require(ids.insert(&item.id))?;
++    }
++    for item in &items {
++        let mut value = json!({"id":item.id,"sessionId":item.session_id,"embedding":item.embedding,"model":model,"dimensions":dimensions,"generation":generation});
++        if let Some(text) = &item.text {
++            value["text"] = json!(text);
++        }
++        if let Some(scope) = &item.source_scope {
++            value["sourceScope"] = json!(scope);
++        }
++        if let Some(version) = &item.source_version {
++            value["sourceVersion"] = json!(version);
++        }
++        database::write(connection, &meta.scope(), &item.id, Some(&value))?;
++    }
++    Ok(json!({"updated":items.len(),"generation":generation}))
++}
++
++pub fn delete(
++    connection: &Connection,
++    id: &str,
++    model: &str,
++    dimensions: usize,
++    generation: &str,
++    ids: &[String],
++) -> anyhow::Result<Value> {
++    let meta = get(connection, id)?;
++    meta.identity(model, dimensions, generation)?;
++    for key in ids {
++        database::write(connection, &meta.scope(), key, None)?;
++    }
++    Ok(json!({"deleted":ids.len(),"generation":generation}))
++}
++
++pub use super::semantic_meta::{Meta, get};
+diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/semantic_meta.rs b/engine/src/workers/state/adapters/sqlite/retrieval/semantic_meta.rs
+new file mode 100644
+index 0000000..f76f9fc
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/semantic_meta.rs
+@@ -0,0 +1,51 @@
++use super::super::{database, protocol};
++use super::{semantic::PREFIX, source};
++use rusqlite::{Connection, OptionalExtension};
++use serde_json::{Value, json};
++
++pub struct Meta {
++    pub index_id: String,
++    pub model: String,
++    pub dimensions: usize,
++    pub generation: String,
++    pub status: String,
++    pub cursor: i64,
++    pub revision: String,
++    pub epoch: i64,
++    pub count: usize,
++    pub lexical_count: usize,
++}
++impl Meta {
++    pub fn scope(&self) -> String {
++        format!("{PREFIX}{}", self.index_id)
++    }
++    pub fn ready(&self, connection: &Connection) -> anyhow::Result<()> {
++        if self.status != "ready"
++            || self.revision != database::revision(connection, &self.scope())?.to_string()
++        {
++            return Err(protocol::error("STATE_INDEX_NOT_READY"));
++        }
++        source::ready(connection, &self.index_id)?;
++        Ok(())
++    }
++    pub fn identity(&self, model: &str, dimensions: usize, generation: &str) -> anyhow::Result<()> {
++        if self.model != model || self.dimensions != dimensions || self.generation != generation {
++            return Err(protocol::error("STATE_SEMANTIC_IDENTITY_MISMATCH"));
++        }
++        Ok(())
++    }
++    pub fn status_value(&self) -> Value {
++        json!({"index_id":self.index_id,"model":self.model,"dimensions":self.dimensions,"generation":self.generation,"status":self.status,"count":self.count,"lexical_count":self.lexical_count,"lexical_ready":self.status=="ready" && self.count==self.lexical_count,"cursor":self.cursor.to_string(),"revision":self.revision})
++    }
++}
++
++pub fn get(connection: &Connection, id: &str) -> anyhow::Result<Meta> {
++    connection.query_row("SELECT index_id,model,dimensions,generation,status,cursor,revision,epoch,count,lexical_count FROM retrieval_semantic_meta WHERE index_id=?1", [id], |r| {
++        Ok(Meta {index_id:r.get(0)?,model:r.get(1)?,dimensions:sql_usize(r,2)?,generation:r.get(3)?,status:r.get(4)?,cursor:r.get(5)?,revision:r.get(6)?,epoch:r.get(7)?,count:sql_usize(r,8)?,lexical_count:sql_usize(r,9)?})
++    }).optional()?.ok_or_else(|| protocol::error("STATE_INDEX_NOT_READY"))
++}
++
++fn sql_usize(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<usize> {
++    let value: i64 = row.get(column)?;
++    usize::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))
++}
+diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/semantic_query.rs b/engine/src/workers/state/adapters/sqlite/retrieval/semantic_query.rs
+new file mode 100644
+index 0000000..e992653
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/semantic_query.rs
+@@ -0,0 +1,100 @@
++use super::{lsh, semantic};
++use rusqlite::{Connection, params};
++use serde_json::{Value, json};
++use std::collections::HashSet;
++
++struct Match {
++    id: String,
++    session: String,
++    score: f64,
++}
++fn rank(a: &Match, b: &Match) -> std::cmp::Ordering {
++    b.score.total_cmp(&a.score).then(a.id.cmp(&b.id))
++}
++
++pub fn search(
++    connection: &Connection,
++    id: &str,
++    model: &str,
++    dimensions: usize,
++    generation: &str,
++    embedding: &str,
++    limit: usize,
++    max_candidates: usize,
++    probes: usize,
++) -> anyhow::Result<Value> {
++    let meta = semantic::get(connection, id)?;
++    meta.identity(model, dimensions, generation)?;
++    meta.ready(connection)?;
++    let query = lsh::decode(embedding, dimensions)?;
++    let buckets: Vec<Vec<u16>> = lsh::signatures(&query)
++        .iter()
++        .map(|signature| lsh::buckets(signature, probes))
++        .collect();
++    let mut seen = HashSet::with_capacity(max_candidates.min(4096));
++    let mut matches: Vec<Match> = Vec::with_capacity(limit);
++    let mut retained_id_bytes = 0usize;
++    let mut visits = 0usize;
++    let max_visits = max_candidates.saturating_mul(lsh::TABLES);
++    let bucket_limit = (max_candidates / lsh::TABLES).max(32);
++    let mut exhausted = false;
++    let mut statement=connection.prepare_cached("SELECT p.id,v.session_id,v.embedding FROM retrieval_vector_postings p CROSS JOIN retrieval_vectors v WHERE p.index_id=?1 AND p.epoch=?2 AND p.table_id=?3 AND p.bucket=?4 AND v.index_id=p.index_id AND v.epoch=p.epoch AND v.id=p.id ORDER BY p.id LIMIT ?5")?;
++    'probe: for probe in 0..probes {
++        for (table, buckets) in buckets.iter().enumerate() {
++            let mut rows = statement.query(params![
++                id,
++                meta.epoch,
++                table as i64,
++                buckets[probe],
++                (bucket_limit + 1) as i64
++            ])?;
++            let mut bucket_seen = 0;
++            while let Some(row) = rows.next()? {
++                visits += 1;
++                bucket_seen += 1;
++                if visits > max_visits {
++                    exhausted = true;
++                    break 'probe;
++                }
++                if bucket_seen > bucket_limit {
++                    exhausted = true;
++                    break;
++                }
++                let id: String = row.get(0)?;
++                if seen.contains(&id) {
++                    continue;
++                }
++                if seen.len() >= max_candidates || retained_id_bytes + id.len() > 4 * 1024 * 1024 {
++                    exhausted = true;
++                    break 'probe;
++                }
++                retained_id_bytes += id.len();
++                seen.insert(id.clone());
++                let vector = lsh::from_blob(&row.get::<_, Vec<u8>>(2)?, dimensions)?;
++                let candidate = Match {
++                    id,
++                    session: row.get(1)?,
++                    score: lsh::cosine(&query, &vector),
++                };
++                if matches.len() < limit
++                    || rank(
++                        &candidate,
++                        matches.last().expect("nonempty bounded top results"),
++                    )
++                    .is_lt()
++                {
++                    matches.push(candidate);
++                    matches.sort_unstable_by(rank);
++                    matches.truncate(limit);
++                }
++            }
++        }
++    }
++    let items: Vec<Value> = matches
++        .into_iter()
++        .map(|item| json!({"obsId":item.id,"sessionId":item.session,"score":item.score}))
++        .collect();
++    Ok(
++        json!({"items":items,"approximate":true,"candidates":seen.len(),"budget_exhausted":exhausted,"model":model,"dimensions":dimensions,"generation":generation}),
++    )
++}
+diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/source.rs b/engine/src/workers/state/adapters/sqlite/retrieval/source.rs
+new file mode 100644
+index 0000000..b64f9da
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/source.rs
+@@ -0,0 +1,204 @@
++use super::super::{database, protocol};
++use super::{eligibility, semantic, source_prepare};
++use rusqlite::{Connection, OptionalExtension, params};
++use serde_json::{Value, json};
++
++pub const SCOPES: &str = "SELECT scope,revision FROM state_scopes WHERE scope>='mem:obs:' AND scope<'mem:obs;' UNION ALL SELECT scope,revision FROM state_scopes WHERE scope='mem:memories'";
++pub fn tracked_scope(scope: &str) -> bool {
++    scope.starts_with("mem:obs:") || scope == "mem:memories"
++}
++
++pub fn schema(connection: &Connection) -> anyhow::Result<()> {
++    eligibility::register(connection)?;
++    connection.execute_batch("CREATE TABLE IF NOT EXISTS retrieval_source_meta(index_id TEXT PRIMARY KEY,kind TEXT NOT NULL,dirty_count INTEGER NOT NULL CHECK(dirty_count>=0),current_scope TEXT NOT NULL,cursor INTEGER NOT NULL,phase TEXT NOT NULL,cleanup_cursor TEXT NOT NULL) WITHOUT ROWID;
++        CREATE TABLE IF NOT EXISTS retrieval_source_scopes(index_id TEXT NOT NULL,scope TEXT NOT NULL,revision TEXT NOT NULL,prepared INTEGER NOT NULL,PRIMARY KEY(index_id,scope)) WITHOUT ROWID;
++        CREATE TABLE IF NOT EXISTS retrieval_source_items(index_id TEXT NOT NULL,scope TEXT NOT NULL,key TEXT NOT NULL,version TEXT NOT NULL,dirty INTEGER NOT NULL,PRIMARY KEY(index_id,scope,key)) WITHOUT ROWID;
++        CREATE INDEX IF NOT EXISTS retrieval_source_items_id ON retrieval_source_items(index_id,key);
++        CREATE INDEX IF NOT EXISTS retrieval_source_items_dirty ON retrieval_source_items(index_id,dirty,scope,key);")?;
++    Ok(())
++}
++
++pub fn kind(connection: &Connection, id: &str) -> anyhow::Result<Option<String>> {
++    Ok(connection
++        .query_row(
++            "SELECT kind FROM retrieval_source_meta WHERE index_id=?1",
++            [id],
++            |r| r.get(0),
++        )
++        .optional()?)
++}
++
++pub fn configure(
++    connection: &Connection,
++    id: &str,
++    source_kind: Option<&str>,
++    existed: bool,
++) -> anyhow::Result<()> {
++    let current = kind(connection, id)?;
++    if existed && current.as_deref() != source_kind {
++        return Err(protocol::error("STATE_SEMANTIC_IDENTITY_MISMATCH"));
++    }
++    if source_kind.is_some() && current.is_none() {
++        connection.execute(
++            "INSERT INTO retrieval_source_meta VALUES(?1,'agentmemory',0,'',-1,'rows','')",
++            [id],
++        )?;
++    }
++    Ok(())
++}
++
++pub fn pending_scope(
++    connection: &Connection,
++    id: &str,
++) -> anyhow::Result<Option<(String, String)>> {
++    let sql = format!(
++        "SELECT s.scope,s.revision FROM ({SCOPES}) s LEFT JOIN retrieval_source_scopes r ON r.index_id=?1 AND r.scope=s.scope WHERE r.scope IS NULL OR r.revision<>s.revision OR r.prepared=0 ORDER BY s.scope LIMIT 1"
++    );
++    Ok(connection
++        .query_row(&sql, [id], |r| Ok((r.get(0)?, r.get(1)?)))
++        .optional()?)
++}
++
++pub fn status(connection: &Connection, id: &str) -> anyhow::Result<Value> {
++    let source_kind = kind(connection, id)?;
++    let dirty: i64 = if source_kind.is_some() {
++        connection.query_row(
++            "SELECT dirty_count FROM retrieval_source_meta WHERE index_id=?1",
++            [id],
++            |r| r.get(0),
++        )?
++    } else {
++        0
++    };
++    let prepared = source_kind.is_none() || pending_scope(connection, id)?.is_none();
++    Ok(
++        json!({"source_kind":source_kind,"source_prepared":prepared,"dirty_count":dirty.to_string(),"coverage_ready":prepared && dirty==0}),
++    )
++}
++
++pub fn ready(connection: &Connection, id: &str) -> anyhow::Result<()> {
++    if status(connection, id)?["coverage_ready"] != true {
++        return Err(protocol::error("STATE_SEMANTIC_SOURCE_NOT_READY"));
++    }
++    Ok(())
++}
++
++pub fn decorate(connection: &Connection, id: &str, mut value: Value) -> anyhow::Result<Value> {
++    if let (Some(output), Some(fields)) =
++        (value.as_object_mut(), status(connection, id)?.as_object())
++    {
++        output.extend(
++            fields
++                .iter()
++                .map(|(key, value)| (key.clone(), value.clone())),
++        );
++    }
++    Ok(value)
++}
++
++pub(super) fn item(
++    connection: &Connection,
++    id: &str,
++    scope: &str,
++    key: &str,
++) -> anyhow::Result<Option<(String, bool)>> {
++    Ok(connection.query_row("SELECT version,dirty FROM retrieval_source_items WHERE index_id=?1 AND scope=?2 AND key=?3",params![id,scope,key],|r|Ok((r.get(0)?,r.get(1)?))).optional()?)
++}
++
++pub fn touch(
++    connection: &Connection,
++    id: &str,
++    scope: &str,
++    key: &str,
++    version: &str,
++    dirty: bool,
++) -> anyhow::Result<()> {
++    let previous = item(connection, id, scope, key)?;
++    let delta = i64::from(dirty) - i64::from(previous.as_ref().is_some_and(|(_, dirty)| *dirty));
++    connection.execute("INSERT INTO retrieval_source_items VALUES(?1,?2,?3,?4,?5) ON CONFLICT(index_id,scope,key) DO UPDATE SET version=excluded.version,dirty=excluded.dirty",params![id,scope,key,version,dirty])?;
++    connection.execute(
++        "UPDATE retrieval_source_meta SET dirty_count=dirty_count+?2 WHERE index_id=?1",
++        params![id, delta],
++    )?;
++    Ok(())
++}
++
++pub fn remove(connection: &Connection, id: &str, scope: &str, key: &str) -> anyhow::Result<()> {
++    let previous = item(connection, id, scope, key)?;
++    connection.execute(
++        "DELETE FROM retrieval_source_items WHERE index_id=?1 AND scope=?2 AND key=?3",
++        params![id, scope, key],
++    )?;
++    if previous.is_some_and(|(_, dirty)| dirty) {
++        connection.execute(
++            "UPDATE retrieval_source_meta SET dirty_count=dirty_count-1 WHERE index_id=?1",
++            [id],
++        )?;
++    }
++    let semantic_scope = format!("{}{id}", semantic::PREFIX);
++    if database::row(connection, &semantic_scope, key)?
++        .value
++        .is_some()
++    {
++        database::write(connection, &semantic_scope, key, None)?;
++    }
++    Ok(())
++}
++
++pub fn validate(connection: &Connection, id: &str, key: &str, value: &Value) -> anyhow::Result<()> {
++    if kind(connection, id)?.is_none() {
++        return Ok(());
++    }
++    let scope = value["sourceScope"]
++        .as_str()
++        .ok_or_else(|| protocol::error("STATE_TX_INVALID_REQUEST"))?;
++    let version = value["sourceVersion"]
++        .as_str()
++        .ok_or_else(|| protocol::error("STATE_TX_INVALID_REQUEST"))?;
++    protocol::require(tracked_scope(scope))?;
++    protocol::counter(version)?;
++    let sql = format!(
++        "SELECT version,value IS NOT NULL,json_extract(value,'$.id'),{} FROM state_rows WHERE scope=?1 AND key=?2",
++        eligibility::SQL
++    );
++    let source: Option<(String, bool, Option<String>, bool)> = connection
++        .query_row(&sql, params![scope, key], |r| {
++            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
++        })
++        .optional()?;
++    if !source.is_some_and(|(current, present, source_id, eligible)| {
++        current == version && present && source_id.as_deref() == Some(key) && eligible
++    }) {
++        return Err(protocol::error("STATE_SEMANTIC_SOURCE_STALE"));
++    }
++    let conflict: bool=connection.query_row("SELECT EXISTS(SELECT 1 FROM retrieval_source_items WHERE index_id=?1 AND key=?2 AND scope<>?3)",params![id,key,scope],|r|r.get(0))?;
++    if conflict {
++        return Err(protocol::error("STATE_SEMANTIC_SOURCE_ID_CONFLICT"));
++    }
++    touch(connection, id, scope, key, version, false)
++}
++
++pub fn embedding_deleted(connection: &Connection, id: &str, key: &str) -> anyhow::Result<()> {
++    let mut statement = connection
++        .prepare("SELECT scope,version FROM retrieval_source_items WHERE index_id=?1 AND key=?2")?;
++    let rows = statement
++        .query_map(params![id, key], |r| {
++            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
++        })?
++        .collect::<rusqlite::Result<Vec<_>>>()?;
++    for (scope, version) in rows {
++        touch(connection, id, &scope, key, &version, true)?;
++    }
++    Ok(())
++}
++
++pub fn prepare(
++    connection: &Connection,
++    id: &str,
++    max_rows: usize,
++    max_bytes: usize,
++) -> anyhow::Result<Value> {
++    source_prepare::prepare(connection, id, max_rows, max_bytes)
++}
++
++pub use super::source_lexical::lexical_text;
+diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/source_lexical.rs b/engine/src/workers/state/adapters/sqlite/retrieval/source_lexical.rs
+new file mode 100644
+index 0000000..b76a676
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/source_lexical.rs
+@@ -0,0 +1,73 @@
++use super::super::protocol;
++use super::source::kind;
++use rusqlite::{Connection, params};
++use serde_json::Value;
++
++pub fn lexical_text(
++    connection: &Connection,
++    id: &str,
++    value: &Value,
++) -> anyhow::Result<Option<String>> {
++    if kind(connection, id)?.is_none() {
++        return value
++            .get("text")
++            .map(|v| {
++                v.as_str()
++                    .map(str::to_owned)
++                    .ok_or_else(|| protocol::error("STATE_TX_INVALID_REQUEST"))
++            })
++            .transpose();
++    }
++    let scope = value["sourceScope"]
++        .as_str()
++        .ok_or_else(|| protocol::error("STATE_TX_INVALID_REQUEST"))?;
++    let key = value["id"]
++        .as_str()
++        .ok_or_else(|| protocol::error("STATE_TX_INVALID_REQUEST"))?;
++    let projection = "json_object('title',json_extract(value,'$.title'),'subtitle',json_extract(value,'$.subtitle'),'narrative',json_extract(value,'$.narrative'),'content',json_extract(value,'$.content'),'facts',json_extract(value,'$.facts'),'concepts',json_extract(value,'$.concepts'),'files',json_extract(value,'$.files'))";
++    let sql = format!(
++        "SELECT length(CAST({projection} AS BLOB)),{projection} FROM state_rows WHERE scope=?1 AND key=?2 AND value IS NOT NULL"
++    );
++    let mut statement = connection.prepare(&sql)?;
++    let mut rows = statement.query(params![scope, key])?;
++    let row = rows
++        .next()?
++        .ok_or_else(|| protocol::error("STATE_SEMANTIC_SOURCE_STALE"))?;
++    if row.get::<_, i64>(0)? > 1_048_576 {
++        return Err(super::request::resource());
++    }
++    let raw: String = row.get(1)?;
++    let document: Value = serde_json::from_str(&raw)?;
++    let fields: &[&str] = if scope == "mem:memories" {
++        &["title", "content", "concepts", "files"]
++    } else {
++        &[
++            "title",
++            "subtitle",
++            "narrative",
++            "facts",
++            "concepts",
++            "files",
++        ]
++    };
++    let mut terms = Vec::new();
++    for field in fields {
++        match &document[field] {
++            Value::Null => {}
++            Value::String(text) => terms.push(text.as_str()),
++            Value::Array(values) => {
++                for value in values {
++                    terms.push(
++                        value
++                            .as_str()
++                            .ok_or_else(|| protocol::error("STATE_TX_INVALID_REQUEST"))?,
++                    );
++                }
++            }
++            _ => return Err(protocol::error("STATE_TX_INVALID_REQUEST")),
++        }
++    }
++    let text = terms.join(" ");
++    protocol::require(!text.trim().is_empty())?;
++    Ok(Some(text))
++}
+diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/source_prepare.rs b/engine/src/workers/state/adapters/sqlite/retrieval/source_prepare.rs
+new file mode 100644
+index 0000000..65fd061
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/source_prepare.rs
+@@ -0,0 +1,156 @@
++use super::super::{database, protocol};
++use super::{eligibility, source};
++use rusqlite::{Connection, OptionalExtension, params};
++use serde_json::{Value, json};
++
++fn dirty_page(
++    connection: &Connection,
++    id: &str,
++    max_rows: usize,
++    max_bytes: usize,
++) -> anyhow::Result<Value> {
++    let mut statement=connection.prepare("SELECT scope,key,version FROM retrieval_source_items INDEXED BY retrieval_source_items_dirty WHERE index_id=?1 AND dirty=1 ORDER BY scope,key LIMIT ?2")?;
++    let mut rows = statement.query(params![id, max_rows as i64])?;
++    let mut items = Vec::new();
++    let mut bytes = 512usize;
++    while let Some(row) = rows.next()? {
++        let item = json!({"source_scope":row.get::<_,String>(0)?,"id":row.get::<_,String>(1)?,"source_version":row.get::<_,String>(2)?});
++        let needed = protocol::size(&item)? + 1;
++        if bytes + needed > max_bytes {
++            if items.is_empty() {
++                return Err(super::request::resource());
++            }
++            break;
++        }
++        items.push(item);
++        bytes += needed;
++    }
++    source::decorate(
++        connection,
++        id,
++        json!({"processed":0,"scope":"","cursor":"-1","items":items}),
++    )
++}
++
++pub fn prepare(
++    connection: &Connection,
++    id: &str,
++    max_rows: usize,
++    max_bytes: usize,
++) -> anyhow::Result<Value> {
++    protocol::require(source::kind(connection, id)?.is_some())?;
++    let (mut scope,mut cursor,mut phase,mut cleanup): (String,i64,String,String)=connection.query_row("SELECT current_scope,cursor,phase,cleanup_cursor FROM retrieval_source_meta WHERE index_id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
++    if scope.is_empty() {
++        if let Some((next, _)) = source::pending_scope(connection, id)? {
++            scope = next;
++            cursor = -1;
++            phase = "rows".into();
++            cleanup.clear();
++        } else {
++            return dirty_page(connection, id, max_rows, max_bytes);
++        }
++    }
++    let revision = database::revision(connection, &scope)?.to_string();
++    let saved: Option<String> = connection
++        .query_row(
++            "SELECT revision FROM retrieval_source_scopes WHERE index_id=?1 AND scope=?2",
++            params![id, scope],
++            |r| r.get(0),
++        )
++        .optional()?;
++    if saved.as_deref() != Some(&revision) {
++        cursor = -1;
++        phase = "rows".into();
++        cleanup.clear();
++    }
++    connection.execute("INSERT INTO retrieval_source_scopes VALUES(?1,?2,?3,0) ON CONFLICT(index_id,scope) DO UPDATE SET revision=excluded.revision,prepared=0",params![id,scope,revision])?;
++    let mut processed = 0usize;
++    let mut bytes = 512usize;
++    let mut items = Vec::new();
++    let mut complete = true;
++    if phase == "rows" {
++        let sql = format!(
++            "SELECT key,position,version,{} FROM state_rows INDEXED BY state_rows_order WHERE scope=?1 AND value IS NOT NULL AND position>?2 ORDER BY position LIMIT ?3",
++            eligibility::SQL
++        );
++        let mut statement = connection.prepare(&sql)?;
++        let mut rows = statement.query(params![scope, cursor, (max_rows + 1) as i64])?;
++        while let Some(row) = rows.next()? {
++            if processed == max_rows {
++                complete = false;
++                break;
++            }
++            let key: String = row.get(0)?;
++            let version: String = row.get(2)?;
++            let item = json!({"source_scope":scope,"id":key,"source_version":version});
++            let needed = protocol::size(&item)? + 1;
++            if bytes + needed > max_bytes {
++                if processed == 0 {
++                    return Err(super::request::resource());
++                }
++                complete = false;
++                break;
++            }
++            if !row.get::<_, bool>(3)? {
++                source::remove(connection, id, &scope, &key)?;
++            } else {
++                let previous: Option<(String,bool)>=connection.query_row("SELECT version,dirty FROM retrieval_source_items WHERE index_id=?1 AND scope=?2 AND key=?3",params![id,scope,key],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
++                let dirty = previous.is_none_or(|(saved, dirty)| saved != version || dirty);
++                source::touch(connection, id, &scope, &key, &version, dirty)?;
++                if dirty {
++                    items.push(item);
++                }
++            }
++            cursor = row.get(1)?;
++            processed += 1;
++            bytes += needed;
++        }
++        if complete {
++            phase = "cleanup".into();
++            complete = false;
++        }
++    } else {
++        let mut statement=connection.prepare("SELECT key FROM retrieval_source_items WHERE index_id=?1 AND scope=?2 AND key>?3 ORDER BY key LIMIT ?4")?;
++        let mut rows = statement.query(params![id, scope, cleanup, (max_rows + 1) as i64])?;
++        while let Some(row) = rows.next()? {
++            if processed == max_rows {
++                complete = false;
++                break;
++            }
++            let key: String = row.get(0)?;
++            let needed = key.len() + 64;
++            if bytes + needed > max_bytes {
++                if processed == 0 {
++                    return Err(super::request::resource());
++                }
++                complete = false;
++                break;
++            }
++            let sql = format!(
++                "SELECT EXISTS(SELECT 1 FROM state_rows WHERE scope=?1 AND key=?2 AND value IS NOT NULL AND {})",
++                eligibility::SQL
++            );
++            let eligible: bool = connection.query_row(&sql, params![scope, key], |r| r.get(0))?;
++            if !eligible {
++                source::remove(connection, id, &scope, &key)?;
++            }
++            cleanup = key;
++            processed += 1;
++            bytes += needed;
++        }
++    }
++    let response_scope = scope.clone();
++    if complete {
++        connection.execute("UPDATE retrieval_source_scopes SET prepared=1,revision=?3 WHERE index_id=?1 AND scope=?2",params![id,scope,revision])?;
++        scope.clear();
++        cursor = -1;
++        phase = "rows".into();
++        cleanup.clear();
++    }
++    connection.execute("UPDATE retrieval_source_meta SET current_scope=?2,cursor=?3,phase=?4,cleanup_cursor=?5 WHERE index_id=?1",params![id,scope,cursor,phase,cleanup])?;
++    source::decorate(
++        connection,
++        id,
++        json!({"processed":processed,"scope":response_scope,"cursor":cursor.to_string(),"items":items}),
++    )
++}
+diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/source_write.rs b/engine/src/workers/state/adapters/sqlite/retrieval/source_write.rs
+new file mode 100644
+index 0000000..e8f9756
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/source_write.rs
+@@ -0,0 +1,74 @@
++use super::super::{database, protocol};
++use super::{
++    eligibility,
++    source::{item, remove, touch, tracked_scope},
++};
++use rusqlite::{Connection, OptionalExtension, params};
++use serde_json::Value;
++
++pub fn changed(
++    connection: &Connection,
++    scope: &str,
++    key: &str,
++    old: &database::Row,
++    value: Option<&Value>,
++    version: u64,
++) -> anyhow::Result<()> {
++    if !tracked_scope(scope) {
++        return Ok(());
++    }
++    let mut statement =
++        connection.prepare("SELECT index_id FROM retrieval_source_meta ORDER BY index_id")?;
++    let ids = statement
++        .query_map([], |r| r.get::<_, String>(0))?
++        .collect::<rusqlite::Result<Vec<_>>>()?;
++    let revision = database::revision(connection, scope)?;
++    for id in ids {
++        let previous: Option<(String,bool)>=connection.query_row("SELECT revision,prepared FROM retrieval_source_scopes WHERE index_id=?1 AND scope=?2",params![id,scope],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
++        let continuous = previous.as_ref().is_some_and(|(saved, _)| {
++            protocol::counter(saved).ok().and_then(|v| v.checked_add(1)) == Some(revision)
++        });
++        let prepared = if continuous {
++            previous.as_ref().is_some_and(|(_, ready)| *ready)
++        } else {
++            revision == 1
++        };
++        if !continuous {
++            connection.execute("UPDATE retrieval_source_meta SET cursor=-1,phase='rows',cleanup_cursor='' WHERE index_id=?1 AND current_scope=?2",params![id,scope])?;
++        }
++        connection.execute("INSERT INTO retrieval_source_scopes VALUES(?1,?2,?3,?4) ON CONFLICT(index_id,scope) DO UPDATE SET revision=excluded.revision,prepared=excluded.prepared",params![id,scope,revision.to_string(),prepared])?;
++        if !eligibility::value(scope, value) {
++            remove(connection, &id, scope, key)?;
++            continue;
++        }
++        let previous = item(connection, &id, scope, key)?;
++        let unchanged = previous
++            .as_ref()
++            .is_some_and(|(saved, dirty)| !dirty && saved == &old.version.to_string())
++            && [
++                "title",
++                "subtitle",
++                "narrative",
++                "content",
++                "facts",
++                "concepts",
++                "files",
++                "sessionId",
++                "sessionIds",
++                "isLatest",
++            ]
++            .iter()
++            .all(|field| {
++                old.value.as_ref().and_then(|v| v.get(field)) == value.and_then(|v| v.get(field))
++            });
++        touch(
++            connection,
++            &id,
++            scope,
++            key,
++            &version.to_string(),
++            !unchanged,
++        )?;
++    }
++    Ok(())
++}
+diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/tests.rs b/engine/src/workers/state/adapters/sqlite/retrieval/tests.rs
+new file mode 100644
+index 0000000..40be768
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/tests.rs
+@@ -0,0 +1,100 @@
++use super::*;
++use rusqlite::Connection;
++use serde_json::{Value, json};
++
++mod durable_tests;
++mod graph_tests;
++mod preparation_performance_tests;
++mod semantic_tests;
++mod source_tests;
++
++fn fresh() -> Connection {
++    database::open(std::path::Path::new(":memory:")).unwrap()
++}
++
++fn call(connection: &Connection, value: Value) -> anyhow::Result<Value> {
++    let request = request::parse(value)?;
++    let transaction = connection.unchecked_transaction()?;
++    let value = bounded(&transaction, || execute(&transaction, request))?;
++    transaction.commit()?;
++    Ok(value)
++}
++
++fn write(connection: &Connection, scope: &str, key: &str, value: Option<&Value>) {
++    let transaction = connection.unchecked_transaction().unwrap();
++    database::write(&transaction, scope, key, value).unwrap();
++    transaction.commit().unwrap();
++}
++
++fn node(id: &str, name: &str, members: &[&str]) -> Value {
++    json!({"id":id,"name":name,"type":"concept","stale":false,"properties":{},"sourceObservationIds":members})
++}
++
++fn edge(id: &str, source: &str, target: &str) -> Value {
++    json!({"id":id,"type":"related_to","sourceNodeId":source,"targetNodeId":target,"weight":0.75,"stale":false,"tvalid":"2026-09-25","tinvalid":null,"context":{"reasoning":"café 東京 😀"}})
++}
++
++fn code(cause: anyhow::Error) -> String {
++    cause
++        .downcast_ref::<protocol::TxError>()
++        .map_or_else(|| cause.to_string(), |cause| cause.0.to_owned())
++}
++
++fn ids(value: &Value) -> Vec<String> {
++    value["items"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .map(|item| item["id"].as_str().unwrap().to_owned())
++        .collect()
++}
++
++fn encoded(vector: &[f32]) -> String {
++    use base64::Engine;
++    base64::engine::general_purpose::STANDARD.encode(lsh::blob(vector))
++}
++
++fn semantic_request(action: &str) -> Value {
++    json!({"action":action,"index_id":"observations","model":"test-local","dimensions":4,"generation":"local-v1"})
++}
++
++fn configure(connection: &Connection) {
++    call(connection, semantic_request("semantic_configure")).unwrap();
++}
++
++fn vector_item(id: &str, vector: &[f32], text: Option<&str>) -> Value {
++    let mut value = json!({"id":id,"session_id":"session","embedding":encoded(vector)});
++    if let Some(text) = text {
++        value["text"] = json!(text);
++    }
++    value
++}
++
++fn upsert(connection: &Connection, items: Vec<Value>) -> anyhow::Result<Value> {
++    let mut request = semantic_request("semantic_upsert");
++    request["items"] = json!(items);
++    call(connection, request)
++}
++
++fn search(connection: &Connection, vector: &[f32], candidates: usize) -> Value {
++    let mut request = semantic_request("semantic_search");
++    request["embedding"] = json!(encoded(vector));
++    request["max_candidates"] = json!(candidates);
++    request["limit"] = json!(3);
++    call(connection, request).unwrap()
++}
++
++fn keywords(connection: &Connection, text: &str) -> anyhow::Result<Value> {
++    let mut request = semantic_request("keyword_search");
++    request["query"] = json!(text);
++    call(connection, request)
++}
++
++fn returned_ids(value: &Value) -> Vec<String> {
++    value["items"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .map(|item| item["obsId"].as_str().unwrap().to_owned())
++        .collect()
++}
+diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/tests/durable_tests.rs b/engine/src/workers/state/adapters/sqlite/retrieval/tests/durable_tests.rs
+new file mode 100644
+index 0000000..897520b
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/tests/durable_tests.rs
+@@ -0,0 +1,222 @@
++use super::*;
++use rusqlite::params;
++
++fn simulate_older_writer(connection: &Connection) {
++    connection.execute("UPDATE state_scopes SET revision=CAST(CAST(revision AS INTEGER)+1 AS TEXT) WHERE scope=?1",[graph::NODES]).unwrap();
++}
++
++#[test]
++fn resumable_prepare_is_projected_atomic_and_survives_reopen() {
++    let root = std::env::var("III_SQLITE_TEST_ROOT").expect("workspace-only synthetic test root");
++    let directory = tempfile::tempdir_in(root).unwrap();
++    let path = directory.path().join("retrieval.sqlite3");
++    {
++        let connection = database::open(&path).unwrap();
++        for index in 0..4 {
++            let mut value = node(&format!("n{index}"), &format!("name{index}"), &["obs"]);
++            value["properties"] = json!({"large":"x".repeat(256*1024)});
++            write(
++                &connection,
++                graph::NODES,
++                &format!("n{index}"),
++                Some(&value),
++            );
++        }
++        simulate_older_writer(&connection);
++        assert_eq!(
++            call(&connection, json!({"action":"index_status"})).unwrap()["graph"][0]["status"],
++            "pending"
++        );
++        {
++            let transaction = connection.unchecked_transaction().unwrap();
++            let request=request::parse(json!({"action":"index_prepare","scope":graph::NODES,"max_rows":1,"max_bytes":1024})).unwrap();
++            execute(&transaction, request).unwrap();
++        }
++        assert_eq!(
++            metadata::graph(&connection, graph::NODES).unwrap().cursor,
++            -1
++        );
++        let value = call(
++            &connection,
++            json!({"action":"index_prepare","scope":graph::NODES,"max_rows":1,"max_bytes":1024}),
++        )
++        .unwrap();
++        assert_eq!(value["processed"], 1);
++        assert_eq!(value["status"], "pending");
++        assert_eq!(value["cursor"], "0");
++        assert_eq!(
++            code(
++                call(
++                    &connection,
++                    json!({"action":"graph_seeds","observation_ids":["obs"]})
++                )
++                .unwrap_err()
++            ),
++            "STATE_INDEX_NOT_READY"
++        );
++    }
++    {
++        let connection = database::open(&path).unwrap();
++        assert_eq!(
++            metadata::graph(&connection, graph::NODES).unwrap().cursor,
++            0
++        );
++        write(&connection, graph::NODES, "n0", None);
++        write(
++            &connection,
++            graph::NODES,
++            "n1",
++            Some(&node("n1", "updated", &["obs"])),
++        );
++        write(
++            &connection,
++            graph::NODES,
++            "appended",
++            Some(&node("appended", "new", &["obs"])),
++        );
++        loop {
++            let value=call(&connection,json!({"action":"index_prepare","scope":graph::NODES,"max_rows":1,"max_bytes":1024})).unwrap();
++            if value["status"] == "ready" {
++                break;
++            }
++        }
++        let value = call(
++            &connection,
++            json!({"action":"graph_seeds","observation_ids":["obs"]}),
++        )
++        .unwrap();
++        assert_eq!(ids(&value), vec!["n1", "n2", "n3", "appended"]);
++        assert!(
++            ids(&call(
++                &connection,
++                json!({"action":"graph_seeds","entity_names":["name0"],"match":"exact"})
++            )
++            .unwrap())
++            .is_empty()
++        );
++        let cache: i64 = connection
++            .pragma_query_value(None, "cache_size", |r| r.get(0))
++            .unwrap();
++        assert_eq!(cache, -65536);
++        let mmap: i64 = connection
++            .pragma_query_value(None, "mmap_size", |r| r.get(0))
++            .unwrap();
++        assert_eq!(mmap, 0);
++    }
++}
++
++#[test]
++fn prepare_restarts_epoch_on_unindexed_old_writer_and_excludes_ghosts() {
++    let connection = fresh();
++    for id in ["a", "b", "c"] {
++        write(&connection, graph::NODES, id, Some(&node(id, "old", &[])));
++    }
++    simulate_older_writer(&connection);
++    call(
++        &connection,
++        json!({"action":"index_prepare","scope":graph::NODES,"max_rows":1}),
++    )
++    .unwrap();
++    let epoch = metadata::graph(&connection, graph::NODES).unwrap().epoch;
++    connection.execute("UPDATE state_rows SET value=NULL,position=NULL,value_bytes=0 WHERE scope=?1 AND key='a'",[graph::NODES]).unwrap();
++    let raw = serde_json::to_string(&node("b", "new", &[])).unwrap();
++    connection
++        .execute(
++            "UPDATE state_rows SET value=?2,value_bytes=?3 WHERE scope=?1 AND key='b'",
++            params![graph::NODES, raw, raw.len() as i64],
++        )
++        .unwrap();
++    simulate_older_writer(&connection);
++    let value = call(
++        &connection,
++        json!({"action":"index_prepare","scope":graph::NODES}),
++    )
++    .unwrap();
++    assert_eq!(value["status"], "ready");
++    assert!(metadata::graph(&connection, graph::NODES).unwrap().epoch > epoch);
++    assert_eq!(
++        ids(&call(
++            &connection,
++            json!({"action":"graph_seeds","entity_names":["old"],"match":"exact"})
++        )
++        .unwrap()),
++        vec!["c"]
++    );
++    assert_eq!(
++        ids(&call(
++            &connection,
++            json!({"action":"graph_seeds","entity_names":["new"],"match":"exact"})
++        )
++        .unwrap()),
++        vec!["b"]
++    );
++}
++
++#[test]
++fn semantic_reprepare_streams_canonical_rows_without_resident_restoration() {
++    let connection = fresh();
++    configure(&connection);
++    upsert(
++        &connection,
++        vec![
++            vector_item("a", &[1.0, 0.0, 0.0, 0.0], Some("original")),
++            vector_item("b", &[0.0, 1.0, 0.0, 0.0], Some("next")),
++        ],
++    )
++    .unwrap();
++    connection
++        .execute(
++            "UPDATE state_scopes SET revision='3' WHERE scope='mem:semantic:observations'",
++            [],
++        )
++        .unwrap();
++    let mut query = semantic_request("semantic_search");
++    query["embedding"] = json!(encoded(&[1.0, 0.0, 0.0, 0.0]));
++    assert_eq!(
++        code(call(&connection, query).unwrap_err()),
++        "STATE_INDEX_NOT_READY"
++    );
++    let value = call(
++        &connection,
++        json!({"action":"index_prepare","scope":"mem:semantic:observations","max_rows":1}),
++    )
++    .unwrap();
++    assert_eq!(value["status"], "pending");
++    assert_eq!(
++        code(keywords(&connection, "original").unwrap_err()),
++        "STATE_INDEX_NOT_READY"
++    );
++    let value = call(
++        &connection,
++        json!({"action":"index_prepare","scope":"mem:semantic:observations","max_rows":1}),
++    )
++    .unwrap();
++    assert_eq!(value["status"], "ready");
++    assert_eq!(
++        returned_ids(&keywords(&connection, "original").unwrap()),
++        vec!["a"]
++    );
++    assert_eq!(
++        search(&connection, &[1.0, 0.0, 0.0, 0.0], 64)["items"][0]["obsId"],
++        "a"
++    );
++    let meta = semantic::get(&connection, "observations").unwrap();
++    assert_eq!(meta.count, 2);
++    assert_eq!(meta.lexical_count, 2);
++}
++
++#[test]
++fn retrieval_request_rejects_unknown_fields_and_oversized_bounds() {
++    for request in [
++        json!({"action":"index_status","unknown":true}),
++        json!({"action":"graph_seeds","max_items":0}),
++        json!({"action":"graph_edges","node_ids":[""],"max_bytes":1024}),
++        json!({"action":"index_prepare","scope":graph::NODES,"max_rows":1025}),
++        json!({"action":"graph_seeds","entity_names":["x".repeat(4097)]}),
++    ] {
++        assert_eq!(
++            code(request::parse(request).err().unwrap()),
++            "STATE_TX_INVALID_REQUEST"
++        );
++    }
++}
+diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/tests/graph_tests.rs b/engine/src/workers/state/adapters/sqlite/retrieval/tests/graph_tests.rs
+new file mode 100644
+index 0000000..cb16f03
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/tests/graph_tests.rs
+@@ -0,0 +1,303 @@
++use super::*;
++
++#[test]
++fn indexed_graph_seeds_preserve_bidirectional_unicode_substrings_and_positions() {
++    let connection = fresh();
++    let names = [
++        "AgentMemory",
++        "AgentMemory graph",
++        "agent",
++        "x",
++        "東京😀",
++        "😀",
++        "",
++        "ÁRBOL",
++        "İstanbul",
++        "ΟΣ",
++    ];
++    for (index, name) in names.iter().enumerate() {
++        write(
++            &connection,
++            graph::NODES,
++            &format!("n{index}"),
++            Some(&node(&format!("n{index}"), name, &[])),
++        );
++    }
++    for (query, expected) in [
++        ("AGENTMEMORY", vec!["n0", "n1", "n2", "n6"]),
++        ("東京", vec!["n4", "n6"]),
++        ("😀x", vec!["n3", "n5", "n6"]),
++        ("ÁR", vec!["n6", "n7"]),
++        ("i\u{307}stan", vec!["n6", "n8"]),
++        ("ΟΣ", vec!["n6", "n9"]),
++    ] {
++        let value = call(
++            &connection,
++            json!({"action":"graph_seeds","entity_names":[query]}),
++        )
++        .unwrap();
++        assert_eq!(ids(&value), expected, "query {query}");
++        assert!(
++            value["items"]
++                .as_array()
++                .unwrap()
++                .iter()
++                .all(|item| item["entity"] == true && item["observation"] == false)
++        );
++    }
++    let value = call(
++        &connection,
++        json!({"action":"graph_seeds","entity_names":[""]}),
++    )
++    .unwrap();
++    assert_eq!(ids(&value).len(), names.len());
++    let value = call(
++        &connection,
++        json!({"action":"graph_seeds","entity_names":["AGENTMEMORY"],"match":"exact"}),
++    )
++    .unwrap();
++    assert_eq!(ids(&value), vec!["n0"]);
++}
++
++#[test]
++fn indexed_graph_membership_flags_are_exact_deduplicated_and_stale_aware() {
++    let connection = fresh();
++    write(
++        &connection,
++        graph::NODES,
++        "a",
++        Some(&node("a", "alpha", &["obs", "obs"])),
++    );
++    write(
++        &connection,
++        graph::NODES,
++        "b",
++        Some(&node("b", "beta", &["obs-extra"])),
++    );
++    write(
++        &connection,
++        graph::NODES,
++        "c",
++        Some(&node("c", "gamma", &["obs"])),
++    );
++    let mut stale = node("stale", "alpha", &["obs"]);
++    stale["stale"] = json!(true);
++    write(&connection, graph::NODES, "stale", Some(&stale));
++    let value=call(&connection,json!({"action":"graph_seeds","entity_names":["ALPHA","ALPHA"],"observation_ids":["obs","obs"]})).unwrap();
++    assert_eq!(ids(&value), vec!["a", "c"]);
++    assert_eq!(value["items"][0]["entity"], true);
++    assert_eq!(value["items"][0]["observation"], true);
++    assert_eq!(value["items"][1]["entity"], false);
++    assert_eq!(value["items"][1]["observation"], true);
++    write(&connection, graph::NODES, "a", None);
++    write(
++        &connection,
++        graph::NODES,
++        "a",
++        Some(&node("a", "alpha", &["obs"])),
++    );
++    let value = call(
++        &connection,
++        json!({"action":"graph_seeds","observation_ids":["obs"]}),
++    )
++    .unwrap();
++    assert_eq!(ids(&value), vec!["c", "a"]);
++}
++
++#[test]
++fn indexed_adjacency_preserves_both_directions_self_edges_and_temporal_json() {
++    let connection = fresh();
++    let originals = [
++        edge("out", "a", "b"),
++        edge("in", "c", "a"),
++        edge("self", "a", "a"),
++        edge("other", "x", "y"),
++    ];
++    for value in &originals {
++        write(
++            &connection,
++            graph::EDGES,
++            value["id"].as_str().unwrap(),
++            Some(value),
++        );
++    }
++    let mut stale = edge("stale", "a", "z");
++    stale["stale"] = json!(true);
++    write(&connection, graph::EDGES, "stale", Some(&stale));
++    let value = call(
++        &connection,
++        json!({"action":"graph_edges","node_ids":["a","a","b"]}),
++    )
++    .unwrap();
++    let edges = value["items"].as_array().unwrap();
++    assert_eq!(edges.len(), 3);
++    for (item, original) in edges.iter().zip(&originals) {
++        assert_eq!(&item["value"], original);
++    }
++    let mut changed = edge("out", "x", "y");
++    changed["weight"] = json!(0.9);
++    write(&connection, graph::EDGES, "out", Some(&changed));
++    write(&connection, graph::EDGES, "in", None);
++    let value = call(
++        &connection,
++        json!({"action":"graph_edges","node_ids":["a"]}),
++    )
++    .unwrap();
++    assert_eq!(value["items"].as_array().unwrap().len(), 1);
++    assert_eq!(value["items"][0]["key"], "self");
++}
++
++#[test]
++fn exact_indexed_graph_limits_fail_without_silent_truncation() {
++    let connection = fresh();
++    for id in ["a", "b", "c"] {
++        write(&connection, graph::NODES, id, Some(&node(id, "many", &[])));
++    }
++    assert_eq!(
++        code(
++            call(
++                &connection,
++                json!({"action":"graph_seeds","entity_names":["many"],"max_items":2})
++            )
++            .unwrap_err()
++        ),
++        "STATE_RETRIEVAL_RESOURCE_LIMIT"
++    );
++    let mut large = edge("large", "a", "b");
++    large["context"]["reasoning"] = json!("x".repeat(2048));
++    write(&connection, graph::EDGES, "large", Some(&large));
++    assert_eq!(
++        code(
++            call(
++                &connection,
++                json!({"action":"graph_edges","node_ids":["a"],"max_bytes":1024})
++            )
++            .unwrap_err()
++        ),
++        "STATE_RETRIEVAL_RESOURCE_LIMIT"
++    );
++    let value = call(
++        &connection,
++        json!({"action":"graph_seeds","entity_names":["many"]}),
++    )
++    .unwrap();
++    assert_eq!(ids(&value), vec!["a", "b", "c"]);
++}
++
++#[test]
++fn canonical_rollback_also_rolls_back_index_changes() {
++    let connection = fresh();
++    write(&connection, graph::NODES, "a", Some(&node("a", "old", &[])));
++    {
++        let transaction = connection.unchecked_transaction().unwrap();
++        database::write(
++            &transaction,
++            graph::NODES,
++            "a",
++            Some(&node("a", "new", &[])),
++        )
++        .unwrap();
++    }
++    let value = call(
++        &connection,
++        json!({"action":"graph_seeds","entity_names":["old"],"match":"exact"}),
++    )
++    .unwrap();
++    assert_eq!(ids(&value), vec!["a"]);
++    let value = call(
++        &connection,
++        json!({"action":"graph_seeds","entity_names":["new"],"match":"exact"}),
++    )
++    .unwrap();
++    assert!(ids(&value).is_empty());
++    assert_eq!(
++        database::row(&connection, graph::NODES, "a")
++            .unwrap()
++            .version,
++        1
++    );
++}
++
++#[test]
++fn arbitrary_canonical_graph_json_remains_compatible_but_never_partially_ready() {
++    let connection = fresh();
++    write(&connection, graph::NODES, "a", Some(&json!({"weight":7})));
++    assert_eq!(
++        database::row(&connection, graph::NODES, "a").unwrap().value,
++        Some(json!({"weight":7}))
++    );
++    assert_eq!(
++        code(
++            call(
++                &connection,
++                json!({"action":"graph_seeds","entity_names":["a"]})
++            )
++            .unwrap_err()
++        ),
++        "STATE_INDEX_NOT_READY"
++    );
++    assert_eq!(
++        code(
++            call(
++                &connection,
++                json!({"action":"index_prepare","scope":graph::NODES})
++            )
++            .unwrap_err()
++        ),
++        "STATE_INDEX_RECORD_INVALID"
++    );
++    write(
++        &connection,
++        graph::NODES,
++        "a",
++        Some(&node("a", "valid", &[])),
++    );
++    assert_eq!(
++        call(
++            &connection,
++            json!({"action":"index_prepare","scope":graph::NODES})
++        )
++        .unwrap()["status"],
++        "ready"
++    );
++    assert_eq!(
++        ids(&call(
++            &connection,
++            json!({"action":"graph_seeds","entity_names":["valid"]})
++        )
++        .unwrap()),
++        vec!["a"]
++    );
++}
++
++#[test]
++fn recovery_barrier_is_shared_by_indexed_queries_and_preparation() {
++    let connection = fresh();
++    write(
++        &connection,
++        graph::NODES,
++        "a",
++        Some(&node("a", "valid", &[])),
++    );
++    let mut control = database::row(&connection, database::CONTROL_SCOPE, "current")
++        .unwrap()
++        .value
++        .unwrap();
++    control["recovery"] = json!({"generation":"1","job_id":"job","logical_delta_id":"delta","delta_ordinal":0,"next_chunk_ordinal":1,"visibility":"applying"});
++    write(
++        &connection,
++        database::CONTROL_SCOPE,
++        "current",
++        Some(&control),
++    );
++    for request in [
++        json!({"action":"graph_seeds","entity_names":["valid"]}),
++        json!({"action":"graph_edges","node_ids":["a"]}),
++        json!({"action":"index_prepare","scope":graph::NODES}),
++    ] {
++        assert_eq!(
++            code(call(&connection, request).unwrap_err()),
++            "STATE_GRAPH_RECOVERY_REQUIRED"
++        );
++    }
++}
+diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/tests/preparation_performance_tests.rs b/engine/src/workers/state/adapters/sqlite/retrieval/tests/preparation_performance_tests.rs
+new file mode 100644
+index 0000000..8eb0e6d
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/tests/preparation_performance_tests.rs
+@@ -0,0 +1,223 @@
++use super::*;
++use super::super::super::{SqliteAdapter, StateAdapter};
++use rusqlite::{params, Connection};
++use std::{
++    fs,
++    path::PathBuf,
++    sync::{
++        atomic::{AtomicU64, Ordering},
++        Arc,
++    },
++    time::Instant,
++};
++
++const ROWS: usize = 4096;
++const BATCH_ROWS: usize = 64;
++const BATCH_BYTES: usize = 8 * 1024 * 1024;
++
++fn replace_vm_steps(connection: &Connection, key: &str, value: &Value, position: i64) -> u64 {
++    let steps = Arc::new(AtomicU64::new(0));
++    let callback_steps = Arc::clone(&steps);
++    connection
++        .progress_handler(1, Some(move || {
++            callback_steps.fetch_add(1, Ordering::Relaxed);
++            false
++        }))
++        .unwrap();
++    graph::replace(connection, graph::NODES, key, Some(value), Some(position), 1).unwrap();
++    connection
++        .progress_handler(0, None::<fn() -> bool>)
++        .unwrap();
++    steps.load(Ordering::Relaxed)
++}
++
++#[test]
++fn graph_replace_vm_cost_does_not_scan_existing_name_grams() {
++    let connection = fresh();
++    let target_key = "performance-node-0000";
++    let target_value = node(
++        target_key,
++        "Synthetic graph preparation concept for constant-work regression",
++        &["synthetic-observation"],
++    );
++    let transaction = connection.unchecked_transaction().unwrap();
++    graph::replace(
++        &transaction,
++        graph::NODES,
++        target_key,
++        Some(&target_value),
++        Some(0),
++        1,
++    )
++    .unwrap();
++    for position in 1..16_i64 {
++        let id = format!("performance-node-{position:04}");
++        let name = format!(
++            "Synthetic graph search concept {position:04} uses independent amber olive cobalt lexicon"
++        );
++        let value = node(&id, &name, &["synthetic-observation"]);
++        graph::replace(
++            &transaction,
++            graph::NODES,
++            &id,
++            Some(&value),
++            Some(position),
++            1,
++        )
++        .unwrap();
++    }
++    transaction.commit().unwrap();
++    let small_index_steps = replace_vm_steps(&connection, target_key, &target_value, 0);
++
++    let transaction = connection.unchecked_transaction().unwrap();
++    for position in 16..256_i64 {
++        let id = format!("performance-node-{position:04}");
++        let name = format!(
++            "Synthetic graph search concept {position:04} uses independent amber olive cobalt lexicon"
++        );
++        let value = node(&id, &name, &["synthetic-observation"]);
++        graph::replace(
++            &transaction,
++            graph::NODES,
++            &id,
++            Some(&value),
++            Some(position),
++            1,
++        )
++        .unwrap();
++    }
++    transaction.commit().unwrap();
++    let large_index_steps = replace_vm_steps(&connection, target_key, &target_value, 0);
++
++    assert!(small_index_steps > 0);
++    assert!(
++        large_index_steps < small_index_steps * 3,
++        "graph replacement VM work scaled from {small_index_steps} to {large_index_steps} steps"
++    );
++}
++
++fn output_dir() -> PathBuf {
++    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
++        .ancestors()
++        .nth(3)
++        .unwrap()
++        .join(".native-pagination-build/native-preparation-performance");
++    fs::create_dir_all(&path).unwrap();
++    path
++}
++
++fn explain(connection: &Connection, sql: &str) -> Vec<String> {
++    let mut statement = connection
++        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
++        .unwrap();
++    let parameters = vec![rusqlite::types::Value::Null; statement.parameter_count()];
++    statement
++        .query_map(rusqlite::params_from_iter(parameters), |row| {
++            row.get::<_, String>(3)
++        })
++        .unwrap()
++        .map(Result::unwrap)
++        .collect()
++}
++
++fn seed_synthetic_graph(connection: &Connection) {
++    let transaction = connection.unchecked_transaction().unwrap();
++    transaction
++        .execute(
++            "INSERT INTO state_scopes(scope,revision,next_position) VALUES(?1,?2,?3)",
++            params![graph::NODES, ROWS.to_string(), ROWS as i64],
++        )
++        .unwrap();
++    let mut insert = transaction
++        .prepare_cached("INSERT INTO state_rows VALUES(?1,?2,?3,'1',?4,?5)")
++        .unwrap();
++    for position in 0..ROWS {
++        let id = format!("synthetic-node-{position:05}");
++        let name = format!("Synthetic graph preparation concept {position:05} index scaling");
++        let value = node(&id, &name, &["synthetic-observation"]);
++        let raw = serde_json::to_string(&value).unwrap();
++        insert
++            .execute(params![graph::NODES, id, raw, position as i64, raw.len() as i64])
++            .unwrap();
++    }
++    drop(insert);
++    metadata::initialize_graph(&transaction, graph::NODES).unwrap();
++    transaction.commit().unwrap();
++}
++
++#[tokio::test]
++#[ignore = "bounded synthetic SQLite preparation growth diagnostic"]
++async fn indexed_prepare_growth_diagnostic() {
++    let probe_id = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .unwrap()
++        .as_millis();
++    let path = output_dir().join(format!("synthetic-baseline-{probe_id}.sqlite3"));
++    let adapter = SqliteAdapter::new(Some(serde_json::json!({
++        "file_path": path.display().to_string()
++    })))
++    .unwrap();
++    let connection = database::open_for_migration(&path).unwrap();
++    seed_synthetic_graph(&connection);
++
++    let prepare_plan = explain(
++        &connection,
++        "SELECT key,position,json_object('id',json_extract(value,'$.id'),'name',json_extract(value,'$.name'),'stale',COALESCE(json_extract(value,'$.stale'),json('false')),'sourceObservationIds',json_extract(value,'$.sourceObservationIds')) FROM state_rows INDEXED BY state_rows_order WHERE scope=?1 AND value IS NOT NULL AND position>?2 ORDER BY position LIMIT ?3",
++    );
++    let gram_delete_plan = explain(
++        &connection,
++        "DELETE FROM retrieval_name_grams WHERE epoch=?1 AND key=?2",
++    );
++    let membership_delete_plan = explain(
++        &connection,
++        "DELETE FROM retrieval_membership WHERE epoch=?1 AND key=?2",
++    );
++
++    let mut elapsed_ms = Vec::new();
++    let mut processed_rows = 0usize;
++    loop {
++        let started = Instant::now();
++        let result = StateAdapter::retrieval(
++            &adapter,
++            serde_json::json!({
++                "action":"index_prepare",
++                "scope":graph::NODES,
++                "max_rows":BATCH_ROWS,
++                "max_bytes":BATCH_BYTES
++            }),
++        )
++        .await
++        .unwrap();
++        let millis = started.elapsed().as_secs_f64() * 1000.0;
++        processed_rows += result["processed"].as_u64().unwrap() as usize;
++        let done = result["status"] == "ready";
++        elapsed_ms.push(millis);
++        if done {
++            break;
++        }
++    }
++    let db_bytes = fs::metadata(&path).unwrap().len();
++    assert_eq!(processed_rows, ROWS);
++    let report = serde_json::json!({
++        "rows": ROWS,
++        "processed_rows": processed_rows,
++        "batch_rows": BATCH_ROWS,
++        "batches": elapsed_ms.len(),
++        "first_8_batch_ms": &elapsed_ms[..8.min(elapsed_ms.len())],
++        "last_8_batch_ms": &elapsed_ms[elapsed_ms.len().saturating_sub(8)..],
++        "mean_first_8_ms": elapsed_ms.iter().take(8).sum::<f64>() / 8.0,
++        "mean_last_8_ms": elapsed_ms.iter().rev().take(8).sum::<f64>() / 8.0,
++        "sqlite_bytes": db_bytes,
++        "prepare_query_plan": prepare_plan,
++        "gram_delete_query_plan": gram_delete_plan,
++        "membership_delete_query_plan": membership_delete_plan,
++        "retrieval_rows": connection.query_row("SELECT count(*) FROM retrieval_nodes", [], |r| r.get::<_, i64>(0)).unwrap(),
++        "gram_rows": connection.query_row("SELECT count(*) FROM retrieval_name_grams", [], |r| r.get::<_, i64>(0)).unwrap(),
++        "membership_rows": connection.query_row("SELECT count(*) FROM retrieval_membership", [], |r| r.get::<_, i64>(0)).unwrap(),
++        "index_status": prepare::prepare(&connection, graph::NODES, 1, BATCH_BYTES).unwrap()["status"],
++    });
++    let report_path = output_dir().join(format!("synthetic-baseline-{probe_id}.json"));
++    fs::write(&report_path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
++    eprintln!("PREPARATION_DIAGNOSTIC={}", report_path.display());
++    eprintln!("PREPARATION_DIAGNOSTIC_RESULT={report}");
++}
+diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/tests/semantic_tests.rs b/engine/src/workers/state/adapters/sqlite/retrieval/tests/semantic_tests.rs
+new file mode 100644
+index 0000000..d6ab9d0
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/tests/semantic_tests.rs
+@@ -0,0 +1,268 @@
++use super::*;
++
++#[test]
++fn native_semantic_candidates_use_cosine_and_deterministic_ties() {
++    let connection = fresh();
++    configure(&connection);
++    upsert(
++        &connection,
++        vec![
++            vector_item("b", &[1.0, 0.0, 0.0, 0.0], Some("graph memory")),
++            vector_item("a", &[1.0, 0.0, 0.0, 0.0], Some("graph memory")),
++            vector_item("near", &[1.0, 0.1, 0.0, 0.0], Some("graph retrieval")),
++            vector_item("other", &[0.0, 1.0, 0.0, 0.0], Some("unrelated")),
++        ],
++    )
++    .unwrap();
++    let value = search(&connection, &[1.0, 0.0, 0.0, 0.0], 64);
++    assert_eq!(&returned_ids(&value)[..2], &["a", "b"]);
++    assert_eq!(value["approximate"], true);
++    assert!(value["candidates"].as_u64().unwrap() <= 64);
++    assert!(value["items"][0]["score"].as_f64().unwrap() > 0.9999);
++    for pair in value["items"].as_array().unwrap().windows(2) {
++        assert!(pair[0]["score"].as_f64().unwrap() >= pair[1]["score"].as_f64().unwrap());
++    }
++}
++
++#[test]
++fn canonical_vector_and_lexical_updates_and_deletes_are_atomic() {
++    let connection = fresh();
++    configure(&connection);
++    upsert(
++        &connection,
++        vec![vector_item(
++            "a",
++            &[1.0, 0.0, 0.0, 0.0],
++            Some("get_code_snippet original"),
++        )],
++    )
++    .unwrap();
++    assert_eq!(
++        returned_ids(&keywords(&connection, "get_code_snippet").unwrap()),
++        vec!["a"]
++    );
++    let mut bad = vector_item("bad", &[1.0, 0.0, 0.0, 0.0], Some("should_not_commit"));
++    bad["embedding"] = json!("not-base64");
++    assert_eq!(
++        code(
++            upsert(
++                &connection,
++                vec![
++                    vector_item("b", &[0.0, 1.0, 0.0, 0.0], Some("should_not_commit")),
++                    bad
++                ]
++            )
++            .unwrap_err()
++        ),
++        "STATE_TX_INVALID_REQUEST"
++    );
++    assert!(
++        database::row(&connection, "mem:semantic:observations", "b")
++            .unwrap()
++            .value
++            .is_none()
++    );
++    assert!(returned_ids(&keywords(&connection, "should_not_commit").unwrap()).is_empty());
++    upsert(
++        &connection,
++        vec![vector_item(
++            "a",
++            &[0.0, 1.0, 0.0, 0.0],
++            Some("replacement_identifier"),
++        )],
++    )
++    .unwrap();
++    assert!(returned_ids(&keywords(&connection, "get_code_snippet").unwrap()).is_empty());
++    assert_eq!(
++        returned_ids(&keywords(&connection, "replacement_identifier").unwrap()),
++        vec!["a"]
++    );
++    let mut request = semantic_request("semantic_delete");
++    request["ids"] = json!(["a"]);
++    call(&connection, request).unwrap();
++    assert!(returned_ids(&keywords(&connection, "replacement_identifier").unwrap()).is_empty());
++    for table in [
++        "retrieval_vectors",
++        "retrieval_vector_postings",
++        "retrieval_lexical_links",
++        "retrieval_lexical",
++    ] {
++        let count: i64 = connection
++            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
++            .unwrap();
++        assert_eq!(count, 0, "{table}");
++    }
++}
++
++#[test]
++fn semantic_identity_dimensions_encoding_and_generation_never_mix() {
++    let connection = fresh();
++    configure(&connection);
++    for (field, value) in [
++        ("model", json!("different")),
++        ("generation", json!("next")),
++        ("dimensions", json!(3)),
++    ] {
++        let mut request = semantic_request("semantic_configure");
++        request[field] = value;
++        assert_eq!(
++            code(call(&connection, request).unwrap_err()),
++            "STATE_SEMANTIC_IDENTITY_MISMATCH"
++        );
++    }
++    for vector in [
++        vec![0.0, 0.0, 0.0, 0.0],
++        vec![f32::NAN, 0.0, 1.0, 0.0],
++        vec![f32::INFINITY, 0.0, 1.0, 0.0],
++        vec![1.0, 0.0, 0.0],
++    ] {
++        assert_eq!(
++            code(upsert(&connection, vec![vector_item("a", &vector, Some("test"))]).unwrap_err()),
++            "STATE_TX_INVALID_REQUEST"
++        );
++    }
++    let value = call(&connection, json!({"action":"index_status"})).unwrap();
++    assert_eq!(value["semantic"][0]["count"], 0);
++    let mut request = semantic_request("semantic_search");
++    request["embedding"] = json!(encoded(&[1.0, 0.0, 0.0, 0.0]));
++    request["model"] = json!("different");
++    assert_eq!(
++        code(call(&connection, request).unwrap_err()),
++        "STATE_SEMANTIC_IDENTITY_MISMATCH"
++    );
++}
++
++#[test]
++fn lexical_coverage_is_explicit_and_code_identifiers_survive() {
++    let connection = fresh();
++    configure(&connection);
++    upsert(
++        &connection,
++        vec![
++            vector_item(
++                "a",
++                &[1.0, 0.0, 0.0, 0.0],
++                Some("get_code_snippet búsqueda semántica"),
++            ),
++            vector_item("b", &[0.0, 1.0, 0.0, 0.0], None),
++        ],
++    )
++    .unwrap();
++    assert_eq!(
++        code(keywords(&connection, "get_code_snippet").unwrap_err()),
++        "STATE_LEXICAL_INDEX_NOT_READY"
++    );
++    let value = call(&connection, json!({"action":"index_status"})).unwrap();
++    assert_eq!(value["semantic"][0]["lexical_ready"], false);
++    upsert(
++        &connection,
++        vec![vector_item(
++            "b",
++            &[0.0, 1.0, 0.0, 0.0],
++            Some("unrelated topic"),
++        )],
++    )
++    .unwrap();
++    assert_eq!(
++        returned_ids(&keywords(&connection, "GET_CODE_SNIPPET").unwrap()),
++        vec!["a"]
++    );
++    assert_eq!(
++        returned_ids(&keywords(&connection, "busqueda semantica").unwrap()),
++        vec!["a"]
++    );
++    assert!(returned_ids(&keywords(&connection, "\" OR * NOT ( )").unwrap()).is_empty());
++    let ranked = keywords(&connection, "get_code_snippet \"OR\" unrelated").unwrap();
++    assert_eq!(returned_ids(&ranked), vec!["b", "a"]);
++    assert!(
++        ranked["items"][0]["score"].as_f64().unwrap()
++            > ranked["items"][1]["score"].as_f64().unwrap()
++    );
++    let value = call(&connection, json!({"action":"index_status"})).unwrap();
++    assert_eq!(value["semantic"][0]["lexical_count"], 2);
++    assert_eq!(value["semantic"][0]["lexical_ready"], true);
++}
++
++#[test]
++fn semantic_candidate_and_posting_budgets_are_reported() {
++    let connection = fresh();
++    configure(&connection);
++    for start in (0..1500).step_by(100) {
++        upsert(
++            &connection,
++            (start..start + 100)
++                .map(|index| {
++                    vector_item(
++                        &format!("obs-{index:04}"),
++                        &[1.0, 0.0, 0.0, 0.0],
++                        Some("same bucket"),
++                    )
++                })
++                .collect(),
++        )
++        .unwrap();
++    }
++    let value = search(&connection, &[1.0, 0.0, 0.0, 0.0], 64);
++    assert!(value["candidates"].as_u64().unwrap() <= 64);
++    assert_eq!(value["budget_exhausted"], true);
++    assert_eq!(value["items"].as_array().unwrap().len(), 3);
++    let mut request = semantic_request("semantic_search");
++    request["embedding"] = json!(encoded(&[1.0, 0.0, 0.0, 0.0]));
++    request["max_candidates"] = json!(2);
++    request["limit"] = json!(3);
++    assert_eq!(
++        code(call(&connection, request).unwrap_err()),
++        "STATE_TX_INVALID_REQUEST"
++    );
++}
++
++#[test]
++fn indexed_query_plans_use_postings_and_point_vector_reads() {
++    let connection = fresh();
++    configure(&connection);
++    let queries = [
++        (
++            "EXPLAIN QUERY PLAN SELECT n.key FROM retrieval_name_grams g CROSS JOIN retrieval_nodes n WHERE g.epoch=1 AND g.gram='abc' AND n.epoch=g.epoch AND n.key=g.key",
++            vec!["SEARCH g", "SEARCH n"],
++        ),
++        (
++            "EXPLAIN QUERY PLAN SELECT key FROM retrieval_edges INDEXED BY retrieval_edges_source WHERE epoch=1 AND source='a'",
++            vec!["SEARCH retrieval_edges"],
++        ),
++        (
++            "EXPLAIN QUERY PLAN SELECT p.id,v.embedding FROM retrieval_vector_postings p CROSS JOIN retrieval_vectors v WHERE p.index_id='observations' AND p.epoch=1 AND p.table_id=0 AND p.bucket=123 AND v.index_id=p.index_id AND v.epoch=p.epoch AND v.id=p.id",
++            vec!["SEARCH p", "SEARCH v"],
++        ),
++    ];
++    for (sql, required) in queries {
++        let plan = connection
++            .prepare(sql)
++            .unwrap()
++            .query_map([], |r| r.get::<_, String>(3))
++            .unwrap()
++            .collect::<rusqlite::Result<Vec<_>>>()
++            .unwrap()
++            .join("\n");
++        for required in required {
++            assert!(plan.contains(required), "{plan}");
++        }
++        assert!(
++            !plan.contains("SCAN state_rows") && !plan.contains("SCAN retrieval_vectors"),
++            "{plan}"
++        );
++    }
++}
++
++#[test]
++fn semantic_search_probe_limit_accepts_256_and_rejects_257() {
++    let mut request = semantic_request("semantic_search");
++    request["embedding"] = json!(encoded(&[1.0, 0.0, 0.0, 0.0]));
++    request["probes"] = json!(256);
++    assert!(request::parse(request.clone()).is_ok());
++
++    request["probes"] = json!(257);
++    assert_eq!(
++        code(request::parse(request).err().expect("257 probes must be rejected")),
++        "STATE_TX_INVALID_REQUEST"
++    );
++}
+diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/tests/source_tests.rs b/engine/src/workers/state/adapters/sqlite/retrieval/tests/source_tests.rs
+new file mode 100644
+index 0000000..a89805d
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/tests/source_tests.rs
+@@ -0,0 +1,327 @@
++use super::*;
++
++const OBS: &str = "mem:obs:orphan-session";
++
++fn observation(id: &str, title: &str) -> Value {
++    json!({"id":id,"sessionId":"orphan-session","title":title,"subtitle":"raw_sqlite","narrative":"canonical narrative","facts":["atomic_commit_batch"],"concepts":["disk_posting"],"files":["worker_state.rs"]})
++}
++
++fn tracked(connection: &Connection) {
++    let mut request = semantic_request("semantic_configure");
++    request["source_kind"] = json!("agentmemory");
++    call(connection, request).unwrap();
++}
++
++fn status(connection: &Connection) -> Value {
++    call(connection, json!({"action":"index_status"})).unwrap()["semantic"][0].clone()
++}
++
++fn prepare(connection: &Connection, rows: usize) -> Value {
++    let mut request = semantic_request("source_prepare");
++    request["max_rows"] = json!(rows);
++    request["max_bytes"] = json!(1024);
++    call(connection, request).unwrap()
++}
++
++fn finish_preparation(connection: &Connection) {
++    for _ in 0..100 {
++        if prepare(connection, 1)["source_prepared"] == true {
++            return;
++        }
++    }
++    panic!("bounded preparation failed to finish");
++}
++
++fn source_item(connection: &Connection, scope: &str, id: &str) -> Value {
++    let mut item = vector_item(id, &[1.0, 0.0, 0.0, 0.0], Some("clipped embedding text"));
++    item["source_scope"] = json!(scope);
++    item["source_version"] = json!(
++        database::row(connection, scope, id)
++            .unwrap()
++            .version
++            .to_string()
++    );
++    item
++}
++
++#[test]
++fn canonical_commit_closes_crash_gap_and_metadata_does_not_dirty() {
++    let connection = fresh();
++    tracked(&connection);
++    let mut value = observation("a", "initial");
++    write(&connection, OBS, "a", Some(&value));
++    assert_eq!(status(&connection)["dirty_count"], "1");
++    assert_eq!(status(&connection)["coverage_ready"], false);
++    assert_eq!(
++        code(keywords(&connection, "initial").unwrap_err()),
++        "STATE_SEMANTIC_SOURCE_NOT_READY"
++    );
++    upsert(&connection, vec![source_item(&connection, OBS, "a")]).unwrap();
++    assert_eq!(status(&connection)["coverage_ready"], true);
++    value["lastAccessed"] = json!("later");
++    write(&connection, OBS, "a", Some(&value));
++    assert_eq!(status(&connection)["coverage_ready"], true);
++    for term in [
++        "raw_sqlite",
++        "atomic_commit_batch",
++        "disk_posting",
++        "worker_state",
++    ] {
++        assert_eq!(
++            returned_ids(&keywords(&connection, term).unwrap()),
++            vec!["a"]
++        );
++    }
++    value["files"] = json!(["different_identifier"]);
++    write(&connection, OBS, "a", Some(&value));
++    assert_eq!(status(&connection)["dirty_count"], "1");
++    upsert(&connection, vec![source_item(&connection, OBS, "a")]).unwrap();
++    assert!(returned_ids(&keywords(&connection, "worker_state").unwrap()).is_empty());
++    assert_eq!(
++        returned_ids(&keywords(&connection, "different_identifier").unwrap()),
++        vec!["a"]
++    );
++}
++
++#[test]
++fn stale_source_batch_rolls_back_vectors_and_dirty_acknowledgement() {
++    let connection = fresh();
++    tracked(&connection);
++    for id in ["a", "b"] {
++        write(&connection, OBS, id, Some(&observation(id, id)));
++    }
++    let a = source_item(&connection, OBS, "a");
++    let b = source_item(&connection, OBS, "b");
++    write(&connection, OBS, "b", Some(&observation("b", "new title")));
++    assert_eq!(
++        code(upsert(&connection, vec![a, b]).unwrap_err()),
++        "STATE_SEMANTIC_SOURCE_STALE"
++    );
++    assert_eq!(status(&connection)["dirty_count"], "2");
++    assert_eq!(status(&connection)["count"], 0);
++    assert!(
++        database::row(&connection, "mem:semantic:observations", "a")
++            .unwrap()
++            .value
++            .is_none()
++    );
++    upsert(
++        &connection,
++        vec![
++            source_item(&connection, OBS, "a"),
++            source_item(&connection, OBS, "b"),
++        ],
++    )
++    .unwrap();
++    assert_eq!(status(&connection)["coverage_ready"], true);
++}
++
++#[test]
++fn deletes_latest_versions_and_embedding_deletes_are_atomic() {
++    let connection = fresh();
++    tracked(&connection);
++    let mut memory = json!({"id":"memory","title":"memory title","content":"memory_content_token","concepts":["concept_identifier"],"files":["memory_file.ts"],"isLatest":true});
++    write(&connection, "mem:memories", "memory", Some(&memory));
++    upsert(
++        &connection,
++        vec![source_item(&connection, "mem:memories", "memory")],
++    )
++    .unwrap();
++    assert_eq!(
++        returned_ids(&keywords(&connection, "concept_identifier").unwrap()),
++        vec!["memory"]
++    );
++    let mut delete = semantic_request("semantic_delete");
++    delete["ids"] = json!(["memory"]);
++    call(&connection, delete).unwrap();
++    assert_eq!(status(&connection)["dirty_count"], "1");
++    upsert(
++        &connection,
++        vec![source_item(&connection, "mem:memories", "memory")],
++    )
++    .unwrap();
++    memory["isLatest"] = json!(false);
++    write(&connection, "mem:memories", "memory", Some(&memory));
++    assert_eq!(status(&connection)["count"], 0);
++    assert_eq!(status(&connection)["dirty_count"], "0");
++    assert_eq!(
++        code(
++            upsert(
++                &connection,
++                vec![source_item(&connection, "mem:memories", "memory")]
++            )
++            .unwrap_err()
++        ),
++        "STATE_SEMANTIC_SOURCE_STALE"
++    );
++    write(&connection, OBS, "a", Some(&observation("a", "a")));
++    upsert(&connection, vec![source_item(&connection, OBS, "a")]).unwrap();
++    write(&connection, OBS, "a", None);
++    assert_eq!(status(&connection)["coverage_ready"], true);
++    assert_eq!(status(&connection)["count"], 0);
++}
++
++#[test]
++fn orphan_scope_preparation_is_bounded_and_unacknowledged_refs_resume() {
++    let connection = fresh();
++    for id in ["a", "b", "c"] {
++        write(&connection, OBS, id, Some(&observation(id, id)));
++    }
++    tracked(&connection);
++    assert_eq!(status(&connection)["source_prepared"], false);
++    let first = prepare(&connection, 1);
++    assert_eq!(first["items"][0]["id"], "a");
++    assert_eq!(first["processed"], 1);
++    finish_preparation(&connection);
++    assert_eq!(status(&connection)["dirty_count"], "3");
++    assert_eq!(prepare(&connection, 1)["items"][0]["id"], "a");
++    upsert(&connection, vec![source_item(&connection, OBS, "a")]).unwrap();
++    assert_eq!(prepare(&connection, 1)["items"][0]["id"], "b");
++    upsert(
++        &connection,
++        vec![
++            source_item(&connection, OBS, "b"),
++            source_item(&connection, OBS, "c"),
++        ],
++    )
++    .unwrap();
++    assert_eq!(prepare(&connection, 1)["coverage_ready"], true);
++}
++
++#[test]
++fn old_writer_revision_gap_blocks_and_reconciles_deleted_source() {
++    let connection = fresh();
++    tracked(&connection);
++    write(&connection, OBS, "a", Some(&observation("a", "initial")));
++    upsert(&connection, vec![source_item(&connection, OBS, "a")]).unwrap();
++    connection.execute("UPDATE state_rows SET value=NULL,version='2',position=NULL,value_bytes=0 WHERE scope=?1 AND key='a'",[OBS]).unwrap();
++    connection
++        .execute("UPDATE state_scopes SET revision='2' WHERE scope=?1", [OBS])
++        .unwrap();
++    assert_eq!(status(&connection)["coverage_ready"], false);
++    assert_eq!(
++        code(keywords(&connection, "initial").unwrap_err()),
++        "STATE_SEMANTIC_SOURCE_NOT_READY"
++    );
++    finish_preparation(&connection);
++    assert_eq!(status(&connection)["coverage_ready"], true);
++    assert_eq!(status(&connection)["count"], 0);
++}
++
++#[test]
++fn source_identity_and_oversized_lexical_documents_reject_without_acknowledgement() {
++    let connection = fresh();
++    tracked(&connection);
++    assert_eq!(
++        code(call(&connection, semantic_request("semantic_configure")).unwrap_err()),
++        "STATE_SEMANTIC_IDENTITY_MISMATCH"
++    );
++    let mut large = observation("large", "large");
++    large["narrative"] = json!("x".repeat(1_048_576));
++    write(&connection, OBS, "large", Some(&large));
++    assert_eq!(
++        code(upsert(&connection, vec![source_item(&connection, OBS, "large")]).unwrap_err()),
++        "STATE_RETRIEVAL_RESOURCE_LIMIT"
++    );
++    assert_eq!(status(&connection)["dirty_count"], "1");
++    assert_eq!(status(&connection)["count"], 0);
++}
++
++#[test]
++fn initial_and_mutation_eligibility_exclude_empty_and_uncompressed_rows() {
++    let connection = fresh();
++    for (id, value) in [
++        ("raw", json!({"id":"raw","text":"uncompressed"})),
++        ("empty", json!({"id":"empty","title":"","narrative":"body"})),
++        (
++            "space",
++            json!({"id":"space","title":"title","narrative":"\u{feff} \t\u{3000}"}),
++        ),
++        (
++            "numeric",
++            json!({"id":"numeric","title":"title","narrative":3}),
++        ),
++    ] {
++        write(&connection, OBS, id, Some(&value));
++    }
++    write(
++        &connection,
++        "mem:memories",
++        "old",
++        Some(&json!({"id":"old","title":"old","content":"body","isLatest":false})),
++    );
++    tracked(&connection);
++    finish_preparation(&connection);
++    assert_eq!(status(&connection)["dirty_count"], "0");
++    assert_eq!(status(&connection)["coverage_ready"], true);
++    let mut value = observation("a", "valid");
++    write(&connection, OBS, "a", Some(&value));
++    upsert(&connection, vec![source_item(&connection, OBS, "a")]).unwrap();
++    value["narrative"] = json!(" \u{feff}");
++    write(&connection, OBS, "a", Some(&value));
++    assert_eq!(status(&connection)["count"], 0);
++    assert_eq!(status(&connection)["dirty_count"], "0");
++    assert_eq!(
++        code(upsert(&connection, vec![source_item(&connection, OBS, "a")]).unwrap_err()),
++        "STATE_SEMANTIC_SOURCE_STALE"
++    );
++    for value in [
++        json!({"title":"title","narrative":"\u{0085}"}),
++        json!({"title":"title","narrative":"\u{feff}"}),
++        json!({"title":1,"narrative":"body"}),
++    ] {
++        let rust = eligibility::value(OBS, Some(&value));
++        let sql: bool=connection.query_row("SELECT retrieval_source_eligible(?1,json_extract(?2,'$.title'),json_extract(?2,'$.narrative'),NULL)",params![OBS,value.to_string()],|r|r.get(0)).unwrap();
++        assert_eq!(rust, sql);
++    }
++}
++
++#[test]
++fn memory_session_ids_changes_require_identity_refresh() {
++    let connection = fresh();
++    tracked(&connection);
++    let mut memory = json!({"id":"m","title":"title","content":"content","isLatest":true,"sessionIds":["first"]});
++    write(&connection, "mem:memories", "m", Some(&memory));
++    upsert(
++        &connection,
++        vec![source_item(&connection, "mem:memories", "m")],
++    )
++    .unwrap();
++    memory["sessionIds"] = json!(["second"]);
++    write(&connection, "mem:memories", "m", Some(&memory));
++    assert_eq!(status(&connection)["dirty_count"], "1");
++    assert_eq!(status(&connection)["coverage_ready"], false);
++    upsert(
++        &connection,
++        vec![source_item(&connection, "mem:memories", "m")],
++    )
++    .unwrap();
++    assert_eq!(status(&connection)["coverage_ready"], true);
++}
++
++#[test]
++fn sqlite_execution_deadline_rolls_back_canonical_and_index_mutations() {
++    let connection = fresh();
++    let transaction = connection.unchecked_transaction().unwrap();
++    let cause=bounded_for(&transaction,std::time::Duration::ZERO,|| {
++        database::write(&transaction,graph::NODES,"a",Some(&node("a","rollback",&[])))?;
++        transaction.query_row("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<100000000) SELECT sum(x) FROM n",[],|r|r.get::<_,i64>(0))?;
++        Ok(())
++    }).unwrap_err();
++    assert_eq!(code(cause), "STATE_RETRIEVAL_RESOURCE_LIMIT");
++    drop(transaction);
++    assert!(
++        database::row(&connection, graph::NODES, "a")
++            .unwrap()
++            .value
++            .is_none()
++    );
++    assert!(
++        ids(&call(
++            &connection,
++            json!({"action":"graph_seeds","entity_names":["rollback"]})
++        )
++        .unwrap())
++        .is_empty()
++    );
++}
 diff --git a/engine/src/workers/state/adapters/sqlite/tests.rs b/engine/src/workers/state/adapters/sqlite/tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..6533b085d08d224b7e9dd0f271a73b9bf53bc31d
+index 0000000..6533b08
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/tests.rs
 @@ -0,0 +1,435 @@
@@ -4433,7 +8635,7 @@ index 0000000000000000000000000000000000000000..6533b085d08d224b7e9dd0f271a73b9b
 +    );
 +}
 diff --git a/engine/src/workers/state/config.rs b/engine/src/workers/state/config.rs
-index 18d5af4791d7e842e5bc4c126699438af6f10ef6..75d3510a0b37dd6d52aa47dc82c764e895b171a4 100644
+index 18d5af4..75d3510 100644
 --- a/engine/src/workers/state/config.rs
 +++ b/engine/src/workers/state/config.rs
 @@ -127,6 +127,15 @@ pub struct RedisAdapterConfig {
@@ -4479,7 +8681,7 @@ index 18d5af4791d7e842e5bc4c126699438af6f10ef6..75d3510a0b37dd6d52aa47dc82c764e8
          // Each adapter's concrete config fields land in definitions.
          let defs = &schema["definitions"];
 diff --git a/engine/src/workers/state/mod.rs b/engine/src/workers/state/mod.rs
-index 495bc55caf1041cabe2a8391a2a8882a004566d1..c5922ab28f44e502f1403d49bca87ff5ae276e14 100644
+index 495bc55..c5922ab 100644
 --- a/engine/src/workers/state/mod.rs
 +++ b/engine/src/workers/state/mod.rs
 @@ -11,7 +11,7 @@ pub mod configuration;
@@ -4492,10 +8694,10 @@ index 495bc55caf1041cabe2a8391a2a8882a004566d1..c5922ab28f44e502f1403d49bca87ff5
  
  pub use self::config::StateModuleConfig;
 diff --git a/engine/src/workers/state/state.rs b/engine/src/workers/state/state.rs
-index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..7b4f3415fa3b0086f6cef385d5014e2743589116 100644
+index dcf1e2a..a9911d6 100644
 --- a/engine/src/workers/state/state.rs
 +++ b/engine/src/workers/state/state.rs
-@@ -24,13 +24,13 @@ use crate::{
+@@ -24,13 +24,14 @@ use crate::{
      trigger::TriggerType,
      workers::{
          state::{
@@ -4509,11 +8711,12 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..7b4f3415fa3b0086f6cef385d5014e27
 -                StateUpdateInput,
 +                STATE_PAGE_MAX_CURSOR_BYTES, StateDeleteInput, StateEventData, StateEventType,
 +                StateGetGroupInput, StateGetInput, StateListGroupsInput, StateListGroupsResult,
-+                StateListPageInput, StateListPageResult, StateSetInput, StateUpdateInput,
++                canonical_state_page_fields, StateListPageInput, StateListPageResult,
++                StateSetInput, StateUpdateInput,
              },
              trigger::{StateTrigger, StateTriggers, TRIGGER_TYPE},
          },
-@@ -62,6 +62,13 @@ pub struct StateWorker {
+@@ -62,6 +63,13 @@ pub struct StateWorker {
      apply_lock: Arc<tokio::sync::Mutex<()>>,
  }
  
@@ -4527,7 +8730,7 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..7b4f3415fa3b0086f6cef385d5014e27
  #[async_trait::async_trait]
  impl Worker for StateWorker {
      fn name(&self) -> &'static str {
-@@ -292,9 +299,11 @@ impl StateWorker {
+@@ -292,9 +300,11 @@ impl StateWorker {
              .transpose()?
              .unwrap_or_default();
          let adapter_config = Self::adapter_config_from_config(&parsed);
@@ -4542,10 +8745,17 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..7b4f3415fa3b0086f6cef385d5014e27
          Ok(Self::from_config(engine, parsed, adapter))
      }
  
-@@ -572,8 +581,38 @@ impl StateWorker {
+@@ -572,8 +582,45 @@ impl StateWorker {
  
  #[service(name = "state")]
  impl StateWorker {
++    #[function(id = "state::retrieval", description = "Query and prepare bounded native graph and semantic indexes")]
++    pub async fn retrieval(&self, input: Value) -> FunctionResult<Value, ErrorBody> {
++        match self.adapter.retrieval(strip_engine_caller_metadata(input)).await {
++            Ok(value) => FunctionResult::Success(value),
++            Err(error) => FunctionResult::Failure(sqlite::error_body(&error, "STATE_TX_FAILED")),
++        }
++    }
 +    #[function(id = "state::get_versioned", description = "Get a versioned state row")]
 +    pub async fn get_versioned(&self, input: Value) -> FunctionResult<Value, ErrorBody> {
 +        match self
@@ -4581,7 +8791,7 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..7b4f3415fa3b0086f6cef385d5014e27
          crate::workers::telemetry::collector::track_state_set();
  
          // LIVE guard: reject oversized values before touching the adapter.
-@@ -621,11 +660,7 @@ impl StateWorker {
+@@ -621,11 +668,7 @@ impl StateWorker {
  
                  FunctionResult::Success(value)
              }
@@ -4594,7 +8804,7 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..7b4f3415fa3b0086f6cef385d5014e27
          }
      }
  
-@@ -634,11 +669,7 @@ impl StateWorker {
+@@ -634,11 +677,7 @@ impl StateWorker {
          crate::workers::telemetry::collector::track_state_get();
          match self.adapter.get(&input.scope, &input.key).await {
              Ok(value) => FunctionResult::Success(value),
@@ -4607,7 +8817,7 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..7b4f3415fa3b0086f6cef385d5014e27
          }
      }
  
-@@ -647,6 +678,7 @@ impl StateWorker {
+@@ -647,6 +686,7 @@ impl StateWorker {
          &self,
          input: StateDeleteInput,
      ) -> FunctionResult<Option<Value>, ErrorBody> {
@@ -4615,7 +8825,7 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..7b4f3415fa3b0086f6cef385d5014e27
          let value = match self.adapter.get(&input.scope, &input.key).await {
              Ok(v) => v,
              Err(e) => {
-@@ -675,11 +707,7 @@ impl StateWorker {
+@@ -675,11 +715,7 @@ impl StateWorker {
  
                  FunctionResult::Success(value)
              }
@@ -4628,7 +8838,7 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..7b4f3415fa3b0086f6cef385d5014e27
          }
      }
  
-@@ -688,6 +716,7 @@ impl StateWorker {
+@@ -688,6 +724,7 @@ impl StateWorker {
          &self,
          input: StateUpdateInput,
      ) -> FunctionResult<StreamUpdateResult, ErrorBody> {
@@ -4636,7 +8846,7 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..7b4f3415fa3b0086f6cef385d5014e27
          crate::workers::telemetry::collector::track_state_update();
          match self
              .adapter
-@@ -715,11 +744,7 @@ impl StateWorker {
+@@ -715,11 +752,7 @@ impl StateWorker {
  
                  FunctionResult::Success(value)
              }
@@ -4649,7 +8859,7 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..7b4f3415fa3b0086f6cef385d5014e27
          }
      }
  
-@@ -730,9 +755,90 @@ impl StateWorker {
+@@ -730,9 +763,128 @@ impl StateWorker {
      ) -> FunctionResult<Option<Value>, ErrorBody> {
          match self.adapter.list(&input.scope).await {
              Ok(values) => FunctionResult::Success(serde_json::to_value(values).ok()),
@@ -4702,13 +8912,41 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..7b4f3415fa3b0086f6cef385d5014e27
 +            });
 +        }
 +
++        let fields = match input.fields.as_deref() {
++            Some(fields) => match canonical_state_page_fields(fields) {
++                Some(fields) => Some(fields),
++                None => {
++                    return FunctionResult::Failure(ErrorBody {
++                        message: "fields must contain 1..=16 unique names, at most 128 UTF-8 bytes each and 1024 bytes total".to_string(),
++                        code: "STATE_PAGE_INVALID_REQUEST".to_string(),
++                        stacktrace: None,
++                    });
++                }
++            },
++            None => None,
++        };
++
 +        let limit = input.limit as u32;
 +        let max_bytes = input.max_bytes as u32;
-+        match self
-+            .adapter
-+            .list_page(&input.scope, input.cursor.as_deref(), limit, max_bytes)
-+            .await
-+        {
++        let page = match fields.as_deref() {
++            Some(fields) => {
++                self.adapter
++                    .list_page_projected(
++                        &input.scope,
++                        input.cursor.as_deref(),
++                        limit,
++                        max_bytes,
++                        fields,
++                    )
++                    .await
++            }
++            None => {
++                self.adapter
++                    .list_page(&input.scope, input.cursor.as_deref(), limit, max_bytes)
++                    .await
++            }
++        };
++        match page {
 +            Ok(page) => FunctionResult::Success(page),
 +            Err(StatePageError::Unsupported) => FunctionResult::Failure(ErrorBody {
 +                message: "the configured state adapter does not support bounded pagination"
@@ -4727,6 +8965,16 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..7b4f3415fa3b0086f6cef385d5014e27
 +                code: "STATE_PAGE_CURSOR_STALE".to_string(),
 +                stacktrace: None,
 +            }),
++            Err(StatePageError::InvalidProjection) => FunctionResult::Failure(ErrorBody {
++                message: "projected state pagination requires valid fields".to_string(),
++                code: "STATE_PAGE_INVALID_REQUEST".to_string(),
++                stacktrace: None,
++            }),
++            Err(StatePageError::ProjectedRecordNotObject) => FunctionResult::Failure(ErrorBody {
++                message: "a projected state record must have a JSON object at its root".to_string(),
++                code: "STATE_PAGE_PROJECTION_NON_OBJECT".to_string(),
++                stacktrace: None,
++            }),
 +            Err(StatePageError::RecordTooLarge { required_bytes }) => {
 +                FunctionResult::Failure(ErrorBody {
 +                    message: format!(
@@ -4743,7 +8991,7 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..7b4f3415fa3b0086f6cef385d5014e27
                  stacktrace: None,
              }),
          }
-@@ -830,6 +936,27 @@ mod tests {
+@@ -830,6 +982,27 @@ mod tests {
          ));
      }
  
@@ -4771,7 +9019,7 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..7b4f3415fa3b0086f6cef385d5014e27
      struct FakeStateAdapter {
          set_error: Option<&'static str>,
          get_error: Option<&'static str>,
-@@ -1031,6 +1158,127 @@ mod tests {
+@@ -1031,6 +1204,131 @@ mod tests {
          assert!(matches!(small, FunctionResult::Success(_)));
      }
  
@@ -4810,6 +9058,7 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..7b4f3415fa3b0086f6cef385d5014e27
 +            .list_page(StateListPageInput {
 +                scope: "scope".to_string(),
 +                cursor: None,
++                fields: None,
 +                limit: 0,
 +                max_bytes: 1024,
 +            })
@@ -4831,6 +9080,7 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..7b4f3415fa3b0086f6cef385d5014e27
 +            .list_page(StateListPageInput {
 +                scope: "scope".to_string(),
 +                cursor: None,
++                fields: None,
 +                limit: 256,
 +                max_bytes: 1024,
 +            })
@@ -4862,6 +9112,7 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..7b4f3415fa3b0086f6cef385d5014e27
 +            .list_page(StateListPageInput {
 +                scope: "scope".to_string(),
 +                cursor: None,
++                fields: None,
 +                limit: 1,
 +                max_bytes: 1024,
 +            })
@@ -4884,6 +9135,7 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..7b4f3415fa3b0086f6cef385d5014e27
 +            .list_page(StateListPageInput {
 +                scope: "scope".to_string(),
 +                cursor: Some(cursor),
++                fields: None,
 +                limit: 1,
 +                max_bytes: 1024,
 +            })
@@ -4900,10 +9152,10 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..7b4f3415fa3b0086f6cef385d5014e27
      async fn is_active_reflects_worker_shutdown_rx() {
          let (_engine, module) = setup();
 diff --git a/engine/src/workers/state/structs.rs b/engine/src/workers/state/structs.rs
-index b7dbf09f04d9cc08fd3764670189563d371142a8..854454ccf3937e3d4b5ef3204e0e2505e8975325 100644
+index b7dbf09..ab0bcaf 100644
 --- a/engine/src/workers/state/structs.rs
 +++ b/engine/src/workers/state/structs.rs
-@@ -60,6 +60,33 @@ pub struct StateListGroupsResult {
+@@ -60,6 +60,57 @@ pub struct StateListGroupsResult {
      pub groups: Vec<String>,
  }
  
@@ -4912,6 +9164,8 @@ index b7dbf09f04d9cc08fd3764670189563d371142a8..854454ccf3937e3d4b5ef3204e0e2505
 +    pub scope: String,
 +    #[serde(default)]
 +    pub cursor: Option<String>,
++    #[serde(default)]
++    pub fields: Option<Vec<String>>,
 +    #[serde(default = "default_state_page_limit")]
 +    pub limit: u64,
 +    #[serde(default = "default_state_page_max_bytes")]
@@ -4934,10 +9188,32 @@ index b7dbf09f04d9cc08fd3764670189563d371142a8..854454ccf3937e3d4b5ef3204e0e2505
 +
 +pub const STATE_PAGE_MAX_CURSOR_BYTES: usize = 4096;
 +
++pub fn canonical_state_page_fields(fields: &[String]) -> Option<Vec<String>> {
++    if !(1..=16).contains(&fields.len()) {
++        return None;
++    }
++    let mut total_bytes = 0usize;
++    for field in fields {
++        if field.len() > 128 {
++            return None;
++        }
++        total_bytes = total_bytes.checked_add(field.len())?;
++        if total_bytes > 1024 {
++            return None;
++        }
++    }
++    let mut canonical = fields.to_vec();
++    canonical.sort_unstable();
++    if canonical.windows(2).any(|pair| pair[0] == pair[1]) {
++        return None;
++    }
++    Some(canonical)
++}
++
  #[derive(Debug, Clone, Serialize, Deserialize)]
  pub enum StateEventType {
      #[serde(rename = "state:created")]
-@@ -86,6 +113,20 @@ mod tests {
+@@ -86,6 +137,20 @@ mod tests {
      use super::*;
      use serde_json::json;
  
@@ -4959,7 +9235,7 @@ index b7dbf09f04d9cc08fd3764670189563d371142a8..854454ccf3937e3d4b5ef3204e0e2505
      fn state_set_input_data_alias() {
          let json = json!({"scope": "s", "key": "k", "data": "hello"});
 diff --git a/engine/tests/worker_trigger_e2e.rs b/engine/tests/worker_trigger_e2e.rs
-index b9ea545ceb2c1cac752fd3d60178848682f07e15..fc6d864cb63ce372aac6173d0d0eb38b828df559 100644
+index b9ea545..fc6d864 100644
 --- a/engine/tests/worker_trigger_e2e.rs
 +++ b/engine/tests/worker_trigger_e2e.rs
 @@ -19,6 +19,8 @@
@@ -4971,3 +9247,138 @@ index b9ea545ceb2c1cac752fd3d60178848682f07e15..fc6d864cb63ce372aac6173d0d0eb38b
  use std::path::PathBuf;
  use std::time::Duration;
  
+--- a/engine/src/workers/state/adapters/sqlite/retrieval/graph.rs
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/graph.rs
+@@ -83,9 +83,6 @@
+         let members = value["sourceObservationIds"]
+             .as_array()
+             .ok_or_else(|| super::super::protocol::error("STATE_TX_INVALID_REQUEST"))?;
+-        if members.len() > request::MAX_ITEMS {
+-            return Err(request::resource());
+-        }
+         connection.execute(
+             "INSERT INTO retrieval_nodes VALUES(?1,?2,?2,?3,?4,?5)",
+             params![epoch, key, name, prefix, position],
+--- a/engine/src/workers/state/adapters/sqlite/retrieval/tests/graph_tests.rs
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/tests/graph_tests.rs
+@@ -1,4 +1,120 @@
+ use super::*;
++
++#[test]
++fn high_fanout_prepare_preserves_complete_memberships_and_public_bounds() {
++    let connection = fresh();
++    let members: Vec<String> = (0..18_814)
++        .map(|index| format!("observation-{index:012}"))
++        .collect();
++    let references: Vec<&str> = members.iter().map(String::as_str).collect();
++    let original = node("high-fanout", "bounded", &references);
++    assert!(serde_json::to_vec(&original).unwrap().len() < 1024 * 1024);
++    write(&connection, graph::NODES, "high-fanout", Some(&original));
++    connection.execute(
++        "UPDATE state_scopes SET revision=CAST(CAST(revision AS INTEGER)+1 AS TEXT) WHERE scope=?1",
++        [graph::NODES],
++    ).unwrap();
++    call(&connection, json!({"action":"index_status"})).unwrap();
++    let before = metadata::graph(&connection, graph::NODES).unwrap();
++    assert_eq!(
++        code(
++            call(
++                &connection,
++                json!({"action":"index_prepare","scope":graph::NODES,"max_rows":1,"max_bytes":1024})
++            )
++            .unwrap_err()
++        ),
++        "STATE_RETRIEVAL_RESOURCE_LIMIT"
++    );
++    assert_eq!(
++        metadata::graph(&connection, graph::NODES).unwrap().cursor,
++        before.cursor
++    );
++    let prepared = call(
++        &connection,
++        json!({"action":"index_prepare","scope":graph::NODES,"max_rows":1,"max_bytes":1048576}),
++    )
++    .unwrap();
++    assert_eq!(prepared["status"], "ready");
++    assert_eq!(prepared["processed"], 1);
++    let epoch = metadata::graph(&connection, graph::NODES).unwrap().epoch;
++    let indexed: Vec<String> = connection.prepare(
++        "SELECT observation FROM retrieval_membership WHERE epoch=?1 AND key=?2 ORDER BY observation",
++    ).unwrap().query_map(rusqlite::params![epoch, "high-fanout"], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
++    assert_eq!(indexed, members);
++    for chunk in members.chunks(request::MAX_INPUT_ITEMS) {
++        let found = call(
++            &connection,
++            json!({"action":"graph_seeds","observation_ids":chunk}),
++        )
++        .unwrap();
++        assert_eq!(ids(&found), vec!["high-fanout"]);
++        assert_eq!(found["items"][0]["observation"], true);
++    }
++    assert_eq!(
++        database::row(&connection, graph::NODES, "high-fanout")
++            .unwrap()
++            .value,
++        Some(original)
++    );
++    for invalid in [
++        json!({"action":"graph_seeds","observation_ids":members[..request::MAX_INPUT_ITEMS+1]}),
++        json!({"action":"graph_seeds","max_items":request::MAX_ITEMS+1}),
++        json!({"action":"index_prepare","scope":graph::NODES,"max_rows":1025}),
++        json!({"action":"index_prepare","scope":graph::NODES,"max_bytes":request::MAX_BYTES+1}),
++    ] {
++        assert_eq!(
++            code(call(&connection, invalid).unwrap_err()),
++            "STATE_TX_INVALID_REQUEST"
++        );
++    }
++}
++
++#[test]
++fn high_fanout_prepare_retains_member_byte_bound_and_atomic_readiness() {
++    let connection = fresh();
++    let members: Vec<String> = (0..513)
++        .map(|index| format!("{index:04}{}", "x".repeat(4092)))
++        .collect();
++    let references: Vec<&str> = members.iter().map(String::as_str).collect();
++    let original = node("over-byte-bound", "bounded", &references);
++    write(
++        &connection,
++        graph::NODES,
++        "over-byte-bound",
++        Some(&original),
++    );
++    let before = metadata::graph(&connection, graph::NODES).unwrap();
++    assert_ne!(before.status, "ready");
++    assert_eq!(code(call(&connection, json!({"action":"index_prepare","scope":graph::NODES,"max_rows":1,"max_bytes":request::MAX_BYTES})).unwrap_err()), "STATE_RETRIEVAL_RESOURCE_LIMIT");
++    let after = metadata::graph(&connection, graph::NODES).unwrap();
++    assert_eq!(after.cursor, before.cursor);
++    assert_eq!(after.status, before.status);
++    let partial: i64 = connection
++        .query_row(
++            "SELECT count(*) FROM retrieval_membership WHERE epoch=?1 AND key=?2",
++            rusqlite::params![after.epoch, "over-byte-bound"],
++            |row| row.get(0),
++        )
++        .unwrap();
++    assert_eq!(partial, 0);
++    assert_eq!(
++        database::row(&connection, graph::NODES, "over-byte-bound")
++            .unwrap()
++            .value,
++        Some(original)
++    );
++    assert_eq!(
++        code(
++            call(
++                &connection,
++                json!({"action":"graph_seeds","observation_ids":[members[0]]})
++            )
++            .unwrap_err()
++        ),
++        "STATE_INDEX_NOT_READY"
++    );
++}
+ 
+ #[test]
+ fn indexed_graph_seeds_preserve_bidirectional_unicode_substrings_and_positions() {

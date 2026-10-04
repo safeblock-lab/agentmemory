@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "freezeSha256": "681d5a7c0e83722d0300345b43b86e223c1b4c4ef33a9c652eca650e3372ef6a",
+  "baselineAssetManifestSha256": "1a9c737ecf635cab0463bac339a6ada82fde1a98dc32474ed0d1a5fcd2a3ef35",
+  "embedding": {
+    "id": "Xenova/all-MiniLM-L6-v2",
+    "revision": "751bff37182d3f1213fa05d7196b954e230abad9",
+    "dimensions": 384,
+    "dtype": "q8"
+  },
+  "native": {
+    "executable": "D:\\agentmemory\\.native-pagination-build\\native-semantic-probe256\\iii.exe",
+    "sha256": "c7d3a0d17a2d2395e698e10835b261c926baf8d7de0dae36669e8927ef629652",
+    "sourcePins": {
+      "D:\\agentmemory\\.native-pagination-build\\iii-source\\engine\\src\\workers\\state\\adapters\\sqlite\\retrieval\\request_validate.rs": "b7a1f9d92afd8553fb65436fca47e543a0e3214b7e9084023bcbe2b7ae16e225",
+      "D:\\agentmemory\\.native-pagination-build\\iii-source\\engine\\src\\workers\\state\\adapters\\sqlite\\retrieval\\tests\\semantic_tests.rs": "7b07b11bc4be8574d59cf180b9e11fcc78b0dafa60f486c21770d27243fe407a",
+      "D:\\agentmemory\\.native-pagination-build\\native-semantic-probe256\\test-repair\\source.patch": "8bc9a27178a62c719a51f6a96b9ef6f3b3230a694d966e4f32e40623058ef6a1",
+      "D:\\agentmemory\\.native-pagination-build\\native-semantic-probe256\\test-repair\\rollback.patch": "8e888eecd3a20a4648f7dd2ebbe935188e3136333fab18d5fc926b004e03659a",
+      "D:\\agentmemory\\.native-pagination-build\\optimized-release\\iii.exe": "bb25470359e1f8cb76905adf8ccf0bf68d0d83f2a5b143055773a831fe607aae"
+    },
+    "probes": 256
+  },
+  "runtime": {
+    "revision": "90213ffc6a8e6f051a6331269a0f5526cdd896f6",
+    "cacheDirectory": "D:\\agentmemory\\.native-pagination-build\\semantic-quality-correction\\combined-bge256\\model-cache",
+    "modelId": "onnx-community/bge-reranker-v2-m3-ONNX",
+    "modelPath": "D:\\agentmemory\\.native-pagination-build\\multilingual-model-provision"
+  },
+  "assets": {
+    "D:\\agentmemory\\.native-pagination-build\\multilingual-model-provision\\README.md": "a75cfab17e2050a3c62c1132ea6952b18158a08d5182b93e1fefa181b36669a9",
+    "D:\\agentmemory\\.native-pagination-build\\multilingual-model-provision\\config.json": "122e922dcfed6503c8721e6fe1daf090340c3d95ca7f3aa3a72730b321a51cfd",
+    "D:\\agentmemory\\.native-pagination-build\\multilingual-model-provision\\special_tokens_map.json": "8c785abebea9ae3257b61681b4e6fd8365ceafde980c21970d001e834cf10835",
+    "D:\\agentmemory\\.native-pagination-build\\multilingual-model-provision\\tokenizer.json": "8bf8afbfd11306bd872018c53bfdf2e160a56f8edbcf49933324404791c148d3",
+    "D:\\agentmemory\\.native-pagination-build\\multilingual-model-provision\\tokenizer_config.json": "b87c8703482b0300d3da30e201519aa641f6a450f5eb5bf1e624afbf70c74d80",
+    "D:\\agentmemory\\.native-pagination-build\\multilingual-model-provision\\provenance\\base-model-card.md": "c887aa6dd2598f908bf0582ca7068cc816585c7a1b6a07df305b631ede0cb174",
+    "D:\\agentmemory\\.native-pagination-build\\multilingual-model-provision\\onnx\\model_quantized.onnx": "912fc1215c2dbff6499700534bd8d31253af01573861abbfc43afd1fab6cce5d"
+  },
+  "provisionManifest": {
+    "path": "D:\\agentmemory\\.native-pagination-build\\multilingual-model-provision\\manifest.json",
+    "sha256": "555a0fc9b140681b8abe96727eb154c890a49db86bb41ae398fa39c20d7f8f52"
+  },
+  "limits": {
+    "candidateWindow": 50,
+    "maxPairs": 5616,
+    "cpuThreads": 1,
+    "pendingBatches": 8,
+    "maxTokens": 512
+  }
+}

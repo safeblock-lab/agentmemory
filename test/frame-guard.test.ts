@@ -14,6 +14,7 @@ import {
 import { registerExportImportFunction } from "../src/functions/export-import.js";
 import { KV } from "../src/state/schema.js";
 import type { Session } from "../src/types.js";
+import { graphStateHarness } from "./helpers/graph-state-harness.js";
 
 // The guard must catch an oversized payload before the return so the frame
 // that would drop the worker is never shipped.
@@ -52,37 +53,9 @@ describe("frame-guard", () => {
   });
 });
 
-function mockKV(store = new Map<string, Map<string, unknown>>()) {
-  return {
-    get: async () => null,
-    set: async <T>(s: string, k: string, d: T) => {
-      if (!store.has(s)) store.set(s, new Map());
-      store.get(s)!.set(k, d);
-      return d;
-    },
-    delete: async () => {},
-    update: async () => {},
-    list: async <T>(scope: string): Promise<T[]> =>
-      Array.from(store.get(scope)?.values() ?? []) as T[],
-    _store: store,
-  };
-}
-
-function mockSdk(kv: ReturnType<typeof mockKV>) {
-  const fns = new Map<string, Function>();
-  return {
-    registerFunction: (id: string, h: Function) => fns.set(id, h),
-    registerTrigger: () => {},
-    trigger: async (input: { function_id: string; payload?: unknown }) =>
-      fns.get(input.function_id)?.(input.payload),
-    _fns: fns,
-    _kv: kv,
-  } as never;
-}
-
 describe("mem::export frame guard", () => {
   it("returns the export object when it fits under the frame limit", async () => {
-    const kv = mockKV();
+    const { sdk, kv } = graphStateHarness();
     await kv.set(KV.sessions, "s1", {
       id: "s1",
       project: "p",
@@ -91,8 +64,7 @@ describe("mem::export frame guard", () => {
       status: "completed",
       observationCount: 0,
     } as Session);
-    const sdk = mockSdk(kv);
-    registerExportImportFunction(sdk, kv as never);
+    registerExportImportFunction(sdk as never, kv as never);
     const result = (await (sdk as any).trigger({
       function_id: "mem::export",
       payload: {},
@@ -102,7 +74,7 @@ describe("mem::export frame guard", () => {
   });
 
   it("returns a clean oversized error (not the object) when the export exceeds the cap", async () => {
-    const kv = mockKV();
+    const { sdk, kv } = graphStateHarness();
     // One memory whose content alone pushes the serialized export past the cap.
     const huge = "z".repeat(SAFE_PAYLOAD_BYTES + 4096);
     await kv.set(KV.memories, "m1", {
@@ -119,8 +91,7 @@ describe("mem::export frame guard", () => {
       version: 1,
       isLatest: true,
     });
-    const sdk = mockSdk(kv);
-    registerExportImportFunction(sdk, kv as never);
+    registerExportImportFunction(sdk as never, kv as never);
     const result = (await (sdk as any).trigger({
       function_id: "mem::export",
       payload: {},

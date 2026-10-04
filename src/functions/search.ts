@@ -5,6 +5,8 @@ import { KV } from '../state/schema.js'
 import { StateKV } from '../state/kv.js'
 import { SearchIndex } from '../state/search-index.js'
 import { VectorIndex } from '../state/vector-index.js'
+import { IndexedVector } from '../state/indexed-vector.js'
+import { prepareIndexedCorpus } from '../state/indexed-preparation.js'
 import type { EmbeddingProvider } from '../types.js'
 import { memoryToObservation } from '../state/memory-utils.js'
 import { recordAccessBatch } from './access-tracker.js'
@@ -18,6 +20,15 @@ import {
 
 let index: SearchIndex | null = null
 let vectorIndex: VectorIndex | null = null
+let indexedVector: IndexedVector | null = null
+class DiskOwnedSearchIndex extends SearchIndex {
+  override add(_observation: CompressedObservation): void {}
+}
+export function setIndexedVector(value: IndexedVector | null): void {
+  if (!value && indexedVector) index = new SearchIndex()
+  indexedVector = value
+  if (value) index = new DiskOwnedSearchIndex()
+}
 let currentEmbeddingProvider: EmbeddingProvider | null = null
 
 // Hybrid ranking hook for mem::search. Wired by index.ts once the
@@ -85,6 +96,7 @@ export function getEmbeddingProvider(): EmbeddingProvider | null {
 }
 
 export function vectorIndexRemove(id: string): void {
+  indexedVector?.remove(id);
   vectorIndex?.remove(id);
 }
 
@@ -124,6 +136,7 @@ export function scheduleIndexSave(): void {
 // flush as a fatal error on the delete itself (the KV delete already
 // committed before this is invoked).
 export async function flushIndexSave(): Promise<void> {
+  await indexedVector?.flush();
   await indexPersistence?.save();
 }
 
@@ -153,10 +166,11 @@ export async function vectorIndexAddGuarded(
 ): Promise<boolean> {
   const vi = vectorIndex
   const ep = currentEmbeddingProvider
-  if (!vi || !ep) return false
+  if ((!vi && !indexedVector) || !ep) return false
   try {
     const embedding = await ep.embed(clipEmbedInput(text))
     if (embedding.length !== ep.dimensions) {
+      await indexedVector?.markIncomplete();
       logger.warn("vector-index add: dimension mismatch — skipping", {
         kind: context.kind,
         id: context.logId,
@@ -166,9 +180,11 @@ export async function vectorIndexAddGuarded(
       })
       return false
     }
-    vi.add(id, sessionId, embedding)
+    if (indexedVector) await indexedVector.add(id, sessionId, embedding, clipEmbedInput(text), context.kind === 'memory' ? KV.memories : KV.observations(sessionId))
+    else vi!.add(id, sessionId, embedding)
     return true
   } catch (err) {
+    await indexedVector?.markIncomplete();
     logger.warn("vector-index add: embed failed — skipping", {
       kind: context.kind,
       id: context.logId,
@@ -199,12 +215,13 @@ export async function vectorIndexAddBatchGuarded(
 ): Promise<{ ok: number; fail: number }> {
   const vi = vectorIndex
   const ep = currentEmbeddingProvider
-  if (!vi || !ep || items.length === 0) return { ok: 0, fail: 0 }
+  if ((!vi && !indexedVector) || !ep || items.length === 0) return { ok: 0, fail: 0 }
 
   let embeddings: Float32Array[]
   try {
     embeddings = await ep.embedBatch(items.map((i) => clipEmbedInput(i.text)))
   } catch (err) {
+    await indexedVector?.markIncomplete();
     logger.warn("vector-index add batch: embed failed — skipping batch", {
       batchSize: items.length,
       provider: ep.name,
@@ -214,6 +231,7 @@ export async function vectorIndexAddBatchGuarded(
   }
 
   if (embeddings.length !== items.length) {
+    await indexedVector?.markIncomplete();
     logger.warn(
       "vector-index add batch: provider returned wrong length — skipping batch",
       {
@@ -231,6 +249,7 @@ export async function vectorIndexAddBatchGuarded(
     const item = items[i]
     const embedding = embeddings[i]
     if (embedding.length !== ep.dimensions) {
+      await indexedVector?.markIncomplete();
       logger.warn("vector-index add batch: dimension mismatch — skipping item", {
         kind: item.context.kind,
         id: item.context.logId,
@@ -242,9 +261,11 @@ export async function vectorIndexAddBatchGuarded(
       continue
     }
     try {
-      vi.add(item.id, item.sessionId, embedding)
+      if (indexedVector) await indexedVector.add(item.id, item.sessionId, embedding, clipEmbedInput(item.text), item.context.kind === 'memory' ? KV.memories : KV.observations(item.sessionId))
+      else vi!.add(item.id, item.sessionId, embedding)
       ok++
     } catch (err) {
+      await indexedVector?.markIncomplete();
       logger.warn("vector-index add batch: index write failed — skipping item", {
         kind: item.context.kind,
         id: item.context.logId,
@@ -269,7 +290,8 @@ function getRebuildEmbedBatchSize(): number {
   const raw = process.env.REBUILD_EMBED_BATCH_SIZE
   if (!raw) return DEFAULT_REBUILD_EMBED_BATCH
   const n = parseInt(raw, 10)
-  return Number.isFinite(n) && n > 0 ? n : DEFAULT_REBUILD_EMBED_BATCH
+  const selected = Number.isFinite(n) && n > 0 ? n : DEFAULT_REBUILD_EMBED_BATCH
+  return indexedVector ? Math.min(selected, 32) : selected
 }
 
 // Shared BM25 + batched-vector indexing for a set of records. The full
@@ -284,7 +306,7 @@ export async function indexRecords(
   memories: Memory[],
 ): Promise<number> {
   const idx = getSearchIndex()
-  const vectorEnabled = Boolean(vectorIndex && currentEmbeddingProvider)
+  const vectorEnabled = Boolean((vectorIndex || indexedVector) && currentEmbeddingProvider)
   const batchSize = getRebuildEmbedBatchSize()
   type EmbedJob = {
     id: string
@@ -308,7 +330,7 @@ export async function indexRecords(
   for (const memory of memories) {
     if (memory.isLatest === false) continue
     if (!memory.title || !memory.content) continue
-    idx.add(memoryToObservation(memory))
+    if (!indexedVector) idx.add(memoryToObservation(memory))
     await enqueue({
       id: memory.id,
       sessionId: memory.sessionIds?.[0] ?? 'memory',
@@ -319,7 +341,7 @@ export async function indexRecords(
   }
   for (const obs of observations) {
     if (!obs.title || !obs.narrative) continue
-    idx.add(obs)
+    if (!indexedVector) idx.add(obs)
     await enqueue({
       id: obs.id,
       sessionId: obs.sessionId,
@@ -336,6 +358,7 @@ export async function indexRecords(
 export async function findUnindexedObservations(
   kv: StateKV,
 ): Promise<{ sessions: number; missing: CompressedObservation[] }> {
+  if (kv.indexedRetrieval) throw new Error('STATE_INDEX_NOT_READY: Use explicit indexed corpus preparation; resident index reconciliation is disabled.');
   const idx = getSearchIndex()
   const sessions = await kv.list<Session>(KV.sessions)
   const indexed = idx.observationCountsBySession()
@@ -361,6 +384,10 @@ export async function reconcileIndex(kv: StateKV): Promise<number> {
 }
 
 export async function rebuildIndex(kv: StateKV): Promise<number> {
+  if (kv.indexedRetrieval) {
+    if (!indexedVector || !currentEmbeddingProvider) throw new Error('STATE_INDEX_NOT_READY: Local embedding provider is required.');
+    return prepareIndexedCorpus(kv, indexedVector, currentEmbeddingProvider);
+  }
   const idx = getSearchIndex()
   idx.clear()
   memoryIndexReady = false
@@ -454,6 +481,7 @@ export async function rebuildKeywordIndex(
   kv: StateKV,
   vectorBackfillSince?: string | null,
 ): Promise<{ documents: number; vectorJobs: VectorBackfillJob[]; fullBackfillPending: number }> {
+  if (kv.indexedRetrieval) throw new Error('STATE_INDEX_NOT_READY: Resident keyword rebuild is disabled; prepare the native indexed corpus explicitly.');
   const idx = getSearchIndex()
   idx.clear()
   memoryIndexReady = false
@@ -634,7 +662,7 @@ export function registerSearchFunction(sdk: IIIClient, kv: StateKV): void {
         tokenBudget = data.token_budget
       }
 
-      if (idx.size === 0) {
+      if (!kv.indexedRetrieval && idx.size === 0) {
         // Share one rebuild across concurrent cold-start queries so they
         // don't each walk the whole corpus and saturate the pool.
         if (!rebuildPromise) {
@@ -674,7 +702,7 @@ export function registerSearchFunction(sdk: IIIClient, kv: StateKV): void {
         score: number
         observation?: CompressedObservation
       }>
-      if (hybridRanker && vectorIndex && vectorIndex.size > 0) {
+      if (hybridRanker && (kv.indexedRetrieval || (vectorIndex && vectorIndex.size > 0))) {
         try {
           const hybrid = await hybridRanker(query, fetchLimit)
           results = hybrid.map((r) => ({
@@ -684,12 +712,14 @@ export function registerSearchFunction(sdk: IIIClient, kv: StateKV): void {
             observation: r.observation,
           }))
         } catch (err) {
+          if (kv.indexedRetrieval) throw err
           logger.warn("hybrid ranking failed, falling back to keyword search", {
             error: err instanceof Error ? err.message : String(err),
           })
           results = idx.search(query, fetchLimit)
         }
       } else {
+        if (kv.indexedRetrieval) throw new Error('STATE_INDEX_NOT_READY: Indexed hybrid ranking is unavailable.');
         results = idx.search(query, fetchLimit)
       }
 
