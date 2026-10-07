@@ -37,7 +37,7 @@ describe("batch destination crash recovery", () => {
     const snap = await h.kv.get<GraphSnapshot>(KV.graphSnapshot, "current");
     expect(snap?.stats).toMatchObject({ totalNodes: 2, totalEdges: 1 });
     expect(Object.values(snap!.topDegrees)).toEqual([1, 1]);
-    expect(await h.kv.list(KV.audit)).toHaveLength(1);
+    expect(await h.kv.list(KV.audit)).toHaveLength(0);
   });
 
   it("merges separate graph callbacks onto canonical endpoints", async () => {
@@ -94,7 +94,7 @@ describe("batch destination crash recovery", () => {
     expect(secondSnapshot?.stats).toMatchObject({ totalNodes: 2, totalEdges: 1 });
     expect(await h.kv.list(KV.graphNodes)).toHaveLength(2);
     expect(await h.kv.list(KV.graphEdges)).toHaveLength(1);
-    expect(await h.kv.list(KV.audit)).toHaveLength(1);
+    expect(await h.kv.list(KV.audit)).toHaveLength(0);
     },
   );
 

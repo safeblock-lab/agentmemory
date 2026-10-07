@@ -146,4 +146,32 @@ describe("Timeline Function", () => {
     const titles = result.entries.map((e) => e.observation.title);
     expect(titles).toContain("Third edit");
   });
+
+  it("caps large windows at 20 while retaining historical anchors and stored observations", async () => {
+    for (let i = 0; i < 40; i++) {
+      const timestamp = new Date(Date.UTC(2026, 1, 2, i)).toISOString();
+      await kv.set("mem:obs:ses_1", `later_${i}`, makeObs(`later_${i}`, timestamp, `Later ${i}`));
+    }
+
+    const result = await sdk.trigger("mem::timeline", {
+      anchor: "Third",
+      before: 100,
+      after: 100,
+    }) as { entries: TimelineEntry[]; anchorIndex: number };
+
+    expect(result.entries.length).toBeLessThanOrEqual(20);
+    expect(result.entries[result.anchorIndex].observation.id).toBe("obs_3");
+    expect(result.entries[result.anchorIndex].relativePosition).toBe(0);
+    expect(await kv.list("mem:obs:ses_1")).toHaveLength(45);
+
+    const fullWindow = await sdk.trigger("mem::timeline", {
+      anchor: "2026-02-02T15:00:00Z",
+      before: 100,
+      after: 100,
+    }) as { entries: TimelineEntry[] };
+    expect(fullWindow.entries).toHaveLength(20);
+    expect(fullWindow.entries.map(entry => entry.relativePosition)).toEqual(
+      Array.from({ length: 20 }, (_, i) => i - 9),
+    );
+  });
 });

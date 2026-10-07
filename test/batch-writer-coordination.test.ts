@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { effectHarness } from "./batch-effects-harness.js";
-import { applyBatchEffect, batchEffectKey, effectMetadata, preserveBatchProvenance, runBatchCallback, withBatchMutationLocks, withBatchRecordLocks, withBatchWriterLocks } from "../src/state/batch-effects.js";
+import { BatchMaintenanceBusyError, applyBatchEffect, batchEffectKey, effectMetadata, preserveBatchProvenance, runBatchCallback, withBatchMutationLocks, withBatchRecordLocks, withBatchWriterLocks } from "../src/state/batch-effects.js";
 import { KV, fingerprintId } from "../src/state/schema.js";
 import { registerTemporalGraphFunctions } from "../src/functions/temporal-graph.js";
 import { registerSkillExtractFunctions } from "../src/functions/skill-extract.js";
@@ -44,6 +44,80 @@ describe("single-worker writer coordination", () => {
     expect(run).not.toHaveBeenCalled();
   });
 
+  it("closes admission while draining so continuing writers cannot starve maintenance", async () => {
+    const h = effectHarness(), entered = deferred(), finish = deferred();
+    const order: string[] = [];
+    const callback = runBatchCallback(h.kv, "consolidation", undefined, async () => {
+      entered.resolve(); await finish.promise;
+      await runBatchCallback(h.kv, "reflect", undefined, async () => { order.push("child"); return { success: true }; });
+      order.push("parent"); return { success: true };
+    });
+    await entered.promise;
+    const maintenance = withBatchMutationLocks(h.kv, async () => { order.push("maintenance"); });
+    await Promise.resolve();
+    const writers = Array.from({ length: 20 }, () => withBatchWriterLocks(h.kv, ["lessons"], async () => { order.push("writer"); }));
+    await Promise.resolve();
+    expect(order).toEqual([]);
+    finish.resolve();
+    await Promise.all([callback, maintenance, ...writers]);
+    expect(order.slice(0, 3)).toEqual(["child", "parent", "maintenance"]);
+    expect(order.slice(3)).toEqual(Array(20).fill("writer"));
+  });
+
+  it("blocks detached descendants after their parent admission ends", async () => {
+    const h = effectHarness(), finishDetached = deferred(), maintenanceEntered = deferred(), finishMaintenance = deferred();
+    const child = vi.fn(async () => ({ success: true }));
+    let detached!: Promise<unknown>;
+    await runBatchCallback(h.kv, "reflect", undefined, async () => {
+      detached = finishDetached.promise.then(() => runBatchCallback(h.kv, "lessons", undefined, child));
+      return { success: true };
+    });
+    const maintenance = withBatchMutationLocks(h.kv, async () => { maintenanceEntered.resolve(); await finishMaintenance.promise; });
+    await maintenanceEntered.promise;
+    finishDetached.resolve();
+    await Promise.resolve(); await Promise.resolve();
+    expect(child).not.toHaveBeenCalled();
+    finishMaintenance.resolve();
+    await Promise.all([maintenance, detached]);
+    expect(child).toHaveBeenCalledOnce();
+  });
+
+  it("rejects nested maintenance instead of waiting for its own admission", async () => {
+    const h = effectHarness();
+    await runBatchCallback(h.kv, "reflect", undefined, async () => {
+      await expect(withBatchMutationLocks(h.kv, async () => true)).rejects.toThrow("inside an admitted callback");
+      return { success: true };
+    });
+    await expect(withBatchMutationLocks(h.kv, async () => true)).resolves.toBe(true);
+  });
+
+  it("keeps graph admission until the callback delta is applied", async () => {
+    const h = effectHarness(), graph = graphKV(h.kv);
+    const committing = deferred(), finishCommit = deferred();
+    let callbackFinished = false, gated = false;
+    const commitBatch = h.kv.commitBatch.bind(h.kv);
+    vi.spyOn(h.kv, "commitBatch").mockImplementation(async (guard, prepared) => {
+      if (callbackFinished && !gated) {
+        gated = true; committing.resolve(); await finishCommit.promise;
+      }
+      return commitBatch(guard, prepared);
+    });
+    const callback = runGraphJob(graph, "batch_callback", {}, () => runBatchCallback(graph, "graph", batchEffectKey("maintenance-delta"), async (_, admit) => {
+      await admit();
+      await graph.set(KV.graphNodes, "n", { id: "n", name: "complete" });
+      callbackFinished = true;
+      return { success: true };
+    }), "maintenance-delta-job");
+    await committing.promise;
+    const run = vi.fn(async () => { expect(await h.kv.get(KV.graphNodes, "n")).toMatchObject({ name: "complete" }); });
+    const maintenance = withBatchMutationLocks(h.kv, run);
+    await Promise.resolve(); await Promise.resolve();
+    expect(run).not.toHaveBeenCalled();
+    finishCommit.resolve();
+    await Promise.all([callback, maintenance]);
+    expect(run).toHaveBeenCalledOnce();
+  });
+
   it("bounds maintenance waiting without interrupting an admitted callback", async () => {
     vi.useFakeTimers();
     const h = effectHarness(), entered = deferred(), finish = deferred();
@@ -51,9 +125,19 @@ describe("single-worker writer coordination", () => {
     try {
       await entered.promise;
       const run = vi.fn(async () => true);
-      const failed = expect(withBatchMutationLocks(h.kv, run)).rejects.toThrow("quiescence timed out");
+      const waiting = withBatchMutationLocks(h.kv, run).catch((error: unknown) => error);
+      await Promise.resolve();
+      const writer = vi.fn(async () => true);
+      const queued = withBatchWriterLocks(h.kv, ["lessons"], writer);
       await vi.advanceTimersByTimeAsync(30001);
-      await failed; expect(run).not.toHaveBeenCalled();
+      const error = await waiting;
+      expect(error).toBeInstanceOf(BatchMaintenanceBusyError);
+      expect(error).toMatchObject({ code: "BATCH_MAINTENANCE_BUSY", details: {
+        waitedMs: 30000, activeAdmissions: 1, waitingAdmissions: 1,
+        families: [{ family: "graph", count: 1, oldestMs: 30000 }],
+      } });
+      expect(run).not.toHaveBeenCalled();
+      await queued; expect(writer).toHaveBeenCalledOnce();
       finish.resolve(); await callback;
       expect(await withBatchMutationLocks(h.kv, async () => true)).toBe(true);
     } finally { finish.resolve(); await callback; vi.useRealTimers(); }

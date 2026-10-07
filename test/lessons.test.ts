@@ -436,20 +436,17 @@ describe("Lessons", () => {
       expect(resaved.lesson.deleted).toBeUndefined();
     });
 
-    it("records a lesson_delete audit row", async () => {
+    it("deletes a lesson without storing an audit row", async () => {
       const saved = (await sdk.trigger("mem::lesson-save", {
         content: "Audited delete",
       })) as { lesson: Lesson };
 
       await sdk.trigger("mem::lesson-delete", { lessonId: saved.lesson.id });
 
-      const auditRows = (await kv.list("mem:audit")) as Array<{
-        operation: string;
-        targetIds: string[];
-      }>;
-      const row = auditRows.find((r) => r.operation === "lesson_delete");
-      expect(row).toBeDefined();
-      expect(row!.targetIds).toEqual([saved.lesson.id]);
+      expect(await kv.get<Lesson>("mem:lessons", saved.lesson.id)).toMatchObject({
+        deleted: true,
+      });
+      expect(await kv.list("mem:audit")).toHaveLength(0);
     });
   });
 });

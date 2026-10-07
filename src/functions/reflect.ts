@@ -21,6 +21,7 @@ import type { FireworksBatchQueue } from "./fireworks-batch.js";
 import { stripPrivateData } from "./privacy.js";
 import { TYPESAFE_REFLECTION_GATE_CONFIDENCE_THRESHOLD } from "../config.js";
 import { graphTransactionFailure, withCompletedGraphRead } from "./graph-jobs.js";
+import { collectProjectedRecords } from "./projected-record-reader.js";
 
 const PROTECTED_REFLECT_SIGNAL = /\b(?:error|failed|failure|decision|instruction|prompt|security|secret|token|password|credential|api[-_ ]?key|auth|permission|mutation|write|edit|patch|delete|move|rename|commit|push|reset|deploy|install|shell|terminal|bash|powershell|environment|env|(?:AGENTS|CLAUDE|GEMINI|COPILOT)\.md)\b/i;
 
@@ -305,7 +306,7 @@ export function registerReflectFunctions(
       const [[graphNodes, graphEdges], semanticMemories, lessons, crystals] =
         await Promise.all([
           withCompletedGraphRead(kv, () => Promise.all([
-            kv.list<GraphNode>(KV.graphNodes).catch((error) => { if (graphTransactionFailure(error)) throw error; return []; }),
+            collectProjectedRecords<GraphNode>(kv, KV.graphNodes).catch((error) => { if (graphTransactionFailure(error)) throw error; return []; }),
             kv.list<GraphEdge>(KV.graphEdges).catch((error) => { if (graphTransactionFailure(error)) throw error; return []; }),
           ])),
           kv.list<SemanticMemory>(KV.semantic).catch(() => []),

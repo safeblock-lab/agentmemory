@@ -153,12 +153,7 @@ describe("mem::evict stale sessions", () => {
 
     expect(result.staleSessions).toBe(1);
     expect(await kv.get(KV.sessions, sessionId)).toBeNull();
-    const audits = await kv.list<{
-      details: { reason: string };
-    }>(KV.audit);
-    expect(audits[0].details.reason).toBe(
-      "stale_session_recovered_then_evicted",
-    );
+    expect(await kv.list(KV.audit)).toHaveLength(0);
     expect(calls.map((call) => call.function_id)).toContain(
       "event::session::stopped",
     );

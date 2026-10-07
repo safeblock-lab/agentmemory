@@ -10,6 +10,7 @@ import {
   setIndexPersistence,
 } from "../src/functions/search.js";
 import { memoryToObservation } from "../src/state/memory-utils.js";
+import { KV } from "../src/state/schema.js";
 import type { Memory, AuditEntry } from "../src/types.js";
 
 function mockKV() {
@@ -241,7 +242,17 @@ describe("Governance Functions", () => {
     });
   });
 
-  it("audit-query returns audit entries", async () => {
+  it("audit-query can read legacy history without storing new audit rows", async () => {
+    const legacyEntry: AuditEntry = {
+      id: "aud_legacy",
+      timestamp: "2026-01-01T00:00:00.000Z",
+      operation: "delete",
+      functionId: "mem::legacy-delete",
+      targetIds: ["mem_legacy"],
+      details: {},
+    };
+    await kv.set(KV.audit, legacyEntry.id, legacyEntry);
+
     await sdk.trigger("mem::governance-delete", {
       memoryIds: ["mem_1"],
       reason: "cleanup",
@@ -249,8 +260,6 @@ describe("Governance Functions", () => {
 
     const entries = (await sdk.trigger("mem::audit-query", {})) as AuditEntry[];
 
-    expect(entries.length).toBe(1);
-    expect(entries[0].operation).toBe("delete");
-    expect(entries[0].functionId).toBe("mem::governance-delete");
+    expect(entries).toEqual([legacyEntry]);
   });
 });

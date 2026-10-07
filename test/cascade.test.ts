@@ -87,6 +87,51 @@ describe("Cascade Update Function", () => {
     expect(unchanged!.stale).toBeUndefined();
   });
 
+  it("scans oversized graph nodes through projected IDs and keeps record locking", async () => {
+    const memory: Memory = {
+      id: "mem_large",
+      createdAt: "2026-03-01T00:00:00Z",
+      updatedAt: "2026-03-01T00:00:00Z",
+      type: "fact",
+      title: "Large fact",
+      content: "Large content",
+      concepts: [],
+      files: [],
+      sessionIds: [],
+      strength: 5,
+      version: 1,
+      isLatest: false,
+      sourceObservationIds: ["obs_large"],
+    };
+    const node: GraphNode = {
+      id: "node_large",
+      type: "concept",
+      name: "large",
+      properties: { text: "x".repeat(1_320_550) },
+      sourceObservationIds: ["obs_large"],
+      createdAt: "2026-03-01T00:00:00Z",
+    };
+    await kv.set("mem:memories", memory.id, memory);
+    await kv.set("mem:graph:nodes", node.id, node);
+    const originalValues = kv.values.bind(kv);
+    const listedScopes: string[] = [];
+    vi.spyOn(kv, "values").mockImplementation(async function* (scope) {
+      listedScopes.push(scope);
+      if (scope === "mem:graph:nodes") throw new Error("whole graph-node values listing used");
+      yield* originalValues(scope);
+    });
+    const pagesSpy = vi.spyOn(kv, "pages");
+
+    const result = (await sdk.trigger("mem::cascade-update", {
+      supersededMemoryId: memory.id,
+    })) as { success: boolean; flagged: { nodes: number } };
+
+    expect(result).toMatchObject({ success: true, flagged: { nodes: 1 } });
+    expect(pagesSpy).toHaveBeenCalledWith("mem:graph:nodes", expect.objectContaining({ fields: ["id"] }));
+    expect(listedScopes).not.toContain("mem:graph:nodes");
+    expect(await kv.get<GraphNode>("mem:graph:nodes", node.id)).toMatchObject({ stale: true });
+  });
+
   it("flags graph edges referencing superseded observation IDs", async () => {
     const memory: Memory = {
       id: "mem_old2",

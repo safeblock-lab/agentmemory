@@ -1,9 +1,18 @@
+import { EXPORT_COLLECTIONS } from "../types.js";
+
 export type McpToolDef = {
   name: string;
   description: string;
   inputSchema: {
     type: "object";
-    properties: Record<string, { type: string; description: string }>;
+    properties: Record<string, {
+      type: string;
+      description: string;
+      enum?: string[];
+      minimum?: number;
+      maximum?: number;
+      maxLength?: number;
+    }>;
     required?: string[];
   };
 };
@@ -195,8 +204,34 @@ export const CORE_TOOLS: McpToolDef[] = [
   },
   {
     name: "memory_export",
-    description: "Export all memory data as JSON.",
-    inputSchema: { type: "object", properties: {} },
+    description:
+      "Export all memory data as JSON. For large stores, request one collection page at a time with collection, cursor, and limit; continue with nextCursor and import returned pages with merge after optionally replacing on the first page.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        collection: {
+          type: "string",
+          description: "Collection to page. Omit all arguments for a compatible full export when it fits the response limit.",
+          enum: [...EXPORT_COLLECTIONS],
+        },
+        offset: {
+          type: "integer",
+          description: "Legacy starting offset. Nonzero continuation is rejected; use the returned cursor.",
+          minimum: 0,
+        },
+        cursor: {
+          type: "string",
+          description: "Opaque continuation token returned by the previous page.",
+          maxLength: 32768,
+        },
+        limit: {
+          type: "integer",
+          description: "Maximum records in this page (default 100; maximum 1000 and still bounded by response bytes).",
+          minimum: 1,
+          maximum: 1000,
+        },
+      },
+    },
   },
   {
     name: "memory_relations",

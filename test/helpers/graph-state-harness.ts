@@ -25,6 +25,8 @@ type KvLike = {
   lease(request: StateLeaseRequest): Promise<StateGraphLease | { released: true }>;
   commitBatch(guard: StateGraphGuard, prepared: StatePreparedBatch): Promise<StateBatchReceipt>;
   values<T = unknown>(scope: string): AsyncGenerator<T>;
+  pages<T = unknown>(scope: string, options?: { cursor?: string; limit?: number; fields?: string[] }): AsyncGenerator<{ items: T[]; next_cursor: string | null }>;
+  scopeRevision(scope: string, prefix?: boolean): Promise<{ generation: string; revision: string }>;
   [key: string]: unknown;
 };
 type SdkLike = {
@@ -207,7 +209,7 @@ export function installGraphStateWire(sdk: SdkLike | undefined, kv: KvLike): Gra
     if (body.checkpoint.visibility === "complete") recovery = null;
     if (body.advance_generation) {
       generation = response.generation;
-      if (lease) lease.generation = generation;
+      lease = null;
     }
     await saveControl({});
     if (loseAck || (failThisCommit && failAfterApply)) {
@@ -248,6 +250,25 @@ export function installGraphStateWire(sdk: SdkLike | undefined, kv: KvLike): Gra
     lease: adapter.lease.bind(adapter),
     commitBatch: adapter.commitBatch.bind(adapter),
     async *values(scope: string) { for (const value of await rawList(scope)) yield value; },
+    async *pages<T>(scope: string, options: { cursor?: string; limit?: number; fields?: string[] } = {}) {
+      const rows = await rawList(scope);
+      const limit = options.limit ?? 256;
+      let start = options.cursor === undefined ? 0 : Number(options.cursor);
+      for (;;) {
+        const end = Math.min(rows.length, start + limit);
+        const items = rows.slice(start, end).map((row) => {
+          if (!options.fields) return copy(row) as T;
+          const source = row && typeof row === "object" ? row as Record<string, unknown> : {};
+          return Object.fromEntries(options.fields.flatMap((field) =>
+            Object.hasOwn(source, field) ? [[field, source[field]]] : [],
+          )) as T;
+        });
+        const next_cursor = end < rows.length ? String(end) : null;
+        yield { items, next_cursor };
+        if (next_cursor === null) return;
+        start = end;
+      }
+    },
   });
   return {
     sdk: attachedSdk, kv, rows, receipts,
@@ -255,10 +276,19 @@ export function installGraphStateWire(sdk: SdkLike | undefined, kv: KvLike): Gra
     seed(scope, key, value, exists = true, version = "1") {
       rows.set(address(scope, key), { exists, value: exists ? copy(value) : null, version });
       if (exists) void rawSet(scope, key, copy(value)); else void rawDelete(scope, key);
+      if (scope === KV.graphCheckpoints) {
+        checkpoints.set(key, {
+          version,
+          value: exists ? copy(value) as StateCommitBatchInput["checkpoint"] : null,
+        });
+      }
       if (scope === KV.graphControl && key === "current") {
         const control = controlValue(value);
         generation = String(control.generation ?? "1");
         fence = String(control.fence ?? "0");
+        recovery = control.recovery && typeof control.recovery === "object"
+          ? copy(control.recovery) as StateCommitBatchInput["checkpoint"]
+          : null;
       }
     },
     failCommitBeforeApply() { failBeforeApply = true; },
@@ -273,14 +303,23 @@ export function installGraphStateWire(sdk: SdkLike | undefined, kv: KvLike): Gra
 export function graphStateHarness(): GraphStateHarness {
   const handlers = new Map<string, Handler>();
   const store = new Map<string, Map<string, unknown>>();
+  const revisions = new Map<string, bigint>();
+  const bumpRevision = (scope: string) => revisions.set(scope, (revisions.get(scope) ?? 0n) + 1n);
   const kv: KvLike = {
     async get<T>(scope: string, key: string) { return (store.get(scope)?.get(key) as T) ?? null; },
     async set<T>(scope: string, key: string, value: T) {
       if (!store.has(scope)) store.set(scope, new Map());
-      store.get(scope)!.set(key, copy(value)); return value;
+      store.get(scope)!.set(key, copy(value)); bumpRevision(scope); return value;
     },
-    async delete(scope: string, key: string) { store.get(scope)?.delete(key); },
+    async delete(scope: string, key: string) {
+      if (store.get(scope)?.has(key)) { store.get(scope)!.delete(key); bumpRevision(scope); }
+    },
     async list<T>(scope: string) { return (Array.from(store.get(scope)?.values() ?? []) as T[]).map(copy); },
+    async scopeRevision(scope: string, prefix = false) {
+      const scopes = prefix ? [...revisions.keys()].filter((candidate) => candidate.startsWith(scope)) : [scope];
+      const total = scopes.reduce((sum, candidate) => sum + (revisions.get(candidate) ?? 0n), 0n);
+      return { generation: "1", revision: prefix ? `${scopes.length}:${total}` : String(revisions.get(scope) ?? 0n) };
+    },
   };
   const sdk: SdkLike = {
     registerFunction(id, handler) { handlers.set(typeof id === "string" ? id : id.id, handler); },

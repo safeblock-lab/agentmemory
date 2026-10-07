@@ -39,7 +39,16 @@ export interface StateBatchReceipt {
   identity: StateCommitIdentity; payload_digest: string; generation: StateCounter
   checkpoint_version: StateCounter; row_versions: Array<{ scope: string; key: string; version: StateCounter }>
 }
-export type StateTransactionFunction = 'state::get_versioned' | 'state::lease' | 'state::commit_batch'
+export interface StatePruneCursor { scope_index: number; after_key: string }
+export interface StatePruneBudget { limit: number; max_bytes: number }
+export interface StateGraphPruneRequest extends StatePruneBudget {
+  guard: StateGraphGuard; job_id: string; expected_checkpoint_version: StateCounter; cursor?: StatePruneCursor
+}
+export interface StateAuditPruneRequest extends StatePruneBudget {
+  guard: StateGraphGuard; through_key: string; cursor?: StatePruneCursor
+}
+export interface StatePruneResult { deleted_count: number; deleted_bytes: number; cursor: StatePruneCursor | null; done: boolean }
+export type StateTransactionFunction = 'state::get_versioned' | 'state::lease' | 'state::commit_batch' | 'state::graph_prune_terminal' | 'state::audit_prune_history'
 export type StateTransactionTrigger = (functionId: StateTransactionFunction, payload: unknown) => Promise<unknown>
 
 const ERROR_MESSAGES = {
@@ -212,4 +221,25 @@ export async function commitStateBatch(trigger: StateTransactionTrigger, writer:
       && row.version === (op.type === 'check' ? op.expected_version : counterAfter(op.expected_version))
   }), response)
   return result as unknown as StateBatchReceipt
+}
+
+export async function pruneStateWork(trigger: StateTransactionTrigger, request: StateGraphPruneRequest | StateAuditPruneRequest): Promise<StatePruneResult> {
+  const graph = Object.hasOwn(request, 'job_id')
+  const names = graph ? ['guard', 'job_id', 'expected_checkpoint_version', 'limit', 'max_bytes'] : ['guard', 'through_key', 'limit', 'max_bytes']
+  requireValid(keys(request, names, ['cursor']) && guard(request.guard)
+    && Number.isInteger(request.limit) && request.limit >= 1 && request.limit <= 256
+    && Number.isInteger(request.max_bytes) && request.max_bytes >= 1 && request.max_bytes <= STATE_COMMIT_TARGET_BYTES)
+  if ('job_id' in request) requireValid(text(request.job_id) && isStateCounter(request.expected_checkpoint_version) && request.expected_checkpoint_version !== '0')
+  else requireValid(text(request.through_key))
+  const validCursor = (value: unknown): value is StatePruneCursor => keys(value, ['scope_index', 'after_key'])
+    && Number.isInteger(value.scope_index) && Number(value.scope_index) >= 0 && Number(value.scope_index) <= (graph ? 6 : 0)
+    && typeof value.after_key === 'string' && value.after_key.length <= 4096
+  requireValid(request.cursor === undefined || validCursor(request.cursor))
+  const result = await invoke(trigger, graph ? 'state::graph_prune_terminal' : 'state::audit_prune_history', request)
+  responseJson(result)
+  requireValid(keys(result, ['deleted_count', 'deleted_bytes', 'cursor', 'done'])
+    && Number.isInteger(result.deleted_count) && Number(result.deleted_count) >= 0 && Number(result.deleted_count) <= request.limit
+    && Number.isSafeInteger(result.deleted_bytes) && Number(result.deleted_bytes) >= 0
+    && typeof result.done === 'boolean' && (result.done ? result.cursor === null : validCursor(result.cursor)), 'STATE_TX_INVALID_RESPONSE')
+  return result as unknown as StatePruneResult
 }

@@ -13,6 +13,7 @@ import { batchEffectKey, createGraphBatchCallbackPreflight, effectMetadata, runB
 import type { StateKV } from "../state/kv.js";
 import {
   GRAPH_EXTRACTION_SYSTEM,
+  GRAPH_EXTRACTION_SYSTEM_WITH_PROVENANCE,
   buildGraphExtractionPrompt,
 } from "../prompts/graph-extraction.js";
 import { isGraphExtractionEnabled } from "../config.js";
@@ -30,6 +31,7 @@ import { stripPrivateData } from "./privacy.js";
 import type { FireworksBatchQueue } from "./fireworks-batch.js";
 import { selectCompactionCandidates } from "./typesafe-compaction.js";
 import { freezeGraphHandledValue, freezeGraphSessionObservations, freezeGraphValue, graphCapturedAt, graphJobId, graphKV, hasGraphDelta, registerGraphJobHandler, runGraphJob, withCompletedGraphRead, withGraphDelta, graphTransactionFailure } from "./graph-jobs.js";
+import { collectProjectedRecords, countProjectedRecordIds } from "./projected-record-reader.js";
 import {
   estimateGraphObservationChars,
   isProtectedGraphObservation,
@@ -249,6 +251,7 @@ async function prepareGraphExtractionInputs(
   sourceObservations: CompressedObservation[],
   targetChars: number,
   localCompactor?: LocalGraphCompactor,
+  preserveSourceIndices = false,
 ): Promise<GraphExtractionUnit[]> {
   const complete = {
     sourceObservations,
@@ -263,7 +266,13 @@ async function prepareGraphExtractionInputs(
   const fullUnits = splitGraphCompactionUnits(sourceObservations, targetChars);
   const compactedUnits: GraphExtractionUnit[] = [];
   for (const unit of fullUnits) {
-    compactedUnits.push(await compactGraphInputUnit(unit, targetChars, localCompactor));
+    if (preserveSourceIndices) {
+      for (const observation of unit) {
+        compactedUnits.push(await compactGraphInputUnit([observation], targetChars, localCompactor));
+      }
+    } else {
+      compactedUnits.push(await compactGraphInputUnit(unit, targetChars, localCompactor));
+    }
   }
   return packGraphInputUnits(compactedUnits, targetChars).map(mergeGraphInputUnits);
 }
@@ -660,12 +669,13 @@ function mergeNode(
 
 function mergeEdge(
   existing: GraphEdge,
+  incoming: GraphEdge,
   obsIds: string[],
 ): GraphEdge {
   return {
     ...existing,
     sourceObservationIds: [
-      ...new Set([...existing.sourceObservationIds, ...obsIds]),
+      ...new Set([...existing.sourceObservationIds, ...incoming.sourceObservationIds, ...obsIds]),
     ],
   };
 }
@@ -745,6 +755,7 @@ function parseAttrs(raw: string): Record<string, string> {
 function parseGraphXml(
   xml: string,
   observationIds: string[],
+  requireProvenance = false,
 ): {
   nodes: GraphNode[];
   edges: GraphEdge[];
@@ -752,6 +763,19 @@ function parseGraphXml(
   const nodes: GraphNode[] = [];
   const edges: GraphEdge[] = [];
   const now = graphCapturedAt();
+  const sourceIds = (raw: string | undefined): string[] => {
+    if (!requireProvenance) return observationIds;
+    if (!raw) throw new Error("Graph extraction omitted observation references");
+    const indices = raw.split(",").map((part) => part.trim());
+    if (indices.some((part) => !/^[1-9]\d*$/.test(part))) {
+      throw new Error("Graph extraction has invalid observation references");
+    }
+    const unique = new Set(indices);
+    if (unique.size !== indices.length || indices.some((part) => Number(part) > observationIds.length)) {
+      throw new Error("Graph extraction has duplicate or out-of-range observation references");
+    }
+    return indices.map((part) => observationIds[Number(part) - 1]);
+  };
 
   // Two passes because <entity> can be self-closing or have a body
   // (<property> children). The self-closing form needs `[^>]*[^/]` on
@@ -766,6 +790,7 @@ function parseGraphXml(
     const type = attrs["type"] as GraphNode["type"] | undefined;
     const name = attrs["name"];
     if (!type || !name) return;
+    const referencedIds = sourceIds(attrs["observations"]);
     const properties: Record<string, string> = {};
     const propRegex = /<property\s+key="([^"]+)">([^<]*)<\/property>/g;
     let propMatch;
@@ -777,7 +802,7 @@ function parseGraphXml(
       type,
       name,
       properties,
-      sourceObservationIds: observationIds,
+      sourceObservationIds: referencedIds,
       createdAt: now,
     });
   };
@@ -797,6 +822,7 @@ function parseGraphXml(
     const sourceName = attrs["source"];
     const targetName = attrs["target"];
     if (!type || !sourceName || !targetName) continue;
+    const referencedIds = sourceIds(attrs["observations"]);
     const parsedWeight = parseFloat(attrs["weight"] ?? "");
     const weight = Number.isFinite(parsedWeight) ? parsedWeight : 0.5;
 
@@ -809,7 +835,7 @@ function parseGraphXml(
       sourceNodeId: sourceNode.id,
       targetNodeId: targetNode.id,
       weight: Math.max(0, Math.min(1, weight)),
-      sourceObservationIds: observationIds,
+      sourceObservationIds: referencedIds,
       createdAt: now,
     });
   }
@@ -827,10 +853,19 @@ const EMPTY_GRAPH_EXTRACTION_ERROR = "Graph extraction response contained no nod
 function parseGraphExtractionResponse(
   response: unknown,
   observationIds: string[],
+  requireProvenance = false,
 ): ParsedGraphExtraction | null {
   if (typeof response !== "string") return null;
-  const parsed = parseGraphXml(response, observationIds);
-  return parsed.nodes.length === 0 && parsed.edges.length === 0 ? null : parsed;
+  try {
+    const parsed = parseGraphXml(response, observationIds, requireProvenance);
+    return parsed.nodes.length === 0 && parsed.edges.length === 0 ? null : parsed;
+  } catch (error) {
+    if (!requireProvenance) throw error;
+    logger.warn("Graph extraction rejected invalid observation references", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
 }
 
 interface BatchGraphDegree extends BatchEffectMetadata { value: number }
@@ -873,19 +908,21 @@ async function applyBatchGraph(kv: StateKV, parsed: ParsedGraphExtraction, obsId
       if (position >= 0) snap.topNodes[position] = next;
     }
   }
-  const seenEdges = new Set<string>();
+  const edgesByIndex = new Map<string, GraphEdge>();
   for (const edge of edges) {
     edge.sourceNodeId = remapped.get(edge.sourceNodeId)!;
     edge.targetNodeId = remapped.get(edge.targetNodeId)!;
     const index = edgeIndexKey(edge.sourceNodeId, edge.targetNodeId, edge.type);
-    if (seenEdges.has(index)) continue;
-    seenEdges.add(index);
+    const prior = edgesByIndex.get(index);
+    edgesByIndex.set(index, prior ? mergeEdge(prior, edge, []) : edge);
+  }
+  for (const [index, edge] of edgesByIndex) {
     const indexedId = await kv.get<string>(KV.graphEdgeKey, index);
     const candidateId = fingerprintId("ge", `${key}:${index}`);
     let current = await kv.get<GraphEdge>(KV.graphEdges, indexedId ?? candidateId);
     if (current && snap.resetAt && current.createdAt < snap.resetAt) current = null;
     const id = current?.id ?? candidateId;
-    const next = current ? mergeEdge(current, obsIds) : { ...edge, id };
+    const next = current ? mergeEdge(current, edge, obsIds) : { ...edge, id };
     await kv.set(KV.graphEdges, id, next);
     await kv.set(KV.graphEdgeKey, index, id);
     if (id === candidateId) {
@@ -1128,7 +1165,7 @@ async function persistGraphDeltaValues(
     }
 
     if (existing) {
-      const merged = mergeEdge(existing, obsIds);
+      const merged = mergeEdge(existing, edge, obsIds);
       await kv.set(KV.graphEdges, existing.id, merged);
       // Replace cached topEdges entry too if present.
       const topIdx = snap.topEdges.findIndex((e) => e.id === existing!.id);
@@ -1175,20 +1212,27 @@ export function registerGraphFunction(
   typeSafe?: TypeSafeDecisionProvider,
 ): void {
   kv = graphKV(kv);
-  type ExtractionRequest = { observations?: CompressedObservation[]; sessionId?: string; batchResponse?: string; deferred?: boolean; force?: boolean; batchEffectKey?: string; replacementOf?: string; graphJobId?: string };
+  type ExtractionRequest = { observations?: CompressedObservation[]; sessionId?: string; batchResponse?: string; deferred?: boolean; force?: boolean; batchEffectKey?: string; replacementOf?: string; graphJobId?: string; graphProvenanceVersion?: 2 };
   const extract = async (request: ExtractionRequest, durableId?: string) => {
     const preflight = request.batchEffectKey === undefined
       ? undefined
       : createGraphBatchCallbackPreflight(request.batchEffectKey, (state) =>
         state === "stale" ? { success: true as const, stale: true as const } : { success: true as const },
       );
-    return runGraphJob(kv, request.batchEffectKey ? "batch_callback" : "extraction", request, async (frozen) => {
+    const input = durableId || request.graphJobId || request.batchEffectKey
+      ? request
+      : { ...request, graphProvenanceVersion: 2 as const };
+    return runGraphJob(kv, request.batchEffectKey ? "batch_callback" : "extraction", input, async (frozen) => {
     const captured = frozen as ExtractionRequest;
     const auditEffectKey = (phase: string): string | undefined => {
       const jobId = graphJobId();
       return jobId ? `graph-extraction:${jobId}:${phase}` : undefined;
     };
     const data = { ...captured, observations: captured.observations ?? (captured.sessionId ? await freezeGraphSessionObservations(kv, captured.sessionId) : []) };
+    const strictProvenance = data.graphProvenanceVersion === 2;
+    const extractionSystem = strictProvenance
+      ? GRAPH_EXTRACTION_SYSTEM_WITH_PROVENANCE
+      : GRAPH_EXTRACTION_SYSTEM;
     const options = await freezeGraphValue(kv, "options", () => ({
       graphEnabled: isGraphExtractionEnabled(), llmEnabled: isGraphExtractionEnabled() && !provider.name.includes("noop"),
       auxiliary: llmRouter?.hasAuxiliaryProvider === true, targetChars: getGraphExtractionInputTargetChars(),
@@ -1205,12 +1249,12 @@ export function registerGraphFunction(
       }
       if (data.batchResponse !== undefined && data.batchEffectKey) {
         const obsIds = data.observations.map((o) => o.id);
-        const parsed = await freezeGraphValue(kv, "parsed-batch", () => parseGraphExtractionResponse(data.batchResponse, obsIds));
+        const parsed = await freezeGraphValue(kv, "parsed-batch", () => parseGraphExtractionResponse(data.batchResponse, obsIds, strictProvenance));
         if (!parsed) {
           return { success: false, error: EMPTY_GRAPH_EXTRACTION_ERROR };
         }
         await admit();
-        await applyBatchGraph(kv, parsed, obsIds, data.batchEffectKey);
+        await applyBatchGraph(kv, parsed, strictProvenance ? [] : obsIds, data.batchEffectKey);
         await recordAudit(kv, "observe", "mem::graph-extract", obsIds, {}, undefined, undefined, data.batchEffectKey).catch(() => {});
         return { success: true };
       }
@@ -1222,7 +1266,7 @@ export function registerGraphFunction(
       let heuristicNodesAdded = 0;
       let heuristicEdgesAdded = 0;
       if (heuristic.nodes.length || heuristic.edges.length) {
-        const persisted = await persistGraphDelta(kv, heuristic.nodes, heuristic.edges, data.observations.map((o) => o.id));
+        const persisted = await persistGraphDelta(kv, heuristic.nodes, heuristic.edges, strictProvenance ? [] : data.observations.map((o) => o.id));
         heuristicNodesAdded = persisted.newNodeCount;
         heuristicEdgesAdded = persisted.newEdgeCount;
         await recordAudit(kv, "observe", "mem::graph-extract", data.observations.map((o) => o.id), {
@@ -1308,6 +1352,7 @@ export function registerGraphFunction(
           observationsForGraph,
           data.deferred ? Math.min(8000, options.targetChars) : options.targetChars,
           data.replacementOf ? undefined : localCompactor,
+          strictProvenance,
         ));
 
       try {
@@ -1320,9 +1365,9 @@ export function registerGraphFunction(
               replacementOf: data.replacementOf,
               correlationId: generateId("fwbgraph"),
               task: "graph_extraction",
-              systemPrompt: GRAPH_EXTRACTION_SYSTEM,
+              systemPrompt: extractionSystem,
               userPrompt: prompt,
-              metadata: { observations: JSON.stringify(unit.sourceObservations), sourceFingerprint: fingerprintId("fwbgraphsrc", JSON.stringify(unit.sourceObservations)) },
+              metadata: { observations: JSON.stringify(unit.sourceObservations), sourceFingerprint: fingerprintId("fwbgraphsrc", JSON.stringify(unit.sourceObservations)), ...(strictProvenance ? { graphProvenanceVersion: "2" } : {}) },
             }));
             if (!queued.queued || !queued.workItemId) {
               logger.warn("Graph extraction batch unit was not queued; retaining source locally", {
@@ -1362,26 +1407,27 @@ export function registerGraphFunction(
             ? await llmRouter.run(
               "graph_extraction",
               (selectedProvider) => selectedProvider.compress(
-                GRAPH_EXTRACTION_SYSTEM,
+                extractionSystem,
                 prompt,
               ),
               (candidate) => {
                 return parseGraphExtractionResponse(
                   candidate,
                   unit.sourceObservations.map((o) => o.id),
+                  strictProvenance,
                 ) !== null;
               },
             )
-            : provider.compress(GRAPH_EXTRACTION_SYSTEM, prompt)));
+            : provider.compress(extractionSystem, prompt)));
 
           const obsIds = unit.sourceObservations.map((o) => o.id);
-          const parsed = await freezeGraphHandledValue(kv, "parsed-response", () => parseGraphExtractionResponse(response, obsIds));
+          const parsed = await freezeGraphHandledValue(kv, "parsed-response", () => parseGraphExtractionResponse(response, obsIds, strictProvenance));
           if (!parsed) {
             throw new Error(EMPTY_GRAPH_EXTRACTION_ERROR);
           }
           const { nodes, edges } = parsed;
 
-          const { newNodeCount, newEdgeCount } = await persistGraphDelta(kv, nodes, edges, obsIds);
+          const { newNodeCount, newEdgeCount } = await persistGraphDelta(kv, nodes, edges, strictProvenance ? [] : obsIds);
         await recordAudit(kv, "observe", "mem::graph-extract", obsIds, {
           nodesExtracted: nodes.length,
           edgesExtracted: edges.length,
@@ -1479,7 +1525,7 @@ export function registerGraphFunction(
       try {
         const [rawNodes, rawEdges] = await withCompletedGraphRead(kv, () => withTimeout(
           Promise.all([
-            kv.list<GraphNode>(KV.graphNodes),
+            collectProjectedRecords<GraphNode>(kv, KV.graphNodes),
             kv.list<GraphEdge>(KV.graphEdges),
           ]),
           LIVE_ENUMERATION_BUDGET_MS,
@@ -1651,9 +1697,9 @@ export function registerGraphFunction(
             success: false,
             legacyCorpus: true,
             error:
-              "No prior snapshot found. Rebuild would call kv.list on " +
-              "KV.graphNodes/Edges, which heartbeat-crashes the worker " +
-              "on corpora past the iii state response budget (~25K nodes). " +
+              "No prior snapshot found. Rebuild must enumerate graph nodes " +
+              "and edges, which exceeds the safe rebuild ceiling on large " +
+              "corpora (~25K nodes). " +
               "Either (a) call POST /agentmemory/graph/reset to drop into " +
               "incremental-only mode and rebuild from new extracts, or " +
               "(b) re-send with `force: true` if you're certain the " +
@@ -1668,31 +1714,45 @@ export function registerGraphFunction(
       }
 
       try {
-        const [nodes, edges] = await withTimeout(
-          Promise.all([
-            kv.list<GraphNode>(KV.graphNodes),
-            kv.list<GraphEdge>(KV.graphEdges),
-          ]),
-          LIVE_ENUMERATION_BUDGET_MS,
-          "graph-snapshot-rebuild enumeration",
-        );
+        const enumeration = await withCompletedGraphRead(kv, async () => {
+          const nodeCount = await withTimeout(
+            countProjectedRecordIds(kv, KV.graphNodes),
+            LIVE_ENUMERATION_BUDGET_MS,
+            "graph-snapshot-rebuild node count",
+          );
+          if (nodeCount > REBUILD_SAFE_NODE_CEILING) return { nodeCount };
+          const [nodes, edges] = await withTimeout(
+            Promise.all([
+              collectProjectedRecords<GraphNode>(kv, KV.graphNodes),
+              kv.list<GraphEdge>(KV.graphEdges),
+            ]),
+            LIVE_ENUMERATION_BUDGET_MS,
+            "graph-snapshot-rebuild enumeration",
+          );
+          if (nodes.length !== nodeCount) throw new Error("Graph changed during snapshot rebuild scan");
+          return { nodeCount, nodes, edges };
+        });
 
-      if (nodes.length > REBUILD_SAFE_NODE_CEILING) {
+      if (enumeration.nodeCount > REBUILD_SAFE_NODE_CEILING) {
         logger.warn("Graph snapshot rebuild aborted: corpus too large", {
-          totalNodes: nodes.length,
+          totalNodes: enumeration.nodeCount,
           ceiling: REBUILD_SAFE_NODE_CEILING,
         });
         return {
           success: false,
           tooLarge: true,
-          totalNodes: nodes.length,
+          totalNodes: enumeration.nodeCount,
           ceiling: REBUILD_SAFE_NODE_CEILING,
           error:
-            `Corpus has ${nodes.length} graph nodes; safe-rebuild ceiling ` +
+            `Corpus has ${enumeration.nodeCount} graph nodes; safe-rebuild ceiling ` +
             `is ${REBUILD_SAFE_NODE_CEILING}. Run POST /agentmemory/graph/reset ` +
             `to wipe and let future extracts rebuild incrementally.`,
         };
       }
+      if (!enumeration.nodes || !enumeration.edges) {
+        throw new Error("Graph snapshot rebuild scan did not return complete records");
+      }
+      const { nodes, edges } = enumeration;
 
       // Backfill the targeted-lookup indexes so post-rebuild
       // graph-extract calls hit the O(1) path instead of falling

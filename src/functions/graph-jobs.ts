@@ -11,12 +11,20 @@ import { GraphJobStorage, graphJson, graphRecordDigest, type GraphDeltaPreparati
 
 const LEASE_TTL_MS = 120_000;
 const CAPTURE_FRAGMENT_CHARS = 128 * 1024;
+const MAX_GRAPH_EXTRACTION_STAGING_CHUNKS = 100_000;
+const MAX_GRAPH_EXTRACTION_RECOVERY_FAILURES = 3;
+const GRAPH_EXTRACTION_RECOVERY_BACKOFF_MS = 30_000;
+const MAX_GRAPH_EXTRACTION_RECOVERY_BACKOFF_MS = 15 * 60_000;
 interface DurableGraphJob extends Omit<GraphExtractionJob, "logicalDeltaCount"> {
   logicalDeltaCount?: number;
   captureParts: number;
   captureDigest: string;
   captureComplete: boolean;
   result?: StateJsonValue;
+  recoveryDeltaId?: string;
+  recoveryAttempts?: number;
+  recoveryAfter?: string | null;
+  recoveryStopped?: boolean;
 }
 interface GraphExecution {
   storage: GraphJobStorage;
@@ -287,9 +295,60 @@ async function readCapture(storage: CaptureReader, job: DurableGraphJob): Promis
 
 async function pendingJob(kv: StateKV, generation?: string): Promise<DurableGraphJob | null> {
   for await (const job of kv.values<DurableGraphJob>(KV.graphJobs)) {
-    if ((!generation || job.generation === generation) && job.state !== "completed" && job.state !== "invalidated") return job;
+    if ((!generation || job.generation === generation) && job.state !== "completed" && job.state !== "invalidated" && job.recoveryStopped !== true) return job;
   }
   return null;
+}
+
+function terminalPayloadFailureCode(error: unknown, seen = new Set<object>()): string | undefined {
+  if (error instanceof StateTransactionError && ["STATE_RECORD_TOO_LARGE", "STATE_TX_LIMIT_EXCEEDED"].includes(error.code)) return error.code;
+  if (typeof error !== "object" || error === null || seen.has(error)) return undefined;
+  seen.add(error);
+  const record = error as { code?: unknown; status?: unknown; statusCode?: unknown; status_code?: unknown; cause?: unknown; response?: unknown };
+  if ([record.status, record.statusCode, record.status_code].some((status) => status === 413 || status === "413")) return "HTTP_413";
+  if (typeof record.code === "string" && /(?:^|[_-])413(?:$|[_-])/.test(record.code)) return record.code;
+  return terminalPayloadFailureCode(record.cause, seen) ?? terminalPayloadFailureCode(record.response, seen);
+}
+
+async function recordStagingFailure(storage: GraphJobStorage, error: unknown): Promise<"retry-scheduled" | "stopped" | false> {
+  const permanentFailureCode = terminalPayloadFailureCode(error);
+  const checkpoint = storage.checkpoint;
+  if (!checkpoint || checkpoint.visibility !== "staging" || checkpoint.logical_delta_id !== `delta:${checkpoint.delta_ordinal}`) return false;
+  const job = await storage.get<DurableGraphJob>(KV.graphJobs, storage.jobId);
+  if (!job || job.kind !== "extraction" || !job.captureComplete || job.generation !== checkpoint.generation || job.state === "completed" || job.state === "invalidated") return false;
+
+  const recoveryAttempts = job.recoveryDeltaId === checkpoint.logical_delta_id
+    && Number.isSafeInteger(job.recoveryAttempts) && (job.recoveryAttempts ?? 0) >= 0
+    ? job.recoveryAttempts! + 1
+    : 1;
+  const stopped = permanentFailureCode !== undefined || recoveryAttempts >= MAX_GRAPH_EXTRACTION_RECOVERY_FAILURES;
+  const failureCode = permanentFailureCode
+    ?? (error instanceof StateTransactionError ? error.code : "STATE_TX_FAILED");
+  const terminalDelta: GraphDeltaPreparation = {
+    id: checkpoint.logical_delta_id,
+    ordinal: checkpoint.delta_ordinal,
+    capturedAt: job.createdAt,
+    attempt: "terminal-payload-failure",
+    phase: "preparing",
+  };
+  await storage.stage(KV.graphJobs, job.id, {
+    ...job,
+    state: "failed",
+    updatedAt: new Date().toISOString(),
+    failureCode,
+    recoveryDeltaId: checkpoint.logical_delta_id,
+    recoveryAttempts,
+    recoveryAfter: stopped ? null : new Date(Date.now() + Math.min(
+      GRAPH_EXTRACTION_RECOVERY_BACKOFF_MS * (2 ** (recoveryAttempts - 1)),
+      MAX_GRAPH_EXTRACTION_RECOVERY_BACKOFF_MS,
+    )).toISOString(),
+    recoveryStopped: stopped,
+  }, terminalDelta);
+  if (stopped) {
+    await storage.completeStaging(terminalDelta);
+    return "stopped";
+  }
+  return "retry-scheduled";
 }
 
 async function leasedControl(storage: GraphJobStorage): Promise<GraphControlState> {
@@ -324,6 +383,7 @@ export async function runGraphJob<T>(kv: StateKV, kind: GraphExtractionJob["kind
       void base.lease({ action: "renew", ...renewing, ttl_ms: LEASE_TTL_MS }).catch((error) => { storage.failLease(error, renewing); logger.error("Graph job lease renewal failed", { jobId: storage.jobId, code: error instanceof StateTransactionError ? error.code : "STATE_TX_FAILED" }); });
     }, LEASE_TTL_MS / 3);
     heartbeat.unref();
+    let recoveryDeferred = false;
     try {
       control = await leasedControl(storage);
       const pending = await discoverJob(storage, control);
@@ -331,6 +391,11 @@ export async function runGraphJob<T>(kv: StateKV, kind: GraphExtractionJob["kind
       const existing = await storage.get<DurableGraphJob>(KV.graphJobs, storage.jobId);
       if (existing && existing.kind !== kind) throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
       if (existing?.state === "invalidated") throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
+      if (existing?.recoveryStopped) throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
+      if (existing?.recoveryAfter && Date.parse(existing.recoveryAfter) > Date.now()) {
+        recoveryDeferred = true;
+        throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
+      }
       if (existing && graphRecordDigest(JSON.stringify(input)) !== existing.captureDigest) throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
       if (existing?.state === "completed") return graphResult<T>(existing.result);
       if (existing && existing.generation !== control.generation) throw new StateTransactionError("STATE_TX_GENERATION_STALE");
@@ -363,6 +428,17 @@ export async function runGraphJob<T>(kv: StateKV, kind: GraphExtractionJob["kind
       }));
       return result;
     } catch (error) {
+      let recoveryOutcome: "retry-scheduled" | "stopped" | false = false;
+      if (!recoveryDeferred) {
+        try {
+          recoveryOutcome = await recordStagingFailure(storage, error);
+        } catch (terminalizeError) {
+          logger.error("Graph job permanent failure could not be terminalized", {
+            jobId: storage.jobId,
+            code: terminalizeError instanceof StateTransactionError ? terminalizeError.code : "STATE_TX_FAILED",
+          });
+        }
+      }
       const checkpoint = storage.checkpoint;
       const descriptor = typeof input === "object" && input !== null ? input as { sessionId?: unknown; observations?: unknown } : null;
       if (error instanceof StatePageError && error.code === "STATE_PAGE_CURSOR_STALE" && kind === "extraction" && typeof descriptor?.sessionId === "string" && descriptor.observations === undefined && checkpoint?.logical_delta_id === "delta:1" && checkpoint.delta_ordinal === 1 && checkpoint.visibility === "staging") {
@@ -377,7 +453,9 @@ export async function runGraphJob<T>(kv: StateKV, kind: GraphExtractionJob["kind
           logger.warn("Initial graph source capture invalidated; retry with a fresh complete request", { jobId: storage.jobId, code: error.code });
         }
       }
-      logger.error("Graph job paused for recovery", { jobId: storage.jobId, code: error instanceof StateTransactionError ? error.code : "STATE_TX_FAILED" });
+      if (recoveryOutcome === "stopped") logger.error("Graph job stopped after repeated or permanent staging failure", { jobId: storage.jobId, code: terminalPayloadFailureCode(error) ?? (error instanceof StateTransactionError ? error.code : "STATE_TX_FAILED") });
+      else if (recoveryOutcome === "retry-scheduled") logger.warn("Graph job retry scheduled with bounded backoff", { jobId: storage.jobId });
+      else logger.error("Graph job paused for recovery", { jobId: storage.jobId, code: error instanceof StateTransactionError ? error.code : "STATE_TX_FAILED" });
       throw error;
     } finally {
       clearInterval(heartbeat);
@@ -410,6 +488,38 @@ export function registerGraphJobRecovery(sdk: IIIClient, kv: StateKV): void {
       const control = await leasedControl(storage);
       job = await discoverJob(storage, control);
       if (!job) return { success: true, recovered: false };
+      const jobStorage = new GraphJobStorage(base, storage.guard, job.id);
+      await jobStorage.restore();
+      const jobCheckpoint = jobStorage.checkpoint;
+      if (job.recoveryStopped) {
+        if (jobCheckpoint?.visibility === "staging" && jobCheckpoint.logical_delta_id === `delta:${jobCheckpoint.delta_ordinal}`) {
+          await jobStorage.completeStaging({
+            id: jobCheckpoint.logical_delta_id,
+            ordinal: jobCheckpoint.delta_ordinal,
+            capturedAt: job.createdAt,
+            attempt: "terminal-failure",
+            phase: "preparing",
+          });
+        }
+        return { success: true, recovered: false, jobId: job.id, stopped: true };
+      }
+      if (job.recoveryAfter && Date.parse(job.recoveryAfter) > Date.now()) {
+        return { success: true, recovered: false, jobId: job.id, retryAfter: job.recoveryAfter };
+      }
+      if (
+        job.kind === "extraction" && job.captureComplete && jobCheckpoint?.visibility === "staging"
+        && jobCheckpoint.logical_delta_id === `delta:${jobCheckpoint.delta_ordinal}`
+        && jobCheckpoint.next_chunk_ordinal >= MAX_GRAPH_EXTRACTION_STAGING_CHUNKS
+      ) {
+        const outcome = await recordStagingFailure(jobStorage, new StateTransactionError("STATE_TX_LIMIT_EXCEEDED"));
+        if (outcome === "stopped") {
+          logger.error("Graph extraction stopped at the staging checkpoint limit", {
+            jobId: job.id,
+            chunkOrdinal: jobCheckpoint.next_chunk_ordinal,
+          });
+          return { success: true, recovered: false, jobId: job.id, stopped: true };
+        }
+      }
       if (!job.captureComplete) {
         if (control.recovery) throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
         const captureStorage = new GraphJobStorage(base, storage.guard, job.id);

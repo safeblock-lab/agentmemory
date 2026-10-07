@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { BatchEffectMetadata, BatchCallbackReceipt } from "../types.js";
 import type { StateKV } from "./kv.js";
 import { KV } from "./schema.js";
@@ -7,23 +8,27 @@ import { withGraphDelta, type GraphJobPreflight } from "../functions/graph-jobs.
 
 const MAX_EFFECTS_PER_RECORD = 4096;
 const destinations = ["consolidation", "crystallize", "graph", "lessons", "reflect"];
-let activeMutations = 0;
+interface Admission { family: string; startedAt: number; active: boolean }
+const activeAdmissions = new Set<Admission>();
+const admissionContext = new AsyncLocalStorage<Admission>();
 let maintenance = false;
 let onQuiescent: (() => void) | undefined;
 let admissionWaiters: Array<() => void> = [];
 
-// One worker owns a state store. Readers may nest through iii function calls;
-// waiting maintenance must not block a child needed by an admitted callback.
-async function withAdmission<T>(run: () => Promise<T>): Promise<T> {
-  while (maintenance) {
+// Only descendants of a still-admitted local callback can join its drain.
+// Expired contexts must not let detached work enter an exclusive operation.
+async function withAdmission<T>(family: string, run: () => Promise<T>): Promise<T> {
+  while (maintenance && !admissionContext.getStore()?.active) {
     if (admissionWaiters.length >= 1024) throw new Error("Batch maintenance admission capacity exhausted");
     await new Promise<void>((resolve) => admissionWaiters.push(resolve));
   }
-  activeMutations++;
-  try { return await run(); }
+  const admission: Admission = { family, startedAt: Date.now(), active: true };
+  activeAdmissions.add(admission);
+  try { return await admissionContext.run(admission, run); }
   finally {
-    activeMutations--;
-    if (activeMutations === 0) onQuiescent?.();
+    admission.active = false;
+    activeAdmissions.delete(admission);
+    if (activeAdmissions.size === 0) onQuiescent?.();
   }
 }
 
@@ -44,7 +49,7 @@ async function assertRecovered(kv: StateKV, families: string[]): Promise<void> {
 }
 
 export function withBatchWriterLocks<T>(kv: StateKV, families: string[], run: () => Promise<T>): Promise<T> {
-  return withAdmission(() => [...new Set(families)].sort().reduceRight<() => Promise<T>>(
+  return withAdmission([...new Set(families)].sort().join("+"), () => [...new Set(families)].sort().reduceRight<() => Promise<T>>(
     (next, family) => () => withKeyedLock(`batch-callback:${family}`, next),
     async () => { await assertRecovered(kv, families); return run(); },
   )());
@@ -161,7 +166,7 @@ export async function runBatchCallback<T extends { success: boolean; stale?: boo
   repairAudit?: () => Promise<unknown>,
 ): Promise<T | { success: true; stale?: boolean }> {
   assertBatchCallbackKey(destination, key);
-  const execute = () => withAdmission(() => withKeyedLock(`batch-callback:${destination}`, async () => {
+  const execute = () => withKeyedLock(`batch-callback:${destination}`, async () => {
     const activeId = `active:${destination}`;
     if (destination === "graph" && !key) return run(false, async () => {});
     const admission = await inspectBatchCallbackAdmission(kv, destination, key);
@@ -187,28 +192,50 @@ export async function runBatchCallback<T extends { success: boolean; stale?: boo
     } satisfies BatchCallbackReceipt);
     if (result.success) await kv.delete(KV.batchCallbacks, activeId);
     return result;
-  })).then(async (result) => {
+  }).then(async (result) => {
     if (result.success && key && repairAudit) await repairAudit().catch(() => { });
     return result;
   });
-  return destination === "graph" && key ? withGraphDelta(kv, execute) : execute();
+  return withAdmission(destination, () => destination === "graph" && key ? withGraphDelta(kv, execute) : execute());
+}
+
+export class BatchMaintenanceBusyError extends Error {
+  readonly code = "BATCH_MAINTENANCE_BUSY";
+  readonly details: { waitedMs: number; activeAdmissions: number; waitingAdmissions: number; families: Array<{ family: string; count: number; oldestMs: number }> };
+
+  constructor(startedAt: number) {
+    const now = Date.now();
+    const families = new Map<string, { family: string; count: number; oldestMs: number }>();
+    for (const admission of activeAdmissions) {
+      const entry = families.get(admission.family) ?? { family: admission.family, count: 0, oldestMs: 0 };
+      entry.count++;
+      entry.oldestMs = Math.max(entry.oldestMs, now - admission.startedAt);
+      families.set(admission.family, entry);
+    }
+    super(`Batch maintenance quiescence timed out (${activeAdmissions.size} active admissions; ${[...families.keys()].join(", ")})`);
+    this.name = "BatchMaintenanceBusyError";
+    this.details = { waitedMs: now - startedAt, activeAdmissions: activeAdmissions.size, waitingAdmissions: admissionWaiters.length, families: [...families.values()] };
+  }
 }
 
 export function withBatchMutationLocks<T>(kv: StateKV, run: () => Promise<T>): Promise<T> {
+  if (admissionContext.getStore()?.active) return Promise.reject(new Error("Batch maintenance cannot run inside an admitted callback"));
   return withKeyedLock("batch-maintenance", async () => {
-    if (activeMutations > 0) await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => { onQuiescent = undefined; reject(new Error("Batch maintenance quiescence timed out")); }, 30000);
-      onQuiescent = () => { clearTimeout(timer); maintenance = true; resolve(); };
-    });
-    else maintenance = true;
-    onQuiescent = undefined;
+    maintenance = true;
     try {
+      if (activeAdmissions.size > 0) await new Promise<void>((resolve, reject) => {
+        const startedAt = Date.now();
+        const timer = setTimeout(() => { onQuiescent = undefined; reject(new BatchMaintenanceBusyError(startedAt)); }, 30000);
+        onQuiescent = () => { clearTimeout(timer); resolve(); };
+      });
+      onQuiescent = undefined;
       return await destinations.reduceRight<() => Promise<T>>((next, destination) => () =>
         withKeyedLock(`batch-callback:${destination}`, next), async () => {
           await assertRecovered(kv, destinations);
           return run();
         })();
     } finally {
+      onQuiescent = undefined;
       maintenance = false;
       const waiters = admissionWaiters;
       admissionWaiters = [];

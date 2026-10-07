@@ -7,8 +7,11 @@ export const REQUIRED_ENGINE_CAPABILITIES = [
   "state::get_versioned",
   "state::lease",
   "state::commit_batch",
-  "state::sqlite_wal_v1",
+  "state::sqlite_wal_v2",
+  "state::native_storage_v2",
   "state::shadow_migration_v1",
+  "state::terminal_retention_v1",
+  "state::scope_revision_v1",
 ] as const;
 export const PINNED_ENGINE_VERSION = "0.22.1";
 export const PINNED_ENGINE_REPOSITORY = "https://github.com/iii-hq/iii.git";
@@ -307,6 +310,7 @@ export function resolveBundledEngineArtifact(
 
 function hasRequiredEngineCapabilities(value: unknown): value is string[] {
   return Array.isArray(value) &&
+    value.length === REQUIRED_ENGINE_CAPABILITIES.length &&
     REQUIRED_ENGINE_CAPABILITIES.every((capability) => value.includes(capability));
 }
 
@@ -323,8 +327,8 @@ export function hasRequiredEngineCapabilitiesOutput(output: string): boolean {
   } catch {
     // The native probe may emit one capability per line.
   }
-  const advertised = new Set(trimmed.split(/[\r\n,\s]+/));
-  return REQUIRED_ENGINE_CAPABILITIES.every((capability) => advertised.has(capability));
+  const advertised = trimmed.split(/[\r\n,\s]+/).filter(Boolean);
+  return hasRequiredEngineCapabilities(advertised);
 }
 
 export function createStateMigrationReceipt(

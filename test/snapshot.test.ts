@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { readFileSync, writeFileSync } from "node:fs";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { installGraphStateWire } from "./helpers/graph-state-harness.js";
 
 vi.mock("../src/logger.js", () => ({
@@ -25,16 +28,20 @@ vi.mock("node:util", async () => {
   };
 });
 
-vi.mock("node:fs", () => ({
-  existsSync: vi.fn().mockReturnValue(true),
-  mkdirSync: vi.fn(),
-  writeFileSync: vi.fn(),
-  readFileSync: vi
-    .fn()
-    .mockReturnValue('{"version":"0.4.0","sessions":[],"memories":[]}'),
-}));
+vi.mock("node:fs", async () => {
+  const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+  return {
+    ...actual,
+    existsSync: vi.fn(actual.existsSync),
+    mkdirSync: vi.fn(actual.mkdirSync),
+    writeFileSync: vi.fn(),
+    readFileSync: vi.fn().mockReturnValue('{"version":"0.4.0","sessions":[],"memories":[]}'),
+  };
+});
 
 import { registerSnapshotFunction } from "../src/functions/snapshot.js";
+import { runBatchCallback } from "../src/state/batch-effects.js";
+import { logger } from "../src/logger.js";
 import type { Session, Memory, SnapshotMeta } from "../src/types.js";
 
 function mockKV() {
@@ -79,9 +86,11 @@ function mockSdk() {
 describe("Snapshot Functions", () => {
   let sdk: ReturnType<typeof mockSdk>;
   let kv: ReturnType<typeof mockKV>;
-  const snapshotDir = "/tmp/agentmemory-snapshots";
+  const snapshotDir = join(tmpdir(), `agentmemory-snapshots-${Date.now()}`);
 
   beforeEach(async () => {
+    await rm(snapshotDir, { recursive: true, force: true });
+    await mkdir(snapshotDir, { recursive: true });
     sdk = mockSdk();
     kv = mockKV();
     installGraphStateWire(sdk as never, kv as never);
@@ -126,6 +135,34 @@ describe("Snapshot Functions", () => {
     expect(result.snapshot.message).toBe("Test snapshot");
     expect(result.snapshot.stats.sessions).toBe(1);
     expect(result.snapshot.stats.memories).toBe(1);
+    const persisted = JSON.parse(await readFile(join(snapshotDir, "state.json"), "utf8"));
+    expect(persisted.sessions).toHaveLength(1);
+    expect(persisted.memories).toHaveLength(1);
+    expect(persisted.observations).toEqual({});
+  });
+
+  it("streams an oversized graph node and publishes the complete JSON", async () => {
+    const largeNode = { id: "large-node", type: "concept", name: "large", properties: { text: "x".repeat(1_320_550) } };
+    await kv.set("mem:graph:nodes", largeNode.id, largeNode);
+
+    const result = await sdk.trigger("mem::snapshot-create", {});
+    expect(result).toMatchObject({ success: true, snapshot: { stats: { graphNodes: 1 } } });
+    const persisted = JSON.parse(await readFile(join(snapshotDir, "state.json"), "utf8"));
+    expect(persisted.graphNodes).toEqual([largeNode]);
+  });
+
+  it("keeps the prior snapshot if a projected node read fails", async () => {
+    const oldState = '{"version":"previous"}';
+    await writeFile(join(snapshotDir, "state.json"), oldState, "utf8");
+    await kv.set("mem:graph:nodes", "broken-node", { id: "broken-node", type: "concept", name: "broken" });
+    const originalGet = kv.get;
+    vi.spyOn(kv, "get").mockImplementation(async (scope, key) => {
+      if (scope === "mem:graph:nodes") throw new Error("projected node read failed");
+      return originalGet(scope, key);
+    });
+
+    expect(await sdk.trigger("mem::snapshot-create", {})).toMatchObject({ success: false, error: "projected node read failed" });
+    expect(await readFile(join(snapshotDir, "state.json"), "utf8")).toBe(oldState);
   });
 
   it("snapshot-list returns snapshots from git log", async () => {
@@ -160,11 +197,11 @@ describe("Snapshot Functions", () => {
     expect(result.commitHash).toBe("abc1234");
   });
 
-  it("snapshot-create records an audit entry", async () => {
-    await sdk.trigger("mem::snapshot-create", { message: "Audit test" });
+  it("snapshot-create succeeds without persisting diagnostic audit history", async () => {
+    const result = await sdk.trigger("mem::snapshot-create", { message: "Snapshot test" });
 
-    const audits = await kv.list("mem:audit");
-    expect(audits.length).toBe(1);
+    expect(result).toMatchObject({ success: true });
+    expect(await kv.list("mem:audit")).toHaveLength(0);
   });
 
   it("refuses restore before touching the snapshot when a callback needs recovery", async () => {
@@ -178,6 +215,38 @@ describe("Snapshot Functions", () => {
     await kv.set("mem:batch-callbacks", "active:graph", { state: "started", activeKey: "a".repeat(64) });
     expect(await sdk.trigger("mem::snapshot-create", {})).toMatchObject({ success: false, error: expect.stringContaining("recovered") });
     expect(writeFileSync).not.toHaveBeenCalled();
+  });
+
+  it("defers long provider work without a partial snapshot and retries after it completes", async () => {
+    vi.useFakeTimers();
+    let entered!: () => void, finish!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const providerResult = new Promise<void>((resolve) => { finish = resolve; });
+    const provider = vi.fn(async () => { entered(); await providerResult; });
+    const callback = runBatchCallback(kv as never, "reflect", undefined, async () => {
+      await kv.set("mem:memories", "provider", { id: "provider", title: "partial" });
+      await provider();
+      await kv.set("mem:memories", "provider", { id: "provider", title: "complete" });
+      return { success: true };
+    });
+    try {
+      await started;
+      const snapshot = sdk.trigger("mem::snapshot-create", {});
+      await vi.advanceTimersByTimeAsync(30001);
+      expect(await snapshot).toMatchObject({
+        success: false, deferred: true, retryable: true, code: "BATCH_MAINTENANCE_BUSY",
+        error: expect.stringContaining("quiescence timed out"),
+        details: { activeAdmissions: 1, families: [{ family: "reflect", count: 1, oldestMs: 30000 }] },
+      });
+      expect(writeFileSync).not.toHaveBeenCalled();
+      expect(logger.error).not.toHaveBeenCalled();
+      expect(logger.warn).toHaveBeenCalledWith("Snapshot deferred", expect.objectContaining({ code: "BATCH_MAINTENANCE_BUSY" }));
+      finish(); await callback;
+      expect(await sdk.trigger("mem::snapshot-create", {})).toMatchObject({ success: true, snapshot: expect.any(Object) });
+      const state = JSON.parse(await readFile(join(snapshotDir, "state.json"), "utf8"));
+      expect(state.memories).toContainEqual({ id: "provider", title: "complete" });
+      expect(provider).toHaveBeenCalledOnce();
+    } finally { finish(); await callback; vi.useRealTimers(); }
   });
 
   it("preserves graph provenance when restoring a legacy snapshot", async () => {
@@ -219,7 +288,9 @@ describe("snapshot-create reentrancy guard", () => {
     };
     const localSdk = mockSdk();
     installGraphStateWire(localSdk as never, gatedKv as never);
-    registerSnapshotFunction(localSdk as never, gatedKv as never, "/tmp/reentrant");
+    const reentrantDir = join(tmpdir(), `agentmemory-reentrant-${Date.now()}`);
+    await mkdir(reentrantDir, { recursive: true });
+    registerSnapshotFunction(localSdk as never, gatedKv as never, reentrantDir);
 
     // Start the first snapshot; it parks inside kv.list with the guard held.
     const p1 = localSdk.trigger("mem::snapshot-create", { message: "first" });

@@ -42,6 +42,11 @@ export interface StatePage<T> {
   next_cursor: string | null
 }
 
+export interface StateScopeRevision {
+  generation: string
+  revision: string
+}
+
 export interface StatePageOptions {
   cursor?: string
   limit?: number

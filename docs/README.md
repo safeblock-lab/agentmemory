@@ -5,9 +5,13 @@ Project documentation by area:
 ## Operations
 
 - [State pagination and patched engine delivery](operations/state-pagination.md)
+- [Native storage format V2 and measured migration](operations/native-storage-format-v2.md)
 - [Frozen release assets](operations/frozen-release-assets.md)
+- [AgentMemory 0.9.82 release acceptance](operations/agentmemory-0.9.82-release.md)
+- [Background health repair](operations/background-health-repair.md)
 - [Installer handoff](operations/installer-handoff.md)
 - [AgentMemory local runtime status](operations/agentmemory-status.md)
+- [Export pagination and restore contract](operations/export-contract.md)
 - [Retrieval quality and retained evidence](operations/retrieval-quality.md)
 
 ## Development and integration

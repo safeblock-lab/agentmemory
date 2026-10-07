@@ -9,6 +9,14 @@ import { StateKV } from "../state/kv.js";
 import { recordAccessBatch } from "./access-tracker.js";
 import { logger } from "../logger.js";
 
+const TIMELINE_LIMIT = 20;
+
+function windowSize(value: number | undefined): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.min(TIMELINE_LIMIT - 1, Math.max(0, Math.floor(value)))
+    : 5;
+}
+
 export function registerTimelineFunction(sdk: IIIClient, kv: StateKV): void {
   sdk.registerFunction("mem::timeline", 
     async (data: {
@@ -17,8 +25,12 @@ export function registerTimelineFunction(sdk: IIIClient, kv: StateKV): void {
       before?: number;
       after?: number;
     }) => {
-      const before = Math.max(0, Math.floor(data.before ?? 5));
-      const after = Math.max(0, Math.floor(data.after ?? 5));
+      let before = windowSize(data.before);
+      let after = windowSize(data.after);
+      if (before + after >= TIMELINE_LIMIT) {
+        before = Math.min(before, Math.max(9, TIMELINE_LIMIT - 1 - after));
+        after = TIMELINE_LIMIT - 1 - before;
+      }
 
       if (!data.anchor || typeof data.anchor !== "string") {
         return { entries: [], anchor: data.anchor, reason: "invalid_anchor" };

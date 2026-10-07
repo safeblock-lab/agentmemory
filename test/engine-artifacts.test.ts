@@ -186,7 +186,13 @@ describe("bundled iii-engine artifacts", () => {
   });
 
   it("requires every exact state capability marker", () => {
+    expect(hasRequiredEngineCapabilitiesOutput(JSON.stringify({ capabilities: [
+      "state::list_page", "state::get_versioned", "state::lease", "state::commit_batch",
+      "state::sqlite_wal_v1", "state::shadow_migration_v1",
+    ] }))).toBe(false);
     expect(hasRequiredEngineCapabilitiesOutput(JSON.stringify({ capabilities: [...REQUIRED_ENGINE_CAPABILITIES] }))).toBe(true);
+    expect(hasRequiredEngineCapabilitiesOutput(JSON.stringify({ capabilities: [...REQUIRED_ENGINE_CAPABILITIES, "state::unknown"] }))).toBe(false);
+    expect(hasRequiredEngineCapabilitiesOutput(JSON.stringify({ capabilities: REQUIRED_ENGINE_CAPABILITIES.filter((capability) => capability !== "state::scope_revision_v1") }))).toBe(false);
     expect(hasRequiredEngineCapabilitiesOutput("iii 0.22.1")).toBe(false);
     expect(hasRequiredEngineCapabilitiesOutput("state::list_page_old")).toBe(false);
     for (const missing of REQUIRED_ENGINE_CAPABILITIES) {

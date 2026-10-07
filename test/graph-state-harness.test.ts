@@ -105,10 +105,13 @@ describe("isolated graph native-wire harness", () => {
     harness.loseAcknowledgment();
     await expect(harness.kv.commitBatch(oldGuard, prepared)).rejects.toMatchObject({ code: "STATE_TX_FAILED" });
     expect(harness.receipts.size).toBe(1);
-    const current = await harness.kv.lease({ action: "acquire", owner_id: "new", generation: "2", ttl_ms: 10_000 }).catch(async () => {
-      await harness.kv.lease({ action: "release", owner_id: oldGuard.owner_id, generation: "2", fence: oldGuard.fence }).catch(() => undefined);
-      return harness.kv.lease({ action: "acquire", owner_id: "new", generation: "2", ttl_ms: 10_000 });
-    }) as StateGraphGuard;
+    await expect(harness.kv.lease({
+      action: "release",
+      owner_id: oldGuard.owner_id,
+      generation: oldGuard.generation,
+      fence: oldGuard.fence,
+    })).rejects.toMatchObject({ code: "STATE_TX_GENERATION_STALE" });
+    const current = await harness.kv.lease({ action: "acquire", owner_id: "new", generation: "2", ttl_ms: 10_000 }) as StateGraphGuard;
     const replay = await harness.kv.commitBatch(current, prepared);
     expect(replay).toEqual([...harness.receipts.values()][0]);
     expect(await harness.kv.getVersioned(KV.graphSnapshot, "current")).toMatchObject({ version: "1", value: { resetAt: "frozen" } });

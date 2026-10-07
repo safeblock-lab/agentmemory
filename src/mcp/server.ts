@@ -6,9 +6,11 @@ import type {
   SessionSummary,
   Memory,
   Session,
-  GraphNode,
-  GraphEdge,
+  ExportCollection,
 } from "../types.js";
+import { EXPORT_COLLECTIONS } from "../types.js";
+import { checkPayloadFrameSize } from "../state/frame-guard.js";
+import { iterateProjectedRecords } from "../functions/projected-record-reader.js";
 import { getVisibleTools } from "./tools-registry.js";
 import { timingSafeCompare } from "../auth.js";
 import { getAgentId, isAgentScopeIsolated } from "../config.js";
@@ -368,14 +370,43 @@ export function registerMcpEndpoints(
           }
 
           case "memory_export": {
-            const result = await sdk.trigger({ function_id: "mem::export", payload: {} });
+            const payload: { collection?: ExportCollection; offset?: number; limit?: number; cursor?: string } = {};
+            if (args.collection !== undefined) {
+              if (typeof args.collection !== "string" || !(EXPORT_COLLECTIONS as readonly string[]).includes(args.collection)) {
+                return { status_code: 400, body: { error: "collection must name a supported export collection" } };
+              }
+              payload.collection = args.collection as ExportCollection;
+              for (const field of ["offset", "limit"] as const) {
+                const value = args[field];
+                if (value === undefined) continue;
+                if (typeof value !== "number" || !Number.isSafeInteger(value) || value < (field === "offset" ? 0 : 1) || (field === "limit" && value > 1_000)) {
+                  return { status_code: 400, body: { error: `${field} is outside the supported integer range` } };
+                }
+                if (field === "offset" && value !== 0) {
+                  return { status_code: 400, body: { error: "Offset continuation is no longer supported; pass the returned cursor" } };
+                }
+                payload[field] = value;
+              }
+              if (args.cursor !== undefined) {
+                if (typeof args.cursor !== "string" || args.cursor.length === 0 || Buffer.byteLength(args.cursor, "utf8") > 32 * 1024) {
+                  return { status_code: 400, body: { error: "cursor must be a non-empty string no longer than 32768 bytes" } };
+                }
+                payload.cursor = args.cursor;
+              }
+            } else if (args.offset !== undefined || args.limit !== undefined || args.cursor !== undefined) {
+              return { status_code: 400, body: { error: "collection is required when offset, cursor, or limit is provided" } };
+            }
+            const result = await sdk.trigger({ function_id: "mem::export", payload });
+            const content = [{ type: "text", text: JSON.stringify(result, null, 2) }];
+            const oversized = checkPayloadFrameSize(
+              { content },
+              "reduce limit and request the next export page; an individual oversized record cannot be split",
+            );
             return {
               status_code: 200,
-              body: {
-                content: [
-                  { type: "text", text: JSON.stringify(result, null, 2) },
-                ],
-              },
+              body: oversized
+                ? { content: [{ type: "text", text: JSON.stringify(oversized, null, 2) }] }
+                : { content },
             };
           }
 
@@ -640,7 +671,7 @@ export function registerMcpEndpoints(
             try {
               const result = await sdk.trigger({ function_id: "mem::snapshot-create", payload: {
                 message: args.message as string,
-              } });
+              }, timeoutMs: 10 * 60 * 1000 });
               return {
                 status_code: 200,
                 body: {
@@ -1480,14 +1511,18 @@ export function registerMcpEndpoints(
 
         if (uri === "agentmemory://graph/stats") {
           try {
-            const nodes = await kv.list<GraphNode>(KV.graphNodes);
-            const edges = await kv.list<GraphEdge>(KV.graphEdges);
             const nodesByType: Record<string, number> = {};
-            for (const n of nodes)
+            let totalNodes = 0;
+            for await (const n of iterateProjectedRecords<{ id: string; type: string }>(kv, KV.graphNodes)) {
+              totalNodes++;
               nodesByType[n.type] = (nodesByType[n.type] || 0) + 1;
+            }
             const edgesByType: Record<string, number> = {};
-            for (const e of edges)
+            let totalEdges = 0;
+            for await (const e of iterateProjectedRecords<{ id: string; type: string }>(kv, KV.graphEdges)) {
+              totalEdges++;
               edgesByType[e.type] = (edgesByType[e.type] || 0) + 1;
+            }
             return {
               status_code: 200,
               body: {
@@ -1496,8 +1531,8 @@ export function registerMcpEndpoints(
                     uri,
                     mimeType: "application/json",
                     text: JSON.stringify({
-                      totalNodes: nodes.length,
-                      totalEdges: edges.length,
+                      totalNodes,
+                      totalEdges,
                       nodesByType,
                       edgesByType,
                     }),
@@ -1507,19 +1542,8 @@ export function registerMcpEndpoints(
             };
           } catch {
             return {
-              status_code: 200,
-              body: {
-                contents: [
-                  {
-                    uri,
-                    mimeType: "application/json",
-                    text: JSON.stringify({
-                      totalNodes: 0,
-                      totalEdges: 0,
-                    }),
-                  },
-                ],
-              },
+              status_code: 500,
+              body: { error: "Graph statistics are temporarily unavailable" },
             };
           }
         }

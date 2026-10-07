@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import type { AuditEntry } from "../src/types.js";
+import { KV } from "../src/state/schema.js";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -27,6 +29,17 @@ function mockKV() {
   };
 }
 
+function legacyAudit(id: string, timestamp: string, operation: AuditEntry["operation"] = "observe"): AuditEntry {
+  return {
+    id,
+    timestamp,
+    operation,
+    functionId: `mem::${id}`,
+    targetIds: [],
+    details: {},
+  };
+}
+
 describe("Audit Functions", () => {
   let kv: ReturnType<typeof mockKV>;
 
@@ -34,73 +47,67 @@ describe("Audit Functions", () => {
     kv = mockKV();
   });
 
-  it("recordAudit creates an entry with proper fields", async () => {
-    const entry = await recordAudit(
-      kv as never,
-      "observe",
-      "mem::compress",
-      ["obs_1", "obs_2"],
-      { count: 2 },
-      0.85,
-      "user-1",
-    );
+  it("does not persist per-operation audit rows or effect-key markers", async () => {
+    const get = vi.spyOn(kv, "get");
+    const set = vi.spyOn(kv, "set");
 
-    expect(entry.id).toMatch(/^aud_/);
-    expect(entry.timestamp).toBeDefined();
-    expect(entry.operation).toBe("observe");
-    expect(entry.functionId).toBe("mem::compress");
-    expect(entry.targetIds).toEqual(["obs_1", "obs_2"]);
-    expect(entry.details).toEqual({ count: 2 });
-    expect(entry.qualityScore).toBe(0.85);
-    expect(entry.userId).toBe("user-1");
+    for (let index = 0; index < 100; index++) {
+      await recordAudit(
+        kv as never,
+        "observe",
+        "mem::compress",
+        [`obs_${index}`],
+        { index },
+        undefined,
+        undefined,
+        "same-effect-key",
+      );
+    }
+
+    expect(get).not.toHaveBeenCalled();
+    expect(set).not.toHaveBeenCalled();
+    expect(await kv.list(KV.audit)).toEqual([]);
   });
 
-  it("queryAudit returns entries sorted by timestamp desc", async () => {
-    await recordAudit(kv as never, "observe", "fn1", ["a"], {});
-    await new Promise((r) => setTimeout(r, 10));
-    await recordAudit(kv as never, "delete", "fn2", ["b"], {});
+  it("queryAudit reads legacy entries sorted by timestamp desc", async () => {
+    await kv.set(KV.audit, "aud_early", legacyAudit("aud_early", "2026-01-01T00:00:00.000Z"));
+    await kv.set(KV.audit, "aud_late", legacyAudit("aud_late", "2026-01-02T00:00:00.000Z", "delete"));
 
     const entries = await queryAudit(kv as never);
-    expect(entries.length).toBe(2);
-    expect(
-      new Date(entries[0].timestamp).getTime(),
-    ).toBeGreaterThanOrEqual(new Date(entries[1].timestamp).getTime());
+    expect(entries.map((entry) => entry.id)).toEqual(["aud_late", "aud_early"]);
   });
 
-  it("queryAudit filters by operation", async () => {
-    await recordAudit(kv as never, "observe", "fn1", [], {});
-    await recordAudit(kv as never, "delete", "fn2", [], {});
-    await recordAudit(kv as never, "observe", "fn3", [], {});
+  it("queryAudit filters legacy entries by operation", async () => {
+    await kv.set(KV.audit, "aud_observe", legacyAudit("aud_observe", "2026-01-01T00:00:00.000Z"));
+    await kv.set(KV.audit, "aud_delete", legacyAudit("aud_delete", "2026-01-02T00:00:00.000Z", "delete"));
+    await kv.set(KV.audit, "aud_observe_2", legacyAudit("aud_observe_2", "2026-01-03T00:00:00.000Z"));
 
     const entries = await queryAudit(kv as never, { operation: "observe" });
-    expect(entries.length).toBe(2);
-    expect(entries.every((e) => e.operation === "observe")).toBe(true);
+    expect(entries.map((entry) => entry.id)).toEqual(["aud_observe_2", "aud_observe"]);
   });
 
-  it("queryAudit filters by dateFrom/dateTo", async () => {
-    const early = await recordAudit(kv as never, "observe", "fn1", [], {});
-    await new Promise((r) => setTimeout(r, 20));
-    const late = await recordAudit(kv as never, "delete", "fn2", [], {});
+  it("queryAudit filters legacy entries by date range", async () => {
+    await kv.set(KV.audit, "aud_early", legacyAudit("aud_early", "2026-01-01T00:00:00.000Z"));
+    await kv.set(KV.audit, "aud_late", legacyAudit("aud_late", "2026-01-02T00:00:00.000Z", "delete"));
 
     const entries = await queryAudit(kv as never, {
-      dateFrom: late.timestamp,
+      dateFrom: "2026-01-02T00:00:00.000Z",
     });
-    expect(entries.length).toBe(1);
-    expect(entries[0].operation).toBe("delete");
+    expect(entries.map((entry) => entry.id)).toEqual(["aud_late"]);
 
     const entriesBefore = await queryAudit(kv as never, {
-      dateTo: early.timestamp,
+      dateTo: "2026-01-01T00:00:00.000Z",
     });
-    expect(entriesBefore.length).toBe(1);
-    expect(entriesBefore[0].operation).toBe("observe");
+    expect(entriesBefore.map((entry) => entry.id)).toEqual(["aud_early"]);
   });
 
-  it("queryAudit respects limit", async () => {
-    for (let i = 0; i < 10; i++) {
-      await recordAudit(kv as never, "observe", `fn${i}`, [], {});
+  it("queryAudit respects the requested limit", async () => {
+    for (let index = 0; index < 10; index++) {
+      const entry = legacyAudit(`aud_${index}`, `2026-01-${String(index + 1).padStart(2, "0")}T00:00:00.000Z`);
+      await kv.set(KV.audit, entry.id, entry);
     }
 
     const entries = await queryAudit(kv as never, { limit: 3 });
-    expect(entries.length).toBe(3);
+    expect(entries).toHaveLength(3);
   });
 });

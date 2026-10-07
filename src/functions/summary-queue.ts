@@ -7,7 +7,7 @@ import type { LlmTaskRouter } from "../providers/task-router.js";
 import type { StateKV } from "../state/kv.js";
 import { KV, fingerprintId, generateId } from "../state/schema.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
-import { getSummaryBudgetConfig } from "../config.js";
+import { getSummaryBudgetConfig, isBackgroundRecoveryPaused } from "../config.js";
 import { recordAudit } from "./audit.js";
 import { SummaryOutputSchema } from "../eval/schemas.js";
 import { validateOutput } from "../eval/validator.js";
@@ -279,6 +279,9 @@ export function registerSummaryQueueFunctions(
       if (!intent) await kv.set(KV.summaryQueueIntents, sessionId, {
         sessionId, createdAt: new Date().toISOString(),
       } satisfies SummaryQueueIntent);
+      if (isBackgroundRecoveryPaused()) {
+        return { success: true, queued: false, paused: true };
+      }
       if (provider.name === "noop") return { success: true, queued: false, skipped: "no_provider" };
       const current = await snapshot(kv, sessionId, session.project);
       if (current.observations.length === 0) {
@@ -323,6 +326,7 @@ export function registerSummaryQueueFunctions(
   });
 
   sdk.registerFunction("mem::summary-dispatch", async (data: { jobId: string; round: number; offset: number }) => {
+    if (isBackgroundRecoveryPaused()) return { success: true, paused: true, dispatched: 0 };
     if (data.offset !== 0) return { success: true, skipped: true };
     return withKeyedLock(`summary-job:${data.jobId}`, async () => {
       const job = await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, data.jobId);
@@ -413,8 +417,9 @@ export function registerSummaryQueueFunctions(
       return { completed: false, nextRound };
     });
 
-  sdk.registerFunction("mem::summary-unit", async (data: { jobId: string; unitId: string; deliveryId?: string }) =>
-    withKeyedLock(`summary-unit:${data.unitId}`, async () => {
+  sdk.registerFunction("mem::summary-unit", async (data: { jobId: string; unitId: string; deliveryId?: string }) => {
+    if (isBackgroundRecoveryPaused()) return { success: true, skipped: true, paused: true };
+    return withKeyedLock(`summary-unit:${data.unitId}`, async () => {
       const job = await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, data.jobId);
       if (!job || job.status !== "pending") return { success: true, skipped: true };
       const unit = await kv.get<SummaryQueueUnit>(KV.summaryQueueUnits(job.id), data.unitId);
@@ -522,7 +527,8 @@ export function registerSummaryQueueFunctions(
         }
         throw error;
       }
-    }));
+    });
+  });
   sdk.registerTrigger({
     type: "durable:subscriber",
     function_id: "mem::summary-unit",
@@ -534,7 +540,8 @@ export function registerSummaryQueueFunctions(
     },
   });
 
-  const reconcilePendingJobs = async (): Promise<{ success: true; recovered: number; replayed: number }> => {
+  const reconcilePendingJobs = async (): Promise<{ success: true; recovered: number; replayed: number; paused?: true }> => {
+    if (isBackgroundRecoveryPaused()) return { success: true, recovered: 0, replayed: 0, paused: true };
     let idle = false;
     try {
       const queue = await sdk.trigger<unknown, { depth?: number; dlq_depth?: number }>({
@@ -602,6 +609,7 @@ export function registerSummaryQueueFunctions(
   sdk.registerFunction("mem::summary-reconcile", reconcilePendingJobs);
 
   sdk.registerFunction("mem::summary-recover", async () => {
+    if (isBackgroundRecoveryPaused()) return { success: true, recovered: 0, cleaned: 0, paused: true };
     let { recovered } = await reconcilePendingJobs();
     let cleaned = 0;
     const jobs = await kv.list<SummaryQueueJob>(KV.summaryQueueJobs);

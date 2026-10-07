@@ -11,7 +11,12 @@ import { KV, fingerprintId, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import {
   SEMANTIC_MERGE_SYSTEM,
+  SEMANTIC_EVIDENCE_SYSTEM,
+  SEMANTIC_CANDIDATE_REDUCTION_SYSTEM,
+  SEMANTIC_CANDIDATE_FINAL_SYSTEM,
   buildSemanticMergePrompt,
+  buildSemanticEvidencePrompt,
+  buildSemanticCandidatePrompt,
   PROCEDURAL_EXTRACTION_SYSTEM,
   buildProceduralExtractionPrompt,
 } from "../prompts/consolidation.js";
@@ -101,6 +106,38 @@ async function compactConsolidationInputs<T>(
 const SEMANTIC_CHECKPOINT_KEY = "semantic-consolidation";
 const SEMANTIC_ANCHOR_SUMMARIES = 5;
 const SEMANTIC_NEW_SUMMARIES_PER_RUN = 15;
+const MAX_SEMANTIC_REQUEST_INPUT_BYTES = 8 * 1024;
+
+interface SemanticFactCandidate {
+  fact: string;
+  confidence: number;
+  sourceSessionIds: string[];
+  candidateIds: string[];
+}
+
+function semanticRequestInputBytes(systemPrompt: string, userPrompt: string): number {
+  return new TextEncoder().encode(JSON.stringify({ systemPrompt, userPrompt })).byteLength;
+}
+
+function boundedSemanticPartitions<T>(
+  items: T[],
+  prompt: (items: T[]) => string,
+  systemPrompt: string,
+): T[][] {
+  const groups: T[][] = [];
+  let group: T[] = [];
+  const fits = (batch: T[]) =>
+    semanticRequestInputBytes(systemPrompt, prompt(batch)) <= MAX_SEMANTIC_REQUEST_INPUT_BYTES;
+  for (const item of items) {
+    if (!fits([item])) {
+      throw new Error("Consolidation source exceeds bounded UTF-8 request input; source retained locally");
+    }
+    if (group.length && !fits([...group, item])) { groups.push(group); group = []; }
+    group.push(item);
+  }
+  if (group.length) groups.push(group);
+  return groups;
+}
 
 function boundedPartitions<T>(items: T[], prompt: (items: T[]) => string): T[][] {
   const groups: T[][] = [];
@@ -112,6 +149,219 @@ function boundedPartitions<T>(items: T[], prompt: (items: T[]) => string): T[][]
   }
   if (group.length) groups.push(group);
   return groups;
+}
+
+function semanticEpisodePrompt(summaries: SessionSummary[]): string {
+  return buildSemanticMergePrompt(summaries.map((summary) => ({
+    sessionId: summary.sessionId,
+    title: summary.title,
+    narrative: summary.narrative,
+    concepts: summary.concepts,
+  })));
+}
+
+function semanticEvidencePrompt(summaries: SessionSummary[]): string {
+  return buildSemanticEvidencePrompt(summaries.map((summary) => ({
+    sessionId: summary.sessionId,
+    title: summary.title,
+    narrative: summary.narrative,
+    concepts: summary.concepts,
+  })));
+}
+
+function normalizeSemanticFactsResponse(response: string): string {
+  return response.trim().replace(/^```(?:xml)?\s*/i, "").replace(/\s*```$/, "").trim();
+}
+
+function validateSemanticFactsEnvelope(response: string): void {
+  if (!isSemanticFactsResponse(response)) {
+    throw new Error("Semantic provider returned malformed fact output; source retained locally");
+  }
+}
+
+function isSemanticFactsResponse(response: string): boolean {
+  const normalized = normalizeSemanticFactsResponse(response);
+  if (/^<facts\s*\/>$/.test(normalized)) return true;
+  const envelope = /^<facts>([\s\S]*)<\/facts>$/.exec(normalized);
+  if (!envelope) return false;
+  const body = envelope[1];
+  const factRegex = /<fact\s+confidence="[^"]+"(?:\s+(?:sourceIds|candidateIds)="[^"]*")?>[^<]+<\/fact>/g;
+  const factTagCount = body.match(/<fact\b/g)?.length ?? 0;
+  if (factTagCount === 0) return body.trim().length === 0;
+  let parsedTagCount = 0;
+  while (factRegex.exec(body) !== null) parsedTagCount++;
+  return parsedTagCount === factTagCount && body.replace(factRegex, "").trim().length === 0;
+}
+
+function isLegacyBareSemanticFactsResponse(response: string): boolean {
+  const normalized = normalizeSemanticFactsResponse(response);
+  return /^(?:<fact\s+confidence="[^"]+"(?:\s+sourceIds="[^"]*")?>[^<]+<\/fact>\s*)+$/.test(normalized);
+}
+
+function parseSemanticFacts(
+  response: string,
+  allowedSessionIds: readonly string[],
+  allowLegacyOutput: boolean,
+): SemanticFactCandidate[] {
+  if (!isSemanticFactsResponse(response) && !(allowLegacyOutput && isLegacyBareSemanticFactsResponse(response))) {
+    throw new Error("Semantic provider returned malformed fact output; source retained locally");
+  }
+  const allowed = new Set(allowedSessionIds);
+  const candidates: SemanticFactCandidate[] = [];
+  const factRegex = /<fact\s+confidence="([^"]+)"(?:\s+sourceIds="([^"]*)")?>([^<]+)<\/fact>/g;
+  const normalized = normalizeSemanticFactsResponse(response);
+  const factTagCount = normalized.match(/<fact\b/g)?.length ?? 0;
+  let match;
+  let parsedTagCount = 0;
+  while ((match = factRegex.exec(normalized)) !== null) {
+    parsedTagCount++;
+    const confidenceValue = Number.parseFloat(match[1]);
+    const confidence = Number.isNaN(confidenceValue) ? 0.5 : confidenceValue;
+    const fact = match[3].trim();
+    if (!fact) throw new Error("Semantic provider returned an empty fact; source retained locally");
+    if (match[2] === undefined && !allowLegacyOutput) {
+      throw new Error("Semantic provider omitted source IDs; source retained locally");
+    }
+    const reportedSources = match[2]?.split(",").map((id) => id.trim()).filter(Boolean);
+    if (reportedSources?.some((id) => !allowed.has(id))) {
+      throw new Error("Semantic provider returned unknown source IDs; source retained locally");
+    }
+    const sourceSessionIds = match[2] === undefined
+      ? [...allowed]
+      : [...new Set(reportedSources)];
+    if (sourceSessionIds.length === 0) {
+      throw new Error("Semantic provider returned a fact without valid source IDs; source retained locally");
+    }
+    const normalizedSources = [...sourceSessionIds].sort();
+    const candidateId = fingerprintId("semcand", JSON.stringify([fact.toLowerCase(), normalizedSources]));
+    candidates.push({ fact, confidence, sourceSessionIds, candidateIds: [candidateId] });
+  }
+  if (parsedTagCount !== factTagCount) {
+    throw new Error("Semantic provider returned malformed fact output; source retained locally");
+  }
+  return candidates;
+}
+
+function parseReducedSemanticFacts(
+  response: string,
+  allowedCandidates: readonly SemanticFactCandidate[],
+  requireAllCandidates: boolean,
+): SemanticFactCandidate[] {
+  validateSemanticFactsEnvelope(response);
+  const byId = new Map<string, SemanticFactCandidate>();
+  for (const candidate of allowedCandidates) {
+    for (const id of candidate.candidateIds) byId.set(id, candidate);
+  }
+  const factRegex = /<fact\s+confidence="([^"]+)"\s+candidateIds="([^"]*)">([^<]+)<\/fact>/g;
+  const factTagCount = response.match(/<fact\b/g)?.length ?? 0;
+  const assigned = new Set<string>();
+  const facts: SemanticFactCandidate[] = [];
+  let parsedTagCount = 0;
+  let match;
+  while ((match = factRegex.exec(response)) !== null) {
+    parsedTagCount++;
+    const fact = match[3].trim();
+    const candidateIds = [...new Set(match[2].split(",").map((id) => id.trim()).filter(Boolean))];
+    if (!fact || candidateIds.length === 0 || candidateIds.some((id) => !byId.has(id))) {
+      throw new Error("Semantic reducer returned invalid candidate IDs; source retained locally");
+    }
+    if (candidateIds.some((id) => assigned.has(id))) {
+      throw new Error("Semantic reducer assigned a candidate more than once; source retained locally");
+    }
+    candidateIds.forEach((id) => assigned.add(id));
+    const represented = candidateIds.map((id) => byId.get(id)!);
+    const confidenceValue = Number.parseFloat(match[1]);
+    facts.push({
+      fact,
+      confidence: Number.isNaN(confidenceValue) ? 0.5 : confidenceValue,
+      sourceSessionIds: sourceIdsInSemanticCandidates(represented),
+      candidateIds,
+    });
+  }
+  if (parsedTagCount !== factTagCount) {
+    throw new Error("Semantic reducer returned malformed fact output; source retained locally");
+  }
+  if (requireAllCandidates && (assigned.size !== byId.size || [...byId.keys()].some((id) => !assigned.has(id)))) {
+    throw new Error("Semantic reducer omitted candidate facts; source retained locally");
+  }
+  return facts;
+}
+
+function sourceIdsInSemanticCandidates(candidates: readonly SemanticFactCandidate[]): string[] {
+  return [...new Set(candidates.flatMap((candidate) => candidate.sourceSessionIds))].sort();
+}
+
+async function reduceSemanticCandidates(
+  candidates: SemanticFactCandidate[],
+  summarize: (systemPrompt: string, userPrompt: string) => Promise<string>,
+): Promise<SemanticFactCandidate[]> {
+  let current = candidates;
+  while (current.length > 0) {
+    const finalPrompt = buildSemanticCandidatePrompt(current);
+    if (semanticRequestInputBytes(SEMANTIC_CANDIDATE_FINAL_SYSTEM, finalPrompt) <= MAX_SEMANTIC_REQUEST_INPUT_BYTES) {
+      const response = await summarize(SEMANTIC_CANDIDATE_FINAL_SYSTEM, finalPrompt);
+      return parseReducedSemanticFacts(response, current, false);
+    }
+
+    const currentSize = semanticRequestInputBytes(SEMANTIC_CANDIDATE_REDUCTION_SYSTEM, finalPrompt);
+    const groups = boundedSemanticPartitions(current, buildSemanticCandidatePrompt, SEMANTIC_CANDIDATE_REDUCTION_SYSTEM);
+    if (groups.length >= current.length) {
+      throw new Error("Semantic candidate set exceeds bounded UTF-8 request input; source retained locally");
+    }
+
+    const reduced: SemanticFactCandidate[] = [];
+    for (const group of groups) {
+      const groupSources = sourceIdsInSemanticCandidates(group);
+      const response = await summarize(
+        SEMANTIC_CANDIDATE_REDUCTION_SYSTEM,
+        buildSemanticCandidatePrompt(group),
+      );
+      const facts = parseReducedSemanticFacts(response, group, true);
+      if (JSON.stringify(sourceIdsInSemanticCandidates(facts)) !== JSON.stringify(groupSources)) {
+        throw new Error("Semantic candidate reduction lost source provenance; source retained locally");
+      }
+      reduced.push(...facts);
+    }
+
+    const reducedSize = semanticRequestInputBytes(
+      SEMANTIC_CANDIDATE_REDUCTION_SYSTEM,
+      buildSemanticCandidatePrompt(reduced),
+    );
+    if (reduced.length >= current.length && reducedSize >= currentSize) {
+      throw new Error("Semantic candidate reduction did not reduce bounded input; source retained locally");
+    }
+    current = reduced;
+  }
+  return [];
+}
+
+async function buildSemanticFacts(
+  summaries: SessionSummary[],
+  summarize: (systemPrompt: string, userPrompt: string) => Promise<string>,
+): Promise<SemanticFactCandidate[]> {
+  const partitions = boundedSemanticPartitions(
+    summaries,
+    semanticEvidencePrompt,
+    SEMANTIC_EVIDENCE_SYSTEM,
+  );
+  if (partitions.length === 1) {
+    const partition = partitions[0];
+    const sourceIds = partition.map((summary) => summary.sessionId);
+    const prompt = semanticEpisodePrompt(partition);
+    if (semanticRequestInputBytes(SEMANTIC_MERGE_SYSTEM, prompt) > MAX_SEMANTIC_REQUEST_INPUT_BYTES) {
+      throw new Error("Consolidation source exceeds bounded UTF-8 request input; source retained locally");
+    }
+    const response = await summarize(SEMANTIC_MERGE_SYSTEM, prompt);
+    return parseSemanticFacts(response, sourceIds, true);
+  }
+
+  const candidates: SemanticFactCandidate[] = [];
+  for (const partition of partitions) {
+    const sourceIds = partition.map((summary) => summary.sessionId);
+    const response = await summarize(SEMANTIC_EVIDENCE_SYSTEM, semanticEvidencePrompt(partition));
+    candidates.push(...parseSemanticFacts(response, sourceIds, false));
+  }
+  return reduceSemanticCandidates(candidates, summarize);
 }
 
 function semanticFingerprint(summaries: SessionSummary[]): string {
@@ -380,13 +630,7 @@ export function registerConsolidationPipelineFunction(
             };
           } else {
 
-            const prompt = buildSemanticMergePrompt(
-              recentSummaries.map((s) => ({
-                title: s.title,
-                narrative: s.narrative,
-                concepts: s.concepts,
-              })),
-            );
+            const prompt = semanticEpisodePrompt(recentSummaries);
             const sourceFingerprint = fingerprintId("fwbconsem", JSON.stringify(
               recentSummaries.map((summary) => [
                 summary.sessionId,
@@ -415,13 +659,13 @@ export function registerConsolidationPipelineFunction(
                     return { success: false, error: "Replacement cohort is missing or invalid" };
                   }
                   const workItemIds: string[] = [];
-                  for (const group of boundedPartitions(recentSummaries, buildSemanticMergePrompt)) {
+                  for (const group of boundedSemanticPartitions(recentSummaries, semanticEpisodePrompt, SEMANTIC_MERGE_SYSTEM)) {
                     const enqueueResult = await batchQueue.enqueue({
                       replacementOf: data.replacementOf,
                       correlationId: data.batchEffectKey ? fingerprintId("fwbcon-sem", data.batchEffectKey) : generateId("fwbcon-sem"),
                       task: "consolidation",
                       systemPrompt: SEMANTIC_MERGE_SYSTEM,
-                      userPrompt: buildSemanticMergePrompt(group),
+                      userPrompt: semanticEpisodePrompt(group),
                       metadata: { tier: "semantic", sourceFingerprint: semanticFingerprint(group), sourceIds: JSON.stringify(group.map((summary) => summary.sessionId)), cohort, ...(data.batchEffectKey ? { batchEffectKey: data.batchEffectKey } : {}) },
                     });
                     if (!enqueueResult.queued || !enqueueResult.workItemId) {
@@ -448,27 +692,24 @@ export function registerConsolidationPipelineFunction(
                 if (failure) return failure;
               }
               if (!queued) {
-                const response = data?.batchResponse ?? (llmRouter
-                  ? await llmRouter.run(
+                const summarize = (systemPrompt: string, userPrompt: string) => llmRouter
+                  ? llmRouter.run(
                     complexity.complex ? "conflict_resolution" : "consolidation",
-                    (selectedProvider) => selectedProvider.summarize(
-                      SEMANTIC_MERGE_SYSTEM,
-                      prompt,
-                    ),
-                    (candidate) => /<fact\s+confidence="[^"]+">[^<]+<\/fact>/.test(candidate),
+                    (selectedProvider) => selectedProvider.summarize(systemPrompt, userPrompt),
+                    isSemanticFactsResponse,
                   )
-                  : await provider.summarize(SEMANTIC_MERGE_SYSTEM, prompt));
+                  : provider.summarize(systemPrompt, userPrompt);
+                const sourceSessionIds = recentSummaries.map((summary) => summary.sessionId);
+                const factCandidates = data?.batchResponse
+                  ? parseSemanticFacts(data.batchResponse, sourceSessionIds, true)
+                  : await buildSemanticFacts(recentSummaries, summarize);
 
-                const factRegex = /<fact\s+confidence="([^"]+)">([^<]+)<\/fact>/g;
                 await admit({ semanticSourceIds: recentSummaries.map((summary) => summary.sessionId), semanticCheckpoint: semanticInput.checkpoint });
-                let match;
                 let newFacts = 0;
                 const now = new Date().toISOString();
 
-                while ((match = factRegex.exec(response)) !== null) {
-                  const parsedConf = parseFloat(match[1]);
-                  const confidence = Number.isNaN(parsedConf) ? 0.5 : parsedConf;
-                  const fact = match[2].trim();
+                for (const candidate of factCandidates) {
+                  const { fact, confidence, sourceSessionIds: factSourceIds } = candidate;
 
                   const existing = existingSemantic.find(
                     (s) => s.fact.toLowerCase() === fact.toLowerCase(),
@@ -478,8 +719,9 @@ export function registerConsolidationPipelineFunction(
                     await applyBatchEffect<SemanticMemory>(kv, KV.semantic, id, data.batchEffectKey, (current) => current ? {
                       ...current, accessCount: current.accessCount + 1, lastAccessedAt: now, updatedAt: now,
                       confidence: Math.max(current.confidence, confidence),
+                      sourceSessionIds: [...new Set([...(current.sourceSessionIds ?? []), ...factSourceIds])],
                     } : {
-                      id, fact, confidence, sourceSessionIds: receipt?.semanticSourceIds ?? recentSummaries.map((s) => s.sessionId), sourceMemoryIds: [],
+                      id, fact, confidence, sourceSessionIds: factSourceIds, sourceMemoryIds: [],
                       accessCount: 1, lastAccessedAt: now, strength: confidence, createdAt: now, updatedAt: now,
                     });
                     continue;
@@ -489,13 +731,14 @@ export function registerConsolidationPipelineFunction(
                     existing.lastAccessedAt = now;
                     existing.updatedAt = now;
                     existing.confidence = Math.max(existing.confidence, confidence);
+                    existing.sourceSessionIds = [...new Set([...existing.sourceSessionIds, ...factSourceIds])];
                     await kv.set(KV.semantic, existing.id, existing);
                   } else {
                     const sem: SemanticMemory = {
                       id: generateId("sem"),
                       fact,
                       confidence,
-                      sourceSessionIds: recentSummaries.map((s) => s.sessionId),
+                      sourceSessionIds: factSourceIds,
                       sourceMemoryIds: [],
                       accessCount: 1,
                       lastAccessedAt: now,
@@ -504,6 +747,7 @@ export function registerConsolidationPipelineFunction(
                       updatedAt: now,
                     };
                     await kv.set(KV.semantic, sem.id, sem);
+                    existingSemantic.push(sem);
                     newFacts++;
                   }
                 }

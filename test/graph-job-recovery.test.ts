@@ -11,7 +11,6 @@ const protocol = JSON.parse(readFileSync(resolve(root, "scenarios.json"), "utf8"
   originalOracleEntryPoint: string;
   semanticCoverage: string[];
   recoveryScenarios: Array<{ id: string; expected: string }>;
-  auditExactlyOnce: { status: string; criterion: string };
   resource: { initialInputBytes: number; extraRamTargetBytes: number; maximumCompleteCommitUtf8Bytes: number; acceptance: string };
 };
 
@@ -27,7 +26,7 @@ describe("graph recovery acceptance protocol", () => {
     expect(protocol.promptGroups.every((group) => group.prompt.length > 0 && group.response.includes("<entities>"))).toBe(true);
   });
 
-  it("enumerates replay, lease, receipt, freeze, and read-barrier boundaries without weakening audit replay", () => {
+  it("enumerates functional replay, lease, receipt, freeze, and read-barrier boundaries", () => {
     const ids = protocol.recoveryScenarios.map((scenario) => scenario.id);
     expect(new Set(ids).size).toBe(ids.length);
     expect(ids).toEqual(expect.arrayContaining([
@@ -47,8 +46,6 @@ describe("graph recovery acceptance protocol", () => {
     expect(protocol.semanticCoverage).toEqual(expect.arrayContaining([
       "persistGraphDelta", "applyBatchGraph", "weights", "sourceObservationIds", "nameIndex", "edgeIndex", "degrees", "snapshot", "topEdges", "query", "resetOrphans", "mesh", "temporal", "reflect",
     ]));
-    expect(protocol.auditExactlyOnce.status).toBe("blocked-main-correction-required");
-    expect(protocol.auditExactlyOnce.criterion).toMatch(/effect identity/i);
   });
 
   it("records the provisional resource campaign boundaries as measurements, not acceptance claims", () => {

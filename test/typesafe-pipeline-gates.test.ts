@@ -178,7 +178,7 @@ describe("TypeSafe pipeline decisions", () => {
       name: "test",
       compress: vi.fn(async (_system: string, prompt: string) => {
         expect(prompt).not.toContain("compacted-out-observation");
-        return '<entity type="concept" name="graph-gate-test"/>';
+        return '<entity type="concept" name="graph-gate-test" observations="1"/>';
       }),
     };
     registerGraphFunction(sdk as never, kv as never, provider as never, undefined, undefined, undefined, typeSafe as never);

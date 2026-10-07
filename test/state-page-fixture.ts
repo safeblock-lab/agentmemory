@@ -8,7 +8,15 @@ export function statePageFixture(
   const prefix = `${request.scope}:`;
   const values = [...entries]
     .filter(([key]) => key.startsWith(prefix))
-    .map(([, value]) => value);
+    .map(([, value]) => {
+      if (request.fields === undefined) return value;
+      const source = value && typeof value === "object" && !Array.isArray(value)
+        ? value as Record<string, unknown>
+        : {};
+      return Object.fromEntries(request.fields.flatMap((field) =>
+        Object.hasOwn(source, field) ? [[field, source[field]]] : [],
+      ));
+    });
   const offset = request.cursor === undefined ? 0 : Number(request.cursor);
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > values.length) {
     throw Object.assign(new Error("STATE_PAGE_CURSOR_INVALID"), { code: "STATE_PAGE_CURSOR_INVALID" });

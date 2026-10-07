@@ -79,7 +79,7 @@ describe("parser failure recovery", () => {
     expect(await s.h.kv.list(KV.graphNodes)).toHaveLength(2);
     expect(await s.h.kv.list(KV.graphEdges)).toHaveLength(1);
     expect(await s.h.kv.get(KV.graphSnapshot, "current")).toMatchObject({ stats: { totalNodes: 2, totalEdges: 1 } });
-    expect(await s.h.kv.list(KV.audit)).toHaveLength(1);
+    expect(await s.h.kv.list(KV.audit)).toHaveLength(0);
     expect(await s.h.kv.get(KV.batchCallbacks, `graph:${batchEffectKey(s.item.id)}`)).toMatchObject({ state: "completed" });
     expect(await s.h.kv.get(KV.fireworksBatchJobs, s.job.id)).toMatchObject({ state: "completed", parserRecovery: { activatedAt: expect.any(String) } });
     for (const scope of [KV.fireworksBatchActiveWork, KV.fireworksBatchActiveJobs]) expect(await s.h.kv.get(scope, "current")).toMatchObject({ ids: [] });
@@ -166,7 +166,7 @@ describe("parser failure recovery", () => {
     expect(await s.h.kv.get(KV.batchCallbacks, `graph:${batchEffectKey(s.item.id)}`)).toMatchObject({ state: "completed" });
     expect(await s.h.kv.list(KV.graphNodes)).toHaveLength(2);
     expect(await s.h.kv.list(KV.graphEdges)).toHaveLength(1);
-    expect(await s.h.kv.list(KV.audit)).toHaveLength(1);
+    expect(await s.h.kv.list(KV.audit)).toHaveLength(0);
   });
 
   it.each([false, 0, "", {}, { state: "started" }, { state: "completed" }])("blocks present or ambiguous receipts: %j", async (receipt) => {
@@ -227,7 +227,7 @@ describe("parser failure recovery", () => {
     expect(s.transport.uploadDataset).not.toHaveBeenCalled();
     expect(await s.h.kv.list(KV.graphNodes)).toHaveLength(14);
     expect(await s.h.kv.list(KV.graphEdges)).toHaveLength(7);
-    expect(await s.h.kv.list(KV.audit)).toHaveLength(7);
+    expect(await s.h.kv.list(KV.audit)).toHaveLength(0);
     for (const work of s.items) {
       expect(await s.h.kv.get(KV.batchCallbacks, `graph:${batchEffectKey(work.id)}`)).toMatchObject({ state: "completed" });
       expect(await s.h.kv.get(KV.fireworksBatchWorkItems, work.id)).toMatchObject({ state: "completed" });

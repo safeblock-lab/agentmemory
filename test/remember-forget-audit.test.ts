@@ -51,8 +51,8 @@ function mockSdk() {
   };
 }
 
-describe("mem::forget audit coverage (issue #125)", () => {
-  it("emits a single audit row when a memory is forgotten", async () => {
+describe("mem::forget without persistent audit history", () => {
+  it("deletes a memory without storing an audit row", async () => {
     const sdk = mockSdk();
     const kv = mockKV();
     registerRememberFunction(sdk as never, kv as never);
@@ -71,17 +71,11 @@ describe("mem::forget audit coverage (issue #125)", () => {
       targetIds: string[];
       details: Record<string, unknown>;
     }>("mem:audit");
-    expect(auditRows).toHaveLength(1);
-    const [row] = auditRows;
-    expect(row.operation).toBe("forget");
-    expect(row.functionId).toBe("mem::forget");
-    expect(row.targetIds).toEqual(["mem_a"]);
-    expect(row.details.memoriesDeleted).toBe(1);
-    expect(row.details.observationsDeleted).toBe(0);
-    expect(row.details.sessionDeleted).toBe(false);
+    expect(await kv.get("mem:memories", "mem_a")).toBeNull();
+    expect(auditRows).toHaveLength(0);
   });
 
-  it("emits one batched audit row when an entire session is forgotten", async () => {
+  it("forgets a session without storing an audit row", async () => {
     const sdk = mockSdk();
     const kv = mockKV();
     registerRememberFunction(sdk as never, kv as never);
@@ -90,6 +84,8 @@ describe("mem::forget audit coverage (issue #125)", () => {
     await kv.set("mem:summaries", "sess_1", { id: "sess_1" });
     await kv.set("mem:obs:sess_1", "obs_a", { id: "obs_a" });
     await kv.set("mem:obs:sess_1", "obs_b", { id: "obs_b" });
+    await kv.set("mem:access", "obs_a", { memoryId: "obs_a", count: 1 });
+    await kv.set("mem:access", "obs_b", { memoryId: "obs_b", count: 1 });
 
     await sdk.trigger({
       function_id: "mem::forget",
@@ -100,13 +96,34 @@ describe("mem::forget audit coverage (issue #125)", () => {
       targetIds: string[];
       details: Record<string, unknown>;
     }>("mem:audit");
-    expect(auditRows).toHaveLength(1);
-    const [row] = auditRows;
-    expect([...row.targetIds].sort()).toEqual(["obs_a", "obs_b"]);
-    expect(row.details.memoriesDeleted).toBe(0);
-    expect(row.details.observationsDeleted).toBe(2);
-    expect(row.details.sessionDeleted).toBe(true);
-    expect(row.details.deleted).toBe(4);
+    expect(await kv.get("mem:sessions", "sess_1")).toBeNull();
+    expect(await kv.get("mem:summaries", "sess_1")).toBeNull();
+    expect(await kv.list("mem:obs:sess_1")).toHaveLength(0);
+    expect(await kv.get("mem:access", "obs_a")).toBeNull();
+    expect(await kv.get("mem:access", "obs_b")).toBeNull();
+    expect(auditRows).toHaveLength(0);
+  });
+
+  it("removes only the forgotten observations' access logs", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerRememberFunction(sdk as never, kv as never);
+
+    await kv.set("mem:obs:sess_1", "obs_a", { id: "obs_a" });
+    await kv.set("mem:obs:sess_1", "obs_b", { id: "obs_b" });
+    await kv.set("mem:access", "obs_a", { memoryId: "obs_a", count: 1 });
+    await kv.set("mem:access", "obs_b", { memoryId: "obs_b", count: 1 });
+
+    const result = await sdk.trigger({
+      function_id: "mem::forget",
+      payload: { sessionId: "sess_1", observationIds: ["obs_a"] },
+    });
+
+    expect(result).toEqual({ success: true, deleted: 1 });
+    expect(await kv.get("mem:obs:sess_1", "obs_a")).toBeNull();
+    expect(await kv.get("mem:access", "obs_a")).toBeNull();
+    expect(await kv.get("mem:obs:sess_1", "obs_b")).not.toBeNull();
+    expect(await kv.get("mem:access", "obs_b")).not.toBeNull();
   });
 
   it("does not emit an audit row when nothing is deleted", async () => {

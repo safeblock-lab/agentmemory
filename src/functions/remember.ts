@@ -282,6 +282,7 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
             obsId,
           );
           await kv.delete(KV.observations(data.sessionId), obsId);
+          await deleteAccessLog(kv, obsId);
           if (obs?.imageData) await decrementImageRef(kv, sdk, obs.imageData);
           if (obs?.imageRef && obs.imageRef !== obs.imageData) {
             await decrementImageRef(kv, sdk, obs.imageRef);
@@ -303,6 +304,7 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
         );
         for (const obs of observations) {
           await kv.delete(KV.observations(data.sessionId), obs.id);
+          await deleteAccessLog(kv, obs.id);
           if (obs.imageData) await decrementImageRef(kv, sdk, obs.imageData);
           if (obs.imageRef && obs.imageRef !== obs.imageData) {
             await decrementImageRef(kv, sdk, obs.imageRef);

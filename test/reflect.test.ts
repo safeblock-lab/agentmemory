@@ -264,8 +264,8 @@ describe("Reflect", () => {
     it("handles LLM failure gracefully", async () => {
       provider.summarize.mockRejectedValue(new Error("LLM timeout"));
 
-      await kv.set("mem:graph:nodes", "node_a", makeConceptNode("concept_a"));
-      await kv.set("mem:graph:nodes", "node_b", makeConceptNode("concept_b"));
+      await kv.set("mem:graph:nodes", "node_concept_a", makeConceptNode("concept_a"));
+      await kv.set("mem:graph:nodes", "node_concept_b", makeConceptNode("concept_b"));
       await kv.set("mem:graph:edges", "edge_1", makeEdge("concept_a", "concept_b"));
       await kv.set("mem:semantic", "sem_1", makeSemantic("fact about concept_a"));
       await kv.set("mem:semantic", "sem_2", makeSemantic("fact about concept_b"));

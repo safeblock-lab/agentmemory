@@ -27,8 +27,11 @@ const REQUIRED_CAPABILITIES = [
   "state::get_versioned",
   "state::lease",
   "state::commit_batch",
-  "state::sqlite_wal_v1",
+  "state::sqlite_wal_v2",
+  "state::native_storage_v2",
   "state::shadow_migration_v1",
+  "state::terminal_retention_v1",
+  "state::scope_revision_v1",
 ];
 const BUILD_TIMEOUT_MS = 30 * 60 * 1000;
 const TARGETS = {
@@ -46,6 +49,7 @@ function fail(message) {
 
 function hasRequiredCapabilities(value) {
   return Array.isArray(value) &&
+    value.length === REQUIRED_CAPABILITIES.length &&
     REQUIRED_CAPABILITIES.every((capability) => value.includes(capability));
 }
 
@@ -142,12 +146,17 @@ function readNativeManifest(patchPath) {
   if (!hasRequiredCapabilities(value.capabilities)) {
     fail(`Native patch manifest must declare all ${REQUIRED_CAPABILITIES.length} required state capabilities.`);
   }
+  if (value.storageFormatVersion !== 2 || value.nativeFormatReady !== true || value.deploymentReady !== true) {
+    fail("Native storage V2 format and deployment readiness must be verified before staging.");
+  }
   return {
     patchSha256: patchHash.toLowerCase(),
     artifactSha256: value.artifactSha256.toLowerCase(),
     artifactBytes: value.artifactBytes,
     buildTarget: value.buildTarget,
-    deploymentReady: value.deploymentReady !== false,
+    storageFormatVersion: 2,
+    nativeFormatReady: true,
+    deploymentReady: true,
     artifactProfile: value.buildProfile?.name ?? null,
   };
 }
@@ -327,15 +336,15 @@ function buildBinary(target, sourceDir, buildDir) {
   return join(targetDir, target.triple, "release", target.executable);
 }
 
-function stageArtifact(binaryPath, key, target, buildDir, patchSha256, expectedNativeArtifact) {
+function stageArtifact(binaryPath, key, target, buildDir, patchSha256, nativeManifest, verifyBoundArtifact) {
   binaryPath = assertWorkspacePath(binaryPath, "Input engine binary");
   if (!existsSync(binaryPath)) fail(`Built engine executable is missing: ${binaryPath}`);
   verifyBinary(binaryPath);
-  if (expectedNativeArtifact) {
+  if (verifyBoundArtifact) {
     if (
-      (expectedNativeArtifact.buildTarget && expectedNativeArtifact.buildTarget !== target.triple) ||
-      (expectedNativeArtifact.artifactBytes && statSync(binaryPath).size !== expectedNativeArtifact.artifactBytes) ||
-      (expectedNativeArtifact.artifactSha256 && hashFile(binaryPath) !== expectedNativeArtifact.artifactSha256)
+      (nativeManifest.buildTarget && nativeManifest.buildTarget !== target.triple) ||
+      (nativeManifest.artifactBytes && statSync(binaryPath).size !== nativeManifest.artifactBytes) ||
+      (nativeManifest.artifactSha256 && hashFile(binaryPath) !== nativeManifest.artifactSha256)
     ) {
       fail("Native staged executable does not match its source manifest target, size, or SHA-256.");
     }
@@ -379,6 +388,9 @@ function stageArtifact(binaryPath, key, target, buildDir, patchSha256, expectedN
   const manifest = {
     schemaVersion: 1,
     engineVersion: VERSION,
+    storageFormatVersion: nativeManifest.storageFormatVersion,
+    nativeFormatReady: nativeManifest.nativeFormatReady,
+    deploymentReady: nativeManifest.deploymentReady,
     capabilities: REQUIRED_CAPABILITIES,
     source: {
       repository: REPOSITORY,
@@ -417,7 +429,8 @@ export function buildIiiEngine({ binary = null, platform = process.platform, arc
     target,
     buildDir,
     nativeManifest.patchSha256,
-    binary ? nativeManifest : null,
+    nativeManifest,
+    Boolean(binary),
   );
 }
 

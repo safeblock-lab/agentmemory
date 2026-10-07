@@ -1,9 +1,9 @@
 import type { IIIClient } from 'iii-sdk'
 import {
-  commitStateBatch, getVersionedState, requestStateLease,
+  commitStateBatch, getVersionedState, requestStateLease, pruneStateWork,
   type StateBatchReceipt, type StateGraphGuard, type StateGraphLease,
   type StateLeaseReleased, type StateLeaseRequest, type StatePreparedBatch,
-  type StateTransactionTrigger, type StateVersioned,
+  type StateTransactionTrigger, type StateVersioned, type StateGraphPruneRequest, type StateAuditPruneRequest, type StatePruneResult,
 } from './state-transactions.js'
 import {
   iterateStatePages,
@@ -12,6 +12,7 @@ import {
   type StatePage,
   type StatePageOptions,
   type StatePageRequest,
+  type StateScopeRevision,
 } from './state-pages.js'
 
 export type { StatePage, StatePageOptions } from './state-pages.js'
@@ -39,6 +40,14 @@ export class StateKV {
 
   commitBatch(guard: StateGraphGuard, prepared: StatePreparedBatch): Promise<StateBatchReceipt> {
     return commitStateBatch(this.transactionTrigger, guard, prepared)
+  }
+
+  pruneTerminalGraphJob(request: StateGraphPruneRequest): Promise<StatePruneResult> {
+    return pruneStateWork(this.transactionTrigger, request)
+  }
+
+  pruneHistoricalAudit(request: StateAuditPruneRequest): Promise<StatePruneResult> {
+    return pruneStateWork(this.transactionTrigger, request)
   }
 
   async get<T = unknown>(scope: string, key: string): Promise<T | null> {
@@ -99,6 +108,13 @@ export class StateKV {
       scope,
       options,
     )
+  }
+
+  scopeRevision(scope: string, prefix = false): Promise<StateScopeRevision> {
+    return this.sdk.trigger<{ scope: string; prefix: boolean }, StateScopeRevision>({
+      function_id: 'state::scope_revision_v1',
+      payload: { scope, prefix },
+    })
   }
 
   async *values<T = unknown>(scope: string, options?: StatePageOptions): AsyncGenerator<T> {

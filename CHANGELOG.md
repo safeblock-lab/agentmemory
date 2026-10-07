@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.83] — 2026-10-06
+
+### Fixed
+
+- Read large graph records through projected ID pages and point reads. Stream snapshots to a temporary file with backpressure before publication.
+- Page exports across every collection with explicit response limits and restore metadata; include large graph nodes without silently dropping records.
+- Make terminal graph-job closure atomic with bounded physical cleanup, and continue safe maintenance of eligible older jobs. Stop producing new audit rows while preserving historical reads.
+- Show only the latest 20 timeline operations without deleting observations needed by recall.
+- Allow operators to pause startup index repair and vector backfill, summary recovery, and graph recovery/terminal retention with `AGENTMEMORY_BACKGROUND_RECOVERY_PAUSED=1`.
+
+## [0.9.82] — 2026-10-06
+
+### Fixed
+
+- Bound semantic consolidation input to 8 KiB of UTF-8 prompt JSON with provenance-preserving evidence and candidate reduction. Oversized individual sources retain their checkpoint and fail locally.
+- Defer snapshots while shared state reads are degraded and return a retryable REST status; retry envelopes without silently accepting malformed responses as empty state.
+- Compare historical graph oracle provenance and the current native manifest against their respective frozen source receipts.
+
+### Release
+
+- Add native SQLite V2 lossless value compression, compact bidirectional membership indexes, and resumable SQLite shadow migration with complete decoded parity and structural checks. The complete frozen pilot decreased from 15,457,689,600 to 9,095,467,008 bytes with all logical data retained.
+- Require exact V2 engine capabilities and reuse the verified public Qwen model, CPU runtime and notices. Include export/import compatibility for 0.9.82.
+
 ## [0.9.74] — 2026-09-29
 
 ### Fixed

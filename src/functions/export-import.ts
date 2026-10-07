@@ -6,6 +6,7 @@ import type {
   SessionSummary,
   ProjectProfile,
   ExportData,
+  ExportCollection,
   GraphNode,
   GraphEdge,
   SemanticMemory,
@@ -23,10 +24,13 @@ import type {
   Insight,
   AccessLogExport,
 } from "../types.js";
+import { EXPORT_COLLECTIONS } from "../types.js";
 import { importOrigin } from "../types.js";
 import { normalizeAccessLog } from "./access-tracker.js";
 import { KV } from "../state/schema.js";
-import { checkPayloadFrameSize } from "../state/frame-guard.js";
+import {
+  checkPayloadFrameSize,
+} from "../state/frame-guard.js";
 import { StateKV } from "../state/kv.js";
 import { VERSION } from "../version.js";
 import { recordAudit } from "./audit.js";
@@ -36,6 +40,11 @@ import { logger } from "../logger.js";
 import { withBatchMutationLocks, preserveBatchProvenance, effectMetadata } from "../state/batch-effects.js";
 import type { BatchEffectMetadata } from "../types.js";
 import { graphKV, graphTransactionFailure, registerGraphJobHandler, runGraphJob, withCompletedGraphRead, withGraphDelta } from "./graph-jobs.js";
+import {
+  collectProjectedRecords,
+  iterateProjectedRecordIds,
+} from "./projected-record-reader.js";
+import { pageExportCollection } from "./export-pagination.js";
 
 // Bounded-concurrency chunk size for the import delete/write loops. A
 // "replace" or "merge" of a large export (up to MAX_TOTAL_OBSERVATIONS,
@@ -44,6 +53,64 @@ import { graphKV, graphTransactionFailure, registerGraphJobHandler, runGraphJob,
 // 20 keeps per-chunk fan-out low enough not to overwhelm the state
 // backend while collapsing wallclock by ~20x versus the serial path.
 const IMPORT_CHUNK_SIZE = 20;
+const DEFAULT_EXPORT_PAGE_LIMIT = 100;
+const MAX_EXPORT_PAGE_LIMIT = 1_000;
+
+function exportCollectionPage(
+  collection: ExportCollection,
+  records: unknown[],
+  page: { limit: number; collectionRevision: string; hasMore: boolean; nextCursor?: string; total?: number },
+): ExportData {
+  const result: ExportData = {
+    version: VERSION,
+    exportedAt: new Date().toISOString(),
+    sessions: [],
+    observations: {},
+    memories: [],
+    summaries: [],
+    pagination: { ...page, collection },
+  };
+  switch (collection) {
+    case "sessions": result.sessions = records as Session[]; break;
+    case "observations":
+      for (const row of records as Array<{ sessionId: string; observation: CompressedObservation }>) {
+        (result.observations[row.sessionId] ??= []).push(row.observation);
+      }
+      break;
+    case "memories": result.memories = records as Memory[]; break;
+    case "summaries": result.summaries = records as SessionSummary[]; break;
+    case "profiles": result.profiles = records as ProjectProfile[]; break;
+    case "graphNodes": result.graphNodes = records as GraphNode[]; break;
+    case "graphEdges": result.graphEdges = records as GraphEdge[]; break;
+    case "semanticMemories": result.semanticMemories = records as SemanticMemory[]; break;
+    case "proceduralMemories": result.proceduralMemories = records as ProceduralMemory[]; break;
+    case "actions": result.actions = records as Action[]; break;
+    case "actionEdges": result.actionEdges = records as ActionEdge[]; break;
+    case "routines": result.routines = records as Routine[]; break;
+    case "signals": result.signals = records as Signal[]; break;
+    case "checkpoints": result.checkpoints = records as Checkpoint[]; break;
+    case "sentinels": result.sentinels = records as Sentinel[]; break;
+    case "sketches": result.sketches = records as Sketch[]; break;
+    case "crystals": result.crystals = records as Crystal[]; break;
+    case "facets": result.facets = records as Facet[]; break;
+    case "lessons": result.lessons = records as Lesson[]; break;
+    case "insights": result.insights = records as Insight[]; break;
+    case "accessLogs": result.accessLogs = records as AccessLogExport[]; break;
+  }
+  return result;
+}
+
+async function hasAppliedBatchEffects(kv: StateKV, scope: string): Promise<boolean> {
+  for await (const page of kv.pages<BatchEffectMetadata>(scope, {
+    fields: ["appliedBatchEffects"],
+    limit: 256,
+  })) {
+    for (const record of page.items) {
+      if (effectMetadata(record).appliedBatchEffects?.length) return true;
+    }
+  }
+  return false;
+}
 
 // Run `fn` over `items` in fixed-size chunks, awaiting each chunk before
 // starting the next. Preserves ordering guarantees across chunks (chunk N
@@ -79,7 +146,7 @@ export function registerExportImportFunction(sdk: IIIClient, kv: StateKV): void 
       }
       if (data.strategy === "replace") {
         for (const scope of [KV.graphNodes, KV.graphEdges]) {
-          for await (const row of kv.values<{ id: string }>(scope)) await kv.delete(scope, row.id);
+          for await (const id of iterateProjectedRecordIds(kv, scope)) await kv.delete(scope, id);
         }
       }
       for (const row of preparedRows) await kv.set(row.scope, row.key, row.value);
@@ -88,7 +155,45 @@ export function registerExportImportFunction(sdk: IIIClient, kv: StateKV): void 
   }, durableId);
   registerGraphJobHandler(kv, "replace", (input, id) => importGraph(input as GraphImport, id));
   sdk.registerFunction("mem::export", 
-    async (data?: { maxSessions?: number; offset?: number }) => withCompletedGraphRead(kv, async () => {
+    async (data?: { maxSessions?: number; offset?: number; collection?: ExportCollection; limit?: number; cursor?: string }) => withCompletedGraphRead(kv, async () => {
+      if (data?.collection !== undefined && !(EXPORT_COLLECTIONS as readonly string[]).includes(data.collection)) {
+        return { success: false, error: "Invalid export collection" };
+      }
+      if (data?.collection !== undefined) {
+        const rawOffset = data.offset ?? 0;
+        const rawLimit = data.limit ?? DEFAULT_EXPORT_PAGE_LIMIT;
+        if (!Number.isSafeInteger(rawOffset) || rawOffset < 0) {
+          return { success: false, error: "offset must be a non-negative safe integer" };
+        }
+        if (rawOffset !== 0) {
+          return { success: false, error: "Offset continuation is no longer supported; continue with the returned cursor" };
+        }
+        if (data.cursor !== undefined && (typeof data.cursor !== "string" || data.cursor.length === 0)) {
+          return { success: false, error: "cursor must be a non-empty string" };
+        }
+        if (!Number.isSafeInteger(rawLimit) || rawLimit < 1 || rawLimit > MAX_EXPORT_PAGE_LIMIT) {
+          return { success: false, error: `limit must be an integer from 1 to ${MAX_EXPORT_PAGE_LIMIT}` };
+        }
+        let page;
+        try {
+          page = await pageExportCollection(kv, data.collection, data.cursor, rawLimit);
+        } catch (error) {
+          return { success: false, error: error instanceof Error ? error.message : "STATE_EXPORT_PAGE_FAILED" };
+        }
+        const exportData = exportCollectionPage(data.collection, page.records, {
+          limit: rawLimit,
+          collectionRevision: page.collectionRevision,
+          hasMore: page.hasMore,
+          ...(page.nextCursor === undefined ? {} : { nextCursor: page.nextCursor }),
+          ...(page.total === undefined ? {} : { total: page.total }),
+        });
+        const oversized = checkPayloadFrameSize(
+          exportData,
+          "reduce limit or fetch a later collection page; an individual oversized record cannot be split",
+        );
+        return oversized ?? exportData;
+      }
+
       const rawMax = Number(data?.maxSessions);
       const maxSessions = Number.isFinite(rawMax) && rawMax > 0 ? Math.min(Math.floor(rawMax), 1000) : undefined;
       const rawOffset = Number(data?.offset);
@@ -145,8 +250,8 @@ export function registerExportImportFunction(sdk: IIIClient, kv: StateKV): void 
         checkpoints,
         accessLogs,
       ] = await Promise.all([
-        kv.list<GraphNode>(KV.graphNodes),
-        kv.list<GraphEdge>(KV.graphEdges),
+        collectProjectedRecords<GraphNode>(kv, KV.graphNodes),
+        collectProjectedRecords<GraphEdge>(kv, KV.graphEdges),
         kv.list<SemanticMemory>(KV.semantic).catch(() => []),
         kv.list<ProceduralMemory>(KV.procedural).catch(() => []),
         kv.list<Action>(KV.actions).catch(() => []),
@@ -212,11 +317,11 @@ export function registerExportImportFunction(sdk: IIIClient, kv: StateKV): void 
         summaries: summaries.length,
       });
 
-      // Only session collections page on ?maxSessions/?offset, so a large
-      // store can exceed the transport cap even at ?maxSessions=1.
+      // Legacy maxSessions/offset pages only the session collections, so a
+      // large non-session collection can still exceed the response cap.
       const oversized = checkPayloadFrameSize(
         exportData,
-        "narrow the range with ?maxSessions / ?offset, or export fewer collections; the non-session collections (memories, graph, semantic, actions, lessons, ...) are not yet paginated",
+        "use collection with offset and limit to export every collection in bounded, importable pages",
       );
       if (oversized) {
         logger.warn("Export exceeds transport frame limit", {
@@ -252,7 +357,7 @@ export function registerExportImportFunction(sdk: IIIClient, kv: StateKV): void 
         )))) return { success: false, error: "Invalid batch effect metadata" };
       }
 
-      const supportedVersions = new Set(["0.3.0", "0.4.0", "0.5.0", "0.6.0", "0.6.1", "0.7.0", "0.7.2", "0.7.3", "0.7.4", "0.7.5", "0.7.6", "0.7.7", "0.7.9", "0.8.0", "0.8.1", "0.8.2", "0.8.3", "0.8.4", "0.8.5", "0.8.6", "0.8.7", "0.8.8", "0.8.9", "0.8.10", "0.8.11", "0.8.12", "0.8.13", "0.9.0", "0.9.1", "0.9.2", "0.9.3", "0.9.4", "0.9.5", "0.9.6", "0.9.7", "0.9.8", "0.9.9", "0.9.10", "0.9.11", "0.9.12", "0.9.13", "0.9.14", "0.9.15", "0.9.16", "0.9.17", "0.9.18", "0.9.19", "0.9.20", "0.9.21", "0.9.22", "0.9.23", "0.9.24", "0.9.25", "0.9.26", "0.9.27", "0.9.28", "0.9.29", "0.9.30", "0.9.31", "0.9.32", "0.9.33", "0.9.34", "0.9.35", "0.9.36", "0.9.37", "0.9.38", "0.9.39", "0.9.40", "0.9.41", "0.9.42", "0.9.43", "0.9.44", "0.9.45", "0.9.46", "0.9.47", "0.9.48", "0.9.49", "0.9.50", "0.9.51", "0.9.52", "0.9.53", "0.9.54", "0.9.55", "0.9.56", "0.9.57", "0.9.58", "0.9.59", "0.9.60", "0.9.61", "0.9.62", "0.9.63", "0.9.64", "0.9.65", "0.9.66", "0.9.67", "0.9.68", "0.9.69", "0.9.70", "0.9.71", "0.9.72", "0.9.73", "0.9.74", "0.9.75", "0.9.76", "0.9.77", "0.9.78", "0.9.79", "0.9.80", "0.9.81"]);
+      const supportedVersions = new Set(["0.3.0", "0.4.0", "0.5.0", "0.6.0", "0.6.1", "0.7.0", "0.7.2", "0.7.3", "0.7.4", "0.7.5", "0.7.6", "0.7.7", "0.7.9", "0.8.0", "0.8.1", "0.8.2", "0.8.3", "0.8.4", "0.8.5", "0.8.6", "0.8.7", "0.8.8", "0.8.9", "0.8.10", "0.8.11", "0.8.12", "0.8.13", "0.9.0", "0.9.1", "0.9.2", "0.9.3", "0.9.4", "0.9.5", "0.9.6", "0.9.7", "0.9.8", "0.9.9", "0.9.10", "0.9.11", "0.9.12", "0.9.13", "0.9.14", "0.9.15", "0.9.16", "0.9.17", "0.9.18", "0.9.19", "0.9.20", "0.9.21", "0.9.22", "0.9.23", "0.9.24", "0.9.25", "0.9.26", "0.9.27", "0.9.28", "0.9.29", "0.9.30", "0.9.31", "0.9.32", "0.9.33", "0.9.34", "0.9.35", "0.9.36", "0.9.37", "0.9.38", "0.9.39", "0.9.40", "0.9.41", "0.9.42", "0.9.43", "0.9.44", "0.9.45", "0.9.46", "0.9.47", "0.9.48", "0.9.49", "0.9.50", "0.9.51", "0.9.52", "0.9.53", "0.9.54", "0.9.55", "0.9.56", "0.9.57", "0.9.58", "0.9.59", "0.9.60", "0.9.61", "0.9.62", "0.9.63", "0.9.64", "0.9.65", "0.9.66", "0.9.67", "0.9.68", "0.9.69", "0.9.70", "0.9.71", "0.9.72", "0.9.73", "0.9.74", "0.9.75", "0.9.76", "0.9.77", "0.9.78", "0.9.79", "0.9.80", "0.9.81", "0.9.82", "0.9.83"]);
       if (!supportedVersions.has(importData.version)) {
         return {
           success: false,
@@ -383,9 +488,7 @@ export function registerExportImportFunction(sdk: IIIClient, kv: StateKV): void 
           // whose identities do not carry a same-record receipt array.
           if ((await kv.list(KV.batchCallbacks)).length) return { success: false, error: "Replace blocked: existing batch callback receipts must be preserved; use merge" };
           for (const scope of [...protectedScopes, KV.graphSnapshot]) {
-            for (const record of await kv.list<BatchEffectMetadata>(scope)) {
-              if (effectMetadata(record).appliedBatchEffects?.length) return { success: false, error: "Replace blocked: existing batch effect metadata must be preserved; use merge" };
-            }
+            if (await hasAppliedBatchEffects(kv, scope)) return { success: false, error: "Replace blocked: existing batch effect metadata must be preserved; use merge" };
           }
         }
         // This preflight runs under maintenance, before any delete/write. A

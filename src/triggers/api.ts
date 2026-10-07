@@ -2,6 +2,7 @@ import type { IIIClient } from "iii-sdk";
 import type { HttpRequest } from "@iii-dev/helpers/http";
 import { randomBytes } from "node:crypto";
 import type { Session, CompressedObservation, HookPayload, CommitLink, SessionSummary } from "../types.js";
+import { EXPORT_COLLECTIONS, type ExportCollection, type GraphEdge, type GraphNode } from "../types.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { KV } from "../state/schema.js";
 import { checkPayloadFrameSize } from "../state/frame-guard.js";
@@ -26,6 +27,7 @@ import { renderViewerDocument } from "../viewer/document.js";
 import { getBoundViewerPort, getViewerSkipped } from "../viewer/server.js";
 import { MAX_FILES_UPPER_BOUND } from "../functions/replay.js";
 import { logger } from "../logger.js";
+import { collectProjectedRecords } from "../functions/projected-record-reader.js";
 import {
   isGraphExtractionEnabled,
   isConsolidationEnabled,
@@ -279,14 +281,39 @@ export function registerApiTriggers(
     },
   });
 
-  sdk.registerFunction("api::health", 
+  const STATUS_CHECK_TIMEOUT_MS = 5000;
+
+  sdk.registerFunction("api::health",
     async (): Promise<Response> => {
-      const health = await getLatestHealth(kv);
-      const functionMetrics = metricsStore ? await metricsStore.getAll() : [];
+      const [health, functionMetrics] = await Promise.all([
+        valueWithin(getLatestHealth(kv), STATUS_CHECK_TIMEOUT_MS),
+        metricsStore
+          ? valueWithin(metricsStore.getAll(), STATUS_CHECK_TIMEOUT_MS)
+          : Promise.resolve([]),
+      ]);
       const circuitBreaker =
         provider && "circuitState" in provider ? provider.circuitState : null;
 
-      const status = health?.status || "healthy";
+      const unavailableComponents = [
+        ...(health === null ? ["health"] : []),
+        ...(functionMetrics === null ? ["functionMetrics"] : []),
+      ];
+      if (health === null || functionMetrics === null) {
+        return {
+          status_code: 503,
+          body: {
+            status: "unavailable",
+            version: VERSION,
+            health,
+            functionMetrics: functionMetrics ?? [],
+            unavailableComponents,
+            circuitBreaker,
+            ...instanceInfo(),
+          },
+        };
+      }
+
+      const status = health.status;
       const statusCode = status === "critical" ? 503 : 200;
 
       return {
@@ -294,7 +321,7 @@ export function registerApiTriggers(
         body: {
           status,
           version: VERSION,
-          health: health || null,
+          health,
           functionMetrics,
           circuitBreaker,
           ...instanceInfo(),
@@ -311,8 +338,6 @@ export function registerApiTriggers(
       middleware_function_ids: ["middleware::api-auth"],
     },
   });
-
-  const STATUS_CHECK_TIMEOUT_MS = 5000;
 
   async function valueWithin<T>(work: Promise<T>, ms: number): Promise<T | null> {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1449,26 +1474,61 @@ export function registerApiTriggers(
     async (req: HttpRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      // mem::export already supports maxSessions/offset internally,
-      // but the HTTP endpoint hardcoded an empty payload — so /export on a
-      // real corpus (40 sessions × 34K observations × 8K memories) hit the
-      // iii engine invocation timeout and `agentmemory status` reported 0.
-      // Pass through the query-string pagination so callers can chunk.
+      // Keep legacy session pagination and expose a collection page contract
+      // for complete exports whose non-session data exceeds the frame cap.
       const rawMax = req.query_params?.["maxSessions"];
       const rawOffset = req.query_params?.["offset"];
-      const payload: { maxSessions?: number; offset?: number } = {};
+      const rawCollection = req.query_params?.["collection"];
+      const rawLimit = req.query_params?.["limit"];
+      const rawCursor = req.query_params?.["cursor"];
+      const payload: { maxSessions?: number; offset?: number; collection?: ExportCollection; limit?: number; cursor?: string } = {};
+      if (rawCollection !== undefined) {
+        if (typeof rawCollection !== "string" || !(EXPORT_COLLECTIONS as readonly string[]).includes(rawCollection)) {
+          return { status_code: 400, body: { error: "Invalid export collection" } };
+        }
+        payload.collection = rawCollection as ExportCollection;
+      } else if (rawLimit !== undefined) {
+        return { status_code: 400, body: { error: "collection is required when limit is provided" } };
+      }
       if (typeof rawMax === "string") {
         const n = Number(rawMax);
         if (Number.isInteger(n) && n > 0) payload.maxSessions = n;
       }
       if (typeof rawOffset === "string") {
         const n = Number(rawOffset);
-        if (Number.isInteger(n) && n >= 0) payload.offset = n;
+        if (payload.collection !== undefined) {
+          if (!Number.isSafeInteger(n) || n < 0) return { status_code: 400, body: { error: "offset must be a non-negative safe integer" } };
+          if (n !== 0) return { status_code: 400, body: { error: "Offset continuation is no longer supported; pass the returned cursor" } };
+        } else if (Number.isInteger(n) && n >= 0) {
+          payload.offset = n;
+        }
+      } else if (rawOffset !== undefined) {
+        return { status_code: 400, body: { error: "offset must be a non-negative integer" } };
+      }
+      if (rawCursor !== undefined) {
+        if (payload.collection === undefined) return { status_code: 400, body: { error: "collection is required when cursor is provided" } };
+        if (typeof rawCursor !== "string" || rawCursor.length === 0 || Buffer.byteLength(rawCursor, "utf8") > 32 * 1024) {
+          return { status_code: 400, body: { error: "cursor must be a non-empty string no longer than 32768 bytes" } };
+        }
+        payload.cursor = rawCursor;
+      }
+      if (rawLimit !== undefined) {
+        if (typeof rawLimit !== "string" || !/^\d+$/.test(rawLimit)) {
+          return { status_code: 400, body: { error: "limit must be an integer from 1 to 1000" } };
+        }
+        const n = Number(rawLimit);
+        if (!Number.isSafeInteger(n) || n < 1 || n > 1_000) {
+          return { status_code: 400, body: { error: "limit must be an integer from 1 to 1000" } };
+        }
+        payload.limit = n;
       }
       const result = await sdk.trigger({
         function_id: "mem::export",
         payload,
       });
+      if (result && typeof result === "object" && (result as { oversized?: unknown }).oversized === true) {
+        return { status_code: 413, body: result };
+      }
       return { status_code: 200, body: result };
     },
   );
@@ -2021,9 +2081,12 @@ export function registerApiTriggers(
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
       try {
-        const result = await sdk.trigger({ function_id: "mem::snapshot-create", payload: req.body || {},
-         });
-        return { status_code: 201, body: result };
+        const result = await sdk.trigger<{ message?: string }, { success: boolean; deferred?: boolean; code?: string }>({
+          function_id: "mem::snapshot-create", payload: req.body || {}, timeoutMs: 10 * 60 * 1000,
+        });
+        const status = result?.success === true ? 201
+          : result?.deferred === true || result?.code === "BATCH_MAINTENANCE_BUSY" ? 503 : 500;
+        return { status_code: status, body: result };
       } catch {
         return { status_code: 404, body: { error: "Snapshots not enabled" } };
       }
@@ -3000,8 +3063,8 @@ export function registerApiTriggers(
         const semantic = await kv.list<import("../types.js").SemanticMemory>(KV.semantic);
         const procedural = await kv.list<import("../types.js").ProceduralMemory>(KV.procedural);
         const relations = await kv.list<import("../types.js").MemoryRelation>(KV.relations);
-        const graphNodes = await kv.list<import("../types.js").GraphNode>(KV.graphNodes);
-        const graphEdges = await kv.list<import("../types.js").GraphEdge>(KV.graphEdges);
+        const graphNodes = await collectProjectedRecords<GraphNode>(kv, KV.graphNodes);
+        const graphEdges = await collectProjectedRecords<GraphEdge>(kv, KV.graphEdges);
         body.semantic = df(semantic, "updatedAt");
         body.procedural = df(procedural, "updatedAt");
         body.relations = df(relations, "createdAt");

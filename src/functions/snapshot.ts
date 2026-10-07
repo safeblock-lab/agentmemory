@@ -1,8 +1,11 @@
 import type { IIIClient } from "iii-sdk";
-import { withBatchMutationLocks, preserveBatchProvenance } from "../state/batch-effects.js";
+import { BatchMaintenanceBusyError, withBatchMutationLocks, preserveBatchProvenance } from "../state/batch-effects.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { rename, rm } from "node:fs/promises";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { join } from "node:path";
 import type {
   SnapshotMeta,
@@ -17,6 +20,7 @@ import { recordAudit } from "./audit.js";
 import { VERSION } from "../version.js";
 import { logger } from "../logger.js";
 import { graphKV, registerGraphJobHandler, runGraphJob, withCompletedGraphRead, withGraphDelta } from "./graph-jobs.js";
+import { iterateProjectedRecords } from "./projected-record-reader.js";
 
 const COMMIT_HASH_RE = /^[0-9a-f]{7,40}$/i;
 
@@ -35,6 +39,114 @@ async function ensureGitRepo(dir: string): Promise<void> {
     await gitExec(dir, ["init"]);
     await gitExec(dir, ["config", "user.email", "agentmemory@local"]);
     await gitExec(dir, ["config", "user.name", "agentmemory"]);
+  }
+}
+
+function serializeSnapshotValue(value: unknown, indent: string): string {
+  const serialized = JSON.stringify(value, null, 2);
+  if (serialized === undefined) throw new Error("Snapshot contains a non-serializable value");
+  return `${indent}${serialized.replace(/\n/g, `\n${indent}`)}`;
+}
+
+async function* snapshotJsonArray<T>(
+  values: Iterable<T> | AsyncIterable<T>,
+  itemIndent: string,
+  closingIndent: string,
+  onValue?: () => void,
+): AsyncGenerator<string> {
+  yield "[";
+  let first = true;
+  for await (const value of values) {
+    if (!first) yield ",";
+    yield `\n${serializeSnapshotValue(value, itemIndent)}`;
+    onValue?.();
+    first = false;
+  }
+  if (!first) yield `\n${closingIndent}`;
+  yield "]";
+}
+
+async function* prependValue<T>(first: T, values: AsyncIterator<T>): AsyncGenerator<T> {
+  yield first;
+  for (;;) {
+    const next = await values.next();
+    if (next.done) return;
+    yield next.value;
+  }
+}
+
+interface SnapshotStats {
+  observations: number;
+  graphNodes: number;
+}
+
+async function* snapshotJson(
+  kv: StateKV,
+  timestamp: string,
+  sessions: Session[],
+  memories: Memory[],
+  accessLogs: AccessLogExport[],
+  stats: SnapshotStats,
+): AsyncGenerator<string> {
+  yield `{"version":${JSON.stringify(VERSION)},"timestamp":${JSON.stringify(timestamp)},\n  "sessions":`;
+  yield* snapshotJsonArray(sessions, "    ", "  ");
+  yield ",\n  \"memories\":";
+  yield* snapshotJsonArray(memories, "    ", "  ");
+  yield ",\n  \"graphNodes\":";
+  yield* snapshotJsonArray(
+    iterateProjectedRecords<GraphNode>(kv, KV.graphNodes),
+    "    ",
+    "  ",
+    () => { stats.graphNodes++; },
+  );
+  yield ",\n  \"observations\":{";
+  let firstSession = true;
+  for (const session of sessions) {
+    const observations = kv.values<Record<string, unknown>>(KV.observations(session.id))[Symbol.asyncIterator]();
+    const first = await observations.next();
+    if (first.done) continue;
+    if (!firstSession) yield ",";
+    yield `\n    ${JSON.stringify(session.id)}:`;
+    yield* snapshotJsonArray(
+      prependValue(first.value, observations),
+      "      ",
+      "    ",
+      () => { stats.observations++; },
+    );
+    firstSession = false;
+  }
+  if (!firstSession) yield "\n  ";
+  yield "},\n  \"accessLogs\":";
+  yield* snapshotJsonArray(accessLogs, "    ", "  ");
+  yield "\n}\n";
+}
+
+async function writeSnapshotAtomically(
+  kv: StateKV,
+  snapshotDir: string,
+  timestamp: string,
+  sessions: Session[],
+  memories: Memory[],
+  accessLogs: AccessLogExport[],
+  stats: SnapshotStats,
+): Promise<void> {
+  const statePath = join(snapshotDir, "state.json");
+  const temporaryPath = join(snapshotDir, `.state-${generateId("write")}.tmp`);
+  try {
+    await withCompletedGraphRead(kv, () => pipeline(
+      Readable.from(snapshotJson(kv, timestamp, sessions, memories, accessLogs, stats)),
+      createWriteStream(temporaryPath, { flags: "wx", encoding: "utf8" }),
+    ));
+    await rename(temporaryPath, statePath);
+  } catch (error) {
+    try {
+      await rm(temporaryPath, { force: true });
+    } catch (cleanupError) {
+      logger.warn("Snapshot temporary file cleanup failed", {
+        error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+      });
+    }
+    throw error;
   }
 }
 
@@ -73,38 +185,21 @@ export function registerSnapshotFunction(
 
           const sessions = await kv.list<Session>(KV.sessions);
           const memories = await kv.list<Memory>(KV.memories);
-          const graphNodes = await withCompletedGraphRead(kv, () => kv.list<GraphNode>(KV.graphNodes));
           const accessLogs = await kv
             .list<AccessLogExport>(KV.accessLog)
             .catch(() => [] as AccessLogExport[]);
-
-          const observations: Record<string, unknown[]> = {};
-          for (const session of sessions) {
-            const obs = await kv
-              .list(KV.observations(session.id))
-              .catch(() => []);
-            if (obs.length > 0) {
-              observations[session.id] = obs;
-            }
-          }
-
-          const state = {
-            version: VERSION,
-            timestamp: ts,
+          const stats = { observations: 0, graphNodes: 0 } satisfies SnapshotStats;
+          await writeSnapshotAtomically(
+            kv,
+            snapshotDir,
+            ts,
             sessions,
             memories,
-            graphNodes,
-            observations,
             accessLogs,
-          };
-
-          writeFileSync(
-            join(snapshotDir, "state.json"),
-            JSON.stringify(state, null, 2),
-            "utf-8",
+            stats,
           );
 
-          await gitExec(snapshotDir, ["add", "."]);
+          await gitExec(snapshotDir, ["add", "--", "state.json"]);
 
           const message = data?.message || `Snapshot ${ts}`;
           try {
@@ -127,12 +222,9 @@ export function registerSnapshotFunction(
             message,
             stats: {
               sessions: sessions.length,
-              observations: Object.values(observations).reduce(
-                (sum, arr) => sum + arr.length,
-                0,
-              ),
+              observations: stats.observations,
               memories: memories.length,
-              graphNodes: graphNodes.length,
+              graphNodes: stats.graphNodes,
             },
           };
 
@@ -145,6 +237,10 @@ export function registerSnapshotFunction(
           return { success: true, snapshot: meta };
         });
       } catch (err) {
+        if (err instanceof BatchMaintenanceBusyError) {
+          logger.warn("Snapshot deferred", { code: err.code, ...err.details });
+          return { success: false, deferred: true, retryable: true, code: err.code, error: err.message, details: err.details };
+        }
         const msg = err instanceof Error ? err.message : String(err);
         logger.error("Snapshot failed", { error: msg });
         return { success: false, error: msg };

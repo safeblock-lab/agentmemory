@@ -3,6 +3,7 @@ import { gzipSync } from "node:zlib";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { UPDATE_HELPER_SOURCE } from "../src/update/helper-source.js";
@@ -43,7 +44,29 @@ function releaseResponse() {
   }), { status: 200 });
 }
 
-function runReadinessUpdate(options: {
+async function stopFakeService(pidPath: string): Promise<void> {
+  if (!existsSync(pidPath)) return;
+  const pid = Number(readFileSync(pidPath, "utf8"));
+  if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("Invalid fake service PID");
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+    throw error;
+  }
+  for (let attempt = 0; attempt < 100; attempt++) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+      throw error;
+    }
+    await delay(50);
+  }
+  throw new Error(`Fake service process ${pid} did not exit`);
+}
+
+async function runReadinessUpdate(options: {
   livez?: Array<{ viewerPort: number | null; viewerSkipped: boolean }>;
   versions: string[];
   engineStates: Array<"connected" | "disconnected">;
@@ -130,13 +153,12 @@ function runReadinessUpdate(options: {
     const status = JSON.parse(readFileSync(statusPath, "utf8"));
     const trace = JSON.parse(readFileSync(tracePath, "utf8")) as string[];
     const log = existsSync(join(root, "update.log")) ? readFileSync(join(root, "update.log"), "utf8") : "";
-    const fakePid = existsSync(pidPath) ? Number(readFileSync(pidPath, "utf8")) : 0;
-    if (fakePid > 0) { try { process.kill(fakePid, "SIGTERM"); } catch {} }
     const installedVersion = existsSync(packageRoot)
       ? JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")).version
       : "missing";
     return { result, status, trace, log, installedVersion };
   } finally {
+    await stopFakeService(join(root, "fake-service.pid"));
     rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 }
@@ -388,8 +410,8 @@ describe("update lifecycle", () => {
     }
   });
 
-  it("waits for the advertised fallback viewer port before completing", () => {
-    const update = runReadinessUpdate({
+  it("waits for the advertised fallback viewer port before completing", async () => {
+    const update = await runReadinessUpdate({
       livez: [{ viewerPort: 4327, viewerSkipped: false }],
       versions: ["0.9.59"], engineStates: ["connected"],
     });
@@ -402,8 +424,8 @@ describe("update lifecycle", () => {
     expect(update.trace.indexOf("health")).toBeLessThan(update.trace.indexOf("viewer:4327"));
   });
 
-  it("rolls back when an open engine socket has no connected worker health", () => {
-    const update = runReadinessUpdate({
+  it("rolls back when an open engine socket has no connected worker health", async () => {
+    const update = await runReadinessUpdate({
       versions: ["0.9.59", "0.9.58"], engineStates: ["disconnected", "connected"],
     });
     expect(update.status).toMatchObject({ phase: "failed", errorCode: "UPDATE_FAILED" });
@@ -412,8 +434,8 @@ describe("update lifecycle", () => {
     expect(update.trace).toContain("engine");
   });
 
-  it("does not accept a persisted connected snapshot from before the restart", () => {
-    const update = runReadinessUpdate({
+  it("does not accept a persisted connected snapshot from before the restart", async () => {
+    const update = await runReadinessUpdate({
       versions: ["0.9.59", "0.9.58"],
       engineStates: ["connected", "connected"],
       workerConnectedAtMs: [Date.now() - 60_000, "now"],
@@ -424,8 +446,8 @@ describe("update lifecycle", () => {
     expect(update.trace.filter((entry) => entry === "health")).toHaveLength(2);
   });
 
-  it("rejects a stale viewer port when the worker says its viewer was skipped", () => {
-    const update = runReadinessUpdate({
+  it("rejects a stale viewer port when the worker says its viewer was skipped", async () => {
+    const update = await runReadinessUpdate({
       livez: [
         { viewerPort: 4327, viewerSkipped: true },
         { viewerPort: 4327, viewerSkipped: false },
@@ -438,8 +460,8 @@ describe("update lifecycle", () => {
     expect(update.installedVersion).toBe("0.9.58");
   });
 
-  it("rolls back when readiness times out on the wrong API version", () => {
-    const update = runReadinessUpdate({
+  it("rolls back when readiness times out on the wrong API version", async () => {
+    const update = await runReadinessUpdate({
       versions: ["0.9.58"], engineStates: ["connected"], readyTimeoutMs: 300,
     });
     expect(update.status).toMatchObject({ phase: "failed", errorCode: "UPDATE_FAILED" });

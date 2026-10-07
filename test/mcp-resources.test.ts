@@ -5,6 +5,8 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 import { registerMcpEndpoints } from "../src/mcp/server.js";
+import { SAFE_PAYLOAD_BYTES } from "../src/state/frame-guard.js";
+import { KV } from "../src/state/schema.js";
 import type { Session, SessionSummary, Memory } from "../src/types.js";
 
 function mockKV() {
@@ -24,6 +26,25 @@ function mockKV() {
     list: async <T>(scope: string): Promise<T[]> => {
       const entries = store.get(scope);
       return entries ? (Array.from(entries.values()) as T[]) : [];
+    },
+    pages: async function* <T>(scope: string, options: { cursor?: string; limit?: number; fields?: string[] } = {}) {
+      const rows = Array.from(store.get(scope)?.values() ?? []);
+      const limit = options.limit ?? 256;
+      let start = options.cursor === undefined ? 0 : Number(options.cursor);
+      while (start < rows.length || start === 0) {
+        const end = Math.min(rows.length, start + limit);
+        const items = rows.slice(start, end).map((row) => {
+          if (!options.fields) return row as T;
+          const source = row && typeof row === "object" ? row as Record<string, unknown> : {};
+          return Object.fromEntries(options.fields.flatMap((field) =>
+            Object.hasOwn(source, field) ? [[field, source[field]]] : [],
+          )) as T;
+        });
+        const next_cursor = end < rows.length ? String(end) : null;
+        yield { items, next_cursor };
+        if (next_cursor === null) return;
+        start = end;
+      }
     },
   };
 }
@@ -229,6 +250,87 @@ describe("MCP Resources", () => {
     expect(data).toHaveLength(1);
     expect(data[0].id).toBe("mem_1");
     expect(data[0].title).toBe("Latest pattern");
+  });
+
+  it("counts graph statistics from projected IDs and reports read failures", async () => {
+    await kv.set(KV.graphNodes, "large-node", {
+      id: "large-node",
+      type: "concept",
+      name: "Large node",
+      properties: { payload: "x".repeat(1_320_550) },
+      sourceObservationIds: [],
+      createdAt: new Date().toISOString(),
+    });
+    await kv.set(KV.graphEdges, "edge-a", {
+      id: "edge-a",
+      type: "related_to",
+      sourceNodeId: "large-node",
+      targetNodeId: "large-node",
+      weight: 1,
+      sourceObservationIds: [],
+      createdAt: new Date().toISOString(),
+    });
+    const list = vi.spyOn(kv, "list").mockImplementation(async (scope) => {
+      if (scope === KV.graphNodes || scope === KV.graphEdges) throw new Error("STATE_RECORD_TOO_LARGE");
+      return [];
+    });
+    const fn = sdk.getFunction("mcp::resources::read")!;
+    const result = await fn(makeReq({ uri: "agentmemory://graph/stats" })) as {
+      status_code: number;
+      body: { contents: Array<{ text: string }> };
+    };
+    expect(result.status_code).toBe(200);
+    expect(JSON.parse(result.body.contents[0].text)).toMatchObject({
+      totalNodes: 1,
+      totalEdges: 1,
+      nodesByType: { concept: 1 },
+      edgesByType: { related_to: 1 },
+    });
+    expect(list).not.toHaveBeenCalledWith(KV.graphNodes);
+    expect(list).not.toHaveBeenCalledWith(KV.graphEdges);
+
+    const unavailable = { pages: async function* () { throw new Error("down"); } };
+    const failedSdk = mockSdk();
+    registerMcpEndpoints(failedSdk as never, unavailable as never);
+    const failed = await failedSdk.getFunction("mcp::resources::read")!(makeReq({ uri: "agentmemory://graph/stats" })) as {
+      status_code: number;
+      body: { error: string };
+    };
+    expect(failed.status_code).toBe(500);
+    expect(failed.body.error).toContain("unavailable");
+  });
+
+  it("forwards bounded export page arguments and rejects page arguments without a collection", async () => {
+    let forwarded: unknown;
+    sdk.overrideTrigger("mem::export", async (payload: unknown) => {
+      forwarded = payload;
+      return { version: "0.9.82", sessions: [], observations: {}, memories: [], summaries: [] };
+    });
+    const fn = sdk.getFunction("mcp::tools::call")!;
+    const result = await fn(makeReq({
+      name: "memory_export",
+      arguments: { collection: "graphNodes", offset: 4, limit: 2 },
+    })) as { status_code: number };
+    expect(result.status_code).toBe(200);
+    expect(forwarded).toEqual({ collection: "graphNodes", offset: 4, limit: 2 });
+
+    const invalid = await fn(makeReq({
+      name: "memory_export",
+      arguments: { offset: 4 },
+    })) as { status_code: number; body: { error: string } };
+    expect(invalid.status_code).toBe(400);
+    expect(invalid.body.error).toContain("collection is required");
+
+    sdk.overrideTrigger("mem::export", async () => ({ payload: "x".repeat(SAFE_PAYLOAD_BYTES + 1) }));
+    const oversized = await fn(makeReq({
+      name: "memory_export",
+      arguments: { collection: "graphNodes", limit: 1 },
+    })) as { status_code: number; body: { content: Array<{ text: string }> } };
+    expect(oversized.status_code).toBe(200);
+    expect(JSON.parse(oversized.body.content[0].text)).toMatchObject({
+      success: false,
+      oversized: true,
+    });
   });
 
   it("returns 404 for unknown URI", async () => {

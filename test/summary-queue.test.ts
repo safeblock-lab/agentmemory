@@ -403,9 +403,7 @@ describe("durable summary queue", () => {
     expect(summary?.narrative).toContain("Ending: The session ended after final verification.");
     expect(await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, jobId))
       .toMatchObject({ status: "completed", round: 1 });
-    const audit = await kv.list<{ details: Record<string, unknown> }>(KV.audit);
-    expect(audit[0]?.details).toMatchObject({ method: "deterministic_fallback", observationCount: 2 });
-    expect(audit[0]?.details).not.toHaveProperty("title");
+    expect(await kv.list(KV.audit)).toHaveLength(0);
     expect(h.messages).toHaveLength(0);
   });
 

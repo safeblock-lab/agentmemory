@@ -13,13 +13,14 @@ import type { StateKV } from "../state/kv.js";
 import { logger } from "../logger.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
 import { freezeGraphValue, graphCapturedAt, graphKV, graphTransactionFailure, registerGraphJobHandler, runGraphJob, withCompletedGraphRead } from "./graph-jobs.js";
+import { collectProjectedRecords, iterateProjectedRecords } from "./projected-record-reader.js";
 
 interface TemporalExtractionRequest {
   observations: Array<{ id: string; title: string; narrative: string; concepts: string[]; files: string[]; type: string; timestamp: string }>;
 }
 
 async function temporalNode(kv: StateKV, node: GraphNode): Promise<GraphNode | undefined> {
-  for await (const current of kv.values<GraphNode>(KV.graphNodes)) {
+  for await (const current of iterateProjectedRecords<GraphNode>(kv, KV.graphNodes)) {
     if (current.name === node.name && current.type === node.type) return current;
   }
   return undefined;
@@ -301,7 +302,7 @@ export function registerTemporalGraphFunctions(
       asOf?: string;
       includeHistory?: boolean;
     }): Promise<TemporalState | { error: string }> => withCompletedGraphRead(kv, async () => {
-      const allNodes = await kv.list<GraphNode>(KV.graphNodes);
+      const allNodes = await collectProjectedRecords<GraphNode>(kv, KV.graphNodes);
       const allEdges = await kv.list<GraphEdge>(KV.graphEdges);
 
       const entity = allNodes.find(
@@ -379,7 +380,7 @@ export function registerTemporalGraphFunctions(
       from?: string;
       to?: string;
     }) => withCompletedGraphRead(kv, async () => {
-      const allNodes = await kv.list<GraphNode>(KV.graphNodes);
+      const allNodes = await collectProjectedRecords<GraphNode>(kv, KV.graphNodes);
       const allEdges = await kv.list<GraphEdge>(KV.graphEdges);
       const historicalEdges = await kv
         .list<GraphEdge>(KV.graphEdgeHistory)

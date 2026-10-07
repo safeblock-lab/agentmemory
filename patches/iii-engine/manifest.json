@@ -4,10 +4,10 @@
   "sourceRepository": "https://github.com/iii-hq/iii.git",
   "sourceCommit": "e7de3820d1e558f3762edf95e4440552444d48d3",
   "patchPath": "patches/iii-engine/0.22.1-state-pagination.patch",
-  "patchSha256": "ee7079faaa615053cdf9832a8ff533ab1a49925bc1b0a9861432e4906e5fd7f8",
-  "artifactPath": ".native-pagination-build/native-graph-high-fanout-repair/iii.exe",
-  "artifactSha256": "bd3126c4549b04c0fb31ce8fd9b298e21dcf20c60b40ee8b0b4105ad7bd5a91d",
-  "artifactBytes": 28849152,
+  "patchSha256": "d4700327dd275de816f8e68a406988b74bcecc17b050b73f664b41700cbdf00f",
+  "artifactPath": ".iii-engine-build/cargo-target/x86_64-pc-windows-msvc/release/iii.exe",
+  "artifactSha256": "57fa7d72b897c654f7d373a0cdcfa8938ad05f805c7db6c551dcd9c6f47161f0",
+  "artifactBytes": 29276160,
   "buildTarget": "x86_64-pc-windows-msvc",
   "verifiedPlatform": "win32-x64",
   "capabilities": [
@@ -15,8 +15,11 @@
     "state::get_versioned",
     "state::lease",
     "state::commit_batch",
-    "state::sqlite_wal_v1",
-    "state::shadow_migration_v1"
+    "state::sqlite_wal_v2",
+    "state::native_storage_v2",
+    "state::shadow_migration_v1",
+    "state::terminal_retention_v1",
+    "state::scope_revision_v1"
   ],
   "retrievalCapabilities": [
     "state::indexed_graph_v1",
@@ -41,26 +44,40 @@
     "locked": true,
     "offline": true,
     "noDefaultFeatures": true,
-    "target": "x86_64-pc-windows-msvc"
+    "target": "x86_64-pc-windows-msvc",
+    "targetSelection": "explicit x86_64-pc-windows-msvc target with direct workspace-local Rust 1.96.0",
+    "command": "D:\\agentmemory\\.iii-engine-build\\rustup-home\\toolchains\\1.96.0-x86_64-pc-windows-msvc\\bin\\cargo.exe build --offline --locked --no-default-features --package iii --bin iii --jobs 1 --release --target x86_64-pc-windows-msvc -v"
   },
   "deploymentReady": true,
   "rustToolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)",
-  "builtAt": "2026-10-03T01:35:42.5596432Z",
+  "builtAt": "2026-10-07T13:37:18.345Z",
   "validation": {
-    "patchChangedPaths": 48,
-    "patchApplyReverseProof": ".native-pagination-build/release-native-current/source-provenance.json",
+    "canonicalCandidateReceipt": "artifacts/private/release-0.9.83/native-candidate/native-candidate-receipt.json",
+    "patchApplyCheck": "previously accepted; source patch unchanged",
     "nativeChecks": {
-      "passed": 44,
-      "failed": 0,
-      "ignored": 2,
-      "evidence": ".native-pagination-build/native256-root-main-verification.json",
-      "completion": ".native-pagination-build/native-semantic-probe256/test-root-correction/native256-root-completion.json"
+      "evidenceKind": "external-exact-body",
+      "assertionsPassed": true,
+      "originalFunctionExecutedByLibtest": false,
+      "command": "node artifacts/private/release-0.9.83/native-candidate/scope-revision-exact-body.mjs",
+      "log": "artifacts/private/release-0.9.83/native-candidate/scope-revision-exact-body.run.stdout.log",
+      "receipt": "artifacts/private/release-0.9.83/native-candidate/scope-revision-exact-body.receipt.json",
+      "cargoTestResidual": "Original libtest invocation timed out during compilation; no assertion result"
     },
-    "optimizedBuild": ".native-pagination-build/native-semantic-probe256/evidence.json#optimizedBuild",
-    "sdkProbe": ".native-pagination-build/native-semantic-probe256/runtime/sdk-probe.json",
-    "migration": ".native-pagination-build/native-semantic-probe256/migration/verify-after-rerun.stdout.txt",
-    "testOnlyRepair": ".native-pagination-build/native-semantic-probe256/test-repair/patch-verification.json",
-    "binaryRebuiltAfterTestOnlyRepair": false
+    "optimizedBuild": {
+      "exitCode": 0,
+      "command": "D:\\agentmemory\\.iii-engine-build\\rustup-home\\toolchains\\1.96.0-x86_64-pc-windows-msvc\\bin\\cargo.exe build --offline --locked --no-default-features --package iii --bin iii --jobs 1 --release --target x86_64-pc-windows-msvc -v",
+      "receipt": "artifacts/private/release-0.9.83/native-candidate/cargo-build-sustained-06.receipt.json"
+    },
+    "capabilityProbe": {
+      "exitCode": 0,
+      "expectedCount": 9,
+      "actualCount": 9,
+      "receipt": "artifacts/private/release-0.9.83/native-candidate/candidate-capabilities.receipt.json"
+    },
+    "pendingGates": [
+      "Package tarball and isolated real RPC/export smoke",
+      "Live operational installation and acceptance"
+    ]
   },
   "historicalRelease": {
     "schemaVersion": 1,
@@ -544,5 +561,621 @@
       "ANN candidate search is approximate; held-out real-model recall and total engine plus Node resource acceptance are separate checks.",
       "The direct crash helper is intentionally ignored because its passing parent test runs it as an isolated subprocess; the bounded growth diagnostic is reported separately in native-check-coverage.md."
     ]
+  },
+  "storageFormatVersion": 2,
+  "nativeFormatReady": true,
+  "nativeFormat": {
+    "codec": "AMV2Z-1 / zlib; raw UTF-8 BLOB fallback",
+    "maxLogicalValueBytes": 16777216,
+    "membership": "integer dictionary with ordered bidirectional indexes",
+    "preservesAllLogicalData": true
+  },
+  "historicalV1Release": {
+    "schemaVersion": 1,
+    "engineVersion": "0.22.1",
+    "sourceRepository": "https://github.com/iii-hq/iii.git",
+    "sourceCommit": "e7de3820d1e558f3762edf95e4440552444d48d3",
+    "patchPath": "patches/iii-engine/0.22.1-state-pagination.patch",
+    "patchSha256": "ee7079faaa615053cdf9832a8ff533ab1a49925bc1b0a9861432e4906e5fd7f8",
+    "artifactPath": ".native-pagination-build/native-graph-high-fanout-repair/iii.exe",
+    "artifactSha256": "bd3126c4549b04c0fb31ce8fd9b298e21dcf20c60b40ee8b0b4105ad7bd5a91d",
+    "artifactBytes": 28849152,
+    "buildTarget": "x86_64-pc-windows-msvc",
+    "verifiedPlatform": "win32-x64",
+    "capabilities": [
+      "state::list_page",
+      "state::get_versioned",
+      "state::lease",
+      "state::commit_batch",
+      "state::sqlite_wal_v1",
+      "state::shadow_migration_v1"
+    ],
+    "retrievalCapabilities": [
+      "state::indexed_graph_v1",
+      "state::semantic_lsh_v1"
+    ],
+    "capabilityProbe": {
+      "functionId": "state::retrieval",
+      "payload": {
+        "action": "index_status"
+      }
+    },
+    "buildProfile": {
+      "name": "release",
+      "optimized": true,
+      "optLevel": "s",
+      "debugInfo": false,
+      "strip": true,
+      "lto": false,
+      "codegenUnits": 16,
+      "jobs": 1,
+      "incremental": false,
+      "locked": true,
+      "offline": true,
+      "noDefaultFeatures": true,
+      "target": "x86_64-pc-windows-msvc"
+    },
+    "deploymentReady": true,
+    "rustToolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "builtAt": "2026-10-03T01:35:42.5596432Z",
+    "validation": {
+      "patchChangedPaths": 48,
+      "patchApplyReverseProof": ".native-pagination-build/release-native-current/source-provenance.json",
+      "nativeChecks": {
+        "passed": 44,
+        "failed": 0,
+        "ignored": 2,
+        "evidence": ".native-pagination-build/native256-root-main-verification.json",
+        "completion": ".native-pagination-build/native-semantic-probe256/test-root-correction/native256-root-completion.json"
+      },
+      "optimizedBuild": ".native-pagination-build/native-semantic-probe256/evidence.json#optimizedBuild",
+      "sdkProbe": ".native-pagination-build/native-semantic-probe256/runtime/sdk-probe.json",
+      "migration": ".native-pagination-build/native-semantic-probe256/migration/verify-after-rerun.stdout.txt",
+      "testOnlyRepair": ".native-pagination-build/native-semantic-probe256/test-repair/patch-verification.json",
+      "binaryRebuiltAfterTestOnlyRepair": false
+    },
+    "historicalRelease": {
+      "schemaVersion": 1,
+      "engineVersion": "0.22.1",
+      "sourceRepository": "https://github.com/iii-hq/iii.git",
+      "sourceCommit": "e7de3820d1e558f3762edf95e4440552444d48d3",
+      "patchPath": "patches/iii-engine/0.22.1-state-pagination.patch",
+      "patchSha256": "c9288a750daab1a38c8a6cce85de26b0443447e966b28c86649a058ed004ea9d",
+      "artifactSha256": "8289dbdfee90aa8afbccc8db661c38b08c0dd968d36d8a63958eaa88b253b559",
+      "artifactBytes": 32028160,
+      "buildTarget": "x86_64-pc-windows-msvc",
+      "verifiedPlatform": "win32-x64",
+      "capabilities": [
+        "state::list_page",
+        "state::get_versioned",
+        "state::lease",
+        "state::commit_batch",
+        "state::sqlite_wal_v1",
+        "state::shadow_migration_v1"
+      ],
+      "buildProfile": {
+        "name": "release",
+        "optimized": true,
+        "optLevel": "s",
+        "strip": true,
+        "lto": false,
+        "codegenUnits": 16,
+        "jobs": 1,
+        "incremental": false,
+        "locked": true,
+        "offline": true
+      },
+      "rustToolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "builtAt": "2026-10-01T06:31:45.5988422Z",
+      "validation": {
+        "sdkAttempt03": {
+          "status": "passed",
+          "binarySha256": "8289dbdfee90aa8afbccc8db661c38b08c0dd968d36d8a63958eaa88b253b559",
+          "sourcePins": 15,
+          "evidencePath": ".native-pagination-build/graph-native-wire-repair/native-caller-wire-activation-attempt-03.json",
+          "evidenceSha256": "ee9b62f9383750871a46aefc86952f0504c6fa85241cc93e8f8ccb1ff05a1d6d",
+          "acceptancePath": ".native-pagination-build/graph-native-wire-repair/native-sdk-main-acceptance.json",
+          "graphRuntimeAccepted": false
+        },
+        "normalizedSourceMatches": 24,
+        "normalizedSourceManifestSha256": "4a9fea1a712746366c474c03b20713408e918ee9b0d9a71d88699e08bf9464e3",
+        "capabilities": [
+          "state::list_page",
+          "state::get_versioned",
+          "state::lease",
+          "state::commit_batch",
+          "state::sqlite_wal_v1",
+          "state::shadow_migration_v1"
+        ],
+        "releaseBuildLog": ".native-pagination-build/graph-native-wire-repair/cargo-release-caller-boundary-attempt-02.stderr.log",
+        "artifactCopyHashMatched": true,
+        "patchChangedPaths": 24,
+        "version": "0.22.1",
+        "nativeChecks": [
+          {
+            "ignored": 0,
+            "failed": 0,
+            "passed": 12,
+            "log": ".native-pagination-build/graph-native/migration-tests-04.log",
+            "reusedAcceptedCheck": true,
+            "name": "migration"
+          },
+          {
+            "ignored": 1,
+            "failed": 0,
+            "passed": 16,
+            "log": ".native-pagination-build/graph-native/migration-native-sqlite.log",
+            "reusedAcceptedCheck": true,
+            "name": "sqlite-crash-config-repair"
+          },
+          {
+            "ignored": 0,
+            "failed": 0,
+            "passed": 15,
+            "log": ".native-pagination-build/graph-native/migration-native-page.log",
+            "reusedAcceptedCheck": true,
+            "name": "native-paging"
+          }
+        ],
+        "historicalMigrationCliProof": {
+          "path": ".native-pagination-build/graph-native/migration-cli-proof.json",
+          "sha256": "5ed5b566514e6f57919b20105e2489eb3f2aa33bc0a313f769f6b34f209dfb8a",
+          "binarySha256": "9b7e1f55e0e6e903fde39e18010a1a1573898788ad8590d5228022cd0f9f5ce4",
+          "preserved": true
+        },
+        "cliCompileLog": ".native-pagination-build/graph-native/migration-cli-check.stderr.log",
+        "migrationCliRepeatExitCode": 0,
+        "patchApplyReverseProof": ".native-pagination-build/graph-native/migration-patch-proof-final.log",
+        "migrationCliResumeExitCode": 0,
+        "migrationCliProof": ".native-pagination-build/graph-native/migration-cli-current-hash-proof.json",
+        "releaseBuildExitCode": 0
+      },
+      "limitations": [
+        "Only win32-x64 artifact verified.",
+        "No production migration or service cutover performed.",
+        "SQLite isolated crash probe is intentionally ignored in the parent suite; subprocess crash coverage is included in the 16 passing tests.",
+        "Default upstream LTO=true/codegen-units=1 release profile previously exhausted memory; this artifact uses the bounded optimized release profile.",
+        "Legacy source must remain frozen; available disk space must be checked independently before migration."
+      ]
+    },
+    "limitations": [
+      "Only the win32-x64 optimized release artifact has been built and verified.",
+      "deploymentReady marks this local artifact as eligible for packaging review; it is not production migration, service cutover, or binary activation.",
+      "Synthetic migration and retrieval probes do not authorize or perform production migration, service restart, or binary activation.",
+      "ANN candidate search is approximate; held-out real-model recall and total engine plus Node resource acceptance are separate checks.",
+      "The direct crash helper is intentionally ignored because its passing parent test runs it as an isolated subprocess; the bounded growth diagnostic is reported separately in native-check-coverage.md."
+    ],
+    "historicalOptimizedRelease": {
+      "schemaVersion": 1,
+      "engineVersion": "0.22.1",
+      "sourceRepository": "https://github.com/iii-hq/iii.git",
+      "sourceCommit": "e7de3820d1e558f3762edf95e4440552444d48d3",
+      "patchPath": "patches/iii-engine/0.22.1-state-pagination.patch",
+      "patchSha256": "8b29523382cd89f100411f13482d6677b64f48df10494f60249a2a3312aef68d",
+      "artifactPath": ".native-pagination-build/native-graph-high-fanout-repair/iii.exe",
+      "artifactSha256": "c7d3a0d17a2d2395e698e10835b261c926baf8d7de0dae36669e8927ef629652",
+      "artifactBytes": 28849152,
+      "buildTarget": "x86_64-pc-windows-msvc",
+      "verifiedPlatform": "win32-x64",
+      "capabilities": [
+        "state::list_page",
+        "state::get_versioned",
+        "state::lease",
+        "state::commit_batch",
+        "state::sqlite_wal_v1",
+        "state::shadow_migration_v1"
+      ],
+      "retrievalCapabilities": [
+        "state::indexed_graph_v1",
+        "state::semantic_lsh_v1"
+      ],
+      "capabilityProbe": {
+        "functionId": "state::retrieval",
+        "payload": {
+          "action": "index_status"
+        }
+      },
+      "buildProfile": {
+        "name": "release",
+        "optimized": true,
+        "optLevel": "s",
+        "debugInfo": false,
+        "strip": true,
+        "lto": false,
+        "codegenUnits": 16,
+        "jobs": 1,
+        "incremental": false,
+        "locked": true,
+        "offline": true,
+        "noDefaultFeatures": true,
+        "target": "x86_64-pc-windows-msvc"
+      },
+      "deploymentReady": true,
+      "rustToolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "builtAt": "2026-10-02T22:39:42.7675832Z",
+      "validation": {
+        "nativeChecks": [
+          {
+            "name": "sqlite-indexed-preparation-performance",
+            "status": "passed",
+            "passed": 43,
+            "failed": 0,
+            "ignored": 2,
+            "command": "cargo test --offline --locked --no-default-features --package iii --lib --jobs 1 workers::state::adapters::sqlite:: -- --test-threads=1",
+            "exitCode": 0,
+            "stdoutLog": ".native-pagination-build/native-preparation-performance/sqlite-focused-tests.stdout.log",
+            "stderrLog": ".native-pagination-build/native-preparation-performance/sqlite-focused-tests.stderr.log",
+            "exitEvidence": ".native-pagination-build/native-preparation-performance/sqlite-focused-tests-exit.json"
+          }
+        ],
+        "debugBuild": {
+          "command": "cargo build --offline --locked --no-default-features --package iii --bin iii --jobs 1",
+          "startedAt": "2026-10-02T20:03:42.18Z",
+          "finishedAt": "2026-10-02T20:07:16.582Z",
+          "exitCode": 0,
+          "stdoutLog": ".native-pagination-build/native-preparation-performance/debug-engine-build.stdout.log",
+          "stderrLog": ".native-pagination-build/native-preparation-performance/debug-engine-build.stderr.log",
+          "exitEvidence": ".native-pagination-build/native-preparation-performance/debug-engine-build-exit.json"
+        },
+        "patchChangedPaths": 48,
+        "patchApplyReverseProof": ".native-pagination-build/optimized-release/source-artifact-provenance.json",
+        "artifactCopyHashMatched": true,
+        "version": "0.22.1",
+        "cliCapabilities": [
+          "state::list_page",
+          "state::get_versioned",
+          "state::lease",
+          "state::commit_batch",
+          "state::sqlite_wal_v1",
+          "state::shadow_migration_v1"
+        ],
+        "integratedRetrievalProbePending": false,
+        "preservedDebugArtifact": {
+          "path": ".native-pagination-build/native-preparation-performance/iii-indexed-preparation-debug.exe",
+          "sha256": "086b36a42b92625cba0479b5de4a73f847d993fe653fc2d5fb928e21af45644d",
+          "bytes": 56893952,
+          "unchangedFromExpected": true
+        },
+        "optimizedRelease": {
+          "schemaVersion": 1,
+          "status": "passed",
+          "artifactPath": ".native-pagination-build/native-graph-high-fanout-repair/iii.exe",
+          "artifactSha256": "bd3126c4549b04c0fb31ce8fd9b298e21dcf20c60b40ee8b0b4105ad7bd5a91d",
+          "artifactBytes": 28849152,
+          "sourceCommit": "e7de3820d1e558f3762edf95e4440552444d48d3",
+          "patchPath": "patches/iii-engine/0.22.1-state-pagination.patch",
+          "patchSha256": "ee7079faaa615053cdf9832a8ff533ab1a49925bc1b0a9861432e4906e5fd7f8",
+          "patchReverseCheckExitCode": 0,
+          "rustToolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+          "target": "x86_64-pc-windows-msvc",
+          "buildProfile": {
+            "name": "release",
+            "optimized": true,
+            "optLevel": "s",
+            "debugInfo": false,
+            "strip": true,
+            "lto": false,
+            "codegenUnits": 16,
+            "jobs": 1,
+            "incremental": false,
+            "locked": true,
+            "offline": true,
+            "noDefaultFeatures": true,
+            "target": "x86_64-pc-windows-msvc"
+          },
+          "build": {
+            "originalCompile": {
+              "startedAt": "2026-10-02T22:28:50.4491095Z",
+              "finishedAt": "2026-10-02T22:39:42.7675832Z",
+              "exitCode": 0,
+              "log": ".native-pagination-build/optimized-release/cargo-build-release-corrected.log",
+              "exitEvidence": ".native-pagination-build/optimized-release/cargo-build-release-corrected.exit.txt",
+              "exactCommandCaptureAvailable": false
+            },
+            "profileVerification": {
+              "command": "cargo build --offline --locked --no-default-features --package iii --bin iii --jobs 1 --release --target x86_64-pc-windows-msvc -v",
+              "cwd": "D:\\agentmemory\\.native-pagination-build\\iii-source\\engine",
+              "env": {
+                "CARGO_HOME": "D:\\agentmemory\\.native-pagination-build\\cargo-home",
+                "CARGO_TARGET_DIR": "D:\\agentmemory\\.native-pagination-build\\cargo-target",
+                "CARGO_INCREMENTAL": "0",
+                "CARGO_PROFILE_RELEASE_OPT_LEVEL": "s",
+                "CARGO_PROFILE_RELEASE_STRIP": "true",
+                "CARGO_PROFILE_RELEASE_DEBUG": "0",
+                "CARGO_PROFILE_RELEASE_LTO": "false",
+                "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "16"
+              },
+              "exitCode": 0,
+              "startedAt": "2026-10-02T23:17:07.0155491Z",
+              "finishedAt": "2026-10-02T23:17:10.4048364Z",
+              "log": ".native-pagination-build/optimized-release/offline-profile-replay.log",
+              "binarySha256Before": "bb25470359e1f8cb76905adf8ccf0bf68d0d83f2a5b143055773a831fe607aae",
+              "binarySha256After": "bb25470359e1f8cb76905adf8ccf0bf68d0d83f2a5b143055773a831fe607aae",
+              "cargoReportedFreshIii": true,
+              "fingerprintProof": ".native-pagination-build/optimized-release/profile-fingerprint-probe/profile-fingerprint-proof.json",
+              "boundedProfileFingerprint": 5781614896979618000,
+              "optimizedIiiFingerprint": 5781614896979618000,
+              "matchesBoundedProfile": true,
+              "defaultProfileFingerprint": 11041700046224734000,
+              "differsFromUpstreamDefault": true
+            }
+          },
+          "preservedDebugArtifact": {
+            "path": ".native-pagination-build/native-preparation-performance/iii-indexed-preparation-debug.exe",
+            "sha256": "086b36a42b92625cba0479b5de4a73f847d993fe653fc2d5fb928e21af45644d",
+            "bytes": 56893952,
+            "unchangedFromExpected": true
+          },
+          "sqliteChecks": {
+            "command": "III_SQLITE_TEST_ROOT=.native-pagination-build/optimized-release/fixtures/sqlite-tests cargo test --offline --locked --no-default-features --package iii --lib --jobs 1 workers::state::adapters::sqlite:: -- --test-threads=1",
+            "passed": 43,
+            "failed": 0,
+            "ignored": 2,
+            "filtered": 2010,
+            "elapsedSeconds": 31.61,
+            "exitCode": 0,
+            "log": ".native-pagination-build/optimized-release/sqlite-focused-tests-corrected.log",
+            "ignoredCoverage": ".native-pagination-build/optimized-release/native-check-coverage.md"
+          },
+          "cli": {
+            "proof": ".native-pagination-build/optimized-release/cli-probes.json",
+            "version": "0.22.1",
+            "capabilities": [
+              "state::list_page",
+              "state::get_versioned",
+              "state::lease",
+              "state::commit_batch",
+              "state::sqlite_wal_v1",
+              "state::shadow_migration_v1"
+            ],
+            "migrationFlags": [
+              "--source",
+              "--target",
+              "--disk-budget-bytes"
+            ],
+            "retrievalCapabilities": [
+              "state::indexed_graph_v1",
+              "state::semantic_lsh_v1"
+            ],
+            "indexStatusProbe": ".native-pagination-build/optimized-release/optimized-corrected-status-after.stdout.txt"
+          },
+          "syntheticMigration": {
+            "firstRunExitCode": 0,
+            "rerunExitCode": 0,
+            "status": "ready",
+            "records": 2,
+            "sourceRetained": true,
+            "sourceManifestSha256": "06360869007c84f218256f639bc18e93a137b715d50b6553af5f9e9491924f33",
+            "rerunIdentityMatches": true,
+            "orderedKeys": [
+              "n2",
+              "n1"
+            ],
+            "canonicalParityEvidence": ".native-pagination-build/optimized-release/synthetic-migration-parity-after-runtime.stdout.txt",
+            "firstRunEvidence": ".native-pagination-build/optimized-release/synthetic-nonempty-migration-first.stdout.txt",
+            "rerunEvidence": ".native-pagination-build/optimized-release/synthetic-nonempty-migration-rerun.stdout.txt"
+          },
+          "indexedRuntime": {
+            "prepareStatus": "ready",
+            "processed": 2,
+            "finalStatus": "ready",
+            "revision": "2",
+            "orderedSeedIds": [
+              "n2",
+              "n1"
+            ],
+            "prepareEvidence": ".native-pagination-build/optimized-release/optimized-corrected-prepare-nodes.stdout.txt",
+            "statusEvidence": ".native-pagination-build/optimized-release/optimized-corrected-status-after.stdout.txt",
+            "orderedSeedsEvidence": ".native-pagination-build/optimized-release/optimized-corrected-graph-seeds.stdout.txt",
+            "cleanupEvidence": ".native-pagination-build/optimized-release/optimized-corrected-runtime-cleanup.json",
+            "initialStatusEvidence": ".native-pagination-build/optimized-release/optimized-corrected-status-before.stdout.txt",
+            "triggerExitCodes": {
+              "statusBefore": 0,
+              "prepare": 0,
+              "statusAfter": 0,
+              "graphSeeds": 0
+            }
+          },
+          "assertions": {
+            "sourceCommit": true,
+            "patchHash": true,
+            "patchReverseCheck": true,
+            "optimizedArtifactHash": true,
+            "preservedDebugArtifact": true,
+            "buildExit": true,
+            "boundedProfileReplay": true,
+            "optimizedFingerprintMatchesBoundedProfile": true,
+            "sqliteTests": true,
+            "cliCapabilities": true,
+            "retrievalCapabilities": true,
+            "migrationNonemptyRepeat": true,
+            "migrationCanonicalParity": true,
+            "indexedRuntimeReady": true,
+            "runtimeCleanup": true
+          },
+          "validationEvidence": ".native-pagination-build/optimized-release/release-artifact-proof.json",
+          "productionMigrationPerformed": false,
+          "installedStateMutated": false,
+          "serviceRestartPerformed": false,
+          "modelProviderCalled": false,
+          "limitations": [
+            "Only the win32-x64 artifact was built and verified.",
+            "Synthetic migration and retrieval probes do not authorize or perform production migration, service restart, or binary activation.",
+            "ANN candidate search is approximate; held-out real-model recall and total engine plus Node resource acceptance are separate checks."
+          ]
+        }
+      },
+      "historicalRelease": {
+        "schemaVersion": 1,
+        "engineVersion": "0.22.1",
+        "sourceRepository": "https://github.com/iii-hq/iii.git",
+        "sourceCommit": "e7de3820d1e558f3762edf95e4440552444d48d3",
+        "patchPath": "patches/iii-engine/0.22.1-state-pagination.patch",
+        "patchSha256": "c9288a750daab1a38c8a6cce85de26b0443447e966b28c86649a058ed004ea9d",
+        "artifactSha256": "8289dbdfee90aa8afbccc8db661c38b08c0dd968d36d8a63958eaa88b253b559",
+        "artifactBytes": 32028160,
+        "buildTarget": "x86_64-pc-windows-msvc",
+        "verifiedPlatform": "win32-x64",
+        "capabilities": [
+          "state::list_page",
+          "state::get_versioned",
+          "state::lease",
+          "state::commit_batch",
+          "state::sqlite_wal_v1",
+          "state::shadow_migration_v1"
+        ],
+        "buildProfile": {
+          "name": "release",
+          "optimized": true,
+          "optLevel": "s",
+          "strip": true,
+          "lto": false,
+          "codegenUnits": 16,
+          "jobs": 1,
+          "incremental": false,
+          "locked": true,
+          "offline": true
+        },
+        "rustToolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+        "builtAt": "2026-10-01T06:31:45.5988422Z",
+        "validation": {
+          "sdkAttempt03": {
+            "status": "passed",
+            "binarySha256": "8289dbdfee90aa8afbccc8db661c38b08c0dd968d36d8a63958eaa88b253b559",
+            "sourcePins": 15,
+            "evidencePath": ".native-pagination-build/graph-native-wire-repair/native-caller-wire-activation-attempt-03.json",
+            "evidenceSha256": "ee9b62f9383750871a46aefc86952f0504c6fa85241cc93e8f8ccb1ff05a1d6d",
+            "acceptancePath": ".native-pagination-build/graph-native-wire-repair/native-sdk-main-acceptance.json",
+            "graphRuntimeAccepted": false
+          },
+          "normalizedSourceMatches": 24,
+          "normalizedSourceManifestSha256": "4a9fea1a712746366c474c03b20713408e918ee9b0d9a71d88699e08bf9464e3",
+          "capabilities": [
+            "state::list_page",
+            "state::get_versioned",
+            "state::lease",
+            "state::commit_batch",
+            "state::sqlite_wal_v1",
+            "state::shadow_migration_v1"
+          ],
+          "releaseBuildLog": ".native-pagination-build/graph-native-wire-repair/cargo-release-caller-boundary-attempt-02.stderr.log",
+          "artifactCopyHashMatched": true,
+          "patchChangedPaths": 24,
+          "version": "0.22.1",
+          "nativeChecks": [
+            {
+              "ignored": 0,
+              "failed": 0,
+              "passed": 12,
+              "log": ".native-pagination-build/graph-native/migration-tests-04.log",
+              "reusedAcceptedCheck": true,
+              "name": "migration"
+            },
+            {
+              "ignored": 1,
+              "failed": 0,
+              "passed": 16,
+              "log": ".native-pagination-build/graph-native/migration-native-sqlite.log",
+              "reusedAcceptedCheck": true,
+              "name": "sqlite-crash-config-repair"
+            },
+            {
+              "ignored": 0,
+              "failed": 0,
+              "passed": 15,
+              "log": ".native-pagination-build/graph-native/migration-native-page.log",
+              "reusedAcceptedCheck": true,
+              "name": "native-paging"
+            }
+          ],
+          "historicalMigrationCliProof": {
+            "path": ".native-pagination-build/graph-native/migration-cli-proof.json",
+            "sha256": "5ed5b566514e6f57919b20105e2489eb3f2aa33bc0a313f769f6b34f209dfb8a",
+            "binarySha256": "9b7e1f55e0e6e903fde39e18010a1a1573898788ad8590d5228022cd0f9f5ce4",
+            "preserved": true
+          },
+          "cliCompileLog": ".native-pagination-build/graph-native/migration-cli-check.stderr.log",
+          "migrationCliRepeatExitCode": 0,
+          "patchApplyReverseProof": ".native-pagination-build/graph-native/migration-patch-proof-final.log",
+          "migrationCliResumeExitCode": 0,
+          "migrationCliProof": ".native-pagination-build/graph-native/migration-cli-current-hash-proof.json",
+          "releaseBuildExitCode": 0
+        },
+        "limitations": [
+          "Only win32-x64 artifact verified.",
+          "No production migration or service cutover performed.",
+          "SQLite isolated crash probe is intentionally ignored in the parent suite; subprocess crash coverage is included in the 16 passing tests.",
+          "Default upstream LTO=true/codegen-units=1 release profile previously exhausted memory; this artifact uses the bounded optimized release profile.",
+          "Legacy source must remain frozen; available disk space must be checked independently before migration."
+        ]
+      },
+      "limitations": [
+        "Only the win32-x64 optimized release artifact has been built and verified.",
+        "deploymentReady marks this local artifact as eligible for packaging review; it is not production migration, service cutover, or binary activation.",
+        "Synthetic migration and retrieval probes do not authorize or perform production migration, service restart, or binary activation.",
+        "ANN candidate search is approximate; held-out real-model recall and total engine plus Node resource acceptance are separate checks.",
+        "The direct crash helper is intentionally ignored because its passing parent test runs it as an isolated subprocess; the bounded growth diagnostic is reported separately in native-check-coverage.md."
+      ]
+    }
+  },
+  "historicalScopeRevisionPredecessor": {
+    "patchSha256": "1820cf0ee91655ee7be5bc7309cda927e16b52712df464f3dc382d580643eee9",
+    "artifactSha256": "306982cafbfbf673ec723595b679077b2f9651a5f1098606c5dff6a9a3db95a4",
+    "artifactBytes": 29281792,
+    "builtAt": "2026-10-06T04:31:26.6999520Z",
+    "capabilities": [
+      "state::list_page",
+      "state::get_versioned",
+      "state::lease",
+      "state::commit_batch",
+      "state::sqlite_wal_v2",
+      "state::native_storage_v2",
+      "state::shadow_migration_v1",
+      "state::terminal_retention_v1"
+    ],
+    "validation": {
+      "canonicalCandidateReceipt": "artifacts/private/native-retention/canonical/canonical-candidate-receipt.json",
+      "patchApplyCheck": "passed",
+      "nativeChecks": {
+        "passed": 26,
+        "failed": 0,
+        "ignored": 1,
+        "command": "cargo test -p iii --lib workers::state::adapters::sqlite:: --offline",
+        "log": "artifacts/private/native-retention/canonical/sqlite-native-v2-retention-tests-attempt-02.log"
+      },
+      "optimizedBuild": {
+        "exitCode": 0,
+        "command": "cargo build --offline --locked --no-default-features --package iii --bin iii --jobs 1 --release",
+        "log": "artifacts/private/native-retention/canonical/canonical-bounded-release-build.log"
+      },
+      "capabilityProbe": {
+        "exitCode": 0,
+        "capabilities": [
+          "state::list_page",
+          "state::get_versioned",
+          "state::lease",
+          "state::commit_batch",
+          "state::sqlite_wal_v2",
+          "state::native_storage_v2",
+          "state::shadow_migration_v1",
+          "state::terminal_retention_v1"
+        ]
+      },
+      "pendingGates": [
+        "live API/viewer/watchdog/snapshot/export and functional health",
+        "bounded live retention and V2 rollback",
+        "real installer acceptance and publication"
+      ],
+      "shadowMigration": {
+        "passed": 32,
+        "failed": 0,
+        "sourceFiles": 22,
+        "evidence": "artifacts/private/native-storage-v2/shadow/handoff.md",
+        "corruptionAndForeignKeyTests": 2,
+        "closedShadowBytes": 9095467008,
+        "tableStreams": 22,
+        "membershipPairs": 37753781
+      }
+    }
   }
 }

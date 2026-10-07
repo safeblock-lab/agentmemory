@@ -1,6 +1,6 @@
 {
   "name": "@agentmemory/agentmemory",
-  "version": "0.9.81",
+  "version": "0.9.83",
   "description": "Persistent memory for AI coding agents, powered by iii-engine's three primitives",
   "type": "module",
   "main": "dist/index.mjs",
@@ -67,7 +67,13 @@
     "docs/fireworks-batch.md",
     "docs/typesafe.md",
     "docs/summary-budget.md",
-    "AGENTS.md"
+    "AGENTS.md",
+    "docs/operations/background-health-repair.md",
+    "docs/operations/agentmemory-0.9.82-release.md",
+    "docs/operations/agentmemory-0.9.83-release.md",
+    "docs/operations/export-contract.md",
+    "docs/operations/graph-job-retention.md",
+    "docs/operations/native-storage-format-v2.md"
   ],
   "author": "Rohit Ghumare <ghumare64@gmail.com>",
   "license": "Apache-2.0",

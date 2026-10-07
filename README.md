@@ -1069,7 +1069,7 @@ Three tool surfaces, smallest to largest: `AGENTMEMORY_TOOLS=core` trims visibil
 | `memory_vision_search` | Search image observations |
 | `memory_timeline` | Chronological observations |
 | `memory_profile` | Project profile (concepts, files, patterns) |
-| `memory_export` | Export all memory data |
+| `memory_export` | Export all memory data; continue large collection exports with the returned cursor |
 | `memory_relations` | Query relationship graph |
 | `memory_commit_lookup` | Sessions behind a git commit |
 | `memory_commits` | Commits recorded for a session |
@@ -1747,7 +1747,7 @@ Create `~/.agentmemory/.env`:
 | `POST` | `/agentmemory/forget` | Delete observations |
 | `POST` | `/agentmemory/enrich` | File context + memories + bugs |
 | `GET` | `/agentmemory/profile` | Project profile |
-| `GET` | `/agentmemory/export` | Export all data |
+| `GET` | `/agentmemory/export` | Page by `collection`, `limit`, and returned cursor; writes invalidate the cursor |
 | `POST` | `/agentmemory/import` | Import from JSON |
 | `POST` | `/agentmemory/graph/query` | Knowledge graph query |
 | `POST` | `/agentmemory/team/share` | Share with team |

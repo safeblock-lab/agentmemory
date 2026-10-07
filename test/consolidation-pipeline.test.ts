@@ -14,8 +14,9 @@ vi.mock("../src/config.js", async (importOriginal) => ({
 import { registerConsolidationPipelineFunction } from "../src/functions/consolidation-pipeline.js";
 import { isConsolidationEnabled } from "../src/config.js";
 import { batchEffectKey } from "../src/state/batch-effects.js";
-import { KV } from "../src/state/schema.js";
-import type { SessionSummary, Memory, SemanticMemory, ProceduralMemory } from "../src/types.js";
+import { fingerprintId, KV } from "../src/state/schema.js";
+import { LlmTaskRouter } from "../src/providers/task-router.js";
+import type { SessionSummary, Memory, SemanticMemory, ProceduralMemory, LlmRoutingConfig } from "../src/types.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -85,6 +86,16 @@ function makePattern(i: number): Memory {
     version: 1,
     isLatest: true,
   };
+}
+
+function candidatesFromPrompt(userPrompt: string): Array<{ fact: string; candidateIds: string[] }> {
+  const prefix = "Candidate facts with source evidence:\n\n";
+  return JSON.parse(userPrompt.slice(prefix.length)) as Array<{ fact: string; candidateIds: string[] }>;
+}
+
+function candidateIdsFromPrompt(userPrompt: string): string[] {
+  const candidates = candidatesFromPrompt(userPrompt);
+  return candidates.flatMap((candidate) => candidate.candidateIds);
 }
 
 describe("Consolidation Pipeline", () => {
@@ -228,6 +239,78 @@ describe("Consolidation Pipeline", () => {
     expect(provider.summarize).not.toHaveBeenCalled();
   });
 
+  it("preserves legacy queued facts and attributes missing sources to the validated batch", async () => {
+    const summaries = Array.from({ length: 5 }, (_, index) => makeSummary(index));
+    for (const summary of summaries) await kv.set(KV.summaries, summary.sessionId, summary);
+    const sourceIds = summaries.map((summary) => summary.sessionId);
+    const sourceFingerprint = fingerprintId("fwbconsem", JSON.stringify(summaries.map((summary) => [
+      summary.sessionId,
+      summary.title,
+      summary.narrative,
+      summary.concepts,
+      summary.createdAt,
+    ])));
+    registerConsolidationPipelineFunction(sdk as never, kv as never, {} as never);
+
+    await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+      force: true,
+      batchSourceIds: sourceIds,
+      batchResponse: '<fact confidence="0.7">Legacy queued fact</fact><fact confidence="0.6">Another queued fact</fact>',
+      batchSourceFingerprint: sourceFingerprint,
+      batchEffectKey: batchEffectKey("legacy-semantic"),
+    });
+
+    const [firstFact] = await kv.list<SemanticMemory>(KV.semantic);
+    expect(firstFact?.sourceSessionIds).toEqual(sourceIds);
+    expect(await kv.get(KV.state, "semantic-consolidation")).toMatchObject({
+      processedThrough: expect.any(String),
+    });
+  });
+
+  it("accepts a valid empty facts envelope through the LLM router", async () => {
+    const primary = { name: "primary", compress: vi.fn(), summarize: vi.fn(async () => "<facts/>") };
+    const auxiliary = { name: "auxiliary", compress: vi.fn(), summarize: vi.fn(async () => "<facts/>") };
+    const routing: LlmRoutingConfig = {
+      routes: { consolidation: "aux", conflict_resolution: "aux" } as LlmRoutingConfig["routes"],
+      explicitRoutes: {},
+      warnings: [],
+    };
+    const router = new LlmTaskRouter({
+      primary: { provider: primary, model: "primary-model" },
+      auxiliary: { provider: auxiliary, model: "aux-model" },
+      routing,
+    });
+    for (let index = 0; index < 5; index++) await kv.set(KV.summaries, `empty-${index}`, { ...makeSummary(index), sessionId: `empty-${index}` });
+    registerConsolidationPipelineFunction(sdk as never, kv as never, primary as never, router);
+
+    await sdk.trigger("mem::consolidate-pipeline", { tier: "semantic", force: true });
+
+    expect(auxiliary.summarize).toHaveBeenCalledTimes(1);
+    expect(primary.summarize).not.toHaveBeenCalled();
+    expect(await kv.list(KV.semantic)).toHaveLength(0);
+    expect(await kv.get(KV.state, "semantic-consolidation")).toMatchObject({
+      processedThrough: expect.any(String),
+    });
+  });
+
+  it.each(["<facts>garbage</facts>", "<facts><unexpected/></facts>"])(
+    "fails closed on unrecognized semantic envelope content (%s)",
+    async (response) => {
+      const provider = { name: "test", compress: vi.fn(), summarize: vi.fn(async () => response) };
+      for (let index = 0; index < 5; index++) await kv.set(KV.summaries, `invalid-${index}`, { ...makeSummary(index), sessionId: `invalid-${index}` });
+      registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+
+      const result = await sdk.trigger("mem::consolidate-pipeline", { tier: "semantic", force: true }) as {
+        results: { semantic: { error?: string } };
+      };
+
+      expect(result.results.semantic.error).toContain("malformed fact output");
+      expect(await kv.list(KV.semantic)).toHaveLength(0);
+      expect(await kv.get(KV.state, "semantic-consolidation")).toBeNull();
+    },
+  );
+
   it("pipeline skips procedural when fewer than 2 patterns", async () => {
     const provider = {
       name: "test",
@@ -257,7 +340,7 @@ describe("Consolidation Pipeline", () => {
       name: "test",
       compress: vi.fn(),
       summarize: vi.fn().mockResolvedValue(
-        `<facts><fact confidence="0.9">TypeScript is the primary language</fact></facts>`,
+        `<facts><fact confidence="0.9" sourceIds="ses_0,ses_1">TypeScript is the primary language</fact></facts>`,
       ),
     };
     registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
@@ -278,6 +361,212 @@ describe("Consolidation Pipeline", () => {
     expect(stored.length).toBe(1);
     expect(stored[0].fact).toBe("TypeScript is the primary language");
     expect(stored[0].confidence).toBe(0.9);
+    expect(stored[0].sourceSessionIds).toEqual(["ses_0", "ses_1"]);
+  });
+
+  it("bounds UTF-8 semantic requests and merges cross-partition evidence with exact provenance", async () => {
+    const requests: Array<{ systemPrompt: string; userPrompt: string }> = [];
+    const provider = {
+      compress: vi.fn(),
+      summarize: vi.fn(async (systemPrompt: string, userPrompt: string) => {
+        requests.push({ systemPrompt, userPrompt });
+        const source = userPrompt.match(/Session ID: (ses_\d+)/)?.[1];
+        if (userPrompt.startsWith("Extract factual candidates")) {
+          return source === "ses_0" || source === "ses_5"
+            ? `<facts><fact confidence="0.8" sourceIds="${source}">Shared retention fact</fact></facts>`
+            : "<facts></facts>";
+        }
+        const candidateIds = candidateIdsFromPrompt(userPrompt).join(",");
+        return `<facts><fact confidence="0.95" candidateIds="${candidateIds}">Shared retention fact</fact></facts>`;
+      }),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+
+    for (let i = 0; i < 6; i++) {
+      await kv.set("mem:summaries", `ses_${i}`, {
+        ...makeSummary(i),
+        narrative: "é".repeat(2_500),
+      });
+    }
+
+    const result = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+    })) as { results: { semantic: { newFacts: number } } };
+
+    expect(result.results.semantic.newFacts).toBe(1);
+    expect(requests.length).toBeGreaterThan(2);
+    expect(requests.every(({ systemPrompt, userPrompt }) =>
+      new TextEncoder().encode(JSON.stringify({ systemPrompt, userPrompt })).byteLength <= 8 * 1024,
+    )).toBe(true);
+    const inputSources = requests
+      .filter(({ userPrompt }) => userPrompt.startsWith("Extract factual candidates"))
+      .map(({ userPrompt }) => userPrompt.match(/Session ID: (ses_\d+)/)?.[1]);
+    expect(inputSources).toEqual(["ses_0", "ses_1", "ses_2", "ses_3", "ses_4", "ses_5"]);
+
+    const stored = await kv.list<SemanticMemory>(KV.semantic);
+    expect(stored).toHaveLength(1);
+    expect(stored[0].fact).toBe("Shared retention fact");
+    expect(stored[0].sourceSessionIds).toEqual(["ses_0", "ses_5"]);
+    expect(await kv.get(KV.state, "semantic-consolidation")).toMatchObject({
+      processedThrough: expect.any(String),
+    });
+  });
+
+  it.each(["<facts></facts>", "malformed response"])("distinguishes an empty final reduction from malformed output: %s", async (finalResponse) => {
+    const provider = {
+      compress: vi.fn(),
+      summarize: vi.fn(async (_systemPrompt: string, userPrompt: string) => {
+        const source = userPrompt.match(/Session ID: (ses_\d+)/)?.[1];
+        if (userPrompt.startsWith("Extract factual candidates")) {
+          return `<facts><fact confidence="0.6" sourceIds="${source}">Single episode detail</fact></facts>`;
+        }
+        return finalResponse;
+      }),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 0; i < 6; i++) {
+      await kv.set("mem:summaries", `ses_${i}`, {
+        ...makeSummary(i),
+        narrative: "é".repeat(2_500),
+      });
+    }
+
+    const result = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+    })) as { results: { semantic: { error?: string; newFacts?: number } } };
+
+    expect(await kv.list<SemanticMemory>(KV.semantic)).toHaveLength(0);
+    if (finalResponse === "<facts></facts>") {
+      expect(result.results.semantic.newFacts).toBe(0);
+      expect(await kv.get(KV.state, "semantic-consolidation")).toMatchObject({
+        processedThrough: expect.any(String),
+      });
+    } else {
+      expect(result.results.semantic.error).toContain("malformed fact output");
+      expect(await kv.get(KV.state, "semantic-consolidation")).toBeNull();
+    }
+  });
+
+  it("leaves checkpoint untouched when a later bounded request fails, then retries all sources", async () => {
+    const evidenceSources: string[] = [];
+    let failOneRequest = true;
+    const provider = {
+      compress: vi.fn(),
+      summarize: vi.fn(async (_systemPrompt: string, userPrompt: string) => {
+        const source = userPrompt.match(/Session ID: (ses_\d+)/)?.[1];
+        if (userPrompt.startsWith("Extract factual candidates")) {
+          evidenceSources.push(source!);
+          if (failOneRequest && source === "ses_2") {
+            failOneRequest = false;
+            throw new Error("HTTP 413 Payload Too Large");
+          }
+          return `<facts><fact confidence="0.8" sourceIds="${source}">Shared retention fact</fact></facts>`;
+        }
+        const candidateIds = candidateIdsFromPrompt(userPrompt).join(",");
+        return `<facts><fact confidence="0.95" candidateIds="${candidateIds}">Shared retention fact</fact></facts>`;
+      }),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 0; i < 6; i++) {
+      await kv.set("mem:summaries", `ses_${i}`, {
+        ...makeSummary(i),
+        narrative: "é".repeat(2_500),
+      });
+    }
+
+    const failed = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+    })) as { results: { semantic: { error: string } } };
+    expect(failed.results.semantic.error).toContain("HTTP 413");
+    expect(await kv.list<SemanticMemory>(KV.semantic)).toHaveLength(0);
+    expect(await kv.get(KV.state, "semantic-consolidation")).toBeNull();
+
+    const retried = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+    })) as { results: { semantic: { newFacts: number } } };
+    expect(retried.results.semantic.newFacts).toBe(1);
+    expect(evidenceSources.slice(3)).toEqual(["ses_0", "ses_1", "ses_2", "ses_3", "ses_4", "ses_5"]);
+    expect(await kv.get(KV.state, "semantic-consolidation")).toMatchObject({
+      processedThrough: expect.any(String),
+    });
+  });
+
+  it("rejects an individually oversized semantic source without sending or checkpointing it", async () => {
+    const provider = {
+      compress: vi.fn(),
+      summarize: vi.fn(),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 0; i < 5; i++) {
+      await kv.set("mem:summaries", `ses_${i}`, {
+        ...makeSummary(i),
+        narrative: i === 0 ? "é".repeat(6_000) : "short summary",
+      });
+    }
+
+    const result = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+    })) as { results: { semantic: { error: string } } };
+
+    expect(result.results.semantic.error).toContain("source retained locally");
+    expect(provider.summarize).not.toHaveBeenCalled();
+    expect(await kv.get(KV.state, "semantic-consolidation")).toBeNull();
+  });
+
+  it("fails closed when a split semantic response omits source IDs", async () => {
+    const provider = {
+      compress: vi.fn(),
+      summarize: vi.fn(async () => '<facts><fact confidence="0.8">Unattributed fact</fact></facts>'),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 0; i < 6; i++) {
+      await kv.set("mem:summaries", `ses_${i}`, {
+        ...makeSummary(i),
+        narrative: "é".repeat(2_500),
+      });
+    }
+
+    const result = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+    })) as { results: { semantic: { error: string } } };
+
+    expect(result.results.semantic.error).toContain("omitted source IDs");
+    expect(await kv.list<SemanticMemory>(KV.semantic)).toHaveLength(0);
+    expect(await kv.get(KV.state, "semantic-consolidation")).toBeNull();
+  });
+
+  it("fails closed when a candidate reducer drops a fact while preserving its source IDs", async () => {
+    const provider = {
+      compress: vi.fn(),
+      summarize: vi.fn(async (_systemPrompt: string, userPrompt: string) => {
+        const source = userPrompt.match(/Session ID: (ses_\d+)/)?.[1];
+        if (userPrompt.startsWith("Extract factual candidates")) {
+          return `<facts>${Array.from({ length: 20 }, (_, index) =>
+            `<fact confidence="0.8" sourceIds="${source}">Fact ${source} ${index}</fact>`,
+          ).join("")}</facts>`;
+        }
+
+        const candidates = candidatesFromPrompt(userPrompt);
+        return `<facts>${candidates.slice(1).map((candidate) =>
+          `<fact confidence="0.8" candidateIds="${candidate.candidateIds.join(",")}">${candidate.fact}</fact>`,
+        ).join("")}</facts>`;
+      }),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 0; i < 6; i++) {
+      await kv.set("mem:summaries", `ses_${i}`, {
+        ...makeSummary(i),
+        narrative: "é".repeat(2_500),
+      });
+    }
+
+    const result = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+    })) as { results: { semantic: { error: string } } };
+
+    expect(result.results.semantic.error).toContain("omitted candidate facts");
+    expect(await kv.list<SemanticMemory>(KV.semantic)).toHaveLength(0);
+    expect(await kv.get(KV.state, "semantic-consolidation")).toBeNull();
   });
 
   it("waits for enough new summaries after its initial semantic checkpoint", async () => {
@@ -285,7 +574,7 @@ describe("Consolidation Pipeline", () => {
       name: "test",
       compress: vi.fn(),
       summarize: vi.fn().mockResolvedValue(
-        `<facts><fact confidence="0.9">TypeScript is the primary language</fact></facts>`,
+        `<facts><fact confidence="0.9" sourceIds="ses_0,ses_1,ses_2,ses_3,ses_4">TypeScript is the primary language</fact></facts>`,
       ),
     };
     registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
@@ -348,8 +637,7 @@ describe("Consolidation Pipeline", () => {
 
     await sdk.trigger("mem::consolidate-pipeline", { tier: "semantic" });
 
-    const audits = await kv.list("mem:audit");
-    expect(audits.length).toBe(1);
+    expect(await kv.list(KV.audit)).toHaveLength(0);
   });
 
   it("pipeline returns early when consolidation is disabled", async () => {

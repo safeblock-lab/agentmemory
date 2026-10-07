@@ -11,6 +11,7 @@ import {
   getTypeSafeConfig,
   isGraphExtractionEnabled,
   isAutoCompressEnabled,
+  isBackgroundRecoveryPaused,
   isConsolidationEnabled,
   isContextInjectionEnabled,
   isDropStaleIndexEnabled,
@@ -73,6 +74,7 @@ import { registerEnrichFunction } from "./functions/enrich.js";
 import { registerClaudeBridgeFunction } from "./functions/claude-bridge.js";
 import { registerGraphFunction } from "./functions/graph.js";
 import { registerGraphJobRecovery } from "./functions/graph-jobs.js";
+import { pruneTerminalGraphWork } from "./functions/graph-retention.js";
 import { registerGraphImportFunction } from "./functions/graph-import.js";
 import { registerConsolidationPipelineFunction } from "./functions/consolidation-pipeline.js";
 import { registerTeamFunction } from "./functions/team.js";
@@ -272,9 +274,10 @@ export function createFireworksBatchCompletionHandler(
       if (!rawObservations) throw new Error("batch graph result is missing observations");
       const observations: unknown = JSON.parse(rawObservations);
       if (!Array.isArray(observations)) throw new Error("batch graph observations are invalid");
+      const graphProvenanceVersion = item.metadata?.graphProvenanceVersion === "2" ? 2 : undefined;
       const result = await sdk.trigger({
         function_id: "mem::graph-extract",
-        payload: { observations, batchResponse: content, batchEffectKey: effectKey },
+        payload: { observations, batchResponse: content, batchEffectKey: effectKey, graphProvenanceVersion },
       });
       return batchCallbackFailure(result, "batch graph extraction failed");
     }
@@ -805,8 +808,15 @@ async function main() {
       : loaded.state === "none" || vectorCountShortfall
         ? null
         : loaded.savedAt;
+  const backgroundRecoveryPaused = isBackgroundRecoveryPaused();
   const keywordStart = Date.now();
   if (indexedRetrieval) {
+    if (backgroundRecoveryPaused) {
+      bootLog("Indexed source recovery is paused by AGENTMEMORY_BACKGROUND_RECOVERY_PAUSED=1.");
+    } else {
+      const repairedSources = await indexedVector!.recoverDirtySources(embeddingProvider!);
+      if (repairedSources > 0) bootLog(`Repaired ${repairedSources} incomplete indexed sources during startup.`);
+    }
     await indexedVector!.ready();
     bootLog('Indexed local semantic + lexical + graph retrieval ready; no resident corpus restored.');
   } else {
@@ -823,15 +833,19 @@ async function main() {
       );
     }
     if (keyword.vectorJobs.length > 0) {
-      bootLog(`Backfilling ${keyword.vectorJobs.length} missing vectors in the background`);
-      void backfillVectors(keyword.vectorJobs)
-        .then((count) => {
-          setPendingVectorBackfillCount(keyword.fullBackfillPending);
-          if (count > 0) bootLog(`Vector index backfilled: ${count} entries`);
-        })
-        .catch((err) => {
-          console.warn(`[agentmemory] Failed to backfill vectors:`, err);
-        });
+      if (backgroundRecoveryPaused) {
+        bootLog(`Vector backfill is paused (${keyword.vectorJobs.length} entries remain pending).`);
+      } else {
+        bootLog(`Backfilling ${keyword.vectorJobs.length} missing vectors in the background`);
+        void backfillVectors(keyword.vectorJobs)
+          .then((count) => {
+            setPendingVectorBackfillCount(keyword.fullBackfillPending);
+            if (count > 0) bootLog(`Vector index backfilled: ${count} entries`);
+          })
+          .catch((err) => {
+            console.warn(`[agentmemory] Failed to backfill vectors:`, err);
+          });
+      }
     }
   } catch (err) {
     console.warn(`[agentmemory] Failed to rebuild the BM25 index:`, err);
@@ -863,46 +877,58 @@ async function main() {
   const autoForgetIntervalMs = parseInt(process.env.AUTO_FORGET_INTERVAL_MS || "3600000", 10);
   const consolidationIntervalMs = parseInt(process.env.CONSOLIDATION_INTERVAL_MS || "7200000", 10);
 
-  let summaryRecoveryRunning = false;
-  const recoverSummaryQueue = async (functionId: "mem::summary-recover" | "mem::summary-reconcile") => {
-    if (summaryRecoveryRunning) return;
-    summaryRecoveryRunning = true;
-    try {
-      const result: unknown = await sdk.trigger({
-        function_id: functionId,
-        payload: {},
-      });
-      if (typeof result !== "object" || result === null ||
-          !("success" in result) || result.success !== true) {
-        console.warn("[agentmemory] Summary queue recovery reported failure");
+  if (!backgroundRecoveryPaused) {
+    let summaryRecoveryRunning = false;
+    const recoverSummaryQueue = async (functionId: "mem::summary-recover" | "mem::summary-reconcile") => {
+      if (summaryRecoveryRunning) return;
+      summaryRecoveryRunning = true;
+      try {
+        const result: unknown = await sdk.trigger({
+          function_id: functionId,
+          payload: {},
+        });
+        if (typeof result !== "object" || result === null ||
+            !("success" in result) || result.success !== true) {
+          console.warn("[agentmemory] Summary queue recovery reported failure");
+        }
+      } catch {
+        console.warn("[agentmemory] Summary queue recovery trigger failed");
+      } finally {
+        summaryRecoveryRunning = false;
       }
-    } catch {
-      console.warn("[agentmemory] Summary queue recovery trigger failed");
-    } finally {
-      summaryRecoveryRunning = false;
-    }
-  };
-  void recoverSummaryQueue("mem::summary-recover");
-  const summaryRecoveryTimer = setInterval(() => void recoverSummaryQueue("mem::summary-recover"), 60 * 60 * 1000);
-  summaryRecoveryTimer.unref();
-  const summaryReconcileTimer = setInterval(() => void recoverSummaryQueue("mem::summary-reconcile"), 30 * 1000);
-  summaryReconcileTimer.unref();
+    };
+    void recoverSummaryQueue("mem::summary-recover");
+    const summaryRecoveryTimer = setInterval(() => void recoverSummaryQueue("mem::summary-recover"), 60 * 60 * 1000);
+    summaryRecoveryTimer.unref();
+    const summaryReconcileTimer = setInterval(() => void recoverSummaryQueue("mem::summary-reconcile"), 30 * 1000);
+    summaryReconcileTimer.unref();
+  } else {
+    bootLog("Summary queue recovery is paused by AGENTMEMORY_BACKGROUND_RECOVERY_PAUSED=1.");
+  }
 
   let graphRecoveryRunning = false;
   const recoverGraphJobs = async () => {
-    if (graphRecoveryRunning) return;
+    if (isBackgroundRecoveryPaused() || graphRecoveryRunning) return;
     graphRecoveryRunning = true;
     try {
       await sdk.trigger({ function_id: "mem::graph-recover", payload: {} });
     } catch {
       console.warn("[agentmemory] Graph recovery paused; durable inputs retained");
     } finally {
-      graphRecoveryRunning = false;
+      try {
+        await pruneTerminalGraphWork(kv);
+      } catch (error) {
+        console.warn("[agentmemory] Graph terminal retention paused", error instanceof Error ? error.message : "STATE_TX_FAILED");
+      } finally { graphRecoveryRunning = false; }
     }
   };
-  void recoverGraphJobs();
-  const graphRecoveryTimer = setInterval(() => void recoverGraphJobs(), 30_000);
-  graphRecoveryTimer.unref();
+  if (!backgroundRecoveryPaused) {
+    void recoverGraphJobs();
+    const graphRecoveryTimer = setInterval(() => void recoverGraphJobs(), 30_000);
+    graphRecoveryTimer.unref();
+  } else {
+    bootLog("Graph recovery and terminal retention are paused by AGENTMEMORY_BACKGROUND_RECOVERY_PAUSED=1.");
+  }
 
   if (process.env.AUTO_FORGET_ENABLED !== "false") {
     const autoForgetTimer = setInterval(async () => {

@@ -112,10 +112,11 @@ export function resolveDataDir(options: ResolveDataDirOptions = {}): ResolvedDat
   }
 
   const legacyDir = resolve(cwd, "data");
-  const hasLegacyStore =
+  const hasExistingStore =
     existsSync(join(legacyDir, "state_store.db")) ||
+    existsSync(join(legacyDir, "state_store.sqlite3")) ||
     existsSync(join(legacyDir, "iii-config.yaml"));
-  if (instance === 0 && hasLegacyStore) {
+  if (instance === 0 && hasExistingStore) {
     return { dataDir: legacyDir, source: "default" };
   }
 

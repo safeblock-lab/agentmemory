@@ -5,6 +5,7 @@ import type { Memory, GraphNode, GraphEdge } from "../types.js";
 import { recordAudit } from "./audit.js";
 import { withBatchWriterLocks, withBatchRecordLocks } from "../state/batch-effects.js";
 import { freezeGraphValue, graphCapturedAt, graphKV, registerGraphJobHandler, runGraphJob, withGraphDelta } from "./graph-jobs.js";
+import { iterateProjectedRecordIds } from "./projected-record-reader.js";
 
 export function registerCascadeFunction(sdk: IIIClient, kv: StateKV): void {
   kv = graphKV(kv);
@@ -39,9 +40,9 @@ export function registerCascadeFunction(sdk: IIIClient, kv: StateKV): void {
 
         if (obsIds.size > 0) {
           const now = graphCapturedAt();
-          for await (const listed of kv.values<GraphNode>(KV.graphNodes)) {
-            await withBatchRecordLocks([[KV.graphNodes, listed.id]], async () => {
-              const node = await kv.get<GraphNode>(KV.graphNodes, listed.id);
+          for await (const nodeId of iterateProjectedRecordIds(kv, KV.graphNodes)) {
+            await withBatchRecordLocks([[KV.graphNodes, nodeId]], async () => {
+              const node = await kv.get<GraphNode>(KV.graphNodes, nodeId);
               if (!node || node.stale) return;
               const overlap = (node.sourceObservationIds ?? []).some((id) => obsIds.has(id));
               if (overlap) {

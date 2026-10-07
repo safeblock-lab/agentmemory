@@ -152,6 +152,33 @@ describe("access-tracker", () => {
     expect((await getAccessLog(kv as never, "mem_b")).count).toBe(1);
   });
 
+  it("deletes an access write already queued by a read", async () => {
+    const { recordAccessBatch, deleteAccessLog } = await import(
+      "../src/functions/access-tracker.js"
+    );
+    const kv = mockKV();
+    const realSet = kv.set.bind(kv);
+    let enteredWrite!: () => void;
+    let releaseWrite!: () => void;
+    const writing = new Promise<void>((resolve) => { enteredWrite = resolve; });
+    const released = new Promise<void>((resolve) => { releaseWrite = resolve; });
+    kv.set = (async (scope: string, key: string, value: unknown) => {
+      if (scope === "mem:access" && key === "obs_a") {
+        enteredWrite();
+        await released;
+      }
+      return realSet(scope, key, value);
+    }) as never;
+
+    const recording = recordAccessBatch(kv as never, ["obs_a"]);
+    await writing;
+    const deleting = deleteAccessLog(kv as never, "obs_a");
+    releaseWrite();
+    await Promise.all([recording, deleting]);
+
+    expect(kv.store.get("mem:access")?.has("obs_a")).toBe(false);
+  });
+
   it("deleteAccessLog is a no-op for unknown ids and empty ids", async () => {
     const { deleteAccessLog, recordAccess } = await import(
       "../src/functions/access-tracker.js"

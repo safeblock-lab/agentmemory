@@ -117,6 +117,20 @@ describe("resolveDataDir", () => {
     }
   });
 
+  it("keeps an existing SQLite store after its legacy source is archived", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agentmemory-data-"));
+    mkdirSync(join(cwd, "data"));
+    writeFileSync(join(cwd, "data", "state_store.sqlite3"), "existing");
+    try {
+      expect(resolveDataDir({ args: [], env: {}, cwd, home: cwd, platform: "win32" })).toEqual({
+        dataDir: join(cwd, "data"),
+        source: "default",
+      });
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("does not adopt an unrelated data directory", () => {
     const cwd = mkdtempSync(join(tmpdir(), "agentmemory-data-"));
     mkdirSync(join(cwd, ".git"));

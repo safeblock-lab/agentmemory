@@ -252,12 +252,11 @@ describe("durable batch effects", () => {
     expect(h.store.get(`${KV.graphJobs}:${durableId}`)).toMatchObject({ state: "completed" });
   });
 
-  it("repairs an acknowledged-lost audit without a second entry", async () => {
+  it("does not store audit rows or effect-key markers across retries", async () => {
     const h = effectHarness();
     const key = batchEffectKey("audit");
-    h.crash(KV.audit, true);
-    await expect(recordAudit(h.kv, "reflect", "mem::reflect", [], {}, undefined, undefined, key)).rejects.toThrow();
     await recordAudit(h.kv, "reflect", "mem::reflect", [], {}, undefined, undefined, key);
-    expect(await h.kv.list(KV.audit)).toHaveLength(1);
+    await recordAudit(h.kv, "reflect", "mem::reflect", [], {}, undefined, undefined, key);
+    expect(await h.kv.list(KV.audit)).toHaveLength(0);
   });
 });

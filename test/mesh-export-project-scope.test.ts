@@ -17,7 +17,8 @@ const SECRET = "mesh-test-secret";
 
 function mockKV(store = new Map<string, Map<string, unknown>>()) {
   return {
-    get: async () => null,
+    get: async <T>(scope: string, key: string): Promise<T | null> =>
+      (store.get(scope)?.get(key) as T | undefined) ?? null,
     set: async <T>(s: string, k: string, d: T) => {
       if (!store.has(s)) store.set(s, new Map());
       store.get(s)!.set(k, d);
@@ -27,6 +28,25 @@ function mockKV(store = new Map<string, Map<string, unknown>>()) {
     update: async () => {},
     list: async <T>(scope: string): Promise<T[]> =>
       Array.from(store.get(scope)?.values() ?? []) as T[],
+    pages: async function* <T>(scope: string, options: { cursor?: string; limit?: number; fields?: string[] } = {}) {
+      const rows = Array.from(store.get(scope)?.values() ?? []);
+      const limit = options.limit ?? 256;
+      let start = options.cursor === undefined ? 0 : Number(options.cursor);
+      while (start < rows.length || start === 0) {
+        const end = Math.min(rows.length, start + limit);
+        const items = rows.slice(start, end).map((row) => {
+          if (!options.fields) return row as T;
+          const source = row && typeof row === "object" ? row as Record<string, unknown> : {};
+          return Object.fromEntries(options.fields.flatMap((field) =>
+            Object.hasOwn(source, field) ? [[field, source[field]]] : [],
+          )) as T;
+        });
+        const next_cursor = end < rows.length ? String(end) : null;
+        yield { items, next_cursor };
+        if (next_cursor === null) return;
+        start = end;
+      }
+    },
     _store: store,
   };
 }

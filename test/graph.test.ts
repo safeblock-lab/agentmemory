@@ -58,11 +58,11 @@ function mockSdk() {
 const mockProvider = {
   name: "test",
   compress: vi.fn().mockResolvedValue(`<entities>
-<entity type="file" name="src/index.ts"><property key="path">src/index.ts</property></entity>
-<entity type="function" name="main"><property key="lang">typescript</property></entity>
+<entity type="file" name="src/index.ts" observations="1"><property key="path">src/index.ts</property></entity>
+<entity type="function" name="main" observations="1"><property key="lang">typescript</property></entity>
 </entities>
 <relationships>
-<relationship type="uses" source="src/index.ts" target="main" weight="0.9"/>
+<relationship type="uses" source="src/index.ts" target="main" weight="0.9" observations="1"/>
 </relationships>`),
   summarize: vi.fn(),
 };
@@ -173,11 +173,11 @@ describe("Graph Functions", () => {
 
   it("graph-extract accepts self-closing entity tags", async () => {
     mockProvider.compress.mockResolvedValueOnce(`<entities>
-<entity type="file" name="src/index.ts"/>
-<entity type="function" name="main"><property key="lang">typescript</property></entity>
+<entity type="file" name="src/index.ts" observations="1"/>
+<entity type="function" name="main" observations="1"><property key="lang">typescript</property></entity>
 </entities>
 <relationships>
-<relationship type="uses" source="src/index.ts" target="main" weight="0.9"/>
+<relationship type="uses" source="src/index.ts" target="main" weight="0.9" observations="1"/>
 </relationships>`);
 
     const result = (await sdk.trigger("mem::graph-extract", {
@@ -202,11 +202,11 @@ describe("Graph Functions", () => {
     // source→target→type rather than the hard-coded type-first /
     // type/source/target/weight sequence the old parser required.
     mockProvider.compress.mockResolvedValueOnce(`<entities>
-<entity name="src/index.ts" type="file"/>
-<entity name="main" type="function"><property key="lang">typescript</property></entity>
+<entity name="src/index.ts" type="file" observations="1"/>
+<entity name="main" type="function" observations="1"><property key="lang">typescript</property></entity>
 </entities>
 <relationships>
-<relationship source="src/index.ts" target="main" type="uses" weight="0.9"/>
+<relationship source="src/index.ts" target="main" type="uses" weight="0.9" observations="1"/>
 </relationships>`);
 
     const result = (await sdk.trigger("mem::graph-extract", {
@@ -303,7 +303,7 @@ describe("Graph Functions", () => {
 
   it("graph-extract accepts nodes without relationships", async () => {
     mockProvider.compress.mockResolvedValueOnce(
-      '<entities><entity type="concept" name="standalone"/></entities>',
+      '<entities><entity type="concept" name="standalone" observations="1"/></entities>',
     );
 
     const result = (await sdk.trigger("mem::graph-extract", {

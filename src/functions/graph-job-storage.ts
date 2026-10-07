@@ -137,7 +137,9 @@ export class GraphJobStorage {
     const run = this.serial.then(async () => {
       this.assertLease();
       const row = await this.kv.getVersioned(scope, key, this.guard);
-      await this.commit(this.prepared([{ type: "set", scope, key, expected_version: row.version, value: graphJson(value) }], delta, "staging"));
+      const normalized = graphJson(value);
+      if (row.exists && JSON.stringify(row.value) === JSON.stringify(normalized)) return;
+      await this.commit(this.prepared([{ type: "set", scope, key, expected_version: row.version, value: normalized }], delta, "staging"));
     });
     this.serial = run.catch(() => undefined);
     return run;

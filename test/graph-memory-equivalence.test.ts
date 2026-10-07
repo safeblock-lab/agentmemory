@@ -56,6 +56,15 @@ const ACCEPTED_NATIVE = JSON.parse(
 const ACCEPTED_NATIVE_MANIFEST = JSON.parse(
   readFileSync(resolve(HERE, "../.native-pagination-build/release-native-current/manifest-verification.json"), "utf8"),
 ) as { manifestPath: string; manifestSha256: string; artifactSha256: string };
+const HISTORICAL_SOURCE_FREEZE = JSON.parse(
+  readFileSync(resolve(HERE, "../.native-pagination-build/release-native-current/hash-freeze.json"), "utf8"),
+) as { pins: Array<{ path: string; sha256: string }> };
+const CURRENT_SOURCE_FREEZE = JSON.parse(
+  readFileSync(resolve(HERE, "../artifacts/private/native-storage-v2/candidate/source-freeze.json"), "utf8"),
+) as Array<{ path: string; sha256: string }>;
+const CURRENT_NATIVE_MANIFEST = JSON.parse(
+  readFileSync(resolve(HERE, "../patches/iii-engine/manifest.json"), "utf8"),
+) as { artifactPath: string; artifactSha256: string; patchPath: string; patchSha256: string };
 const pins = JSON.parse(readFileSync(resolve(RESOURCE_ROOT, "pins.json"), "utf8")) as {
   oracle: { gitRef: string; files: Array<{ path: string; sha256: string }> };
   candidate: { acceptedForRuntime: boolean; sourcePinsMustBeRefreshedAfterMainCorrection: boolean };
@@ -159,7 +168,15 @@ describe("frozen pre-transaction graph oracle", () => {
     expect(await sha256File(ACCEPTED_NATIVE.executable)).toBe(ACCEPTED_NATIVE.sha256);
     expect(ACCEPTED_NATIVE_MANIFEST.manifestPath).toBe("patches/iii-engine/manifest.json");
     expect(ACCEPTED_NATIVE_MANIFEST.artifactSha256).toBe(ACCEPTED_NATIVE.sha256);
-    expect(await sha256File(resolve(HERE, "..", ACCEPTED_NATIVE_MANIFEST.manifestPath))).toBe(ACCEPTED_NATIVE_MANIFEST.manifestSha256);
+    expect(HISTORICAL_SOURCE_FREEZE.pins.find((pin) => pin.path === ACCEPTED_NATIVE_MANIFEST.manifestPath)?.sha256)
+      .toBe(ACCEPTED_NATIVE_MANIFEST.manifestSha256);
+    for (const path of [ACCEPTED_NATIVE_MANIFEST.manifestPath, CURRENT_NATIVE_MANIFEST.patchPath]) {
+      const pin = CURRENT_SOURCE_FREEZE.find((entry) => entry.path === path);
+      expect(pin, path).toBeDefined();
+      expect(await sha256File(resolve(HERE, "..", path)), path).toBe(pin?.sha256);
+    }
+    expect(await sha256File(resolve(HERE, "..", CURRENT_NATIVE_MANIFEST.artifactPath)))
+      .toBe(CURRENT_NATIVE_MANIFEST.artifactSha256);
     expect(await sha256File(resolve(RESOURCE_ROOT, "..", "..", pins.native.proofPath))).toBe(pins.native.proofSha256);
     expect(await sha256File(resolve(RESOURCE_ROOT, pins.native.resourceConfigTemplatePath))).toBe(pins.native.resourceConfigTemplateSha256);
   });
