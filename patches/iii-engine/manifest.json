@@ -4,10 +4,10 @@
   "sourceRepository": "https://github.com/iii-hq/iii.git",
   "sourceCommit": "e7de3820d1e558f3762edf95e4440552444d48d3",
   "patchPath": "patches/iii-engine/0.22.1-state-pagination.patch",
-  "patchSha256": "315bdb52b0324d6271132b84c50650f7028c6ba32fc1dba319a5f82730db605a",
+  "patchSha256": "9dfd2676ae7e7e1a8d749d5a2493af9463261b42386b419a7a4bcd54ec29e004",
   "artifactPath": ".codex-task/bounded-engine/cargo-target/x86_64-pc-windows-msvc/release/iii.exe",
-  "artifactSha256": "9d62f27f72d43b3cab203b433607fa6223251be7c4f7949248a481d4819aa61f",
-  "artifactBytes": 29145088,
+  "artifactSha256": "143d77823a48003d10dba9c1ad96ebe894eb3e45f94386b57061eb1d8ce4ac6c",
+  "artifactBytes": 29135360,
   "buildTarget": "x86_64-pc-windows-msvc",
   "verifiedPlatform": "win32-x64",
   "capabilities": [
@@ -50,7 +50,7 @@
   },
   "deploymentReady": true,
   "rustToolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)",
-  "builtAt": "2026-10-08T16:47:36Z",
+  "builtAt": "2026-10-08T19:18:24.846Z",
   "validation": {
     "canonicalCandidateReceipt": "artifacts/private/release-0.9.83/native-candidate/native-candidate-receipt.json",
     "patchApplyCheck": "not rerun for this version",
@@ -1179,5 +1179,14 @@
         "membershipPairs": 37753781
       }
     }
+  },
+  "currentReleaseBuild": {
+    "version": "0.22.1",
+    "exitCode": 0,
+    "command": "cargo build --locked --release --no-default-features --jobs 1 --package iii --bin iii --target x86_64-pc-windows-msvc",
+    "log": ".codex-task/bounded-engine/build.log",
+    "applicationTestsRun": false,
+    "typecheckRun": false,
+    "capabilityProbeRun": false
   }
 }

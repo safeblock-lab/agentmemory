@@ -4953,7 +4953,7 @@ new file mode 100644
 index 0000000..7b3541a
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/commit.rs
-@@ -0,0 +1,415 @@
+@@ -0,0 +1,441 @@
 +use super::{
 +    database::{self, CHECKPOINT_SCOPE, CONTROL_SCOPE, RECEIPT_SCOPE},
 +    protocol::{
@@ -4964,6 +4964,8 @@ index 0000000..7b3541a
 +use rusqlite::Connection;
 +use serde::{Deserialize, Serialize};
 +use serde_json::{Value, json};
++
++const COMMIT_LEASE_RENEWAL_MS: i64 = 120_000;
 +
 +#[derive(Clone, Serialize, Deserialize)]
 +#[serde(deny_unknown_fields)]
@@ -5014,6 +5016,25 @@ index 0000000..7b3541a
 +    }) {
 +        return Err(error("STATE_TX_FENCED"));
 +    }
++    Ok(())
++}
++fn refresh_committed_lease(control: &mut Control, guard: &Guard) -> anyhow::Result<()> {
++    if control.generation != guard.generation || control.fence != guard.fence {
++        return Err(error("STATE_TX_FENCED"));
++    }
++    let Some(lease) = control.lease.as_mut().filter(|lease| {
++        lease.owner_id == guard.owner_id
++            && lease.generation == guard.generation
++            && lease.fence == guard.fence
++    }) else {
++        return Err(error("STATE_TX_FENCED"));
++    };
++    let refreshed_until = chrono::Utc::now()
++        .timestamp_millis()
++        .checked_add(COMMIT_LEASE_RENEWAL_MS)
++        .filter(|time| *time > 0 && *time <= 9_007_199_254_740_991)
++        .ok_or_else(|| error("STATE_TX_LIMIT_EXCEEDED"))?;
++    lease.expires_at_ms = lease.expires_at_ms.max(refreshed_until);
 +    Ok(())
 +}
 +pub fn read_allowed(
@@ -5281,6 +5302,8 @@ index 0000000..7b3541a
 +        if receipt["payload_digest"] != request.payload_digest {
 +            return Err(error("STATE_TX_REPLAY_CONFLICT"));
 +        }
++        refresh_committed_lease(&mut control, &request.guard)?;
++        save_control(connection, &control)?;
 +        return Ok(receipt);
 +    }
 +    if body.identity.generation != control.generation {
@@ -5354,10 +5377,13 @@ index 0000000..7b3541a
 +        control.generation = protocol::next(protocol::counter(&control.generation)?)?.to_string();
 +        control.lease = None;
 +    }
-+    save_control(connection, &control)?;
 +    let receipt = json!({"identity":body.identity,"payload_digest":request.payload_digest,"generation":control.generation,"checkpoint_version":checkpoint_version.to_string(),"row_versions":row_versions});
 +    database::write(connection, RECEIPT_SCOPE, &receipt_key, Some(&receipt))?;
 +    prune_terminal_job(connection, &body)?;
++    if body.advance_generation != Some(true) {
++        refresh_committed_lease(&mut control, &request.guard)?;
++    }
++    save_control(connection, &control)?;
 +    Ok(receipt)
 +}
 +

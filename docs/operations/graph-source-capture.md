@@ -30,6 +30,23 @@ been written. Interrupted publication leaves unreferenced partial rows; replay
 uses a fresh namespace rather than mixing old prefixes and a newer session
 revision. Terminal job retention owns eventual removal of those remnants.
 
+## Apply checkpoint lease
+
+The native SQLite actor serializes lease renewal and graph commits. Each commit
+checks the owner, generation, fence, and expiry at transaction entry. After a
+successful checkpoint and receipt write, the same transaction refreshes that
+same lease to a bounded 120-second window. Exact receipt replays refresh it
+after the payload digest matches. A failed transaction rolls the refresh back,
+and a lease that was already expired on entry remains fenced. The final
+generation-advance commit clears the lease as before.
+
+The refresh occurs before SQLite commits the transaction. A transaction whose
+own final commit takes longer than the refreshed window can still leave the
+next chunk fenced; this repair does not extend a lease without bound.
+The adapter's WAL pressure check also runs before it opens the guarded
+transaction. A guard that expires while queued or during that preflight is
+still rejected when the transaction validates it.
+
 Complete older captures retain their existing row keys and remain replayable.
 An exhausted stale initial capture is invalidated with no graph effects and no
 scheduled retry. Later deltas retain their existing recovery behavior. Logs
