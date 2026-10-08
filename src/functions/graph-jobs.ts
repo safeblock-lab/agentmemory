@@ -36,6 +36,11 @@ interface GraphExecution {
 type GraphHandler = (data: unknown, jobId: string) => Promise<unknown>;
 type CaptureReader = Pick<GraphJobStorage, "get">;
 const execution = new AsyncLocalStorage<GraphExecution>();
+const localRecovery = new AsyncLocalStorage<boolean>();
+class GraphProviderRecoveryRequired extends Error {
+  constructor() { super("Graph recovery requires an uncaptured provider operation"); }
+}
+const LOCAL_FROZEN_VALUES = new Set(["options", "heuristic", "parsed-batch", "parsed-response"]);
 const originals = new WeakMap<StateKV, StateKV>();
 const handlers = new WeakMap<StateKV, Map<GraphExtractionJob["kind"], GraphHandler>>();
 const graphJobQueues = new WeakMap<StateKV, Promise<void>>();
@@ -64,6 +69,7 @@ export type GraphJobReadOnlyStorage = Pick<GraphJobStorage, "get">;
 export type GraphJobPreflight<T> = (storage: GraphJobReadOnlyStorage) => Promise<T | null>;
 
 export function graphTransactionFailure(error: unknown): boolean {
+  if (error instanceof GraphProviderRecoveryRequired) return true;
   if (error instanceof StateTransactionError) return true;
   if (typeof error !== "object" || error === null) return false;
   const record = error as { code?: unknown; message?: unknown; cause?: unknown };
@@ -153,6 +159,7 @@ async function freezeValue<T>(kv: StateKV, name: string, create: () => Promise<T
     const scope = KV.graphProviderResults(context.job.id), key = `value:${current.delta.ordinal}:${name}`;
     const saved = await context.storage.get<FrozenValue>(scope, key);
     if (saved) return { scope, key, ...saved };
+    if (localRecovery.getStore() && !LOCAL_FROZEN_VALUES.has(name)) throw new GraphProviderRecoveryRequired();
     let value: T | FrozenFailure;
     let failure = false;
     try { value = await create(); }
@@ -439,8 +446,9 @@ export async function runGraphJob<T>(kv: StateKV, kind: GraphExtractionJob["kind
       }));
       return result;
     } catch (error) {
+      storage.discardPendingShadows();
       let recoveryOutcome: "retry-scheduled" | "stopped" | false = false;
-      if (!recoveryDeferred) {
+      if (!recoveryDeferred && !(error instanceof GraphProviderRecoveryRequired)) {
         try {
           recoveryOutcome = await recordStagingFailure(storage, error);
         } catch (terminalizeError) {
@@ -464,8 +472,12 @@ export async function runGraphJob<T>(kv: StateKV, kind: GraphExtractionJob["kind
           logger.warn("Initial graph source capture invalidated; retry with a fresh complete request", { jobId: storage.jobId, code: error.code });
         }
       }
-      if (recoveryOutcome === "stopped") logger.error("Graph job stopped after repeated or permanent staging failure", { jobId: storage.jobId, code: terminalPayloadFailureCode(error) ?? (error instanceof StateTransactionError ? error.code : "STATE_TX_FAILED") });
-      else if (recoveryOutcome === "retry-scheduled") logger.warn("Graph job retry scheduled with bounded backoff", { jobId: storage.jobId });
+      const cause = error instanceof Error ? error.cause : undefined;
+      const causeCode = typeof cause === "object" && cause !== null && "code" in cause && typeof cause.code === "string" && /^[A-Z0-9_:-]{1,80}$/.test(cause.code) ? cause.code : undefined;
+      const diagnostic = { jobId: storage.jobId, code: terminalPayloadFailureCode(error) ?? (error instanceof StateTransactionError ? error.code : "STATE_TX_FAILED"), causeCode, deltaOrdinal: checkpoint?.delta_ordinal, chunkOrdinal: checkpoint?.next_chunk_ordinal, visibility: checkpoint?.visibility };
+      if (error instanceof GraphProviderRecoveryRequired) logger.info("Local graph recovery paused before provider operation", diagnostic);
+      else if (recoveryOutcome === "stopped") logger.error("Graph job stopped after repeated or permanent staging failure", diagnostic);
+      else if (recoveryOutcome === "retry-scheduled") logger.warn("Graph job retry scheduled with bounded backoff", diagnostic);
       else logger.error("Graph job paused for recovery", { jobId: storage.jobId, code: error instanceof StateTransactionError ? error.code : "STATE_TX_FAILED" });
       throw error;
     } finally {
@@ -485,7 +497,8 @@ export function registerGraphJobHandler(kv: StateKV, kind: GraphExtractionJob["k
 }
 
 export function registerGraphJobRecovery(sdk: IIIClient, kv: StateKV): void {
-  sdk.registerFunction("mem::graph-recover", async () => {
+  sdk.registerFunction("mem::graph-recover", async (request?: { localOnly?: boolean }) => {
+    if (request?.localOnly !== undefined && typeof request.localOnly !== "boolean") throw new StateTransactionError("STATE_TX_INVALID_REQUEST");
     const base = baseKV(kv);
     const initial = (await base.getVersioned<GraphControlState>(KV.graphControl, "current")).value;
     if (!initial) {
@@ -550,7 +563,12 @@ export function registerGraphJobRecovery(sdk: IIIClient, kv: StateKV): void {
       // acquires a new lease and independently validates the durable request.
       await base.lease({ action: "release", ...storage.guard });
     }
-    await handler(input, job.id);
+    try {
+      await localRecovery.run(request?.localOnly === true, () => handler!(input, job!.id));
+    } catch (error) {
+      if (error instanceof GraphProviderRecoveryRequired && request?.localOnly === true) return { success: true, recovered: false, jobId: job.id, localOnly: true, providerRequired: true };
+      throw error;
+    }
     return { success: true, recovered: true, jobId: job.id };
   });
 }

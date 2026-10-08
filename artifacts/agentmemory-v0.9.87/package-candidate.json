@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 1,
+  "packageVersion": "0.9.87",
+  "publishable": true,
+  "distributionDecision": "Reuse the published v0.9.81 Qwen model and CPU runtime assets. No CUDA binaries are published. The application archive is built with the current source and companion patched engine for this release.",
+  "cpuRuntime": {
+    "archive": "agentmemory-qwen-cpu-runtime-b11371-win-x64.zip",
+    "sha256": "b4c49b21511af2c514438403a4ec4b2db6af7a14e2a92bc5ec26a75d5913b876",
+    "includesCudaDlls": false,
+    "reusedFrom": "v0.9.81"
+  },
+  "cuda": {
+    "upstreamManifest": "qwen-gpu-upstream-assets.json",
+    "publishedBinaryCount": 0
+  },
+  "model": {
+    "file": "qwen3-reranker-0.6b-q8_0.gguf",
+    "bytes": 639153184,
+    "sha256": "22c9979ce4fbcdc5acdc310c6641c32797eff1aa980b8f7a2db8a8ea23429a48"
+  },
+  "package": {
+    "file": "agentmemory-agentmemory-0.9.87.tgz",
+    "bytes": 12949861,
+    "sha256": "b280355a98e8fd8246586349ce508e761debabb31ef1cde5aed63e127e149502"
+  },
+  "native": {
+    "engineVersion": "0.22.1",
+    "storageFormatVersion": 2,
+    "artifact": {
+      "path": "win32-x64/iii.exe",
+      "sha256": "7bcb34ac9779d031a3c58b6884d4fd058c7ceb4589f37b45f3e2b291a6d5a84b",
+      "sizeBytes": 29126656
+    }
+  },
+  "validation": {
+    "build": "passed: application build and package creation",
+    "tests": "not run by user preference",
+    "typecheck": "not run by user preference",
+    "runtime": "Corrected worker startup and localOnly graph recovery receipt recorded separately",
+    "publication": "frozen draft workflow required"
+  },
+  "publicAssets": [
+    {
+      "file": "agentmemory-agentmemory-0.9.87.tgz",
+      "sizeBytes": 12949861,
+      "sha256": "b280355a98e8fd8246586349ce508e761debabb31ef1cde5aed63e127e149502"
+    },
+    {
+      "file": "qwen3-reranker-0.6b-q8_0.gguf",
+      "sizeBytes": 639153184,
+      "sha256": "22c9979ce4fbcdc5acdc310c6641c32797eff1aa980b8f7a2db8a8ea23429a48"
+    },
+    {
+      "file": "agentmemory-qwen-cpu-runtime-b11371-win-x64.zip",
+      "sizeBytes": 19512706,
+      "sha256": "b4c49b21511af2c514438403a4ec4b2db6af7a14e2a92bc5ec26a75d5913b876"
+    },
+    {
+      "file": "qwen-gpu-upstream-assets.json",
+      "sizeBytes": 1560,
+      "sha256": "df841642f3bbab55a1e96f023d49123b8e7cd58ec39c95d4fbbdf47e949e8430"
+    },
+    {
+      "file": "qwen-model-notice.md",
+      "sizeBytes": 961,
+      "sha256": "40d5743b7cfd5b59f8fb7e296187f294f366a7dbca9083273c7e28ad40f48644"
+    },
+    {
+      "file": "Apache-2.0.txt",
+      "sizeBytes": 11358,
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "file": "README.txt",
+      "sizeBytes": 424,
+      "sha256": "75e3834533b2d48ac5ff1f6eee36d732e5282b4479cd16048a86b51250955fd2"
+    }
+  ]
+}

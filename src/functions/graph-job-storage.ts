@@ -13,6 +13,7 @@ import {
 const NATIVE_ENVELOPE_BYTES = 16 * 1024 * 1024 - 64 * 1024;
 const TEMPLATE_TARGET_BYTES = 768 * 1024;
 const PREPARED_FRAGMENT_CHARS = 128 * 1024;
+const SHADOW_BUFFER_BYTES = 512 * 1024;
 const encodeKey = (value: unknown): string => Buffer.from(JSON.stringify(value)).toString("base64url");
 const successor = (value: StateCounter, count = 1): StateCounter => {
   const next = BigInt(value) + BigInt(count);
@@ -38,6 +39,12 @@ interface ShadowRow {
   operation: StateCommitOperation;
   exists: boolean;
   value?: StateJsonValue;
+}
+interface BufferedShadow {
+  row: ShadowRow;
+  version: StateCounter;
+  order?: number;
+  bytes: number;
 }
 
 const shadowValue = (row: ShadowRow): StateJsonValue => row.operation.type === "set" ? row.operation.value : row.value ?? null;
@@ -65,6 +72,8 @@ export class GraphJobStorage {
   private serial: Promise<unknown> = Promise.resolve();
   private leaseFailure: unknown;
   private accessSerial: Promise<unknown> = Promise.resolve();
+  private shadowBuffer = new Map<string, BufferedShadow>();
+  private shadowBufferBytes = 0;
 
   constructor(readonly kv: StateKV, readonly guard: StateGraphGuard, readonly jobId: string) {}
 
@@ -155,7 +164,10 @@ export class GraphJobStorage {
   }
 
   async row(delta: GraphDeltaPreparation, scope: string, key: string): Promise<ShadowRow> {
-    const saved = await this.get<ShadowRow>(KV.graphDeltas(this.jobId), this.shadowKey(delta, scope, key));
+    const keyInShadow = this.shadowKey(delta, scope, key);
+    const buffered = this.shadowBuffer.get(keyInShadow);
+    if (buffered) return buffered.row;
+    const saved = await this.get<ShadowRow>(KV.graphDeltas(this.jobId), keyInShadow);
     if (saved) return saved;
     const original = await this.kv.getVersioned<StateJsonValue>(scope, key, this.guard);
     return { operation: { type: "check", scope, key, expected_version: original.version }, exists: original.exists, value: original.value };
@@ -163,12 +175,50 @@ export class GraphJobStorage {
 
   private async remember(delta: GraphDeltaPreparation, scope: string, key: string, row: ShadowRow): Promise<void> {
     const shadowKey = this.shadowKey(delta, scope, key);
-    if (!(await this.get<ShadowRow>(KV.graphDeltas(this.jobId), shadowKey))) {
-      const ordinal = delta.shadowCount ?? 0;
-      delta.shadowCount = ordinal + 1;
-      await this.stage(KV.graphRemaps(this.jobId), `row-order:${delta.ordinal}:${delta.attempt}:${ordinal}`, shadowKey, delta);
+    let entry = this.shadowBuffer.get(shadowKey);
+    if (!entry) {
+      const saved = await this.kv.getVersioned<ShadowRow>(KV.graphDeltas(this.jobId), shadowKey, this.guard);
+      entry = { row, version: saved.version, bytes: 0 };
+      if (!saved.exists) {
+        entry.order = delta.shadowCount ?? 0;
+        delta.shadowCount = entry.order + 1;
+      }
     }
-    await this.stage(KV.graphDeltas(this.jobId), shadowKey, row, delta);
+    this.shadowBufferBytes -= entry.bytes;
+    entry.row = row;
+    entry.bytes = Buffer.byteLength(JSON.stringify(row)) + Buffer.byteLength(shadowKey) * 2 + 512;
+    this.shadowBuffer.set(shadowKey, entry);
+    this.shadowBufferBytes += entry.bytes;
+    if (this.shadowBuffer.size >= MAX_STATE_COMMIT_OPERATIONS / 2 || this.shadowBufferBytes >= SHADOW_BUFFER_BYTES) await this.flushShadows(delta);
+  }
+
+  discardPendingShadows(): void {
+    this.shadowBuffer.clear();
+    this.shadowBufferBytes = 0;
+  }
+
+  private async flushShadows(delta: GraphDeltaPreparation): Promise<void> {
+    let operations: StateCommitOperation[] = [];
+    const flush = async () => {
+      if (operations.length) await this.commit(this.prepared(operations, delta, "staging"));
+      operations = [];
+    };
+    for (const [key, entry] of this.shadowBuffer) {
+      const value = graphJson(entry.row);
+      const row: StateCommitOperation = { type: "set", scope: KV.graphDeltas(this.jobId), key, expected_version: entry.version, value };
+      const additions: StateCommitOperation[] = entry.order === undefined ? [row] : [
+        { type: "set", scope: KV.graphRemaps(this.jobId), key: `row-order:${delta.ordinal}:${delta.attempt}:${entry.order}`, expected_version: "0", value: key }, row,
+      ];
+      if (operations.length && (operations.length + additions.length > MAX_STATE_COMMIT_OPERATIONS || Buffer.byteLength(JSON.stringify([...operations, ...additions])) > TEMPLATE_TARGET_BYTES)) await flush();
+      // A large shadow uses the existing single-record exception; its order
+      // marker remains in the same staged attempt and never publishes live rows.
+      if (Buffer.byteLength(JSON.stringify(additions)) > TEMPLATE_TARGET_BYTES) {
+        await flush();
+        for (const operation of additions) await this.commit(this.prepared([operation], delta, "staging"));
+      } else operations.push(...additions);
+    }
+    await flush();
+    this.discardPendingShadows();
   }
 
   private access<T>(run: () => Promise<T>): Promise<T> {
@@ -222,6 +272,7 @@ export class GraphJobStorage {
   private preparedKey(delta: GraphDeltaPreparation, ordinal: number): string { return `prepared:${delta.ordinal}:${delta.attempt}:${ordinal}`; }
 
   async freeze(delta: GraphDeltaPreparation, result: unknown): Promise<void> {
+    await this.flushShadows(delta);
     const snapshot = await this.workingSnapshot(delta);
     let operations: StateCommitOperation[] = [];
     let count = 0;

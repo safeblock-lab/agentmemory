@@ -31,6 +31,7 @@ import { batchEffectKey } from "./state/batch-effects.js";
 import { KV } from "./state/schema.js";
 import { VectorIndex } from "./state/vector-index.js";
 import { getIndexedVector } from './state/indexed-vector.js';
+import { IndexedRetrievalError } from './state/indexed-retrieval.js';
 import { IndexedLocalEmbedding } from './state/indexed-embedding.js';
 import { HybridSearch } from "./state/hybrid-search.js";
 import { IndexPersistence } from "./state/index-persistence.js";
@@ -810,15 +811,24 @@ async function main() {
         : loaded.savedAt;
   const backgroundRecoveryPaused = isBackgroundRecoveryPaused();
   const keywordStart = Date.now();
+  let indexedRetrievalReady = false;
   if (indexedRetrieval) {
     if (backgroundRecoveryPaused) {
       bootLog("Indexed source recovery is paused by AGENTMEMORY_BACKGROUND_RECOVERY_PAUSED=1.");
+      try {
+        await indexedVector!.ready();
+        indexedRetrievalReady = true;
+      } catch (error) {
+        if (!(error instanceof IndexedRetrievalError) || error.code !== 'STATE_INDEX_NOT_READY') throw error;
+        console.warn('[agentmemory] Indexed retrieval is degraded (STATE_INDEX_NOT_READY); core services remain available. Search requires complete compatible indexes. Source recovery remains paused.');
+      }
     } else {
       const repairedSources = await indexedVector!.recoverDirtySources(embeddingProvider!);
       if (repairedSources > 0) bootLog(`Repaired ${repairedSources} incomplete indexed sources during startup.`);
+      await indexedVector!.ready();
+      indexedRetrievalReady = true;
     }
-    await indexedVector!.ready();
-    bootLog('Indexed local semantic + lexical + graph retrieval ready; no resident corpus restored.');
+    if (indexedRetrievalReady) bootLog('Indexed local semantic + lexical + graph retrieval ready; no resident corpus restored.');
   } else {
   try {
     const keyword = await rebuildKeywordIndex(kv, vectorBackfillSince);
@@ -857,7 +867,9 @@ async function main() {
   // CLI surfaces a compact summary when it sees the worker reach
   // ready state.
   bootLog(
-    `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
+    indexedRetrieval && !indexedRetrievalReady
+      ? 'Ready. Core services active; indexed search unavailable (STATE_INDEX_NOT_READY).'
+      : `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
   );
   bootLog(
     `REST API: 132 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
