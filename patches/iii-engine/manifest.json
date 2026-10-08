@@ -4,10 +4,10 @@
   "sourceRepository": "https://github.com/iii-hq/iii.git",
   "sourceCommit": "e7de3820d1e558f3762edf95e4440552444d48d3",
   "patchPath": "patches/iii-engine/0.22.1-state-pagination.patch",
-  "patchSha256": "d4700327dd275de816f8e68a406988b74bcecc17b050b73f664b41700cbdf00f",
+  "patchSha256": "b44287f964e7443327776307169329cc6327b0dd059d95d562a6eb0362b59611",
   "artifactPath": ".iii-engine-build/cargo-target/x86_64-pc-windows-msvc/release/iii.exe",
-  "artifactSha256": "57fa7d72b897c654f7d373a0cdcfa8938ad05f805c7db6c551dcd9c6f47161f0",
-  "artifactBytes": 29276160,
+  "artifactSha256": "30ddeb002245965825094d7eea5a63bde4356b24eb9c73b5905029bde8bb40a2",
+  "artifactBytes": 29297664,
   "buildTarget": "x86_64-pc-windows-msvc",
   "verifiedPlatform": "win32-x64",
   "capabilities": [

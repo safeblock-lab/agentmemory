@@ -7567,10 +7567,9 @@ index 0000000000000000000000000000000000000000..79c021146b196432f66506c4be48afdf
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/retention.rs b/engine/src/workers/state/adapters/sqlite/retention.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..58c0a62c1659000bf31471ca5190c8137f6d83ed
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retention.rs
-@@ -0,0 +1,238 @@
+@@ -0,0 +1,273 @@
 +use super::{commit, database, protocol};
 +use protocol::{Checkpoint, Guard, JOBS, WORKING, error, require};
 +use rusqlite::{Connection, params};
@@ -7702,27 +7701,62 @@ index 0000000000000000000000000000000000000000..58c0a62c1659000bf31471ca5190c813
 +    max_bytes: u64,
 +    cursor: Option<Cursor>,
 +) -> anyhow::Result<Value> {
++    let start = std::time::Instant::now();
++    let budget = std::time::Duration::from_secs(3);
++    connection.progress_handler(10_000, Some(move || start.elapsed() >= budget))?;
++    let result = remove_page_inner(connection, ranges, limit, max_bytes, cursor);
++    connection.progress_handler(0, None::<fn() -> bool>)?;
++    if start.elapsed() >= budget || result.as_ref().err().is_some_and(|cause| {
++        cause.downcast_ref::<rusqlite::Error>().is_some_and(|error| {
++            matches!(error, rusqlite::Error::SqliteFailure(code, _)
++                if code.code == rusqlite::ErrorCode::OperationInterrupted)
++        })
++    }) {
++        return Err(error("STATE_TX_LIMIT_EXCEEDED"));
++    }
++    result
++}
++fn remove_page_inner(
++    connection: &Connection,
++    ranges: &[Range],
++    limit: usize,
++    max_bytes: u64,
++    cursor: Option<Cursor>,
++) -> anyhow::Result<Value> {
 +    let mut cursor = cursor.unwrap_or_default();
 +    let mut count = 0usize;
 +    let mut bytes = 0u64;
 +    while cursor.scope_index < ranges.len() {
 +        let range = &ranges[cursor.scope_index];
 +        let rows = {
-+            let mut statement = connection.prepare_cached("SELECT key,value_bytes FROM state_rows WHERE scope=?1 AND key>?2 AND (?3='' OR key>=?3) AND (?4='' OR key<?4 OR (?6 AND key=?4)) AND key<>?5 AND (NOT ?6 OR key=?3) ORDER BY key LIMIT ?7")?;
-+            let selected = statement
-+                .query_map(
-+                    params![
-+                        range.scope,
-+                        cursor.after_key,
-+                        range.lower,
-+                        range.upper,
-+                        range.keep,
-+                        range.exact,
-+                        (limit - count + 1) as i64
-+                    ],
-+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
-+                )?
-+                .collect::<Result<Vec<_>, _>>()?;
++            let after = cursor.after_key.as_str();
++            let lower = range.lower.as_str();
++            let upper = range.upper.as_str();
++            let (sql, lower, upper) = if range.exact {
++                ("SELECT key,value_bytes FROM state_rows WHERE scope=?1 AND key=?3 AND key>?2 AND key<>?5 ORDER BY key LIMIT ?4", lower, None)
++            } else if !upper.is_empty() {
++                ("SELECT key,value_bytes FROM state_rows WHERE scope=?1 AND key>?2 AND key>=?3 AND key<?6 AND key<>?5 ORDER BY key LIMIT ?4", lower, Some(upper))
++            } else if !lower.is_empty() {
++                ("SELECT key,value_bytes FROM state_rows WHERE scope=?1 AND key>?2 AND key>=?3 AND key<>?5 ORDER BY key LIMIT ?4", lower, None)
++            } else {
++                ("SELECT key,value_bytes FROM state_rows WHERE scope=?1 AND key>?2 AND key<>?5 ORDER BY key LIMIT ?4", "", None)
++            };
++            let mut statement = connection.prepare_cached(sql)?;
++            statement.raw_bind_parameter(1, &range.scope)?;
++            statement.raw_bind_parameter(2, after)?;
++            if range.exact || !range.upper.is_empty() || !range.lower.is_empty() {
++                statement.raw_bind_parameter(3, lower)?;
++            }
++            statement.raw_bind_parameter(4, (limit - count + 1) as i64)?;
++            statement.raw_bind_parameter(5, &range.keep)?;
++            if let Some(upper) = upper {
++                statement.raw_bind_parameter(6, upper)?;
++            }
++            let mut selected = Vec::new();
++            let mut rows = statement.raw_query();
++            while let Some(row) = rows.next()? {
++                selected.push((row.get::<_, String>(0)?, row.get::<_, i64>(1)?));
++            }
 +            selected
 +        };
 +        if rows.is_empty() {

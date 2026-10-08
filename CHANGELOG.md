@@ -16,6 +16,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Show only the latest 20 timeline operations without deleting observations needed by recall.
 - Allow operators to pause startup index repair and vector backfill, summary recovery, and graph recovery/terminal retention with `AGENTMEMORY_BACKGROUND_RECOVERY_PAUSED=1`.
 
+### Native package correction (2026-10-08)
+
+- Replace the Windows engine package with the compiled revision-aware native build and refresh its patch and binary manifest metadata.
+
 ## [0.9.82] — 2026-10-06
 
 ### Fixed
