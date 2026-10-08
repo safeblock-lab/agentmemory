@@ -475,13 +475,14 @@ describe("update lifecycle", () => {
     expect(support.supported).toBe(false);
   });
 
-  it("keeps the updater disabled without a sufficiently long dedicated secret", () => {
+  it("does not depend on a dedicated update secret", () => {
     const original = process.env.AGENTMEMORY_UPDATE_SECRET;
     try {
       delete process.env.AGENTMEMORY_UPDATE_SECRET;
-      expect(getUpdateSupport()).toMatchObject({ supported: false, reason: expect.stringContaining("AGENTMEMORY_UPDATE_SECRET") });
+      const support = getUpdateSupport();
       process.env.AGENTMEMORY_UPDATE_SECRET = "too-short";
-      expect(getUpdateSupport()).toMatchObject({ supported: false, reason: expect.stringContaining("AGENTMEMORY_UPDATE_SECRET") });
+      expect(getUpdateSupport()).toEqual(support);
+      expect(support.reason ?? "").not.toContain("AGENTMEMORY_UPDATE_SECRET");
     } finally {
       if (original === undefined) delete process.env.AGENTMEMORY_UPDATE_SECRET;
       else process.env.AGENTMEMORY_UPDATE_SECRET = original;

@@ -13,7 +13,10 @@ import type { ResilientProvider } from "../providers/resilient.js";
 import { III_PINNED_VERSION, VERSION } from "../version.js";
 import { CONSOLIDATION_COUNTS_REUSE_MS, CONSOLIDATION_LAST_RUN_KEY, PROCEDURAL_MIN_SESSIONS_PER_PATTERN, describeConsolidation, type ConsolidationRunRecord } from "../functions/consolidation-status.js";
 import { UNINDEXED_SCAN_REUSE_MS, evaluateStatus, prefersHtml, renderStatusHtml, singleFlight, type GraphStatsInput } from "../functions/status.js";
+import { readNativeIndexStatus } from "../state/indexed-retrieval.js";
+import { createDashboardActivity } from "../functions/dashboard-activity.js";
 import {
+  getEmbeddingProvider,
   findUnindexedObservations,
   getIndexPersistenceStatus,
   getPendingVectorBackfillCount,
@@ -351,23 +354,25 @@ export function registerApiTriggers(
     }
   }
 
+  const activity = createDashboardActivity();
   const sharedUnindexedScan = singleFlight(() => findUnindexedObservations(kv), UNINDEXED_SCAN_REUSE_MS);
 
   sdk.registerFunction("api::status",
     async (req: HttpRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      const idx = getSearchIndex();
-      const [health, functionMetrics, graph, unindexed] = await Promise.all([
+      const idx = kv.indexedRetrieval ? null : getSearchIndex();
+      const [health, functionMetrics, graph, native, unindexed] = await Promise.all([
         valueWithin(getLatestHealth(kv), STATUS_CHECK_TIMEOUT_MS),
         metricsStore ? valueWithin(metricsStore.getAll(), STATUS_CHECK_TIMEOUT_MS) : Promise.resolve([]),
         valueWithin(
           sdk.trigger({ function_id: "mem::graph-stats", payload: {} }) as Promise<GraphStatsInput>,
           STATUS_CHECK_TIMEOUT_MS,
         ),
-        valueWithin(sharedUnindexedScan(), STATUS_CHECK_TIMEOUT_MS),
+        kv.indexedRetrieval ? valueWithin(readNativeIndexStatus(kv, getEmbeddingProvider()), STATUS_CHECK_TIMEOUT_MS) : Promise.resolve(null),
+        kv.indexedRetrieval ? Promise.resolve(null) : valueWithin(sharedUnindexedScan(), STATUS_CHECK_TIMEOUT_MS),
       ]);
-      const observationsIndexed = [...idx.observationCountsBySession().values()].reduce((a, n) => a + n, 0);
+      const observationsIndexed = idx ? [...idx.observationCountsBySession().values()].reduce((a, n) => a + n, 0) : null;
       const circuit =
         provider && "circuitState" in provider
           ? (provider.circuitState as { state?: string; failures?: number } | null)
@@ -395,18 +400,21 @@ export function registerApiTriggers(
         provider: detectLlmProviderKind(),
         embeddingProvider: detectEmbeddingProvider() ? "embeddings" : "none",
         flags: buildConfigFlags(),
+        activity: activity.snapshot(isAgentScopeIsolated() ? getAgentId() : undefined),
         index: {
-          bm25Documents: idx.size,
-          vectorDocuments: getVectorIndex()?.size ?? null,
+          mode: kv.indexedRetrieval ? "native" : "legacy",
+          bm25Documents: kv.indexedRetrieval ? native?.lexicalCount ?? null : idx?.size ?? null,
+          vectorDocuments: kv.indexedRetrieval ? native?.vectorCount ?? null : getVectorIndex()?.size ?? null,
           observationsIndexed,
           missingObservations: unindexed ? unindexed.missing.length : null,
           sessions: unindexed ? unindexed.sessions : null,
-          bm25Incomplete: isBm25RebuildIncomplete(),
-          pendingVectorBackfill: getPendingVectorBackfillCount(),
+          bm25Incomplete: kv.indexedRetrieval ? null : isBm25RebuildIncomplete(),
+          pendingVectorBackfill: kv.indexedRetrieval ? null : getPendingVectorBackfillCount(),
+          ...(kv.indexedRetrieval ? { native } : {}),
         },
         graph,
         graphExtractionEnabled: isGraphExtractionEnabled(),
-        indexPersistence: getIndexPersistenceStatus(),
+        indexPersistence: kv.indexedRetrieval ? null : getIndexPersistenceStatus(),
       });
       const accept = req.headers?.["accept"] ?? req.headers?.["Accept"];
       const format = req.query_params?.["format"];

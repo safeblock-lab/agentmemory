@@ -18,6 +18,27 @@ import {
 export type { StatePage, StatePageOptions } from './state-pages.js'
 export type { StateGraphGuard, StateGraphLease, StateLeaseRequest, StatePreparedBatch, StateBatchReceipt, StateVersioned } from './state-transactions.js'
 
+type StateWriteListener = (event: { scope: string; key: string; value: unknown }) => void
+
+const stateWriteListeners = new Set<StateWriteListener>()
+
+export function subscribeStateWrites(listener: StateWriteListener): () => void {
+  stateWriteListeners.add(listener)
+  return () => stateWriteListeners.delete(listener)
+}
+
+function notifyStateWrite(event: { scope: string; key: string; value: unknown }): void {
+  for (const listener of stateWriteListeners) {
+    try {
+      listener(event)
+    } catch {
+      try {
+        console.warn('StateKV write observer failed')
+      } catch {}
+    }
+  }
+}
+
 export class StateKV {
   constructor(private sdk: IIIClient) {}
 
@@ -58,10 +79,12 @@ export class StateKV {
   }
 
   async set<T = unknown>(scope: string, key: string, value: T): Promise<T> {
-    return this.sdk.trigger<{ scope: string; key: string; value: T }, T>({
+    const committedValue = await this.sdk.trigger<{ scope: string; key: string; value: T }, T>({
       function_id: 'state::set',
       payload: { scope, key, value },
     })
+    notifyStateWrite({ scope, key, value: committedValue })
+    return committedValue
   }
 
   async update<T = unknown>(
@@ -69,13 +92,15 @@ export class StateKV {
     key: string,
     ops: Array<{ type: string; path: string; value?: unknown }>,
   ): Promise<T> {
-    return this.sdk.trigger<
+    const committedValue = await this.sdk.trigger<
       { scope: string; key: string; ops: Array<{ type: string; path: string; value?: unknown }> },
       T
     >({
       function_id: 'state::update',
       payload: { scope, key, ops },
     })
+    notifyStateWrite({ scope, key, value: committedValue })
+    return committedValue
   }
 
   async delete(scope: string, key: string): Promise<void> {

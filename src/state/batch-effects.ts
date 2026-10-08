@@ -11,6 +11,7 @@ const destinations = ["consolidation", "crystallize", "graph", "lessons", "refle
 interface Admission { family: string; startedAt: number; active: boolean }
 const activeAdmissions = new Set<Admission>();
 const admissionContext = new AsyncLocalStorage<Admission>();
+const maintenanceContext = new AsyncLocalStorage<{ active: boolean }>();
 let maintenance = false;
 let onQuiescent: (() => void) | undefined;
 let admissionWaiters: Array<() => void> = [];
@@ -30,6 +31,12 @@ async function withAdmission<T>(family: string, run: () => Promise<T>): Promise<
     activeAdmissions.delete(admission);
     if (activeAdmissions.size === 0) onQuiescent?.();
   }
+}
+
+export function withGraphLeaseAdmission<T>(run: () => Promise<T>): Promise<T> {
+  // The exclusive maintenance owner may import graph state under its own lock.
+  if (maintenanceContext.getStore()?.active) return run();
+  return withAdmission("graph-lease", run);
 }
 
 export function withBatchRecordLocks<T>(records: ReadonlyArray<readonly [string, string]>, run: () => Promise<T>): Promise<T> {
@@ -221,6 +228,7 @@ export class BatchMaintenanceBusyError extends Error {
 export function withBatchMutationLocks<T>(kv: StateKV, run: () => Promise<T>): Promise<T> {
   if (admissionContext.getStore()?.active) return Promise.reject(new Error("Batch maintenance cannot run inside an admitted callback"));
   return withKeyedLock("batch-maintenance", async () => {
+    const exclusive = { active: true };
     maintenance = true;
     try {
       if (activeAdmissions.size > 0) await new Promise<void>((resolve, reject) => {
@@ -229,12 +237,13 @@ export function withBatchMutationLocks<T>(kv: StateKV, run: () => Promise<T>): P
         onQuiescent = () => { clearTimeout(timer); resolve(); };
       });
       onQuiescent = undefined;
-      return await destinations.reduceRight<() => Promise<T>>((next, destination) => () =>
+      return await maintenanceContext.run(exclusive, () => destinations.reduceRight<() => Promise<T>>((next, destination) => () =>
         withKeyedLock(`batch-callback:${destination}`, next), async () => {
           await assertRecovered(kv, destinations);
           return run();
-        })();
+        })());
     } finally {
+      exclusive.active = false;
       onQuiescent = undefined;
       maintenance = false;
       const waiters = admissionWaiters;

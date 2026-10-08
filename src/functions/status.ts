@@ -1,4 +1,6 @@
 import type { IndexLegStatus, IndexPersistenceStatus } from "../state/index-persistence.js";
+import type { DashboardActivity } from "./dashboard-activity.js";
+import type { readNativeIndexStatus } from "../state/indexed-retrieval.js";
 
 export type StatusLevel = "ok" | "info" | "warn" | "error";
 
@@ -26,8 +28,10 @@ export interface StatusFlag {
 }
 
 export interface GraphStatsInput {
-  totalNodes?: number;
-  totalEdges?: number;
+  totalNodes?: number | null;
+  totalEdges?: number | null;
+  provenance?: "snapshot" | "unavailable";
+  countsAreCurrent?: boolean;
   fromSnapshot?: boolean;
   updatedAt?: string;
   dirty?: boolean;
@@ -52,14 +56,17 @@ export interface StatusInputs {
   embeddingProvider: string;
   flags: StatusFlag[];
   index: {
-    bm25Documents: number;
+    mode?: "native" | "legacy";
+    bm25Documents: number | null;
     vectorDocuments: number | null;
-    observationsIndexed: number;
+    observationsIndexed: number | null;
     missingObservations: number | null;
     sessions: number | null;
-    bm25Incomplete: boolean;
-    pendingVectorBackfill: number;
+    bm25Incomplete: boolean | null;
+    pendingVectorBackfill: number | null;
+    native?: Awaited<ReturnType<typeof readNativeIndexStatus>>;
   };
+  activity?: DashboardActivity | null;
   graph: GraphStatsInput | null;
   graphExtractionEnabled: boolean;
   indexPersistence?: IndexPersistenceStatus | null;
@@ -77,6 +84,7 @@ export interface StatusReport {
   health: StatusInputs["health"];
   provider: { llm: string; embeddings: string; circuitBreaker: StatusInputs["circuitBreaker"] };
   index: StatusInputs["index"];
+  activity: DashboardActivity | null;
   indexPersistence: IndexPersistenceStatus | null;
   graph: (GraphStatsInput & { ageSeconds: number | null; extractionEnabled: boolean }) | null;
   functions: Array<FunctionMetricInput & { failureRate: number }>;
@@ -166,7 +174,10 @@ export function evaluateStatus(input: StatusInputs): StatusReport {
       fix: "Restart agentmemory: the boot reconcile re-indexes observations missing from the snapshot.",
     });
   }
-  if (missingObservations === null) {
+  if (input.index.mode === "native" && !input.index.native?.ready) {
+    problems.push({ level: "warn", code: "native-index-not-ready", message: "The active native search index is unavailable or its source coverage is not ready." });
+  }
+  if (missingObservations === null && input.index.mode !== "native") {
     problems.push({
       level: "info",
       code: "index-check-unavailable",
@@ -183,7 +194,7 @@ export function evaluateStatus(input: StatusInputs): StatusReport {
     });
   }
 
-  if (input.index.pendingVectorBackfill > 0) {
+  if (input.index.pendingVectorBackfill !== null && input.index.pendingVectorBackfill > 0) {
     problems.push({
       level: "info",
       code: "index-vector-backfill-pending",
@@ -231,8 +242,8 @@ export function evaluateStatus(input: StatusInputs): StatusReport {
       problems.push({
         level: "warn",
         code: "graph-no-snapshot",
-        message: "Graph extraction is on but no graph snapshot exists, so graph counts read as zero.",
-        fix: "Use Rebuild Graph in the viewer, or POST /agentmemory/graph/snapshot-rebuild.",
+        message: "Graph extraction is on but no graph snapshot exists, so graph counts are unavailable.",
+        fix: "Check snapshot provenance before any explicit rebuild; large corpora may exceed the safe rebuild limit.",
       });
     } else if (input.graph.fromSnapshot && ageSeconds !== null && ageSeconds > GRAPH_SNAPSHOT_STALE_SECONDS) {
       const age = ageSeconds >= 2 * 86400 ? `${Math.floor(ageSeconds / 86400)} days` : `${Math.round(ageSeconds / 3600)} hours`;
@@ -240,7 +251,7 @@ export function evaluateStatus(input: StatusInputs): StatusReport {
         level: "info",
         code: "graph-snapshot-stale",
         message: `The graph snapshot is ${age} old, so dashboard graph counts can lag the live graph.`,
-        fix: "POST /agentmemory/graph/snapshot-rebuild refreshes it.",
+        fix: "These are historical snapshot totals. Refreshing the snapshot is an explicit operation with corpus size limits.",
       });
     }
     if (input.graph.dirty) {
@@ -273,6 +284,7 @@ export function evaluateStatus(input: StatusInputs): StatusReport {
       circuitBreaker: input.circuitBreaker,
     },
     index: input.index,
+    activity: input.activity ?? null,
     indexPersistence: persistence,
     graph,
     functions,
@@ -401,19 +413,20 @@ ${row("Embeddings", escapeHtml(report.provider.embeddings))}
 ${row("Circuit breaker", escapeHtml(report.provider.circuitBreaker ? `${report.provider.circuitBreaker.state ?? "unknown"} (${report.provider.circuitBreaker.failures ?? 0} failures)` : "not in use"))}
 </table>
 <h2>Search index</h2><table>
-${row("BM25 documents", escapeHtml(idx.bm25Documents))}
-${row("Vector documents", escapeHtml(idx.vectorDocuments ?? "vector search off"))}
-${row("Observations indexed", escapeHtml(idx.observationsIndexed))}
+${row("Index mode", escapeHtml(idx.mode ?? "legacy"))}
+${row("BM25 documents", escapeHtml(idx.bm25Documents ?? "unknown"))}
+${row("Vector documents", escapeHtml(idx.vectorDocuments ?? (idx.mode === "native" ? "unknown" : "vector search off")))}
+${row("Observations indexed", escapeHtml(idx.observationsIndexed ?? "unknown (native corpus includes memories)"))}
 ${row("Missing from index", escapeHtml(idx.missingObservations ?? "not checked"))}
 ${row("Sessions", escapeHtml(idx.sessions ?? "unknown"))}
-${row("BM25 rebuild", idx.bm25Incomplete ? '<span class="warn">incomplete</span>' : "complete")}
-${row("Pending vector backfill", escapeHtml(idx.pendingVectorBackfill))}
+${row("Index readiness", idx.mode === "native" ? (idx.native?.ready ? "ready" : "unavailable or not ready") : idx.bm25Incomplete ? '<span class="warn">incomplete</span>' : "complete")}
+${row("Pending vector backfill", escapeHtml(idx.pendingVectorBackfill ?? "unknown"))}
 ${indexPersistenceRows(report)}
 </table>
 <h2>Knowledge graph</h2><table>
 ${graph
   ? row("Extraction", graph.extractionEnabled ? "on" : "off") +
-    row("Nodes / edges", escapeHtml(`${graph.totalNodes ?? 0} / ${graph.totalEdges ?? 0}`)) +
+    row("Snapshot nodes / edges", escapeHtml(`${graph.totalNodes ?? "unknown"} / ${graph.totalEdges ?? "unknown"}`)) +
     row("Snapshot age", escapeHtml(graph.fromSnapshot ? formatDuration(graph.ageSeconds) : "no snapshot"))
   : row("Graph", "unavailable")}
 </table>

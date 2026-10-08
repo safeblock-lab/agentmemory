@@ -20,7 +20,6 @@ import { runtimeMetadataPath } from "../runtime-paths.js";
 import { VERSION } from "../version.js";
 import { downloadVerifiedRelease } from "./release.js";
 import { UPDATE_HELPER_SOURCE } from "./helper-source.js";
-import { configuredUpdateSecret, UPDATE_SECRET_REQUIRED } from "./auth.js";
 
 export { checkForUpdate } from "./release.js";
 export type { ReleaseInfo } from "./release.js";
@@ -83,7 +82,6 @@ function npmCliPath(): string {
 }
 
 function localInstallContext(): InstallContext {
-  if (!configuredUpdateSecret()) throw new Error(UPDATE_SECRET_REQUIRED);
   if (process.platform !== "win32") {
     throw new Error("UI updates currently support native Windows global npm installations only.");
   }
@@ -130,7 +128,6 @@ export function getUpdateSupport(): UpdateSupport {
   } catch (error) {
     const reason = error instanceof Error ? error.message : "";
     const safeReasons = [
-      UPDATE_SECRET_REQUIRED,
       "UI updates currently support native Windows global npm installations only.",
       "Running instance has no complete local runtime configuration.",
       "UI updates require an owned native AgentMemory engine.",

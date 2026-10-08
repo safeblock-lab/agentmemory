@@ -1623,19 +1623,18 @@ export function registerGraphFunction(
     },
   );
 
-  // #814 v2: graph-stats reads the snapshot exclusively. The snapshot
-  // is maintained inline by mem::graph-extract, so for any corpus built
-  // on a post-#814 agentmemory the stats are always current without an
-  // enumeration. Legacy corpora without a snapshot get an empty
-  // envelope + a warning pointing at the snapshot-rebuild or graph-reset
-  // endpoints — never a 500.
+  // Native index metadata has revisions but no live aggregate counts.
+  // Snapshot totals retain their own provenance rather than claiming freshness.
   sdk.registerFunction("mem::graph-stats", async () => {
     const snap = await readSnapshot(kv);
     if (snap) {
       return {
         ...snap.stats,
         fromSnapshot: true,
+        provenance: "snapshot",
+        countsAreCurrent: false,
         updatedAt: snap.updatedAt,
+        dirty: snap.dirty === true,
         ...(snap.dirty
           ? {
               warning:
@@ -1646,15 +1645,16 @@ export function registerGraphFunction(
       };
     }
     return {
-      totalNodes: 0,
-      totalEdges: 0,
+      totalNodes: null,
+      totalEdges: null,
       nodesByType: {},
       edgesByType: {},
       fromSnapshot: false,
+      provenance: "unavailable",
+      countsAreCurrent: false,
       warning:
-        "No graph snapshot available. Run POST /agentmemory/graph/snapshot-rebuild " +
-        "(safe up to ~25K nodes) or POST /agentmemory/graph/reset to wipe " +
-        "and let future extracts repopulate.",
+        "No graph snapshot available; live graph totals are unknown. " +
+        "Snapshot rebuilding is an explicit operation and may be unsafe for a large corpus.",
     };
   });
 

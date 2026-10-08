@@ -10,7 +10,6 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { renderViewerDocument } from "./document.js";
 import { timingSafeCompare } from "../auth.js";
-import { configuredUpdateSecret, UPDATE_SECRET_REQUIRED } from "../update/auth.js";
 import {
   getUpdateSupport,
   checkForUpdate,
@@ -306,16 +305,6 @@ export function startViewerServer(
       }
       if (qs) {
         updateJson(res, 400, { error: "Update requests do not accept query parameters." });
-        return;
-      }
-      const secret = configuredUpdateSecret();
-      if (!secret) {
-        updateJson(res, 409, { error: UPDATE_SECRET_REQUIRED });
-        return;
-      }
-      const submittedSecret = req.headers["x-agentmemory-update-secret"];
-      if (typeof submittedSecret !== "string" || !timingSafeCompare(submittedSecret, secret)) {
-        updateJson(res, 401, { error: "Update secret is missing or incorrect." });
         return;
       }
       if (pathname === "/update/support" && method === "GET") {

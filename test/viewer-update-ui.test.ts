@@ -25,7 +25,7 @@ type UpdateFunctions = {
   startReleaseUpdateFromViewer: () => Promise<void>;
   scheduleUpdatePoll: () => void;
   renderUpdateCard: () => string;
-  loadUpdateStatus: (promptForSecret?: boolean) => Promise<void>;
+  loadUpdateStatus: () => Promise<void>;
 };
 
 function sandbox(fetcher: (url: string, options?: RequestInit) => Promise<Response>, enteredSecret = "viewer-secret") {
@@ -94,20 +94,20 @@ describe("viewer release update controls", () => {
     ui.update.status = { phase: "idle", currentVersion: "0.9.58" };
     expect(fetcher).not.toHaveBeenCalled();
     await ui.checkReleaseUpdate();
-    expect(ui.dialogs).toHaveLength(1);
+    expect(ui.dialogs).toHaveLength(0);
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(fetcher.mock.calls[0][0]).toBe("/update/check");
-    expect(fetcher.mock.calls[0][1]).toMatchObject({ headers: { "X-AgentMemory-Update-Secret": "viewer-secret" } });
+    expect(fetcher.mock.calls[0][1]?.headers).not.toHaveProperty("X-AgentMemory-Update-Secret");
     expect(ui.renderUpdateCard()).toContain("Release v0.9.59 is available (currently v0.9.58)");
     expect(ui.renderUpdateCard()).toContain('data-action="confirm-update"');
     expect(ui.focus).toHaveBeenCalled();
     await ui.startReleaseUpdateFromViewer();
-    expect(ui.dialogs).toHaveLength(1);
+    expect(ui.dialogs).toHaveLength(0);
     expect(fetcher).toHaveBeenCalledTimes(3);
-    expect(fetcher.mock.calls[1][1]).toMatchObject({ headers: { "X-AgentMemory-Update-Secret": "viewer-secret" } });
+    expect(fetcher.mock.calls[1][1]?.headers).not.toHaveProperty("X-AgentMemory-Update-Secret");
     const [path, request] = fetcher.mock.calls[2];
     expect(path).toBe("/update/start");
-    expect(request).toMatchObject({ method: "POST", mode: "same-origin", credentials: "same-origin", headers: { "X-AgentMemory-Update-Token": "fresh-token", "X-AgentMemory-Update-Secret": "viewer-secret" } });
+    expect(request).toMatchObject({ method: "POST", mode: "same-origin", credentials: "same-origin", headers: { "X-AgentMemory-Update-Token": "fresh-token" } });
     expect(request).not.toHaveProperty("body");
     expect(ui.update.check).toBeNull();
     expect(ui.renderUpdateCard()).toContain("Stopping AgentMemory");
@@ -167,25 +167,22 @@ describe("viewer release update controls", () => {
     expect(ui.renderUpdateCard()).toContain("Update authorization expired. Check for a release again.");
   });
 
-  it("makes no automatic update call and reports a rejected secret without posting", async () => {
+  it("loads local status without a password and reports a rejected check without posting", async () => {
     const fetcher = vi.fn(async (url: string) => {
-      if (url === "/update/check") return Response.json({ error: "Update secret is missing or incorrect." }, { status: 401 });
+      if (url === "/update/status") return Response.json({ support: { supported: true }, status: { phase: "idle" }, csrfToken: "local-token" });
+      if (url === "/update/check") return Response.json({ error: "Local request denied." }, { status: 403 });
       throw new Error(`Unexpected ${url}`);
     });
-    const ui = sandbox(fetcher, "incorrect-secret");
+    const ui = sandbox(fetcher);
     await ui.loadUpdateStatus();
-    expect(fetcher).not.toHaveBeenCalled();
+    expect(fetcher).toHaveBeenCalledTimes(1);
     expect(ui.dialogs).toHaveLength(0);
     await ui.checkReleaseUpdate();
-    expect(ui.dialogs).toHaveLength(1);
-    expect(ui.renderUpdateCard()).toContain("Update secret is missing or incorrect.");
+    expect(ui.dialogs).toHaveLength(0);
+    expect(ui.renderUpdateCard()).toContain("Local request denied.");
     expect(fetcher.mock.calls.some(([url]) => url === "/update/start")).toBe(false);
-    await ui.checkReleaseUpdate();
-    expect(ui.dialogs).toHaveLength(2);
-    expect(ui.dialogs[0].innerHTML).toContain('type="password"');
-    expect(ui.dialogs[0].innerHTML).toContain('autocomplete="off"');
-    expect(ui.dialogs[0].input.value).toBe("");
-    expect(ui.dialogs[0].removed).toBe(true);
+    expect(viewer).not.toContain("update-secret-input");
+    expect(viewer).not.toContain("X-AgentMemory-Update-Secret");
     expect(viewer).not.toContain("window.prompt(");
     expect(viewer).not.toContain("localStorage.setItem('updateSecret'");
   });

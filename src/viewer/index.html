@@ -934,10 +934,6 @@
       justify-content: flex-end;
       gap: 8px;
     }
-    .update-secret-dialog { color: var(--ink); margin: auto; }
-    .update-secret-dialog::backdrop { background: rgba(0,0,0,0.45); }
-    .update-secret-dialog label { display: block; font-size: 12px; font-weight: 700; margin-bottom: 6px; }
-    .update-secret-dialog input { box-sizing: border-box; width: 100%; margin-bottom: 16px; padding: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--ink); }
     .selected-node-info {
       margin-top: 16px;
       padding-top: 16px;
@@ -1179,10 +1175,10 @@
 
     var state = {
       activeTab: 'dashboard',
-      dashboard: { loaded: false, health: null, sessions: [], memories: [], graphStats: null, recentAudit: [], lessons: [], crystals: [] },
+      dashboard: { loaded: false, health: null, sessions: [], memories: [], status: null, statusError: null, lessons: [], crystals: [] },
       graph: { loaded: false, nodes: [], edges: [], stats: null, filters: {}, selectedNode: null, queryError: null, truncated: false, totalNodes: 0, totalEdges: 0 },
       memories: { loaded: false, items: [], search: '', typeFilter: '', selectedId: null },
-      timeline: { loaded: false, observations: [], sessionId: '', minImportance: 0, page: 0, pageSize: 50 },
+      timeline: { loaded: false, observations: [], sessionId: '', minImportance: 0, page: 0, pageSize: 20 },
       sessions: { loaded: false, items: [], selectedId: null },
       audit: { loaded: false, entries: [], opFilter: '' },
       activity: { loaded: false, observations: [], sessions: [], typeFilter: '' },
@@ -1533,6 +1529,60 @@
       return result[key] || (fallbackKey && result[fallbackKey]) || [];
     }
 
+    var viewerStatusPending = null;
+    var viewerStatusRefreshTimer = null;
+    function scheduleViewerStatusRefresh() {
+      if (viewerStatusRefreshTimer) return;
+      viewerStatusRefreshTimer = setTimeout(async function() {
+        viewerStatusRefreshTimer = null;
+        if (state.activeTab !== 'dashboard' && state.activeTab !== 'health') return;
+        await loadViewerStatus();
+        if (state.activeTab === 'dashboard' && state.dashboard.loaded) renderDashboard();
+        if (state.activeTab === 'health') renderHealth();
+      }, DASHBOARD_RELOAD_COALESCE_MS);
+    }
+
+    function loadViewerStatus() {
+      if (viewerStatusPending) return viewerStatusPending;
+      viewerStatusPending = api('status', { headers: { Accept: 'application/json' } }).then(function(report) {
+        var valid = report && Array.isArray(report.problems) && report.service && report.index;
+        var error = valid ? null : 'The status check did not answer. The server may be restarting.';
+        state.health.error = error;
+        state.dashboard.statusError = error;
+        if (valid) {
+          state.health.report = report;
+          state.dashboard.status = report;
+        }
+        return valid ? report : null;
+      }).finally(function() { viewerStatusPending = null; });
+      return viewerStatusPending;
+    }
+
+    function knownCount(value) {
+      return typeof value === 'number' && Number.isFinite(value) ? String(value) : 'unknown';
+    }
+
+    function renderRecentActivity(report, error) {
+      var activity = report && report.activity;
+      var available = activity && activity.source === 'runtime-writes' && Array.isArray(activity.items);
+      var html = '<div class="card"><div class="card-title">Recent Activity</div>';
+      if (error) html += '<p role="status" style="font-size:12px;color:var(--ink-muted);">Activity could not refresh.' + (available ? ' Showing the last result.' : '') + '</p>';
+      if (!available) return html + '<div class="empty-state"><p>Runtime activity is unavailable. Retry the status check.</p></div></div>';
+      html += '<p style="font-size:12px;color:var(--ink-muted);">Recent writes since service start' +
+        (activity.availableSince ? ' (' + esc(formatTime(activity.availableSince)) + ')' : '') +
+        '. Bounded runtime feed; earlier history is not included.</p>';
+      if (!activity.items.length) html += '<div class="empty-state"><p>No session or observation writes recorded since service start.</p></div>';
+      activity.items.slice(0, 10).forEach(function(item) {
+        html += '<div style="padding:6px 0;border-bottom:1px solid var(--border-light);font-size:13px;overflow-wrap:anywhere;">' +
+          '<span class="badge ' + (item.kind === 'session' ? 'badge-blue' : 'badge-green') + '">' + esc(item.kind) + '</span> ' +
+          '<span>' + esc(item.title) + '</span>' +
+          '<div style="font-size:11px;color:var(--ink-muted);font-family:var(--font-mono);">' +
+          'ID: ' + esc(item.id) + ' · Session: ' + esc(item.sessionId) +
+          (item.agentId ? ' · Agent: ' + esc(item.agentId) : '') + ' · ' + esc(formatTime(item.timestamp)) + '</div></div>';
+      });
+      return html + '</div>';
+    }
+
     async function loadDashboard() {
       if (dashboardLoading) {
         dashboardReloadPending = true;
@@ -1549,8 +1599,7 @@
           api('health', { readErrorBody: true }),
           apiGet('sessions'),
           apiGet('memories?latest=true&count=true'),
-          apiGet('graph/stats'),
-          apiGet('audit?limit=5'),
+          loadViewerStatus(),
           apiGet('semantic'),
           apiGet('procedural'),
           apiGet('relations'),
@@ -1573,14 +1622,12 @@
         if (countToken === memoryCountRequest && results[2] && typeof results[2].total === 'number') {
           d.memoryTotal = results[2].total;
         }
-        if (results[3]) d.graphStats = results[3];
-        d.recentAudit = listOr(d.recentAudit, results[4], 'entries');
-        d.semantic = listOr(d.semantic, results[5], 'facts', 'semantic');
-        d.procedural = listOr(d.procedural, results[6], 'procedures', 'procedural');
-        d.relations = listOr(d.relations, results[7], 'relations');
-        d.lessons = listOr(d.lessons, results[8], 'lessons');
-        d.crystals = listOr(d.crystals, results[9], 'crystals');
-        if (results[10] && results[10].tiers) d.consolidation = results[10];
+        d.semantic = listOr(d.semantic, results[4], 'facts', 'semantic');
+        d.procedural = listOr(d.procedural, results[5], 'procedures', 'procedural');
+        d.relations = listOr(d.relations, results[6], 'relations');
+        d.lessons = listOr(d.lessons, results[7], 'lessons');
+        d.crystals = listOr(d.crystals, results[8], 'crystals');
+        if (results[9] && results[9].tiers) d.consolidation = results[9];
         d.loaded = true;
         renderDashboard();
       } catch (err) {
@@ -1595,7 +1642,7 @@
         console.error('[viewer] loadDashboard failed:', err);
         el.innerHTML =
           '<div class="loading" style="color:var(--accent);">' +
-          'Dashboard failed to load: ' + msg +
+          'Dashboard failed to load: ' + esc(msg) +
           '<br><br><span style="font-size:12px;color:var(--ink-muted);">' +
           'Check the browser console for the full error. If you see CSP ' +
           'violations, please open an issue with the agentmemory version ' +
@@ -1674,9 +1721,9 @@
       var healthStatus = h.status || 'unknown';
       var dotClass = healthStatus === 'healthy' ? 'healthy' : healthStatus === 'degraded' ? 'degraded' : healthStatus === 'critical' ? 'critical' : '';
       var activeSessions = d.sessions.filter(function(s) { return s.status === 'active'; }).length;
-      var gs = d.graphStats || {};
-      var nodeCount = gs.totalNodes !== undefined ? gs.totalNodes : (gs.nodes !== undefined ? gs.nodes : (gs.nodeCount || 0));
-      var edgeCount = gs.totalEdges !== undefined ? gs.totalEdges : (gs.edges !== undefined ? gs.edges : (gs.edgeCount || 0));
+      var gs = (d.status && d.status.graph) || {};
+      var nodeCount = knownCount(gs.totalNodes);
+      var edgeCount = knownCount(gs.totalEdges);
       var fMetrics = h.functionMetrics || [];
       var cb = h.circuitBreaker || null;
       var workers = snap.workers || [];
@@ -1703,7 +1750,7 @@
       var crystalCount = (d.crystals || []).length;
       html += '<div class="stat-card" data-action="goto-tab" data-tab="lessons" role="link" tabindex="0"><div class="label">Lessons</div><div class="value">' + lessonCount + '</div><div class="sub">confidence-scored</div></div>';
       html += '<div class="stat-card" data-action="goto-tab" data-tab="crystals" role="link" tabindex="0"><div class="label">Crystals</div><div class="value">' + crystalCount + '</div><div class="sub">action digests</div></div>';
-      html += '<div class="stat-card" data-action="goto-tab" data-tab="graph" role="link" tabindex="0"><div class="label">Graph Nodes</div><div class="value">' + nodeCount + '</div><div class="sub">' + edgeCount + ' edges' + (gs.fromSnapshot && gs.updatedAt ? ' · snapshot ' + esc(shortTime(gs.updatedAt)) : '') + '</div></div>';
+      html += '<div class="stat-card" data-action="goto-tab" data-tab="graph" role="link" tabindex="0"><div class="label">Graph snapshot nodes</div><div class="value">' + nodeCount + '</div><div class="sub">' + edgeCount + ' snapshot edges' + (gs.fromSnapshot && gs.updatedAt ? ' · ' + esc(formatTime(gs.updatedAt)) : '') + (gs.countsAreCurrent === false ? ' · historical counts' : '') + (d.statusError ? ' · stale / unavailable' : '') + '</div></div>';
       html += '<div class="stat-card"><div class="label">Health</div><div class="value"><div class="health-bar"><span class="health-dot ' + dotClass + '"></span> ' + esc(healthStatus) + '</div></div>';
       html += '<div class="sub">' + esc(snap.connectionState || 'unknown') + '</div></div>';
       var totalCalls = fMetrics.reduce(function(a, m) { return a + (m.totalCalls || 0); }, 0);
@@ -1795,21 +1842,7 @@
       }
       html += '</div>';
 
-      html += '<div class="card"><div class="card-title">Recent Activity</div>';
-      if (d.recentAudit.length === 0) {
-        html += '<div class="empty-state"><p>No activity recorded yet</p></div>';
-      } else {
-        d.recentAudit.forEach(function(a) {
-          var badgeClass = OP_BADGES[a.operation] || 'badge-muted';
-          html += '<div style="padding:6px 0;border-bottom:1px solid var(--border-light);font-size:13px;">';
-          html += '<span class="badge ' + badgeClass + '">' + esc(a.operation) + '</span> ';
-          if (a.functionId) html += '<span style="font-size:11px;color:var(--ink-muted);font-family:var(--font-mono);">' + esc(a.functionId) + '</span> ';
-          html += '<span style="color:var(--ink-faint);font-size:10px;font-family:var(--font-mono);">' + esc(shortTime(a.timestamp)) + '</span>';
-          if (a.targetIds && a.targetIds.length) html += '<span style="font-size:10px;color:var(--ink-faint);margin-left:4px;">(' + a.targetIds.length + ' targets)</span>';
-          html += '</div>';
-        });
-      }
-      html += '</div>';
+      html += renderRecentActivity(d.status, d.statusError);
 
       html += '</div>';
 
@@ -2955,8 +2988,17 @@
       }
       content.innerHTML = '<div class="loading">Loading observations...</div>';
       var result = await apiGet('observations?sessionId=' + encodeURIComponent(state.timeline.sessionId));
-      state.timeline.observations = (result && result.observations) || [];
+      state.timeline.observations = latestTimelineObservations((result && result.observations) || []);
+      state.timeline.page = 0;
       renderObservations();
+    }
+
+    function latestTimelineObservations(observations) {
+      return observations.slice().sort(function(a, b) {
+        var aTime = Date.parse(a.timestamp) || 0;
+        var bTime = Date.parse(b.timestamp) || 0;
+        return bTime - aTime;
+      }).slice(0, 20);
     }
 
     var tlTypeFilter = '';
@@ -2964,7 +3006,7 @@
     function renderObservations() {
       var content = document.getElementById('tl-content');
       if (!content) return;
-      var obs = state.timeline.observations;
+      var obs = latestTimelineObservations(state.timeline.observations);
       var minImp = state.timeline.minImportance;
       var filtered = minImp > 0 ? obs.filter(function(o) { return (o.importance || 0) >= minImp; }) : obs;
 
@@ -3004,7 +3046,7 @@
         return;
       }
 
-      html += '<div style="font-size:11px;color:var(--ink-faint);margin-bottom:16px;font-family:var(--font-mono);text-transform:uppercase;letter-spacing:0.06em;">' + filtered.length + ' observations shown</div>';
+      html += '<div style="font-size:11px;color:var(--ink-faint);margin-bottom:16px;font-family:var(--font-mono);text-transform:uppercase;letter-spacing:0.06em;">' + filtered.length + ' observations shown · Latest 20 operations</div>';
 
       html += '<div class="timeline-container">';
 
@@ -3805,15 +3847,11 @@
       starting: 'Starting AgentMemory', complete: 'Update complete', failed: 'Update failed'
     };
     var updateControls = (function() {
-    var updateSecret = '';
 
     async function updateRequest(path, options) {
       var response;
       try {
         var settings = Object.assign({ cache: 'no-store', credentials: 'same-origin', mode: 'same-origin' }, options || {});
-        if (updateSecret) {
-          settings.headers = Object.assign({}, settings.headers || {}, { 'X-AgentMemory-Update-Secret': updateSecret });
-        }
         response = await fetch('/update/' + path, settings);
       } catch (error) {
         var offline = new Error('Cannot reach the local viewer.');
@@ -3834,49 +3872,6 @@
       return error && error.message ? error.message : 'The update request failed.';
     }
 
-    function requestUpdateSecret() {
-      return new Promise(function(resolve) {
-        var dialog = document.createElement('dialog');
-        dialog.className = 'modal update-secret-dialog';
-        dialog.setAttribute('aria-labelledby', 'update-secret-title');
-        dialog.innerHTML = '<form><h3 id="update-secret-title">Authorize release update</h3>' +
-          '<p>Enter the update secret configured in ~/.agentmemory/.env.</p>' +
-          '<label for="update-secret-input">Update secret</label>' +
-          '<input id="update-secret-input" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" required>' +
-          '<div class="modal-actions"><button type="button" class="btn" data-update-cancel>Cancel</button>' +
-          '<button type="submit" class="btn btn-primary">Continue</button></div></form>';
-        document.body.appendChild(dialog);
-        var input = dialog.querySelector('#update-secret-input');
-        function finish(value) {
-          input.value = '';
-          dialog.close();
-          dialog.remove();
-          resolve(value);
-        }
-        dialog.querySelector('form').addEventListener('submit', function(event) {
-          event.preventDefault();
-          finish(input.value);
-        });
-        dialog.querySelector('[data-update-cancel]').addEventListener('click', function() { finish(null); });
-        dialog.addEventListener('cancel', function(event) { event.preventDefault(); finish(null); });
-        dialog.showModal();
-        input.focus();
-      });
-    }
-
-    async function askUpdateSecret() {
-      if (updateSecret) return true;
-      var entered = await requestUpdateSecret();
-      if (entered === null) return false;
-      if (!entered) {
-        state.health.update.error = 'The update secret is required.';
-        renderHealth();
-        return false;
-      }
-      updateSecret = entered;
-      return true;
-    }
-
     function scheduleUpdatePoll() {
       var u = state.health.update;
       if (u.pollTimer) return;
@@ -3891,10 +3886,8 @@
           u.pollMisses = 0;
           u.error = '';
           if (u.status && UPDATE_ACTIVE_PHASES[u.status.phase]) scheduleUpdatePoll();
-          else updateSecret = '';
         } catch (error) {
-          if (error.status === 401 || error.status === 409) {
-            updateSecret = '';
+          if (error.status === 401 || error.status === 403 || error.status === 409) {
             u.csrfToken = '';
             u.reconnecting = false;
             u.error = updateError(error);
@@ -3909,10 +3902,8 @@
       }, 2000);
     }
 
-    async function loadUpdateStatus(promptForSecret) {
+    async function loadUpdateStatus() {
       var u = state.health.update;
-      if (promptForSecret && !await askUpdateSecret()) return;
-      if (!updateSecret) return;
       try {
         var data = await updateRequest('status');
         u.support = data.support;
@@ -3923,8 +3914,7 @@
         u.error = '';
         if (u.status && UPDATE_ACTIVE_PHASES[u.status.phase]) scheduleUpdatePoll();
       } catch (error) {
-        if (error.status === 401 || error.status === 409) {
-          updateSecret = '';
+        if (error.status === 401 || error.status === 403 || error.status === 409) {
           u.csrfToken = '';
         }
         u.error = updateError(error);
@@ -3940,7 +3930,6 @@
     async function checkReleaseUpdate() {
       var u = state.health.update;
       if (u.checking || u.starting || (u.support && !u.support.supported) || (u.status && UPDATE_ACTIVE_PHASES[u.status.phase])) return;
-      if (!await askUpdateSecret()) return;
       u.checking = true;
       u.check = null;
       u.error = '';
@@ -3949,7 +3938,6 @@
         u.check = await updateRequest('check');
         u.support = { supported: true };
       } catch (error) {
-        if (error.status === 401 || error.status === 409) updateSecret = '';
         u.error = updateError(error);
       } finally {
         u.checking = false;
@@ -3962,7 +3950,6 @@
     async function startReleaseUpdateFromViewer() {
       var u = state.health.update;
       if (u.starting || u.checking || !u.check || !u.check.available || !u.support || !u.support.supported) return;
-      if (!await askUpdateSecret()) return;
       u.starting = true;
       u.error = '';
       renderHealth();
@@ -3974,6 +3961,7 @@
         u.csrfToken = fresh.csrfToken || '';
         if (!u.support || !u.support.supported) throw new Error((u.support && u.support.reason) || 'Updates are unavailable.');
         if (u.status && UPDATE_ACTIVE_PHASES[u.status.phase]) throw new Error('An update is already in progress.');
+        if (!u.csrfToken) throw new Error('Update authorization is unavailable. Retry the status check.');
         postAttempted = true;
         var result = await updateRequest('start', {
           method: 'POST',
@@ -3984,7 +3972,6 @@
         if (UPDATE_ACTIVE_PHASES[result.phase]) scheduleUpdatePoll();
       } catch (error) {
         if (error.status === 401) {
-          updateSecret = '';
           u.csrfToken = '';
           u.error = updateError(error);
         } else if (postAttempted && error.status === 0) {
@@ -4017,7 +4004,7 @@
       if (s.message) html += '<p class="update-note">' + esc(s.message) + '</p>';
       if (s.errorCode) html += '<p class="update-note error">Error code: ' + esc(s.errorCode) + '</p>';
       if (u.error) html += '<p class="update-note error">' + esc(u.error) + '</p>';
-      if (!u.support && !u.status) html += '<p class="update-note">Enter the update secret to check releases or view update status.</p>';
+      if (!u.support && !u.status) html += '<p class="update-note">Check for a release or retry the local update status.</p>';
       html += '</div>';
       if (u.support && !u.support.supported) {
         html += '<p class="update-note">' + esc(u.support.reason || 'Updates are unavailable for this installation.') + '</p>';
@@ -4049,19 +4036,50 @@
       var el = document.getElementById('view-health');
       if (!state.health.report) el.innerHTML = '<div class="loading">Checking agentmemory...</div>';
       var updateStatusPromise = loadUpdateStatus();
-      var report = await api('status', { headers: { Accept: 'application/json' } });
-      if (report && report.problems) {
-        state.health.report = report;
-        state.health.error = null;
-      } else {
-        state.health.error = 'The status check did not answer. The server may be restarting.';
-      }
+      await loadViewerStatus();
       renderHealth();
       await updateStatusPromise;
     }
 
     function healthRow(label, value) {
       return '<div class="detail-row"><div class="dl">' + esc(label) + '</div><div class="dv">' + esc(value === null || value === undefined ? '' : String(value)) + '</div></div>';
+    }
+
+    function readinessLabel(value) {
+      return value === true ? 'ready' : value === false ? 'not ready' : 'unknown';
+    }
+
+    function renderSearchIndexRows(idx) {
+      var native = idx.native || {};
+      var html = healthRow('Index mode', idx.mode || 'legacy');
+      if (idx.mode === 'native') {
+        html += healthRow('Lexical documents', knownCount(native.lexicalCount) + ' (memories and observations)') +
+          healthRow('Vector documents', knownCount(native.vectorCount)) +
+          healthRow('Dirty documents', knownCount(native.dirtyCount)) +
+          healthRow('Native index', readinessLabel(native.ready)) +
+          healthRow('Lexical search', readinessLabel(native.lexicalReady)) +
+          healthRow('Source preparation', readinessLabel(native.sourcePrepared)) +
+          healthRow('Source coverage', readinessLabel(native.coverageReady)) +
+          healthRow('Native graph', readinessLabel(native.graphReady));
+        var identity = native.identity || {};
+        html += healthRow('Index ID', identity.indexId || 'unknown') +
+          healthRow('Embedding model', identity.model || 'unknown') +
+          healthRow('Dimensions', knownCount(identity.dimensions)) +
+          healthRow('Generation', identity.generation === null || identity.generation === undefined ? 'unknown' : identity.generation);
+        (Array.isArray(native.graph) ? native.graph : []).forEach(function(graph) {
+          html += healthRow('Graph scope: ' + (graph.scope || 'unknown'),
+            (graph.status || 'unknown') + ' · revision ' +
+            (graph.revision === null || graph.revision === undefined ? 'unknown' : graph.revision));
+        });
+        if (typeof idx.observationsIndexed === 'number') html += healthRow('Observations indexed', knownCount(idx.observationsIndexed));
+        if (typeof idx.missingObservations === 'number') html += healthRow('Missing observations', knownCount(idx.missingObservations));
+      } else {
+        html += healthRow('BM25 documents', knownCount(idx.bm25Documents)) +
+          healthRow('Vector documents', idx.vectorDocuments === null ? 'vector search off' : knownCount(idx.vectorDocuments)) +
+          healthRow('Observations indexed', knownCount(idx.observationsIndexed)) +
+          healthRow('Missing from index', idx.missingObservations === null || idx.missingObservations === undefined ? 'not checked' : knownCount(idx.missingObservations));
+      }
+      return html + healthRow('Sessions checked for index coverage', knownCount(idx.sessions));
     }
 
     function formatSeconds(seconds) {
@@ -4113,19 +4131,17 @@
         healthRow('Embeddings', r.provider.embeddings) +
         healthRow('Circuit breaker', cb ? (cb.state + ' (' + (cb.failures || 0) + ' failures)') : 'not in use') +
         '</div>';
-      html += '<div class="card"><div class="card-title">Search index &amp; graph</div>' +
-        healthRow('BM25 documents', idx.bm25Documents) +
-        healthRow('Vector documents', idx.vectorDocuments === null ? 'vector search off' : idx.vectorDocuments) +
-        healthRow('Observations indexed', idx.observationsIndexed) +
-        healthRow('Missing from index', idx.missingObservations === null ? 'not checked' : idx.missingObservations) +
-        healthRow('Sessions', idx.sessions === null ? 'unknown' : idx.sessions);
+      html += '<div class="card"><div class="card-title">Search index &amp; graph</div>' + renderSearchIndexRows(idx);
       if (r.graph) {
         html += healthRow('Graph extraction', r.graph.extractionEnabled ? 'on' : 'off') +
-          healthRow('Graph nodes / edges', (r.graph.totalNodes || 0) + ' / ' + (r.graph.totalEdges || 0)) +
+          healthRow('Snapshot nodes / edges', knownCount(r.graph.totalNodes) + ' / ' + knownCount(r.graph.totalEdges)) +
+          healthRow('Graph count provenance', r.graph.fromSnapshot ? 'historical snapshot' : 'unavailable') +
+          healthRow('Counts current', r.graph.countsAreCurrent === true ? 'yes' : r.graph.countsAreCurrent === false ? 'no' : 'unknown') +
           healthRow('Graph snapshot age', r.graph.fromSnapshot ? formatSeconds(r.graph.ageSeconds) : 'no snapshot');
       }
       html += '</div></div>';
 
+      html += renderRecentActivity(r, state.health.error);
       html += renderUpdateCard();
 
       var fns = (r.functions || []).slice().sort(function(a, b) { return b.totalCalls - a.totalCalls; });
@@ -4526,6 +4542,7 @@
         (type === 'session.updated' && data.session && sessionKey(data.session)) ||
         ((type === 'session.activity' || type === 'session.deleted') && data.sessionId);
       if (!isSessionEvent) return;
+      scheduleViewerStatusRefresh();
       var entry = { seq: ++liveSessionSeq, type: type, data: data };
       liveSessionLog.push(entry);
       if (liveSessionLog.length > LIVE_SESSION_LOG_MAX) liveSessionLog.shift();
@@ -4575,6 +4592,7 @@
     }
 
     function routeWsMessage(msg) {
+      if (msg.observation) scheduleViewerStatusRefresh();
       if (state.activeTab === 'timeline' && msg.observation) {
         if (!state.timeline.sessionId || msg.observation.sessionId === state.timeline.sessionId) {
           var existing = state.timeline.observations.findIndex(function(o) { return o.id === msg.observation.id; });
@@ -4799,7 +4817,7 @@
         return;
       }
       if (action === 'refresh-update-status') {
-        loadUpdateStatus(true);
+        loadUpdateStatus();
         return;
       }
       if (action === 'zoom-graph') {

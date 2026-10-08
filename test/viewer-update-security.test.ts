@@ -48,7 +48,6 @@ describe("viewer update routes", () => {
         method,
         headers: {
           Host: `127.0.0.1:${port}`,
-          ...(path.startsWith("/update/") ? { "X-AgentMemory-Update-Secret": updateSecret } : {}),
           ...headers,
           ...(body === undefined ? {} : { "Content-Length": String(Buffer.byteLength(body)) }),
         },
@@ -98,31 +97,13 @@ describe("viewer update routes", () => {
     else process.env.AGENTMEMORY_UPDATE_SECRET = originalUpdateSecret;
   });
 
-  it("rejects missing and incorrect secrets on every update route before npm or GitHub", async () => {
-    await listen();
-    for (const [path, method] of [["/update/support", "GET"], ["/update/check", "GET"], ["/update/status", "GET"], ["/update/start", "POST"]]) {
-      for (const submitted of ["", "wrong"]) {
-        const response = await request(path, method, {
-          Origin: `http://127.0.0.1:${port}`, "X-AgentMemory-Update-Secret": submitted,
-        });
-        expect(response).toEqual({ status: 401, body: { error: "Update secret is missing or incorrect." } });
-      }
-    }
-    expect(updater.getUpdateSupport).not.toHaveBeenCalled();
-    expect(updater.checkForUpdate).not.toHaveBeenCalled();
-    expect(updater.readUpdateStatus).not.toHaveBeenCalled();
-    expect(updater.startReleaseUpdate).not.toHaveBeenCalled();
-  });
-
-  it("disables every updater route before npm or GitHub when the secret is not configured", async () => {
+  it("allows local updater reads without a password and requires a token to start", async () => {
     delete process.env.AGENTMEMORY_UPDATE_SECRET;
     await listen();
-    for (const [path, method] of [["/update/support", "GET"], ["/update/check", "GET"], ["/update/status", "GET"], ["/update/start", "POST"]]) {
-      expect((await request(path, method, { Origin: `http://127.0.0.1:${port}` })).status).toBe(409);
+    for (const path of ["/update/support", "/update/check", "/update/status"]) {
+      expect((await request(path)).status).toBe(200);
     }
-    expect(updater.getUpdateSupport).not.toHaveBeenCalled();
-    expect(updater.checkForUpdate).not.toHaveBeenCalled();
-    expect(updater.readUpdateStatus).not.toHaveBeenCalled();
+    expect((await request("/update/start", "POST", { Origin: `http://127.0.0.1:${port}` })).status).toBe(403);
     expect(updater.startReleaseUpdate).not.toHaveBeenCalled();
   });
 

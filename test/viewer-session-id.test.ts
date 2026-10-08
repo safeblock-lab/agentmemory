@@ -177,6 +177,50 @@ function loadViewerSandbox() {
 }
 
 describe("viewer session rendering", () => {
+  it("loads only the latest 20 timeline operations into view state", async () => {
+    const { sandbox, getElement } = loadViewerSandbox();
+    const observations = Array.from({ length: 30 }, (_, i) => ({
+      id: `operation_${i}`,
+      title: `Operation ${i}`,
+      type: "file_edit",
+      timestamp: new Date(Date.UTC(2026, 1, 1, i)).toISOString(),
+      importance: i < 10 ? 9 : 5,
+    }));
+    sandbox.state.timeline.sessionId = "ses_1";
+    sandbox.state.timeline.page = 3;
+    sandbox.apiGet = async () => ({ observations });
+
+    await sandbox.loadObservations();
+
+    expect(sandbox.state.timeline.observations.map((o: { id: string }) => o.id)).toEqual(
+      Array.from({ length: 20 }, (_, i) => `operation_${29 - i}`),
+    );
+    expect(observations).toHaveLength(30);
+    expect(observations[0].id).toBe("operation_0");
+    expect(sandbox.state.timeline.page).toBe(0);
+    expect(getElement("tl-content").innerHTML.match(/class="timeline-item /g)).toHaveLength(20);
+    expect(getElement("tl-content").innerHTML).toContain("Latest 20 operations");
+    expect(getElement("tl-content").innerHTML).not.toContain('data-action="timeline-page"');
+
+    sandbox.state.timeline.minImportance = 9;
+    sandbox.renderObservations();
+    expect(getElement("tl-content").innerHTML).toContain("No observations match the filter (20 total)");
+    expect(getElement("tl-content").innerHTML).not.toContain("Operation 0");
+  });
+
+  it("keeps malformed dates behind the latest valid timeline operations", () => {
+    const { sandbox } = loadViewerSandbox();
+    const observations = [
+      { id: "missing" },
+      { id: "old", timestamp: "2026-01-01T00:00:00Z" },
+      { id: "invalid", timestamp: "invalid" },
+      { id: "new", timestamp: "2026-01-02T00:00:00Z" },
+    ];
+    expect(sandbox.latestTimelineObservations(observations).map((o: { id: string }) => o.id)).toEqual(
+      ["new", "old", "missing", "invalid"],
+    );
+  });
+
   it("attaches the saved viewer bearer to API calls", async () => {
     const { sandbox } = loadViewerSandbox();
     const requests: Array<{ url: string; opts: { headers?: Record<string, string> } }> = [];

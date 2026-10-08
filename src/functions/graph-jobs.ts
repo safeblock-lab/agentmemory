@@ -7,6 +7,7 @@ import { logger } from "../logger.js";
 import type { CompressedObservation, GraphControlState, GraphExtractionJob } from "../types.js";
 import { StateTransactionError, type StateGraphLease, type StateJsonValue } from "../state/state-transactions.js";
 import { StatePageError } from "../state/state-pages.js";
+import { withGraphLeaseAdmission } from "../state/batch-effects.js";
 import { GraphJobStorage, graphJson, graphRecordDigest, type GraphDeltaPreparation } from "./graph-job-storage.js";
 
 const LEASE_TTL_MS = 120_000;
@@ -40,18 +41,16 @@ const handlers = new WeakMap<StateKV, Map<GraphExtractionJob["kind"], GraphHandl
 const graphJobQueues = new WeakMap<StateKV, Promise<void>>();
 const baseKV = (kv: StateKV): StateKV => originals.get(kv) ?? kv;
 
-async function withGraphJobQueue<T>(kv: StateKV, run: () => Promise<T>): Promise<T> {
+async function acquireGraphJobQueue(kv: StateKV): Promise<() => void> {
   const previous = graphJobQueues.get(kv);
   let release!: () => void;
   const current = new Promise<void>((resolve) => { release = resolve; });
   graphJobQueues.set(kv, current);
   if (previous) await previous;
-  try {
-    return await run();
-  } finally {
+  return () => {
     release();
     if (graphJobQueues.get(kv) === current) graphJobQueues.delete(kv);
-  }
+  };
 }
 
 export function graphCapturedAt(): string { return execution.getStore()?.delta?.capturedAt ?? new Date().toISOString(); }
@@ -373,10 +372,22 @@ async function discoverJob(storage: GraphJobStorage, control: GraphControlState)
 export async function runGraphJob<T>(kv: StateKV, kind: GraphExtractionJob["kind"], input: unknown, run: (frozen: unknown) => Promise<T>, durableId?: string, preflight?: GraphJobPreflight<T>): Promise<T> {
   const base = baseKV(kv), nested = execution.getStore();
   if (nested?.storage.kv === base) return run(input);
-  return withGraphJobQueue(base, async () => {
-    let control = (await base.getVersioned<GraphControlState>(KV.graphControl, "current")).value;
-    if (!control) throw new StateTransactionError("STATE_TX_UNSUPPORTED");
-    const lease = await base.lease({ action: "acquire", owner_id: randomUUID(), generation: control.generation, ttl_ms: LEASE_TTL_MS }) as StateGraphLease;
+  // Admit before queueing so maintenance cannot own a lock needed by queued work.
+  const admitted = await withGraphLeaseAdmission(async () => {
+    const releaseQueue = await acquireGraphJobQueue(base);
+    try {
+      const control = (await base.getVersioned<GraphControlState>(KV.graphControl, "current")).value;
+      if (!control) throw new StateTransactionError("STATE_TX_UNSUPPORTED");
+      const lease = await base.lease({ action: "acquire", owner_id: randomUUID(), generation: control.generation, ttl_ms: LEASE_TTL_MS }) as StateGraphLease;
+      return { control, lease, releaseQueue };
+    } catch (error) {
+      releaseQueue();
+      throw error;
+    }
+  });
+  try {
+    let { control } = admitted;
+    const { lease } = admitted;
     const storage = new GraphJobStorage(base, { owner_id: lease.owner_id, generation: lease.generation, fence: lease.fence }, durableId ?? generateId("graphjob"));
     const heartbeat = setInterval(() => {
       const renewing = { ...storage.guard };
@@ -463,7 +474,9 @@ export async function runGraphJob<T>(kv: StateKV, kind: GraphExtractionJob["kind
         if (!(error instanceof StateTransactionError) || !["STATE_TX_FENCED", "STATE_TX_GENERATION_STALE"].includes(error.code)) logger.warn("Graph job lease release failed", { jobId: storage.jobId });
       });
     }
-  });
+  } finally {
+    admitted.releaseQueue();
+  }
 }
 
 export function registerGraphJobHandler(kv: StateKV, kind: GraphExtractionJob["kind"], handler: GraphHandler): void {
@@ -479,7 +492,7 @@ export function registerGraphJobRecovery(sdk: IIIClient, kv: StateKV): void {
       if (await pendingJob(base)) throw new StateTransactionError("STATE_TX_UNSUPPORTED");
       return { success: true, recovered: false };
     }
-    const lease = await base.lease({ action: "acquire", owner_id: randomUUID(), generation: initial.generation, ttl_ms: LEASE_TTL_MS }) as StateGraphLease;
+    const lease = await withGraphLeaseAdmission(() => base.lease({ action: "acquire", owner_id: randomUUID(), generation: initial.generation, ttl_ms: LEASE_TTL_MS })) as StateGraphLease;
     const storage = new GraphJobStorage(base, { owner_id: lease.owner_id, generation: lease.generation, fence: lease.fence }, initial.recovery?.job_id ?? "recovery-discovery");
     let job: DurableGraphJob | null = null;
     let input: unknown;

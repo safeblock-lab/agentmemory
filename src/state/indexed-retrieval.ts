@@ -1,6 +1,8 @@
 import { InvocationError } from 'iii-sdk';
 import type { StateKV } from './kv.js';
 import type { GraphEdge } from '../types.js';
+import type { EmbeddingProvider } from '../types.js';
+import { KV } from './schema.js';
 
 export class IndexedRetrievalError extends Error {
   constructor(readonly code: string, detail: string) { super(`${code}: ${detail}`); }
@@ -11,7 +13,46 @@ export interface IndexedStatus {
   version: number;
   capabilities: string[];
   graph: Array<{ scope: string; status: string; revision: string }>;
-  semantic: Array<{ index_id: string; model: string; dimensions: number; generation: string; status: string; count: string; lexical_count: string; lexical_ready: boolean; source_kind: string; source_prepared: boolean; dirty_count: string; coverage_ready: boolean }>;
+  semantic: Array<{ index_id: string; model: string; dimensions: number; generation: string; status: string; count: number | string; lexical_count: number | string; lexical_ready: boolean; source_kind: string; source_prepared: boolean; dirty_count: number | string; coverage_ready: boolean }>;
+}
+export function nativeCount(value: unknown): number | null {
+  if (typeof value === 'number') return Number.isSafeInteger(value) && value >= 0 ? value : null;
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) return null;
+  const count = Number(value);
+  return Number.isSafeInteger(count) ? count : null;
+}
+
+export async function readNativeIndexStatus(kv: StateKV, provider: EmbeddingProvider | null) {
+  const [status, marker] = await Promise.all([
+    retrievalRequest<IndexedStatus>(kv, { action: 'index_status' }),
+    kv.get<{ status: string; model: string; dimensions: number; generation: string }>(KV.config, 'indexed-corpus'),
+  ]);
+  const selected = provider && status.version === 1 && Array.isArray(status.semantic)
+    ? status.semantic.find(item => item.index_id === 'observations' && item.model === provider.name &&
+      item.dimensions === provider.dimensions && item.generation === 'local-v1') : undefined;
+  if (!selected) return null;
+  const lexicalCount = nativeCount(selected.lexical_count);
+  const vectorCount = nativeCount(selected.count);
+  const dirtyCount = nativeCount(selected.dirty_count);
+  const identityMatches = marker?.model === selected.model && marker.dimensions === selected.dimensions && marker.generation === selected.generation;
+  const graph = [KV.graphNodes, KV.graphEdges].map(scope => {
+    const entry = status.graph?.find(item => item.scope === scope);
+    return { scope, status: typeof entry?.status === 'string' ? entry.status : null, revision: typeof entry?.revision === 'string' ? entry.revision : null };
+  });
+  const graphReady = status.capabilities?.includes('state::indexed_graph_v1') === true && graph.every(item => item.status === 'ready');
+  const ready = selected.status === 'ready' && selected.lexical_ready === true &&
+    selected.source_kind === 'agentmemory' && selected.source_prepared === true && selected.coverage_ready === true &&
+    dirtyCount === 0 && lexicalCount !== null && lexicalCount === vectorCount &&
+    identityMatches && marker?.status === 'ready' &&
+    status.capabilities?.includes('state::semantic_lsh_v1') === true &&
+    graphReady;
+  return {
+    lexicalCount, vectorCount, dirtyCount, ready, graphReady, graph,
+    lexicalReady: selected.lexical_ready === true,
+    sourcePrepared: selected.source_prepared === true,
+    coverageReady: selected.coverage_ready === true,
+    identity: { indexId: selected.index_id, model: selected.model, dimensions: selected.dimensions, generation: selected.generation },
+  };
 }
 export async function retrievalRequest<T>(kv: StateKV, payload: Record<string, unknown>): Promise<T> {
   let result: unknown;

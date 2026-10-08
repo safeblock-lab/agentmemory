@@ -106,7 +106,7 @@ Configuration is read from the environment and from `~/.agentmemory/.env` (no `e
 - `AGENTMEMORY_TYPESAFE_SCORING_ENABLED`
 - `AGENTMEMORY_TYPESAFE_TIMEOUT_MS`
 - `AGENTMEMORY_UPDATE_RESTART`
-- `AGENTMEMORY_UPDATE_SECRET`
+- Local viewer updates require no separate update secret; loopback checks and one-use update tokens apply.
 - `AGENTMEMORY_URL`
 - `AGENTMEMORY_USE_DOCKER`
 - `AGENTMEMORY_VECTOR_BACKFILL`
