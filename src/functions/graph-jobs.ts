@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import type { IIIClient } from "iii-sdk";
-import type { StateKV, StatePage } from "../state/kv.js";
+import type { StateKV } from "../state/kv.js";
 import { generateId, isGuardedGraphRecord, KV } from "../state/schema.js";
 import { logger } from "../logger.js";
 import type { CompressedObservation, GraphControlState, GraphExtractionJob } from "../types.js";
@@ -9,6 +9,7 @@ import { isStateCounter, StateTransactionError, type StateGraphLease, type State
 import { StatePageError } from "../state/state-pages.js";
 import { withGraphLeaseAdmission } from "../state/batch-effects.js";
 import { GraphJobStorage, graphJson, graphRecordDigest, type GraphDeltaPreparation } from "./graph-job-storage.js";
+import { readGraphSessionCapture } from "./graph-session-capture.js";
 
 const LEASE_TTL_MS = 120_000;
 const CAPTURE_FRAGMENT_CHARS = 128 * 1024;
@@ -232,45 +233,23 @@ export async function freezeGraphSessionObservations(kv: StateKV, sessionId: str
     const delta = execution.getStore()?.delta;
     if (!delta) throw new StateTransactionError("STATE_TX_INVALID_REQUEST");
     const key = `session:${delta.ordinal}`;
-    let source = await context.storage.get<{ count: number; pageOrdinal: number; cursor?: string; complete: boolean }>(scope, key);
-    if (!source) {
-      // The first cursor pins the source revision before any admitted row is
-      // materialized. Recovery uses it and fails visibly if the source moved.
-      source = { count: 0, pageOrdinal: 0, complete: false };
+    const source = await context.storage.get<{ count: number; complete: boolean; rowPrefix?: string }>(scope, key);
+    if (source?.complete) return { key, count: source.count, ...(source.rowPrefix ? { rowPrefix: source.rowPrefix } : {}) };
+
+    const { observations, ...captureMetrics } = await readGraphSessionCapture(context.storage.kv, sessionId);
+    logger.info("Graph session source captured consistently", { jobId: context.job.id, ...captureMetrics });
+    // Interrupted attempts have their own namespace. A complete reference is
+    // published only after every row, so recovery never joins source revisions.
+    const rowPrefix = `${key}:attempt:${randomUUID()}`;
+    for (let ordinal = 0; ordinal < observations.length; ordinal++) {
+      await writeFrozenValue(context.storage, scope, `${rowPrefix}:row:${ordinal}`, observations[ordinal], delta);
     }
-    while (!source.complete) {
-        const pageKey: string = `${key}:page:${source.pageOrdinal}`;
-        const pageReference = await context.storage.get<FrozenValue>(scope, pageKey);
-        let page: StatePage<CompressedObservation>;
-        if (pageReference) page = await readFrozenValue<StatePage<CompressedObservation>>(context.storage, scope, pageKey, pageReference);
-        else {
-          const pages: AsyncGenerator<StatePage<CompressedObservation>> = context.storage.kv.pages<CompressedObservation>(KV.observations(sessionId), { ...(source.cursor ? { cursor: source.cursor } : {}), limit: 1 });
-          try {
-            const next: IteratorResult<StatePage<CompressedObservation>> = await pages.next();
-            if (next.done) throw new StateTransactionError("STATE_TX_INVALID_RESPONSE");
-            page = next.value;
-            await writeFrozenValue(context.storage, scope, pageKey, page, delta);
-          } finally { await pages.return(undefined); }
-        }
-        for (const observation of page.items) {
-          if (observation.title) {
-            const rowKey = `${key}:row:${source.count}`;
-            const previous = await context.storage.get<FrozenValue>(scope, rowKey);
-            if (previous) {
-              const frozen = await readFrozenValue<CompressedObservation>(context.storage, scope, rowKey, previous);
-              if (graphRecordDigest(JSON.stringify(frozen)) !== graphRecordDigest(JSON.stringify(observation))) throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
-            } else await writeFrozenValue(context.storage, scope, rowKey, observation, delta);
-            source.count++;
-          }
-        }
-        source = { count: source.count, pageOrdinal: source.pageOrdinal + 1, complete: page.next_cursor === null, ...(page.next_cursor ? { cursor: page.next_cursor } : {}) };
-        await context.storage.stage(scope, key, source, delta);
-    }
-    return { key, count: source.count };
+    await context.storage.stage(scope, key, { count: observations.length, complete: true, rowPrefix }, delta);
+    return { key, count: observations.length, rowPrefix };
   });
   const observations: CompressedObservation[] = [];
   for (let ordinal = 0; ordinal < reference.count; ordinal++) {
-    const key = `${reference.key}:row:${ordinal}`;
+    const key = `${reference.rowPrefix ?? reference.key}:row:${ordinal}`;
     const row = await context.storage.get<FrozenValue>(scope, key);
     if (!row) throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
     observations.push(await readFrozenValue<CompressedObservation>(context.storage, scope, key, row));
@@ -488,17 +467,7 @@ export async function runGraphJob<T>(kv: StateKV, kind: GraphExtractionJob["kind
     } catch (error) {
       storage.discardPendingShadows();
       const failedCheckpoint = storage.checkpoint;
-      let recoveryOutcome: "retry-scheduled" | "stopped" | false = false;
-      if (!recoveryDeferred && !(error instanceof GraphProviderRecoveryRequired)) {
-        try {
-          recoveryOutcome = await recordStagingFailure(storage, error);
-        } catch (terminalizeError) {
-          logger.error("Graph job permanent failure could not be terminalized", {
-            jobId: storage.jobId,
-            code: terminalizeError instanceof StateTransactionError ? terminalizeError.code : "STATE_TX_FAILED",
-          });
-        }
-      }
+      let recoveryOutcome: "retry-scheduled" | "stopped" | "invalidated" | false = false;
       const checkpoint = storage.checkpoint;
       const descriptor = typeof input === "object" && input !== null ? input as { sessionId?: unknown; observations?: unknown } : null;
       if (error instanceof StatePageError && error.code === "STATE_PAGE_CURSOR_STALE" && kind === "extraction" && typeof descriptor?.sessionId === "string" && descriptor.observations === undefined && checkpoint?.logical_delta_id === "delta:1" && checkpoint.delta_ordinal === 1 && checkpoint.visibility === "staging") {
@@ -508,13 +477,24 @@ export async function runGraphJob<T>(kv: StateKV, kind: GraphExtractionJob["kind
           // Cursor epochs change on native restart. An unfinished initial source
           // capture has no graph effects and cannot adopt a changed source.
           const delta: GraphDeltaPreparation = { id: checkpoint.logical_delta_id, ordinal: checkpoint.delta_ordinal, capturedAt: admitted.createdAt, attempt: "capture-abort", phase: "preparing" };
-          await storage.stage(KV.graphJobs, storage.jobId, { ...admitted, state: "invalidated", failureCode: error.code }, delta);
+          await storage.stage(KV.graphJobs, storage.jobId, { ...admitted, state: "invalidated", failureCode: error.code, recoveryAfter: null, recoveryStopped: true, updatedAt: new Date().toISOString() }, delta);
           await storage.completeStaging(delta);
-          logger.warn("Initial graph source capture invalidated; retry with a fresh complete request", { jobId: storage.jobId, code: error.code });
+          recoveryOutcome = "invalidated";
+        }
+      }
+      if (!recoveryOutcome && !recoveryDeferred && !(error instanceof GraphProviderRecoveryRequired)) {
+        try {
+          recoveryOutcome = await recordStagingFailure(storage, error);
+        } catch (terminalizeError) {
+          logger.error("Graph job permanent failure could not be terminalized", {
+            jobId: storage.jobId,
+            code: terminalizeError instanceof StateTransactionError ? terminalizeError.code : "STATE_TX_FAILED",
+          });
         }
       }
       const diagnostic = { jobId: storage.jobId, ...graphFailureDiagnostic(error), ...(error instanceof StateTransactionError ? error.diagnostic : undefined), deltaOrdinal: failedCheckpoint?.delta_ordinal, chunkOrdinal: failedCheckpoint?.next_chunk_ordinal, visibility: failedCheckpoint?.visibility };
       if (error instanceof GraphProviderRecoveryRequired) logger.info("Local graph recovery paused before provider operation", diagnostic);
+      else if (recoveryOutcome === "invalidated") logger.warn("Initial graph source capture invalidated; retry with a fresh complete request", diagnostic);
       else if (recoveryOutcome === "stopped") logger.error("Graph job stopped after repeated or permanent staging failure", diagnostic);
       else if (recoveryOutcome === "retry-scheduled") logger.warn("Graph job retry scheduled with bounded backoff", diagnostic);
       else logger.error("Graph job paused for recovery", diagnostic);

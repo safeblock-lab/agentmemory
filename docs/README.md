@@ -4,6 +4,7 @@ Project documentation by area:
 
 ## Operations
 
+- [Graph source capture](operations/graph-source-capture.md)
 - [State pagination and patched engine delivery](operations/state-pagination.md)
 - [Native storage format V2 and measured migration](operations/native-storage-format-v2.md)
 - [Frozen release assets](operations/frozen-release-assets.md)
