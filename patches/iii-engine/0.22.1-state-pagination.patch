@@ -4953,7 +4953,7 @@ new file mode 100644
 index 0000000..7b3541a
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/commit.rs
-@@ -0,0 +1,348 @@
+@@ -0,0 +1,415 @@
 +use super::{
 +    database::{self, CHECKPOINT_SCOPE, CONTROL_SCOPE, RECEIPT_SCOPE},
 +    protocol::{
@@ -5189,18 +5189,78 @@ index 0000000..7b3541a
 +    matches!(job["state"].as_str(), Some("completed" | "invalidated"))
 +        || job["recoveryStopped"] == true
 +}
++pub(super) fn prunable_job(job: &Value) -> bool {
++    matches!(job["state"].as_str(), Some("completed" | "invalidated"))
++}
 +
 +fn prune_terminal_job(connection: &Connection, body: &CommitBody) -> anyhow::Result<()> {
 +    if body.checkpoint.visibility != "complete" {
 +        return Ok(());
 +    }
 +    let job = database::row(connection, JOBS, &body.identity.job_id)?.value;
-+    if !job.as_ref().is_some_and(terminal_job) {
++    if !job.as_ref().is_some_and(prunable_job) {
 +        return Ok(());
 +    }
 +    let version = database::row(connection, CHECKPOINT_SCOPE, &body.identity.job_id)?.version.to_string();
 +    super::retention::close_page(connection, &body.identity.job_id, &version)?;
 +    Ok(())
++}
++
++fn stopped_continuation(
++    connection: &Connection,
++    body: &CommitBody,
++    job: &Value,
++    checkpoint: &Value,
++) -> anyhow::Result<bool> {
++    let Some(ordinal) = checkpoint["delta_ordinal"].as_u64() else {
++        return Ok(false);
++    };
++    let Some(next_ordinal) = ordinal.checked_add(1) else {
++        return Ok(false);
++    };
++    if ordinal == 0 || job["state"] != "failed"
++        || job["recoveryStopped"] != true
++        || job["kind"] != "extraction"
++        || job["captureComplete"] != true
++        || job.get("continuationFromOrdinal").is_some()
++        || checkpoint["logical_delta_id"] != format!("delta:{ordinal}")
++        || body.identity.logical_delta_id != format!("delta:{next_ordinal}")
++        || body.identity.chunk_ordinal != 0
++        || body.checkpoint.delta_ordinal != next_ordinal
++        || body.checkpoint.visibility != "staging"
++    {
++        return Ok(false);
++    }
++    let [Operation::Set { scope, key, value, .. }] = body.operations.as_slice() else {
++        return Ok(false);
++    };
++    if scope != JOBS || key != &body.identity.job_id {
++        return Ok(false);
++    }
++    let mut expected = job.clone();
++    let Some(expected) = expected.as_object_mut() else {
++        return Ok(false);
++    };
++    expected.insert("state".into(), json!("staging"));
++    expected.insert("recoveryStopped".into(), json!(false));
++    expected.insert("recoveryAfter".into(), Value::Null);
++    expected.insert("continuationFromOrdinal".into(), json!(ordinal));
++    if value.as_object() != Some(&*expected) {
++        return Ok(false);
++    }
++    let manifest = database::row(
++        connection,
++        &format!("mem:graph:deltas:{}", body.identity.job_id),
++        &format!("manifest:{ordinal}"),
++    )?.value;
++    Ok(manifest.is_some_and(|manifest| {
++        manifest["id"] == format!("delta:{ordinal}")
++            && manifest["ordinal"] == ordinal
++            && manifest["phase"] == "preparing"
++            && manifest["advanceGeneration"] == false
++            && ["templateCount", "applyOrdinal", "applyCheckpointVersion", "result"]
++                .iter().all(|key| manifest.get(key).is_none())
++    }))
 +}
 +
 +pub fn commit(
@@ -5245,7 +5305,14 @@ index 0000000..7b3541a
 +            .as_ref()
 +            .is_some_and(|point| point["visibility"] == "complete")
 +    {
-+        return Err(error("STATE_TX_CHECKPOINT_CONFLICT"));
++        if !stopped_continuation(
++            connection,
++            &body,
++            persisted_job.as_ref().expect("terminal job exists"),
++            checkpoint.value.as_ref().expect("complete checkpoint exists"),
++        )? {
++            return Err(error("STATE_TX_CHECKPOINT_CONFLICT"));
++        }
 +    }
 +    progression(checkpoint.value.as_ref(), &body)?;
 +    job_ownership(connection, &body)?;
@@ -7766,7 +7833,7 @@ index 0000000..29aa19e
 +            .ok_or_else(|| error("STATE_TX_CHECKPOINT_CONFLICT"))?,
 +    )?;
 +    require(
-+        commit::terminal_job(&job)
++        commit::prunable_job(&job)
 +            && point.visibility == "complete"
 +            && point.job_id == job_id
 +            && job["id"] == job_id

@@ -427,7 +427,22 @@ async function readSnapshot(kv: StateKV): Promise<GraphSnapshot | null> {
 
 function projectGraphSnapshot(snapshot: GraphSnapshot): GraphSnapshot {
   const projected = structuredClone(snapshot);
-  for (const node of projected.topNodes) {
+  const nodes = projected.topNodes;
+  const edges = projected.topEdges;
+  const degrees = projected.topDegrees;
+  projected.topNodes = [];
+  projected.topEdges = [];
+  projected.topDegrees = {};
+  let bytes = Buffer.byteLength(JSON.stringify(projected), "utf8");
+  if (bytes > MAX_GRAPH_SNAPSHOT_BYTES) {
+    throw new Error(
+      `Graph snapshot projection is ${bytes} bytes, over the ${MAX_GRAPH_SNAPSHOT_BYTES}-byte cache limit`,
+    );
+  }
+  const retainedIds = new Set<string>();
+  const retainedDegrees: Array<[string, number]> = [];
+  for (const node of nodes.slice(0, SNAPSHOT_TOP_NODES)) {
+    if (retainedIds.has(node.id)) continue;
     if (
       Array.isArray(node.sourceObservationIds) &&
       node.sourceObservationIds.length > SNAPSHOT_MAX_OBSERVATIONS_PER_RECORD
@@ -436,8 +451,19 @@ function projectGraphSnapshot(snapshot: GraphSnapshot): GraphSnapshot {
         -SNAPSHOT_MAX_OBSERVATIONS_PER_RECORD,
       );
     }
+    const degree = degrees[node.id] ?? 0;
+    const addition = Buffer.byteLength(JSON.stringify(node), "utf8")
+      + Buffer.byteLength(`${JSON.stringify(node.id)}:${JSON.stringify(degree)}`, "utf8")
+      + (retainedIds.size ? 2 : 0);
+    if (bytes + addition > MAX_GRAPH_SNAPSHOT_BYTES) continue;
+    projected.topNodes.push(node);
+    retainedIds.add(node.id);
+    retainedDegrees.push([node.id, degree]);
+    bytes += addition;
   }
-  for (const edge of projected.topEdges) {
+  projected.topDegrees = Object.fromEntries(retainedDegrees);
+  for (const edge of edges) {
+    if (!retainedIds.has(edge.sourceNodeId) || !retainedIds.has(edge.targetNodeId)) continue;
     if (
       Array.isArray(edge.sourceObservationIds) &&
       edge.sourceObservationIds.length > SNAPSHOT_MAX_OBSERVATIONS_PER_RECORD
@@ -446,13 +472,11 @@ function projectGraphSnapshot(snapshot: GraphSnapshot): GraphSnapshot {
         -SNAPSHOT_MAX_OBSERVATIONS_PER_RECORD,
       );
     }
-  }
-
-  const bytes = Buffer.byteLength(JSON.stringify(projected) ?? "", "utf8");
-  if (bytes > MAX_GRAPH_SNAPSHOT_BYTES) {
-    throw new Error(
-      `Graph snapshot projection is ${bytes} bytes, over the ${MAX_GRAPH_SNAPSHOT_BYTES}-byte cache limit`,
-    );
+    const addition = Buffer.byteLength(JSON.stringify(edge), "utf8")
+      + (projected.topEdges.length ? 1 : 0);
+    if (bytes + addition > MAX_GRAPH_SNAPSHOT_BYTES) continue;
+    projected.topEdges.push(edge);
+    bytes += addition;
   }
   return projected;
 }

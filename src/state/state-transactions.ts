@@ -67,8 +67,13 @@ const ERROR_MESSAGES = {
   STATE_TX_FAILED: 'The state transaction failed',
 } as const
 export type StateTransactionErrorCode = keyof typeof ERROR_MESSAGES
+export interface StateTransactionDiagnostic {
+  stateFunction: StateTransactionFunction
+  transportCode?: string
+  failureKind: 'timeout' | 'native-rejection' | 'transport'
+}
 export class StateTransactionError extends Error {
-  constructor(readonly code: StateTransactionErrorCode, cause?: unknown) {
+  constructor(readonly code: StateTransactionErrorCode, cause?: unknown, readonly diagnostic?: StateTransactionDiagnostic) {
     super(`${code}: ${ERROR_MESSAGES[code]}`, { cause }); this.name = 'StateTransactionError'
   }
 }
@@ -167,10 +172,18 @@ async function invoke(trigger: StateTransactionTrigger, functionId: StateTransac
   catch (error) {
     const record = object(error) ? error : {}; const message = typeof record.message === 'string' ? record.message : ''
     const code = typeof record.code === 'string' ? record.code : message.match(/^([A-Z][A-Z0-9_]+):/)?.[1]
-    if (code && Object.hasOwn(ERROR_MESSAGES, code)) throw new StateTransactionError(code as StateTransactionErrorCode, error)
+    const nestedCode = message.match(/^(?:invocation_failed: )?(STATE_[A-Z0-9_]+):/)?.[1]
+    const nativeCode = code && Object.hasOwn(ERROR_MESSAGES, code) ? code : nestedCode && Object.hasOwn(ERROR_MESSAGES, nestedCode) ? nestedCode : undefined
+    const transportCodes = ['invocation_failed', 'invocation_timeout', 'TIMEOUT', 'timeout', 'UNKNOWN', 'function_not_found', 'FUNCTION_NOT_FOUND', 'NO_SUCH_FUNCTION', 'UNKNOWN_FUNCTION', 'UNSUPPORTED']
+    const diagnostic: StateTransactionDiagnostic = {
+      stateFunction: functionId,
+      ...(code && (transportCodes.includes(code) || Object.hasOwn(ERROR_MESSAGES, code)) ? { transportCode: code } : {}),
+      failureKind: /timeout|timed out/i.test(code ?? '') || /^(?:invocation_failed: )?(?:Invocation )?(?:timeout|timed out)/i.test(message) ? 'timeout' : nativeCode ? 'native-rejection' : 'transport',
+    }
+    if (nativeCode) throw new StateTransactionError(nativeCode as StateTransactionErrorCode, error, diagnostic)
     const missing = ['FUNCTION_NOT_FOUND', 'NO_SUCH_FUNCTION', 'UNKNOWN_FUNCTION'].includes(code ?? '')
       || ((code === 'UNSUPPORTED' || /(?:no function|function not found|unknown function)/i.test(message)) && (record.function_id === functionId || message.includes(functionId)))
-    throw new StateTransactionError(missing ? 'STATE_TX_UNSUPPORTED' : 'STATE_TX_FAILED', error)
+    throw new StateTransactionError(missing ? 'STATE_TX_UNSUPPORTED' : 'STATE_TX_FAILED', error, diagnostic)
   }
 }
 export async function getVersionedState<T>(trigger: StateTransactionTrigger, request: StateVersionedRequest): Promise<StateVersioned<T>> {

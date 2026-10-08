@@ -5,7 +5,7 @@ import type { StateKV, StatePage } from "../state/kv.js";
 import { generateId, isGuardedGraphRecord, KV } from "../state/schema.js";
 import { logger } from "../logger.js";
 import type { CompressedObservation, GraphControlState, GraphExtractionJob } from "../types.js";
-import { StateTransactionError, type StateGraphLease, type StateJsonValue } from "../state/state-transactions.js";
+import { isStateCounter, StateTransactionError, type StateGraphLease, type StateJsonValue } from "../state/state-transactions.js";
 import { StatePageError } from "../state/state-pages.js";
 import { withGraphLeaseAdmission } from "../state/batch-effects.js";
 import { GraphJobStorage, graphJson, graphRecordDigest, type GraphDeltaPreparation } from "./graph-job-storage.js";
@@ -26,6 +26,7 @@ interface DurableGraphJob extends Omit<GraphExtractionJob, "logicalDeltaCount"> 
   recoveryAttempts?: number;
   recoveryAfter?: string | null;
   recoveryStopped?: boolean;
+  continuationFromOrdinal?: number;
 }
 interface GraphExecution {
   storage: GraphJobStorage;
@@ -39,6 +40,12 @@ const execution = new AsyncLocalStorage<GraphExecution>();
 const localRecovery = new AsyncLocalStorage<boolean>();
 class GraphProviderRecoveryRequired extends Error {
   constructor() { super("Graph recovery requires an uncaptured provider operation"); }
+}
+class GraphCaptureUnavailableError extends StateTransactionError {
+  constructor(readonly jobId: string) {
+    super("STATE_GRAPH_RECOVERY_REQUIRED");
+    this.name = "GraphCaptureUnavailableError";
+  }
 }
 const LOCAL_FROZEN_VALUES = new Set(["options", "heuristic", "parsed-batch", "parsed-response"]);
 const originals = new WeakMap<StateKV, StateKV>();
@@ -109,11 +116,15 @@ function nextDelta(ordinal: number): GraphDeltaPreparation {
   return { id: `delta:${ordinal}`, ordinal, capturedAt: new Date().toISOString(), attempt: randomUUID(), phase: "preparing", shadowCount: 0 };
 }
 
+function nativeDeltaOrdinal(job: DurableGraphJob, logicalOrdinal: number): number {
+  return logicalOrdinal + (job.continuationFromOrdinal !== undefined && logicalOrdinal >= job.continuationFromOrdinal ? 1 : 0);
+}
+
 export async function withGraphDelta<T>(kv: StateKV, run: () => Promise<T>, advanceGeneration = false): Promise<T> {
   const context = execution.getStore();
   if (!context || context.storage.kv !== baseKV(kv)) throw new StateTransactionError("STATE_TX_INVALID_REQUEST");
   if (context.delta) return run();
-  const ordinal = context.cursor++;
+  const ordinal = nativeDeltaOrdinal(context.job, context.cursor++);
   const scope = KV.graphDeltas(context.job.id);
   const saved = await context.storage.get<GraphDeltaPreparation>(scope, `manifest:${ordinal}`);
   const checkpoint = context.storage.checkpoint;
@@ -291,7 +302,7 @@ async function readCapture(storage: CaptureReader, job: DurableGraphJob): Promis
   let text = "";
   for (let ordinal = 0; ordinal < job.captureParts; ordinal++) {
     const part = await storage.get<string>(KV.graphInputs(job.id), `capture:${ordinal}`);
-    if (part === null) throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
+    if (part === null) throw new GraphCaptureUnavailableError(job.id);
     if (typeof part !== "string") throw new StateTransactionError("STATE_TX_INVALID_RESPONSE");
     text += part;
   }
@@ -316,6 +327,36 @@ function terminalPayloadFailureCode(error: unknown, seen = new Set<object>()): s
   return terminalPayloadFailureCode(record.cause, seen) ?? terminalPayloadFailureCode(record.response, seen);
 }
 
+function graphFailureDiagnostic(error: unknown): { code: string; errorClass: string; errorCategory?: string; sourceFrames: string[] } {
+  const names = ["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "DOMException", "StateTransactionError", "StatePageError", "IndexedRetrievalError", "InvocationError", "GraphProviderRecoveryRequired"];
+  const candidate = error instanceof Error ? error.constructor.name : "unknown";
+  const errorClass = names.includes(candidate) ? candidate : "unknown";
+  const record = typeof error === "object" && error !== null ? error as { code?: unknown } : null;
+  const knownCodes = ["TIMEOUT", "invocation_failed", "function_not_found", "STATE_INDEX_NOT_READY", "STATE_RETRIEVAL_RESOURCE_LIMIT", "STATE_GRAPH_RECOVERY_REQUIRED", "STATE_TX_INVALID_REQUEST"];
+  const code = terminalPayloadFailureCode(error)
+    ?? (error instanceof StateTransactionError || error instanceof StatePageError ? error.code
+      : typeof record?.code === "string" && knownCodes.includes(record.code) ? record.code : "GRAPH_EXECUTION_FAILED");
+  const categories: Record<string, string> = {
+    "Graph snapshot read failed; refusing to continue": "snapshot-read",
+    "Graph snapshot is malformed; refusing to continue": "snapshot-invalid",
+    "Invalid batch effect receipt metadata": "batch-receipt-invalid",
+    "Batch effect receipt capacity exhausted": "batch-receipt-limit",
+    "A batch graph application must be recovered first": "batch-graph-recovery",
+    "A batch callback must be recovered first": "batch-callback-recovery",
+    "Ambiguous batch callback admission state": "batch-admission-invalid",
+    "Ambiguous batch callback receipt state": "batch-receipt-state-invalid",
+    "Graph job configuration changed; restore the captured provider/compaction configuration before recovery": "job-configuration-changed",
+  };
+  const message = error instanceof Error ? error.message : "";
+  const errorCategory = Object.hasOwn(categories, message) ? categories[message]
+    : /^Graph snapshot projection is \d{1,16} bytes, over the \d{1,16}-byte cache limit$/.test(message) ? "snapshot-size-limit" : undefined;
+  const sourceFrames = error instanceof Error && typeof error.stack === "string"
+    ? [...error.stack.matchAll(/[\\/](graph(?:-[a-z-]+)?|state-transactions|state-pages|indexed-retrieval|index|(?:src|schema|keyed-mutex)-[A-Za-z0-9_-]{8})\.(?:m?js|ts):(\d+):(\d+)/g)]
+      .slice(0, 4).map((match) => `${match[1]}:${match[2]}:${match[3]}`)
+    : [];
+  return { code, errorClass, ...(errorCategory ? { errorCategory } : {}), sourceFrames };
+}
+
 async function recordStagingFailure(storage: GraphJobStorage, error: unknown): Promise<"retry-scheduled" | "stopped" | false> {
   const permanentFailureCode = terminalPayloadFailureCode(error);
   const checkpoint = storage.checkpoint;
@@ -328,8 +369,7 @@ async function recordStagingFailure(storage: GraphJobStorage, error: unknown): P
     ? job.recoveryAttempts! + 1
     : 1;
   const stopped = permanentFailureCode !== undefined || recoveryAttempts >= MAX_GRAPH_EXTRACTION_RECOVERY_FAILURES;
-  const failureCode = permanentFailureCode
-    ?? (error instanceof StateTransactionError ? error.code : "STATE_TX_FAILED");
+  const failureCode = graphFailureDiagnostic(error).code;
   const terminalDelta: GraphDeltaPreparation = {
     id: checkpoint.logical_delta_id,
     ordinal: checkpoint.delta_ordinal,
@@ -441,12 +481,13 @@ export async function runGraphJob<T>(kv: StateKV, kind: GraphExtractionJob["kind
       await execution.run(context, () => withGraphDelta(kv, async () => {
         const active = execution.getStore();
         if (!active?.delta) throw new StateTransactionError("STATE_TX_INVALID_REQUEST");
-        await storage.facade(active.delta).set(KV.graphJobs, job.id, { ...job, state: "completed", logicalDeltaCount: context.cursor, updatedAt: active.delta.capturedAt, result: graphJson({ value: result }) });
+        await storage.facade(active.delta).set(KV.graphJobs, job.id, { ...job, state: "completed", logicalDeltaCount: nativeDeltaOrdinal(job, context.cursor), updatedAt: active.delta.capturedAt, result: graphJson({ value: result }) });
         return result;
       }));
       return result;
     } catch (error) {
       storage.discardPendingShadows();
+      const failedCheckpoint = storage.checkpoint;
       let recoveryOutcome: "retry-scheduled" | "stopped" | false = false;
       if (!recoveryDeferred && !(error instanceof GraphProviderRecoveryRequired)) {
         try {
@@ -472,13 +513,11 @@ export async function runGraphJob<T>(kv: StateKV, kind: GraphExtractionJob["kind
           logger.warn("Initial graph source capture invalidated; retry with a fresh complete request", { jobId: storage.jobId, code: error.code });
         }
       }
-      const cause = error instanceof Error ? error.cause : undefined;
-      const causeCode = typeof cause === "object" && cause !== null && "code" in cause && typeof cause.code === "string" && /^[A-Z0-9_:-]{1,80}$/.test(cause.code) ? cause.code : undefined;
-      const diagnostic = { jobId: storage.jobId, code: terminalPayloadFailureCode(error) ?? (error instanceof StateTransactionError ? error.code : "STATE_TX_FAILED"), causeCode, deltaOrdinal: checkpoint?.delta_ordinal, chunkOrdinal: checkpoint?.next_chunk_ordinal, visibility: checkpoint?.visibility };
+      const diagnostic = { jobId: storage.jobId, ...graphFailureDiagnostic(error), ...(error instanceof StateTransactionError ? error.diagnostic : undefined), deltaOrdinal: failedCheckpoint?.delta_ordinal, chunkOrdinal: failedCheckpoint?.next_chunk_ordinal, visibility: failedCheckpoint?.visibility };
       if (error instanceof GraphProviderRecoveryRequired) logger.info("Local graph recovery paused before provider operation", diagnostic);
       else if (recoveryOutcome === "stopped") logger.error("Graph job stopped after repeated or permanent staging failure", diagnostic);
       else if (recoveryOutcome === "retry-scheduled") logger.warn("Graph job retry scheduled with bounded backoff", diagnostic);
-      else logger.error("Graph job paused for recovery", { jobId: storage.jobId, code: error instanceof StateTransactionError ? error.code : "STATE_TX_FAILED" });
+      else logger.error("Graph job paused for recovery", diagnostic);
       throw error;
     } finally {
       clearInterval(heartbeat);
@@ -496,10 +535,57 @@ export function registerGraphJobHandler(kv: StateKV, kind: GraphExtractionJob["k
   registry.set(kind, handler); handlers.set(base, registry);
 }
 
+interface StoppedGraphContinuation {
+  jobId: string;
+  generation: string;
+  checkpointVersion: string;
+  chunkOrdinal: number;
+}
+
+async function continueStoppedJob(base: StateKV, discovery: GraphJobStorage, control: GraphControlState, expected: StoppedGraphContinuation): Promise<DurableGraphJob> {
+  if (control.recovery || control.generation !== expected.generation || await pendingJob(base, control.generation)) throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
+  const storage = new GraphJobStorage(base, discovery.guard, expected.jobId);
+  await storage.restore();
+  const checkpoint = storage.checkpoint;
+  const job = await storage.get<DurableGraphJob>(KV.graphJobs, expected.jobId);
+  if (!job || job.id !== expected.jobId || job.generation !== expected.generation || job.kind !== "extraction" || job.state !== "failed" || job.recoveryStopped !== true || job.captureComplete !== true || job.continuationFromOrdinal !== undefined
+    || !checkpoint || checkpoint.visibility !== "complete" || checkpoint.generation !== expected.generation || checkpoint.logical_delta_id !== `delta:${checkpoint.delta_ordinal}` || checkpoint.next_chunk_ordinal !== expected.chunkOrdinal || storage.checkpointVersion !== expected.checkpointVersion || checkpoint.delta_ordinal < 1) throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
+  await readCapture(storage, job);
+  const manifest = await storage.get<GraphDeltaPreparation>(KV.graphDeltas(job.id), `manifest:${checkpoint.delta_ordinal}`);
+  if (!manifest || manifest.id !== checkpoint.logical_delta_id || manifest.ordinal !== checkpoint.delta_ordinal || manifest.phase !== "preparing" || manifest.advanceGeneration !== false || manifest.templateCount !== undefined || manifest.applyOrdinal !== undefined || manifest.result !== undefined) throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
+  const continued: DurableGraphJob = { ...job, state: "staging", recoveryStopped: false, recoveryAfter: null, continuationFromOrdinal: checkpoint.delta_ordinal };
+  const next: GraphDeltaPreparation = { ...nextDelta(checkpoint.delta_ordinal + 1), capturedAt: manifest.capturedAt, advanceGeneration: false };
+  // Terminal delta stays immutable; its original logical operation continues
+  // at the next native ordinal while its captured prefix is reused.
+  storage.checkpoint = null;
+  await storage.stage(KV.graphJobs, job.id, continued, next);
+  await storage.stage(KV.graphDeltas(job.id), `manifest:${next.ordinal}`, next, next);
+  return continued;
+}
+
+async function stopMissingCapture(storage: GraphJobStorage, job: DurableGraphJob): Promise<void> {
+  const control = await leasedControl(storage);
+  const checkpoint = storage.checkpoint;
+  if (control.recovery || !checkpoint || checkpoint.visibility !== "staging" || checkpoint.generation !== job.generation || checkpoint.logical_delta_id !== `delta:${checkpoint.delta_ordinal}` || job.generation !== storage.guard.generation) throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
+  const manifest = await storage.get<GraphDeltaPreparation>(KV.graphDeltas(job.id), `manifest:${checkpoint.delta_ordinal}`);
+  if (!manifest || manifest.id !== checkpoint.logical_delta_id || manifest.ordinal !== checkpoint.delta_ordinal || manifest.phase !== "preparing" || manifest.advanceGeneration !== false || manifest.templateCount !== undefined || manifest.applyOrdinal !== undefined || manifest.applyCheckpointVersion !== undefined || manifest.result !== undefined) throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
+  const delta: GraphDeltaPreparation = { ...manifest, attempt: "capture-unavailable" };
+  await storage.stage(KV.graphJobs, job.id, {
+    ...job, state: "failed", recoveryStopped: true, recoveryAfter: null,
+    captureComplete: false, failureCode: "GRAPH_CAPTURE_UNAVAILABLE", updatedAt: new Date().toISOString(),
+  }, delta);
+  await storage.completeStaging(delta);
+}
+
 export function registerGraphJobRecovery(sdk: IIIClient, kv: StateKV): void {
-  sdk.registerFunction("mem::graph-recover", async (request?: { localOnly?: boolean }) => {
+  sdk.registerFunction("mem::graph-recover", async (request?: { localOnly?: boolean; continuation?: StoppedGraphContinuation }) => {
+    let recoveryPhase = "validation";
+    try {
     if (request?.localOnly !== undefined && typeof request.localOnly !== "boolean") throw new StateTransactionError("STATE_TX_INVALID_REQUEST");
+    const expected = request?.continuation;
+    if (expected !== undefined && (request?.localOnly !== true || typeof expected !== "object" || expected === null || Object.keys(expected).some(key => !["jobId", "generation", "checkpointVersion", "chunkOrdinal"].includes(key)) || typeof expected.jobId !== "string" || !/^graphjob_[a-z0-9_]+$/.test(expected.jobId) || !isStateCounter(expected.generation) || !isStateCounter(expected.checkpointVersion) || !Number.isSafeInteger(expected.chunkOrdinal) || expected.chunkOrdinal < 1)) throw new StateTransactionError("STATE_TX_INVALID_REQUEST");
     const base = baseKV(kv);
+    recoveryPhase = "admission";
     const initial = (await base.getVersioned<GraphControlState>(KV.graphControl, "current")).value;
     if (!initial) {
       if (await pendingJob(base)) throw new StateTransactionError("STATE_TX_UNSUPPORTED");
@@ -512,7 +598,8 @@ export function registerGraphJobRecovery(sdk: IIIClient, kv: StateKV): void {
     let handler: GraphHandler | undefined;
     try {
       const control = await leasedControl(storage);
-      job = await discoverJob(storage, control);
+      recoveryPhase = "discovery";
+      job = expected ? await continueStoppedJob(base, storage, control, expected) : await discoverJob(storage, control);
       if (!job) return { success: true, recovered: false };
       const jobStorage = new GraphJobStorage(base, storage.guard, job.id);
       await jobStorage.restore();
@@ -557,19 +644,37 @@ export function registerGraphJobRecovery(sdk: IIIClient, kv: StateKV): void {
       }
       handler = handlers.get(base)?.get(job.kind);
       if (!handler) throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
-      input = await readCapture(storage, job);
+      try { input = await readCapture(storage, job); }
+      catch (error) {
+        if (!(error instanceof GraphCaptureUnavailableError)) throw error;
+        await stopMissingCapture(jobStorage, job);
+        throw error;
+      }
     } finally {
       // Reconstruction must finish releasing its fence before the handler
       // acquires a new lease and independently validates the durable request.
       await base.lease({ action: "release", ...storage.guard });
     }
     try {
+      recoveryPhase = "execution";
       await localRecovery.run(request?.localOnly === true, () => handler!(input, job!.id));
     } catch (error) {
       if (error instanceof GraphProviderRecoveryRequired && request?.localOnly === true) return { success: true, recovered: false, jobId: job.id, localOnly: true, providerRequired: true };
       throw error;
     }
     return { success: true, recovered: true, jobId: job.id };
+    } catch (error) {
+      if (error instanceof GraphCaptureUnavailableError) {
+        logger.warn("Graph captured input is unavailable; operation cannot be resumed", { jobId: error.jobId, recoveryPhase });
+        return { success: true, recovered: false, jobId: error.jobId, stopped: true, captureUnavailable: true };
+      }
+      logger.error("Graph recovery failed", {
+        recoveryPhase,
+        ...graphFailureDiagnostic(error),
+        ...(error instanceof StateTransactionError ? error.diagnostic : undefined),
+      });
+      throw error;
+    }
   });
 }
 

@@ -20,30 +20,30 @@
   },
   "package": {
     "file": "agentmemory-agentmemory-0.9.87.tgz",
-    "bytes": 12949861,
-    "sha256": "b280355a98e8fd8246586349ce508e761debabb31ef1cde5aed63e127e149502"
+    "bytes": 12967304,
+    "sha256": "7b69a8d8c0d1c6840bc2f0c73c09176440a8524d6ce19c19ba8bcbc36df6668f"
   },
   "native": {
     "engineVersion": "0.22.1",
     "storageFormatVersion": 2,
     "artifact": {
       "path": "win32-x64/iii.exe",
-      "sha256": "7bcb34ac9779d031a3c58b6884d4fd058c7ceb4589f37b45f3e2b291a6d5a84b",
-      "sizeBytes": 29126656
+      "sha256": "9d62f27f72d43b3cab203b433607fa6223251be7c4f7949248a481d4819aa61f",
+      "sizeBytes": 29145088
     }
   },
   "validation": {
     "build": "passed: application build and package creation",
     "tests": "not run by user preference",
     "typecheck": "not run by user preference",
-    "runtime": "Corrected worker startup and localOnly graph recovery receipt recorded separately",
+    "runtime": "Guarded local graph continuation outcome is recorded separately; no tests or optional probes",
     "publication": "frozen draft workflow required"
   },
   "publicAssets": [
     {
       "file": "agentmemory-agentmemory-0.9.87.tgz",
-      "sizeBytes": 12949861,
-      "sha256": "b280355a98e8fd8246586349ce508e761debabb31ef1cde5aed63e127e149502"
+      "sizeBytes": 12967304,
+      "sha256": "7b69a8d8c0d1c6840bc2f0c73c09176440a8524d6ce19c19ba8bcbc36df6668f"
     },
     {
       "file": "qwen3-reranker-0.6b-q8_0.gguf",

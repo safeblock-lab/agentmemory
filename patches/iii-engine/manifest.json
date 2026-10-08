@@ -4,10 +4,10 @@
   "sourceRepository": "https://github.com/iii-hq/iii.git",
   "sourceCommit": "e7de3820d1e558f3762edf95e4440552444d48d3",
   "patchPath": "patches/iii-engine/0.22.1-state-pagination.patch",
-  "patchSha256": "44d06e9dbf9492aaa84863999c456843b28b9f033081cfe90238f1fb6272eafe",
+  "patchSha256": "315bdb52b0324d6271132b84c50650f7028c6ba32fc1dba319a5f82730db605a",
   "artifactPath": ".codex-task/bounded-engine/cargo-target/x86_64-pc-windows-msvc/release/iii.exe",
-  "artifactSha256": "7bcb34ac9779d031a3c58b6884d4fd058c7ceb4589f37b45f3e2b291a6d5a84b",
-  "artifactBytes": 29126656,
+  "artifactSha256": "9d62f27f72d43b3cab203b433607fa6223251be7c4f7949248a481d4819aa61f",
+  "artifactBytes": 29145088,
   "buildTarget": "x86_64-pc-windows-msvc",
   "verifiedPlatform": "win32-x64",
   "capabilities": [
@@ -50,7 +50,7 @@
   },
   "deploymentReady": true,
   "rustToolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)",
-  "builtAt": "2026-10-08T13:20:44.3759648Z",
+  "builtAt": "2026-10-08T16:47:36Z",
   "validation": {
     "canonicalCandidateReceipt": "artifacts/private/release-0.9.83/native-candidate/native-candidate-receipt.json",
     "patchApplyCheck": "not rerun for this version",
@@ -68,7 +68,7 @@
       "command": "C:\\Users\\harus\\.cargo\\bin\\cargo.exe build --locked --release --no-default-features --jobs 1 --package iii --bin iii --target x86_64-pc-windows-msvc",
       "log": ".codex-task/bounded-engine/build.log",
       "exitEvidence": ".codex-task/bounded-engine/build-exit.txt",
-      "scope": "Compilation only; append_bounded behavior was not runtime exercised."
+      "scope": "Compilation only; failed-job retention preservation and safe capture-unavailable closure included. Tests and optional probes were not run."
     },
     "capabilityProbe": {
       "exitCode": 0,

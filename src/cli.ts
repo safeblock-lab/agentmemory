@@ -83,6 +83,7 @@ import {
 } from "./cli/engine-launch.js";
 import { runtimeMetadataPath } from "./runtime-paths.js";
 import { createStartupStderrCapture } from "./cli/startup-stderr.js";
+import { createNativeStateDiagnostics } from "./cli/native-state-diagnostics.js";
 import {
   clearPersistedBuiltinConfig,
   inspectLegacyStateStore,
@@ -1397,10 +1398,11 @@ function spawnEngineBackground(
 ): ChildProcess {
   vlog(`spawn: ${bin} ${spawnArgs.join(" ")}${cwd ? ` (cwd: ${cwd})` : ""}`);
   const stderrCapture = createStartupStderrCapture();
+  const nativeDiagnostics = createNativeStateDiagnostics((message) => console.warn(message));
   activeStartupStderr = stderrCapture;
   const child = spawn(bin, spawnArgs, {
     detached: true,
-    stdio: ["ignore", "ignore", "pipe"],
+    stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
     env: engineChildEnv(process.env),
     ...(cwd ? { cwd } : {}),
@@ -1412,6 +1414,8 @@ function spawnEngineBackground(
   child.stderr?.on("data", (chunk: Buffer) => {
     stderrCapture.append(chunk);
   });
+  child.stdout?.on("data", (chunk: Buffer) => nativeDiagnostics.append(chunk));
+  child.stdout?.on("end", () => nativeDiagnostics.finish());
   child.on("error", (error) => {
     startupFailure = {
       kind: isDocker ? "docker-crashed" : "engine-crashed",
