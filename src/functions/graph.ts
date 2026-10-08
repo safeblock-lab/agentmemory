@@ -7,6 +7,7 @@ import type {
   CompressedObservation,
   MemoryProvider,
   BatchEffectMetadata,
+  RecentOperation,
 } from "../types.js";
 import { KV, generateId, fingerprintId } from "../state/schema.js";
 import { batchEffectKey, createGraphBatchCallbackPreflight, effectMetadata, runBatchCallback } from "../state/batch-effects.js";
@@ -18,6 +19,7 @@ import {
 } from "../prompts/graph-extraction.js";
 import { isGraphExtractionEnabled } from "../config.js";
 import { recordAudit } from "./audit.js";
+import { recordOperation } from "./dashboard-activity.js";
 import { logger } from "../logger.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
 import type { TypeSafeDecisionProvider, TypeSafeQuestion } from "../providers/typesafe.js";
@@ -870,9 +872,9 @@ function parseGraphExtractionResponse(
 
 interface BatchGraphDegree extends BatchEffectMetadata { value: number }
 
-async function applyBatchGraph(kv: StateKV, parsed: ParsedGraphExtraction, obsIds: string[], key: string): Promise<void> {
+async function applyBatchGraph(kv: StateKV, parsed: ParsedGraphExtraction, obsIds: string[], key: string): Promise<{ nodesAdded: number; edgesAdded: number }> {
   const snap = structuredClone((await readSnapshot(kv)) ?? emptySnapshot());
-  if (snap.appliedBatchEffects?.includes(key)) return;
+  if (snap.appliedBatchEffects?.includes(key)) return { nodesAdded: 0, edgesAdded: 0 };
   if (snap.batchInProgress && snap.batchInProgress !== key) throw new Error("A batch graph application must be recovered first");
   if (!snap.batchInProgress) {
     snap.batchInProgress = key;
@@ -882,6 +884,7 @@ async function applyBatchGraph(kv: StateKV, parsed: ParsedGraphExtraction, obsId
   const { nodes, edges } = parsed;
   const remapped = new Map<string, string>();
   const countedNodes = new Set<string>();
+  let edgesAdded = 0;
   for (const node of nodes) {
     const index = nameIndexKey(node.type, node.name);
     const indexedId = await kv.get<string>(KV.graphNameIndex, index);
@@ -926,6 +929,7 @@ async function applyBatchGraph(kv: StateKV, parsed: ParsedGraphExtraction, obsId
     await kv.set(KV.graphEdges, id, next);
     await kv.set(KV.graphEdgeKey, index, id);
     if (id === candidateId) {
+      edgesAdded++;
       snap.stats.totalEdges++;
       snap.stats.edgesByType[edge.type] = (snap.stats.edgesByType[edge.type] ?? 0) + 1;
       for (const [endpoint, nodeId] of [edge.sourceNodeId, edge.targetNodeId].entries()) {
@@ -958,6 +962,7 @@ async function applyBatchGraph(kv: StateKV, parsed: ParsedGraphExtraction, obsId
     dirty: false,
     updatedAt: graphCapturedAt(),
   });
+  return { nodesAdded: countedNodes.size, edgesAdded };
 }
 
 const HEURISTIC_EDGE_WEIGHT = 0.4;
@@ -1217,12 +1222,15 @@ export function registerGraphFunction(
     const preflight = request.batchEffectKey === undefined
       ? undefined
       : createGraphBatchCallbackPreflight(request.batchEffectKey, (state) =>
-        state === "stale" ? { success: true as const, stale: true as const } : { success: true as const },
+        state === "stale"
+          ? { success: true as const, stale: true as const, nodesAdded: 0, edgesAdded: 0 }
+          : { success: true as const, nodesAdded: 0, edgesAdded: 0 },
       );
     const input = durableId || request.graphJobId || request.batchEffectKey
       ? request
       : { ...request, graphProvenanceVersion: 2 as const };
-    return runGraphJob(kv, request.batchEffectKey ? "batch_callback" : "extraction", input, async (frozen) => {
+    try {
+      const result = await runGraphJob(kv, request.batchEffectKey ? "batch_callback" : "extraction", input, async (frozen) => {
     const captured = frozen as ExtractionRequest;
     const auditEffectKey = (phase: string): string | undefined => {
       const jobId = graphJobId();
@@ -1254,9 +1262,9 @@ export function registerGraphFunction(
           return { success: false, error: EMPTY_GRAPH_EXTRACTION_ERROR };
         }
         await admit();
-        await applyBatchGraph(kv, parsed, strictProvenance ? [] : obsIds, data.batchEffectKey);
+        const added = await applyBatchGraph(kv, parsed, strictProvenance ? [] : obsIds, data.batchEffectKey);
         await recordAudit(kv, "observe", "mem::graph-extract", obsIds, {}, undefined, undefined, data.batchEffectKey).catch(() => {});
-        return { success: true };
+        return { success: true, ...added };
       }
       if ((await kv.get<GraphSnapshot>(KV.graphSnapshot, SNAPSHOT_KEY))?.batchInProgress) {
         return { success: false, error: "A batch graph application must be recovered first" };
@@ -1285,6 +1293,8 @@ export function registerGraphFunction(
           return {
             success: true,
             skipped: true,
+            nodesAdded: heuristicNodesAdded,
+            edgesAdded: heuristicEdgesAdded,
             reason: "TypeSafe compaction removed only empty routine notifications",
             observationsRetained: true,
           };
@@ -1331,6 +1341,8 @@ export function registerGraphFunction(
             return {
               success: true,
               skipped: true,
+              nodesAdded: heuristicNodesAdded,
+              edgesAdded: heuristicEdgesAdded,
               reason: "TypeSafe pipeline gate",
               observationsRetained: true,
             };
@@ -1355,6 +1367,8 @@ export function registerGraphFunction(
           strictProvenance,
         ));
 
+      let totalNodesAdded = heuristicNodesAdded;
+      let totalEdgesAdded = heuristicEdgesAdded;
       try {
         if (!data.batchResponse && data.deferred && batchQueue) {
           const workItemIds: string[] = [];
@@ -1380,6 +1394,8 @@ export function registerGraphFunction(
                 deferred: true,
                 queued: false,
                 queuedWorkItemIds: workItemIds,
+                nodesAdded: heuristicNodesAdded,
+                edgesAdded: heuristicEdgesAdded,
                 error: queued.reason ?? "Graph extraction batch queue rejected a complete unit",
               };
             }
@@ -1388,13 +1404,13 @@ export function registerGraphFunction(
           return {
             success: true,
             queued: true,
+            nodesAdded: heuristicNodesAdded,
+            edgesAdded: heuristicEdgesAdded,
             workItemId: workItemIds[0],
             workItemIds,
           };
         }
 
-        let totalNodesAdded = heuristicNodesAdded;
-        let totalEdgesAdded = heuristicEdgesAdded;
         if (data.batchResponse && inputUnits.length !== 1) {
           return {
             success: false,
@@ -1452,12 +1468,30 @@ export function registerGraphFunction(
         if (graphTransactionFailure(err)) throw err;
         const msg = err instanceof Error ? err.message : String(err);
         logger.error("Graph extraction failed", { error: msg });
-        return heuristic.nodes.length || heuristic.edges.length
-          ? { success: true, nodesAdded: heuristicNodesAdded, edgesAdded: heuristicEdgesAdded, llmError: msg }
+        return heuristic.nodes.length || heuristic.edges.length || totalNodesAdded || totalEdgesAdded
+          ? { success: true, nodesAdded: totalNodesAdded, edgesAdded: totalEdgesAdded, llmError: msg }
           : { success: false, error: msg };
       }
     }, () => recordAudit(kv, "observe", "mem::graph-extract", data.observations.map((o) => o.id), {}, undefined, undefined, data.batchEffectKey));
     }, durableId ?? request.graphJobId ?? (request.batchEffectKey ? `graphcallback:${request.batchEffectKey}` : undefined), preflight);
+      const outcome = result && typeof result === "object" ? result as Record<string, unknown> : {};
+      const counts: RecentOperation["counts"] = {};
+      if (typeof outcome.nodesAdded === "number") counts.nodesAdded = outcome.nodesAdded;
+      if (typeof outcome.edgesAdded === "number") counts.edgesAdded = outcome.edgesAdded;
+      if (Array.isArray(outcome.workItemIds)) counts.unitsQueued = outcome.workItemIds.length;
+      if (Array.isArray(outcome.queuedWorkItemIds)) counts.unitsQueued = outcome.queuedWorkItemIds.length;
+      const madeProgress = Object.values(counts).some(count => count > 0);
+      let status: RecentOperation["outcome"] = "completed";
+      if (outcome.success !== true) status = madeProgress ? "partial" : "failed";
+      else if (outcome.queued === true) status = "queued";
+      else if (outcome.skipped === true || outcome.stale === true) status = "skipped";
+      else if (outcome.llmError) status = "partial";
+      await recordOperation(kv, "mem::graph-extract", status, counts);
+      return result;
+    } catch (error) {
+      await recordOperation(kv, "mem::graph-extract", "failed", {});
+      throw error;
+    }
   };
   sdk.registerFunction("mem::graph-extract", (input: ExtractionRequest) => extract(input));
   registerGraphJobHandler(kv, "extraction", (data, id) => extract(data as ExtractionRequest, id));

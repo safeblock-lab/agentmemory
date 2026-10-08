@@ -1,5 +1,5 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 82af87a26a6012ae361fa36fab77f204637548fe..04844c2fd85614af9cbe6c7e363734973be3c0b8 100644
+index 82af87a..04844c2 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -1857,6 +1857,18 @@ dependencies = [
@@ -144,7 +144,7 @@ index 82af87a26a6012ae361fa36fab77f204637548fe..04844c2fd85614af9cbe6c7e36373497
  name = "version_check"
  version = "0.9.5"
 diff --git a/engine/Cargo.toml b/engine/Cargo.toml
-index 2bd88afe53fcd951c0b8bac50809a1333efe21ff..e510bdcf889d0c62dd35b4c3a6e51eb8654683ab 100644
+index 2bd88af..e510bdc 100644
 --- a/engine/Cargo.toml
 +++ b/engine/Cargo.toml
 @@ -154,6 +154,7 @@ winapi = { version = "0.3.9", features = ["minwindef", "wincon", "winbase", "con
@@ -162,7 +162,7 @@ index 2bd88afe53fcd951c0b8bac50809a1333efe21ff..e510bdcf889d0c62dd35b4c3a6e51eb8
 +[target.'cfg(unix)'.dev-dependencies]
  iii-worker = { path = "../crates/iii-worker" }
 diff --git a/engine/src/builtins/kv.rs b/engine/src/builtins/kv.rs
-index f7c768236fe74391e407ebcadcdf921b54b2fa9d..66b7275d5de91aabe9ad31272e6551a1138a9dcf 100644
+index f7c7682..2b10208 100644
 --- a/engine/src/builtins/kv.rs
 +++ b/engine/src/builtins/kv.rs
 @@ -7,12 +7,15 @@
@@ -348,7 +348,20 @@ index f7c768236fe74391e407ebcadcdf921b54b2fa9d..66b7275d5de91aabe9ad31272e6551a1
                      let dirty = if index_map.is_empty() {
                          Some(DirtyOp::Delete)
                      } else {
-@@ -538,6 +633,7 @@ impl BuiltinKvStore {
+@@ -530,14 +625,16 @@ impl BuiltinKvStore {
+     ) -> StreamUpdateResult {
+         let mut store = self.store.write().await;
+ 
+-        // Automatically create index_map if it doesn't exist
+-        let index_map = store.entry(index.clone()).or_insert_with(IndexMap::new);
+-
+-        let old_value = index_map.get(&key).cloned();
++        let old_value = store.get(&index).and_then(|entries| entries.get(&key)).cloned();
+         let (updated_value, errors) = crate::update_ops::apply_update_ops(old_value.clone(), &ops);
++        if errors.iter().any(|error| error.code.starts_with("append_bounded.")) {
++            return StreamUpdateResult { old_value, new_value: updated_value, errors };
++        }
++        let index_map = store.entry(index.clone()).or_insert_with(IndexMap::new);
  
          // Write the updated value back to the store
          index_map.insert(key.clone(), updated_value.clone());
@@ -356,7 +369,7 @@ index f7c768236fe74391e407ebcadcdf921b54b2fa9d..66b7275d5de91aabe9ad31272e6551a1
  
          drop(store);
  
-@@ -571,6 +667,96 @@ impl BuiltinKvStore {
+@@ -571,6 +668,96 @@ impl BuiltinKvStore {
              .map_or(vec![], |topic| topic.values().cloned().collect())
      }
  
@@ -453,7 +466,7 @@ index f7c768236fe74391e407ebcadcdf921b54b2fa9d..66b7275d5de91aabe9ad31272e6551a1
      pub async fn list_groups(&self) -> Vec<String> {
          let store = self.store.read().await;
          store.keys().cloned().collect()
-@@ -589,6 +775,284 @@ mod test {
+@@ -589,6 +776,284 @@ mod test {
          dir
      }
  
@@ -739,7 +752,7 @@ index f7c768236fe74391e407ebcadcdf921b54b2fa9d..66b7275d5de91aabe9ad31272e6551a1
      async fn test_file_based_load_set_delete() {
          let dir = temp_store_dir();
 diff --git a/engine/src/lib.rs b/engine/src/lib.rs
-index 0bedec343a198d97f159e6bef408dc8629b1c400..0c146dcbf52964f2444544cc6f6a560e7d46a649 100644
+index 0bedec3..0c146dc 100644
 --- a/engine/src/lib.rs
 +++ b/engine/src/lib.rs
 @@ -14,6 +14,7 @@ pub mod invocation;
@@ -751,7 +764,7 @@ index 0bedec343a198d97f159e6bef408dc8629b1c400..0c146dcbf52964f2444544cc6f6a560e
  pub mod trigger;
  pub mod trigger_formats;
 diff --git a/engine/src/main.rs b/engine/src/main.rs
-index f12d720dee49b9bb3c66ede0b8c606c997268d1c..9b2856075946b40c00c9620536d6e61519aabf22 100644
+index f12d720..9b28560 100644
 --- a/engine/src/main.rs
 +++ b/engine/src/main.rs
 @@ -109,6 +109,10 @@ struct Cli {
@@ -844,7 +857,7 @@ index f12d720dee49b9bb3c66ede0b8c606c997268d1c..9b2856075946b40c00c9620536d6e615
          // `--use-default-config` was removed: `iii` now creates config.yaml
 diff --git a/engine/src/state_migration/archive.rs b/engine/src/state_migration/archive.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..283881ad448341d59d56b8ab3dfff8994aa24667
+index 0000000..283881a
 --- /dev/null
 +++ b/engine/src/state_migration/archive.rs
 @@ -0,0 +1,176 @@
@@ -1026,7 +1039,7 @@ index 0000000000000000000000000000000000000000..283881ad448341d59d56b8ab3dfff899
 +}
 diff --git a/engine/src/state_migration/mod.rs b/engine/src/state_migration/mod.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..dc64126ca080f1a226f9ac008a0bf1befdd3c30c
+index 0000000..dc64126
 --- /dev/null
 +++ b/engine/src/state_migration/mod.rs
 @@ -0,0 +1,283 @@
@@ -1315,7 +1328,7 @@ index 0000000000000000000000000000000000000000..dc64126ca080f1a226f9ac008a0bf1be
 +}
 diff --git a/engine/src/state_migration/sqlite_bulk.rs b/engine/src/state_migration/sqlite_bulk.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..f02dcde1669b19f4120a8de82b3b56a8fe3b46da
+index 0000000..f02dcde
 --- /dev/null
 +++ b/engine/src/state_migration/sqlite_bulk.rs
 @@ -0,0 +1,146 @@
@@ -1467,7 +1480,7 @@ index 0000000000000000000000000000000000000000..f02dcde1669b19f4120a8de82b3b56a8
 +}
 diff --git a/engine/src/state_migration/sqlite_bulk_tests.rs b/engine/src/state_migration/sqlite_bulk_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..db79a037b4466a846cfeebf7a385d03eb8dfecdb
+index 0000000..db79a03
 --- /dev/null
 +++ b/engine/src/state_migration/sqlite_bulk_tests.rs
 @@ -0,0 +1,200 @@
@@ -1673,7 +1686,7 @@ index 0000000000000000000000000000000000000000..db79a037b4466a846cfeebf7a385d03e
 +}
 diff --git a/engine/src/state_migration/sqlite_file.rs b/engine/src/state_migration/sqlite_file.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..9da2b483beeeef6e5c55a2660143dab707ef86d4
+index 0000000..9da2b48
 --- /dev/null
 +++ b/engine/src/state_migration/sqlite_file.rs
 @@ -0,0 +1,301 @@
@@ -1980,7 +1993,7 @@ index 0000000000000000000000000000000000000000..9da2b483beeeef6e5c55a2660143dab7
 +}
 diff --git a/engine/src/state_migration/sqlite_indexes.rs b/engine/src/state_migration/sqlite_indexes.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..2c54993610dec9dca47b7965afc061f521600457
+index 0000000..2c54993
 --- /dev/null
 +++ b/engine/src/state_migration/sqlite_indexes.rs
 @@ -0,0 +1,164 @@
@@ -2150,7 +2163,7 @@ index 0000000000000000000000000000000000000000..2c54993610dec9dca47b7965afc061f5
 +}
 diff --git a/engine/src/state_migration/sqlite_parity.rs b/engine/src/state_migration/sqlite_parity.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..0bc5b0d05bd93f560f40e845ee20cfc1900dd59d
+index 0000000..0bc5b0d
 --- /dev/null
 +++ b/engine/src/state_migration/sqlite_parity.rs
 @@ -0,0 +1,93 @@
@@ -2249,7 +2262,7 @@ index 0000000000000000000000000000000000000000..0bc5b0d05bd93f560f40e845ee20cfc1
 +}
 diff --git a/engine/src/state_migration/sqlite_replay_tests.rs b/engine/src/state_migration/sqlite_replay_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..398af01ee1917c2b0812be7a404e23896071d21b
+index 0000000..398af01
 --- /dev/null
 +++ b/engine/src/state_migration/sqlite_replay_tests.rs
 @@ -0,0 +1,87 @@
@@ -2342,7 +2355,7 @@ index 0000000000000000000000000000000000000000..398af01ee1917c2b0812be7a404e2389
 +}
 diff --git a/engine/src/state_migration/sqlite_schema.rs b/engine/src/state_migration/sqlite_schema.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..c7fde1021183434dff91c44bb3fcb83cf662bf43
+index 0000000..c7fde10
 --- /dev/null
 +++ b/engine/src/state_migration/sqlite_schema.rs
 @@ -0,0 +1,101 @@
@@ -2449,7 +2462,7 @@ index 0000000000000000000000000000000000000000..c7fde1021183434dff91c44bb3fcb83c
 +}
 diff --git a/engine/src/state_migration/sqlite_simple.rs b/engine/src/state_migration/sqlite_simple.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..229080c548034f83f3a92a7a3554d06a4b96f247
+index 0000000..229080c
 --- /dev/null
 +++ b/engine/src/state_migration/sqlite_simple.rs
 @@ -0,0 +1,105 @@
@@ -2560,7 +2573,7 @@ index 0000000000000000000000000000000000000000..229080c548034f83f3a92a7a3554d06a
 +}
 diff --git a/engine/src/state_migration/sqlite_simple_tests.rs b/engine/src/state_migration/sqlite_simple_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..d50f71d686eab7fa0b562e77d3aea5552658a939
+index 0000000..d50f71d
 --- /dev/null
 +++ b/engine/src/state_migration/sqlite_simple_tests.rs
 @@ -0,0 +1,167 @@
@@ -2733,7 +2746,7 @@ index 0000000000000000000000000000000000000000..d50f71d686eab7fa0b562e77d3aea555
 +}
 diff --git a/engine/src/state_migration/sqlite_state.rs b/engine/src/state_migration/sqlite_state.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..6d0dd62003b519f84958c25c9da483bf3e2f2c77
+index 0000000..6d0dd62
 --- /dev/null
 +++ b/engine/src/state_migration/sqlite_state.rs
 @@ -0,0 +1,147 @@
@@ -2886,7 +2899,7 @@ index 0000000000000000000000000000000000000000..6d0dd62003b519f84958c25c9da483bf
 +}
 diff --git a/engine/src/state_migration/sqlite_state_pool.rs b/engine/src/state_migration/sqlite_state_pool.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..a6ae7aad4182f00fd20fd70c346eedb552eb9e70
+index 0000000..a6ae7aa
 --- /dev/null
 +++ b/engine/src/state_migration/sqlite_state_pool.rs
 @@ -0,0 +1,192 @@
@@ -3084,7 +3097,7 @@ index 0000000000000000000000000000000000000000..a6ae7aad4182f00fd20fd70c346eedb5
 +}
 diff --git a/engine/src/state_migration/sqlite_state_tests.rs b/engine/src/state_migration/sqlite_state_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..76846b20c57236028ddc870d318c81fbd821e371
+index 0000000..76846b2
 --- /dev/null
 +++ b/engine/src/state_migration/sqlite_state_tests.rs
 @@ -0,0 +1,255 @@
@@ -3345,7 +3358,7 @@ index 0000000000000000000000000000000000000000..76846b20c57236028ddc870d318c81fb
 +}
 diff --git a/engine/src/state_migration/sqlite_tables.rs b/engine/src/state_migration/sqlite_tables.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..18826ede5e421eaef75ce260ea1dbbdaf7df0082
+index 0000000..18826ed
 --- /dev/null
 +++ b/engine/src/state_migration/sqlite_tables.rs
 @@ -0,0 +1,236 @@
@@ -3587,7 +3600,7 @@ index 0000000000000000000000000000000000000000..18826ede5e421eaef75ce260ea1dbbda
 +}
 diff --git a/engine/src/state_migration/sqlite_tests.rs b/engine/src/state_migration/sqlite_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..3670edd99499e2f34f77a6e2bdf07d47519a191c
+index 0000000..3670edd
 --- /dev/null
 +++ b/engine/src/state_migration/sqlite_tests.rs
 @@ -0,0 +1,223 @@
@@ -3816,7 +3829,7 @@ index 0000000000000000000000000000000000000000..3670edd99499e2f34f77a6e2bdf07d47
 +}
 diff --git a/engine/src/state_migration/sqlite_values.rs b/engine/src/state_migration/sqlite_values.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..79b28289f574cdb10914c9a56ded55777a02a916
+index 0000000..79b2828
 --- /dev/null
 +++ b/engine/src/state_migration/sqlite_values.rs
 @@ -0,0 +1,72 @@
@@ -3894,7 +3907,7 @@ index 0000000000000000000000000000000000000000..79b28289f574cdb10914c9a56ded5577
 +}
 diff --git a/engine/src/state_migration/sqlite_verification.rs b/engine/src/state_migration/sqlite_verification.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..8c1f29de6ca7a8e41de7586b0066a7ab7a971380
+index 0000000..8c1f29d
 --- /dev/null
 +++ b/engine/src/state_migration/sqlite_verification.rs
 @@ -0,0 +1,85 @@
@@ -3985,7 +3998,7 @@ index 0000000000000000000000000000000000000000..8c1f29de6ca7a8e41de7586b0066a7ab
 +}
 diff --git a/engine/src/state_migration/sqlite_wal.rs b/engine/src/state_migration/sqlite_wal.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..913c40ee74b7be241e79a27107dda6d234b154a5
+index 0000000..913c40e
 --- /dev/null
 +++ b/engine/src/state_migration/sqlite_wal.rs
 @@ -0,0 +1,63 @@
@@ -4054,7 +4067,7 @@ index 0000000000000000000000000000000000000000..913c40ee74b7be241e79a27107dda6d2
 +}
 diff --git a/engine/src/state_migration/sqlite_wal_tests.rs b/engine/src/state_migration/sqlite_wal_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..7223d79cbfc7d6dce30ebd80f3f339d3a9b8a2af
+index 0000000..7223d79
 --- /dev/null
 +++ b/engine/src/state_migration/sqlite_wal_tests.rs
 @@ -0,0 +1,101 @@
@@ -4161,7 +4174,7 @@ index 0000000000000000000000000000000000000000..7223d79cbfc7d6dce30ebd80f3f339d3
 +}
 diff --git a/engine/src/state_migration/tests.rs b/engine/src/state_migration/tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..5ab63b660a79f3189a2c8a81d0d0b7653b6866cc
+index 0000000..5ab63b6
 --- /dev/null
 +++ b/engine/src/state_migration/tests.rs
 @@ -0,0 +1,272 @@
@@ -4439,7 +4452,7 @@ index 0000000000000000000000000000000000000000..5ab63b660a79f3189a2c8a81d0d0b765
 +}
 diff --git a/engine/src/state_migration/transfer.rs b/engine/src/state_migration/transfer.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..fe17f77be9759fc32af996a3bab5b000841c7e0e
+index 0000000..fe17f77
 --- /dev/null
 +++ b/engine/src/state_migration/transfer.rs
 @@ -0,0 +1,161 @@
@@ -4604,8 +4617,113 @@ index 0000000000000000000000000000000000000000..fe17f77be9759fc32af996a3bab5b000
 +    }
 +    Ok(())
 +}
+diff --git a/engine/src/update_ops.rs b/engine/src/update_ops.rs
+index 81da07b..70b4f46 100644
+--- a/engine/src/update_ops.rs
++++ b/engine/src/update_ops.rs
+@@ -326,6 +326,8 @@ pub(crate) fn apply_update_ops(
+     old_value: Option<Value>,
+     ops: &[UpdateOp],
+ ) -> (Value, Vec<UpdateOpError>) {
++    let original = ops.iter().any(|op| matches!(op, UpdateOp::AppendBounded { .. }))
++        .then(|| old_value.clone().unwrap_or_else(|| Value::Object(Map::new())));
+     let mut using_missing_default = old_value.is_none();
+     let mut current = old_value.unwrap_or_else(|| Value::Object(Map::new()));
+     let mut errors: Vec<UpdateOpError> = Vec::new();
+@@ -568,6 +570,34 @@ pub(crate) fn apply_update_ops(
+                     }
+                 }
+             }
++            UpdateOp::AppendBounded { path, value } => {
++                if path.is_empty() || !validate_op_path("append_bounded", op_index, field_path_segments(path), &mut errors) {
++                    if path.is_empty() {
++                        errors.push(err(op_index, "append_bounded.path.empty_segment", "A field path is required".to_string()));
++                    }
++                    continue;
++                }
++                let limit = value.get("limit").and_then(Value::as_u64).filter(|limit| (1..=30).contains(limit));
++                let Some((limit, item)) = limit.zip(value.get("item")) else {
++                    errors.push(err(op_index, "append_bounded.invalid_value", "Expected item and integer limit between 1 and 30".to_string()));
++                    continue;
++                };
++                let Value::Object(map) = &mut current else {
++                    errors.push(err(op_index, "append_bounded.target_not_object", "Expected object root".to_string()));
++                    continue;
++                };
++                if map.get(path).is_some_and(|target| !target.is_array()) {
++                    errors.push(err(op_index, "append_bounded.type_mismatch", "Expected array field".to_string()));
++                    continue;
++                }
++                let target = map.entry(path.clone()).or_insert_with(|| Value::Array(Vec::new()));
++                if let Value::Array(items) = target {
++                    items.push(item.clone());
++                    let excess = items.len().saturating_sub(limit as usize);
++                    items.drain(..excess);
++                    using_missing_default = false;
++                }
++            }
+             UpdateOp::Remove { path } => {
+                 let segments = field_path_segments(path);
+                 if !validate_op_path("remove", op_index, segments, &mut errors) {
+@@ -595,6 +625,9 @@ pub(crate) fn apply_update_ops(
+     }
+ 
+     let _ = using_missing_default;
++    if errors.iter().any(|error| error.code.starts_with("append_bounded.")) {
++        return (original.unwrap_or(current), errors);
++    }
+     (current, errors)
+ }
+ 
+diff --git a/engine/src/workers/redis.rs b/engine/src/workers/redis.rs
+index dff896b..f2336b8 100644
+--- a/engine/src/workers/redis.rs
++++ b/engine/src/workers/redis.rs
+@@ -463,6 +463,30 @@ pub const JSON_UPDATE_SCRIPT: &str = r#"
+                 end
+               end
+             end
++        elseif op.type == 'append_bounded' then
++            local path = op.path
++            if path == '' or path == nil then
++                push_error(zero_index, 'append_bounded.path.empty_segment', 'A field path is required')
++            elseif validate_op_path('append_bounded', zero_index, field_path_segments(path)) then
++                local value = op.value
++                local limit = type(value) == 'table' and value.limit or nil
++                if type(limit) ~= 'number' or limit ~= math.floor(limit) or limit < 1 or limit > 30 or value.item == nil then
++                    push_error(zero_index, 'append_bounded.invalid_value', 'Expected item and integer limit between 1 and 30')
++                elseif not is_object_shape(current) then
++                    push_error(zero_index, 'append_bounded.target_not_object', 'Expected object root')
++                elseif current[path] ~= nil and not is_array(current[path]) then
++                    push_error(zero_index, 'append_bounded.type_mismatch', 'Expected array field')
++                else
++                    local items = current[path] or {}
++                    table.insert(items, value.item)
++                    local trimmed = {}
++                    for i = math.max(1, #items - limit + 1), #items do
++                        table.insert(trimmed, items[i])
++                    end
++                    current[path] = trimmed
++                    using_missing_default = false
++                end
++            end
+         elseif op.type == 'remove' then
+             local path = get_path(op.path)
+             if validate_op_path('remove', zero_index, field_path_segments(path)) then
+@@ -480,6 +504,11 @@ pub const JSON_UPDATE_SCRIPT: &str = r#"
+         end
+     end
+ 
++    for _, failure in ipairs(errors) do
++        if string.sub(failure.code, 1, 15) == 'append_bounded.' then
++            return {'true', old_value_str or '', old_value_str or '{}', json_encode(errors)}
++        end
++    end
+     local new_value_str = json_encode(current)
+     redis.call('HSET', key, field, new_value_str)
+ 
 diff --git a/engine/src/workers/state/adapters/kv_store.rs b/engine/src/workers/state/adapters/kv_store.rs
-index dd5648f27cce7b368dab5c65ef1b111801cb3461..a4515f9331e67b1184172f57969d7e418a4a14bc 100644
+index dd5648f..a4515f9 100644
 --- a/engine/src/workers/state/adapters/kv_store.rs
 +++ b/engine/src/workers/state/adapters/kv_store.rs
 @@ -15,8 +15,9 @@ use crate::{
@@ -4639,7 +4757,7 @@ index dd5648f27cce7b368dab5c65ef1b111801cb3461..a4515f9331e67b1184172f57969d7e41
          Ok(self.storage.list_groups().await)
      }
 diff --git a/engine/src/workers/state/adapters/mod.rs b/engine/src/workers/state/adapters/mod.rs
-index 29eafa68a884a899435ee0b4f3050fb89b6da398..2cf04d318d28e48f4a3beedff98f9b66b85167d5 100644
+index 29eafa6..2cf04d3 100644
 --- a/engine/src/workers/state/adapters/mod.rs
 +++ b/engine/src/workers/state/adapters/mod.rs
 @@ -7,13 +7,46 @@
@@ -4720,7 +4838,7 @@ index 29eafa68a884a899435ee0b4f3050fb89b6da398..2cf04d318d28e48f4a3beedff98f9b66
  
 diff --git a/engine/src/workers/state/adapters/sqlite/codec.rs b/engine/src/workers/state/adapters/sqlite/codec.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..d1ec5d497f13c230edcf9a4a8e710a291aa601e4
+index 0000000..d1ec5d4
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/codec.rs
 @@ -0,0 +1,106 @@
@@ -4832,7 +4950,7 @@ index 0000000000000000000000000000000000000000..d1ec5d497f13c230edcf9a4a8e710a29
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/commit.rs b/engine/src/workers/state/adapters/sqlite/commit.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..7b3541ab3ae80a562eb5317d15316910171e561d
+index 0000000..7b3541a
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/commit.rs
 @@ -0,0 +1,348 @@
@@ -5186,7 +5304,7 @@ index 0000000000000000000000000000000000000000..7b3541ab3ae80a562eb5317d15316910
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/crash_tests.rs b/engine/src/workers/state/adapters/sqlite/crash_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..98a5d383dab350a3f2157ec3dca2282dfc49a587
+index 0000000..98a5d38
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/crash_tests.rs
 @@ -0,0 +1,242 @@
@@ -5434,7 +5552,7 @@ index 0000000000000000000000000000000000000000..98a5d383dab350a3f2157ec3dca2282d
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/database.rs b/engine/src/workers/state/adapters/sqlite/database.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..06e69751dc9681d670a3c7be449e5d890f55db3c
+index 0000000..06e6975
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/database.rs
 @@ -0,0 +1,297 @@
@@ -5737,7 +5855,7 @@ index 0000000000000000000000000000000000000000..06e69751dc9681d670a3c7be449e5d89
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/format_tests.rs b/engine/src/workers/state/adapters/sqlite/format_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..14c4cd88f227b3d1d1b7990b227b8118dbd8c481
+index 0000000..14c4cd8
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/format_tests.rs
 @@ -0,0 +1,121 @@
@@ -5864,10 +5982,10 @@ index 0000000000000000000000000000000000000000..14c4cd88f227b3d1d1b7990b227b8118
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/mod.rs b/engine/src/workers/state/adapters/sqlite/mod.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..20241aa00108855564d6ceed47b3dff00b78974f
+index 0000000..7e9ab3c
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/mod.rs
-@@ -0,0 +1,360 @@
+@@ -0,0 +1,362 @@
 +mod commit;
 +pub(crate) mod codec;
 +pub(crate) mod database;
@@ -6075,7 +6193,9 @@ index 0000000000000000000000000000000000000000..20241aa00108855564d6ceed47b3dff0
 +            if protocol::size(&new_value)? > MAX_ENVELOPE_BYTES - 4096 {
 +                return Err(protocol::error("STATE_RECORD_TOO_LARGE"));
 +            }
-+            database::write(connection, &scope, &key, Some(&new_value))?;
++            if !errors.iter().any(|error| error.code.starts_with("append_bounded.")) {
++                database::write(connection, &scope, &key, Some(&new_value))?;
++            }
 +            Ok(StreamUpdateResult {
 +                old_value,
 +                new_value,
@@ -6230,7 +6350,7 @@ index 0000000000000000000000000000000000000000..20241aa00108855564d6ceed47b3dff0
 +crate::register_adapter!(<StateAdapterRegistration> name: "sqlite", make_adapter);
 diff --git a/engine/src/workers/state/adapters/sqlite/paging.rs b/engine/src/workers/state/adapters/sqlite/paging.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..5ce0db71be2e2654882f85fa614a3a0d32a26d36
+index 0000000..5ce0db7
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/paging.rs
 @@ -0,0 +1,347 @@
@@ -6583,7 +6703,7 @@ index 0000000000000000000000000000000000000000..5ce0db71be2e2654882f85fa614a3a0d
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/protocol.rs b/engine/src/workers/state/adapters/sqlite/protocol.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..1e368544d03ee0d0e5162dc6cd2b90f31ea32164
+index 0000000..1e36854
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/protocol.rs
 @@ -0,0 +1,460 @@
@@ -7049,7 +7169,7 @@ index 0000000000000000000000000000000000000000..1e368544d03ee0d0e5162dc6cd2b90f3
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/resource_tests.rs b/engine/src/workers/state/adapters/sqlite/resource_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..79c021146b196432f66506c4be48afdf6babc7cf
+index 0000000..79c0211
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/resource_tests.rs
 @@ -0,0 +1,512 @@
@@ -7567,6 +7687,7 @@ index 0000000000000000000000000000000000000000..79c021146b196432f66506c4be48afdf
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/retention.rs b/engine/src/workers/state/adapters/sqlite/retention.rs
 new file mode 100644
+index 0000000..29aa19e
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retention.rs
 @@ -0,0 +1,273 @@
@@ -7845,7 +7966,7 @@ new file mode 100644
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/retention_tests.rs b/engine/src/workers/state/adapters/sqlite/retention_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..2ad712c59dcfff17fd0525e665b67ec9d0896cd4
+index 0000000..2ad712c
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retention_tests.rs
 @@ -0,0 +1,116 @@
@@ -7967,7 +8088,7 @@ index 0000000000000000000000000000000000000000..2ad712c59dcfff17fd0525e665b67ec9
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/dispatch.rs b/engine/src/workers/state/adapters/sqlite/retrieval/dispatch.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..45678ea41cef482ac1c4acc5444ddf60916a86de
+index 0000000..45678ea
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retrieval/dispatch.rs
 @@ -0,0 +1,115 @@
@@ -8088,7 +8209,7 @@ index 0000000000000000000000000000000000000000..45678ea41cef482ac1c4acc5444ddf60
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/eligibility.rs b/engine/src/workers/state/adapters/sqlite/retrieval/eligibility.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..572f5cba7efc169efe084ad51bea454fa333af0a
+index 0000000..572f5cb
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retrieval/eligibility.rs
 @@ -0,0 +1,48 @@
@@ -8142,7 +8263,7 @@ index 0000000000000000000000000000000000000000..572f5cba7efc169efe084ad51bea454f
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/graph.rs b/engine/src/workers/state/adapters/sqlite/retrieval/graph.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..025a758e269131837d0adc87ff8c16d5c0393842
+index 0000000..025a758
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retrieval/graph.rs
 @@ -0,0 +1,187 @@
@@ -8335,7 +8456,7 @@ index 0000000000000000000000000000000000000000..025a758e269131837d0adc87ff8c16d5
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/graph_query.rs b/engine/src/workers/state/adapters/sqlite/retrieval/graph_query.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..fffb108e1d1f2691e4686a6b90e2ae513b30e83e
+index 0000000..fffb108
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retrieval/graph_query.rs
 @@ -0,0 +1,243 @@
@@ -8584,7 +8705,7 @@ index 0000000000000000000000000000000000000000..fffb108e1d1f2691e4686a6b90e2ae51
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/lexical.rs b/engine/src/workers/state/adapters/sqlite/retrieval/lexical.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..ceb45898becdc6284aa65184180edde83181adcd
+index 0000000..ceb4589
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retrieval/lexical.rs
 @@ -0,0 +1,112 @@
@@ -8702,7 +8823,7 @@ index 0000000000000000000000000000000000000000..ceb45898becdc6284aa65184180edde8
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/lsh.rs b/engine/src/workers/state/adapters/sqlite/retrieval/lsh.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..363cff6d23f6679a1c69ffa1af56ebcdd21c922b
+index 0000000..363cff6
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retrieval/lsh.rs
 @@ -0,0 +1,139 @@
@@ -8847,7 +8968,7 @@ index 0000000000000000000000000000000000000000..363cff6d23f6679a1c69ffa1af56ebcd
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/metadata.rs b/engine/src/workers/state/adapters/sqlite/retrieval/metadata.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..81974a90a43f0e3a595fe773cb154c23acf6f7f0
+index 0000000..81974a9
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retrieval/metadata.rs
 @@ -0,0 +1,90 @@
@@ -8943,7 +9064,7 @@ index 0000000000000000000000000000000000000000..81974a90a43f0e3a595fe773cb154c23
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/mod.rs b/engine/src/workers/state/adapters/sqlite/retrieval/mod.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..b05c4738237df0f0e8641d680b7bfa0d8678b9c2
+index 0000000..b05c473
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retrieval/mod.rs
 @@ -0,0 +1,179 @@
@@ -9128,7 +9249,7 @@ index 0000000000000000000000000000000000000000..b05c4738237df0f0e8641d680b7bfa0d
 +pub use dispatch::execute;
 diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/prepare.rs b/engine/src/workers/state/adapters/sqlite/retrieval/prepare.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..79a4ca7acd0e2cfabcb626d7f9cc31f083e642e2
+index 0000000..79a4ca7
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retrieval/prepare.rs
 @@ -0,0 +1,126 @@
@@ -9260,7 +9381,7 @@ index 0000000000000000000000000000000000000000..79a4ca7acd0e2cfabcb626d7f9cc31f0
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/request.rs b/engine/src/workers/state/adapters/sqlite/retrieval/request.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..f442056d375a0c1cbf2c1acda26c9439bfd65d3f
+index 0000000..f442056
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retrieval/request.rs
 @@ -0,0 +1,172 @@
@@ -9438,7 +9559,7 @@ index 0000000000000000000000000000000000000000..f442056d375a0c1cbf2c1acda26c9439
 +pub use super::request_validate::parse;
 diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/request_validate.rs b/engine/src/workers/state/adapters/sqlite/retrieval/request_validate.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..717500e6c3d4c3618e63d8ef97f397097b89959d
+index 0000000..717500e
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retrieval/request_validate.rs
 @@ -0,0 +1,128 @@
@@ -9572,7 +9693,7 @@ index 0000000000000000000000000000000000000000..717500e6c3d4c3618e63d8ef97f39709
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/semantic.rs b/engine/src/workers/state/adapters/sqlite/retrieval/semantic.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..1d5709b74b44fe05b2ac7b463937177c8de5e0a8
+index 0000000..1d5709b
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retrieval/semantic.rs
 @@ -0,0 +1,221 @@
@@ -9799,7 +9920,7 @@ index 0000000000000000000000000000000000000000..1d5709b74b44fe05b2ac7b463937177c
 +pub use super::semantic_meta::{Meta, get};
 diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/semantic_meta.rs b/engine/src/workers/state/adapters/sqlite/retrieval/semantic_meta.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..f76f9fc9da849c303af3873f356a2f0fc3f96255
+index 0000000..f76f9fc
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retrieval/semantic_meta.rs
 @@ -0,0 +1,51 @@
@@ -9856,7 +9977,7 @@ index 0000000000000000000000000000000000000000..f76f9fc9da849c303af3873f356a2f0f
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/semantic_query.rs b/engine/src/workers/state/adapters/sqlite/retrieval/semantic_query.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..e99265300feb4a5e16da9c52edd32d47d2cd7db0
+index 0000000..e992653
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retrieval/semantic_query.rs
 @@ -0,0 +1,100 @@
@@ -9962,7 +10083,7 @@ index 0000000000000000000000000000000000000000..e99265300feb4a5e16da9c52edd32d47
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/source.rs b/engine/src/workers/state/adapters/sqlite/retrieval/source.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..e5529756c5c978e47d98cd4bb188963fa9fd0f75
+index 0000000..e552975
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retrieval/source.rs
 @@ -0,0 +1,204 @@
@@ -10172,7 +10293,7 @@ index 0000000000000000000000000000000000000000..e5529756c5c978e47d98cd4bb188963f
 +pub use super::source_lexical::lexical_text;
 diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/source_lexical.rs b/engine/src/workers/state/adapters/sqlite/retrieval/source_lexical.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..0a05b54d9449d87421bddbbea7e0f00167650829
+index 0000000..0a05b54
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retrieval/source_lexical.rs
 @@ -0,0 +1,73 @@
@@ -10251,7 +10372,7 @@ index 0000000000000000000000000000000000000000..0a05b54d9449d87421bddbbea7e0f001
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/source_prepare.rs b/engine/src/workers/state/adapters/sqlite/retrieval/source_prepare.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..ff486736732a3a969befdaf99ef19c3fa3fb7bdb
+index 0000000..ff48673
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retrieval/source_prepare.rs
 @@ -0,0 +1,156 @@
@@ -10413,7 +10534,7 @@ index 0000000000000000000000000000000000000000..ff486736732a3a969befdaf99ef19c3f
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/source_write.rs b/engine/src/workers/state/adapters/sqlite/retrieval/source_write.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..e8f9756accdc759ec03e5815c62aa2871ad1e0a8
+index 0000000..e8f9756
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retrieval/source_write.rs
 @@ -0,0 +1,74 @@
@@ -10493,7 +10614,7 @@ index 0000000000000000000000000000000000000000..e8f9756accdc759ec03e5815c62aa287
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/tests.rs b/engine/src/workers/state/adapters/sqlite/retrieval/tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..40be768987957e5e0e196d8c1f36347c8d327eda
+index 0000000..40be768
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retrieval/tests.rs
 @@ -0,0 +1,100 @@
@@ -10599,7 +10720,7 @@ index 0000000000000000000000000000000000000000..40be768987957e5e0e196d8c1f36347c
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/tests/durable_tests.rs b/engine/src/workers/state/adapters/sqlite/retrieval/tests/durable_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..897520be62361299f637a53f4123b743809dd9e9
+index 0000000..897520b
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retrieval/tests/durable_tests.rs
 @@ -0,0 +1,222 @@
@@ -10827,7 +10948,7 @@ index 0000000000000000000000000000000000000000..897520be62361299f637a53f4123b743
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/tests/graph_tests.rs b/engine/src/workers/state/adapters/sqlite/retrieval/tests/graph_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..e50c6e7a8a2584e197fd61b7378386a80fc2dcac
+index 0000000..e50c6e7
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retrieval/tests/graph_tests.rs
 @@ -0,0 +1,546 @@
@@ -11379,7 +11500,7 @@ index 0000000000000000000000000000000000000000..e50c6e7a8a2584e197fd61b7378386a8
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/tests/preparation_performance_tests.rs b/engine/src/workers/state/adapters/sqlite/retrieval/tests/preparation_performance_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..8eb0e6d3044b7ba80ae8179ed36930eb0813c362
+index 0000000..8eb0e6d
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retrieval/tests/preparation_performance_tests.rs
 @@ -0,0 +1,223 @@
@@ -11608,7 +11729,7 @@ index 0000000000000000000000000000000000000000..8eb0e6d3044b7ba80ae8179ed36930eb
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/tests/semantic_tests.rs b/engine/src/workers/state/adapters/sqlite/retrieval/tests/semantic_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..d6ab9d0dc98a1ffb1fa4e56f1a4b20cec4255199
+index 0000000..d6ab9d0
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retrieval/tests/semantic_tests.rs
 @@ -0,0 +1,268 @@
@@ -11882,7 +12003,7 @@ index 0000000000000000000000000000000000000000..d6ab9d0dc98a1ffb1fa4e56f1a4b20ce
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/retrieval/tests/source_tests.rs b/engine/src/workers/state/adapters/sqlite/retrieval/tests/source_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..a89805d228f1c1b2b07b389827329c315f4b067d
+index 0000000..a89805d
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/retrieval/tests/source_tests.rs
 @@ -0,0 +1,327 @@
@@ -12215,7 +12336,7 @@ index 0000000000000000000000000000000000000000..a89805d228f1c1b2b07b389827329c31
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/tests.rs b/engine/src/workers/state/adapters/sqlite/tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..0ad879903ca7479ed21635742d67630ab08ed35c
+index 0000000..0ad8799
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/tests.rs
 @@ -0,0 +1,665 @@
@@ -12885,7 +13006,7 @@ index 0000000000000000000000000000000000000000..0ad879903ca7479ed21635742d67630a
 +    );
 +}
 diff --git a/engine/src/workers/state/config.rs b/engine/src/workers/state/config.rs
-index 18d5af4791d7e842e5bc4c126699438af6f10ef6..75d3510a0b37dd6d52aa47dc82c764e895b171a4 100644
+index 18d5af4..75d3510 100644
 --- a/engine/src/workers/state/config.rs
 +++ b/engine/src/workers/state/config.rs
 @@ -127,6 +127,15 @@ pub struct RedisAdapterConfig {
@@ -12931,7 +13052,7 @@ index 18d5af4791d7e842e5bc4c126699438af6f10ef6..75d3510a0b37dd6d52aa47dc82c764e8
          // Each adapter's concrete config fields land in definitions.
          let defs = &schema["definitions"];
 diff --git a/engine/src/workers/state/mod.rs b/engine/src/workers/state/mod.rs
-index 495bc55caf1041cabe2a8391a2a8882a004566d1..c5922ab28f44e502f1403d49bca87ff5ae276e14 100644
+index 495bc55..c5922ab 100644
 --- a/engine/src/workers/state/mod.rs
 +++ b/engine/src/workers/state/mod.rs
 @@ -11,7 +11,7 @@ pub mod configuration;
@@ -12944,7 +13065,7 @@ index 495bc55caf1041cabe2a8391a2a8882a004566d1..c5922ab28f44e502f1403d49bca87ff5
  
  pub use self::config::StateModuleConfig;
 diff --git a/engine/src/workers/state/state.rs b/engine/src/workers/state/state.rs
-index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..99cde267d77c0fc8e7bccb45cc626d932b6365cc 100644
+index dcf1e2a..a386618 100644
 --- a/engine/src/workers/state/state.rs
 +++ b/engine/src/workers/state/state.rs
 @@ -24,13 +24,15 @@ use crate::{
@@ -13111,7 +13232,17 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..99cde267d77c0fc8e7bccb45cc626d93
          crate::workers::telemetry::collector::track_state_update();
          match self
              .adapter
-@@ -715,11 +767,7 @@ impl StateWorker {
+@@ -695,6 +747,9 @@ impl StateWorker {
+             .await
+         {
+             Ok(value) => {
++                if value.errors.iter().any(|error| error.code.starts_with("append_bounded.")) {
++                    return FunctionResult::Success(value);
++                }
+                 let old_value = value.old_value.clone();
+                 let new_value = value.new_value.clone();
+                 let is_create = old_value.is_none();
+@@ -715,11 +770,7 @@ impl StateWorker {
  
                  FunctionResult::Success(value)
              }
@@ -13124,7 +13255,7 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..99cde267d77c0fc8e7bccb45cc626d93
          }
      }
  
-@@ -730,11 +778,157 @@ impl StateWorker {
+@@ -730,14 +781,160 @@ impl StateWorker {
      ) -> FunctionResult<Option<Value>, ErrorBody> {
          match self.adapter.list(&input.scope).await {
              Ok(values) => FunctionResult::Success(serde_json::to_value(values).ok()),
@@ -13148,11 +13279,11 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..99cde267d77c0fc8e7bccb45cc626d93
 +            Err(_) => FunctionResult::Failure(ErrorBody {
 +                message: "invalid state pagination request".to_string(),
 +                code: "STATE_PAGE_INVALID_REQUEST".to_string(),
-+                stacktrace: None,
-+            }),
-+        }
-+    }
-+
+                 stacktrace: None,
+             }),
+         }
+     }
+ 
 +    pub async fn list_page(
 +        &self,
 +        input: StateListPageInput,
@@ -13233,8 +13364,8 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..99cde267d77c0fc8e7bccb45cc626d93
 +            Err(StatePageError::InvalidProjection) => FunctionResult::Failure(ErrorBody {
 +                message: "projected state pagination requires valid fields".to_string(),
 +                code: "STATE_PAGE_INVALID_REQUEST".to_string(),
-                 stacktrace: None,
-             }),
++                stacktrace: None,
++            }),
 +            Err(StatePageError::ProjectedRecordNotObject) => FunctionResult::Failure(ErrorBody {
 +                message: "a projected state record must have a JSON object at its root".to_string(),
 +                code: "STATE_PAGE_PROJECTION_NON_OBJECT".to_string(),
@@ -13282,10 +13413,13 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..99cde267d77c0fc8e7bccb45cc626d93
 +        match self.adapter.scope_revision(&input.scope, input.prefix).await {
 +            Ok(value) => FunctionResult::Success(value),
 +            Err(error) => FunctionResult::Failure(sqlite::error_body(&error, "STATE_SCOPE_REVISION_FAILED")),
-         }
-     }
- 
-@@ -830,6 +1024,27 @@ mod tests {
++        }
++    }
++
+     #[function(id = "state::list_groups", description = "List all state groups")]
+     pub async fn list_groups(
+         &self,
+@@ -830,6 +1027,27 @@ mod tests {
          ));
      }
  
@@ -13313,7 +13447,7 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..99cde267d77c0fc8e7bccb45cc626d93
      struct FakeStateAdapter {
          set_error: Option<&'static str>,
          get_error: Option<&'static str>,
-@@ -1031,6 +1246,131 @@ mod tests {
+@@ -1031,6 +1249,131 @@ mod tests {
          assert!(matches!(small, FunctionResult::Success(_)));
      }
  
@@ -13446,7 +13580,7 @@ index dcf1e2a15907a1b50605b208d7f09661d80e7cf3..99cde267d77c0fc8e7bccb45cc626d93
      async fn is_active_reflects_worker_shutdown_rx() {
          let (_engine, module) = setup();
 diff --git a/engine/src/workers/state/structs.rs b/engine/src/workers/state/structs.rs
-index b7dbf09f04d9cc08fd3764670189563d371142a8..b0e3e4e96f1a38d71c1f50565f5c313a88f148e5 100644
+index b7dbf09..b0e3e4e 100644
 --- a/engine/src/workers/state/structs.rs
 +++ b/engine/src/workers/state/structs.rs
 @@ -60,6 +60,64 @@ pub struct StateListGroupsResult {
@@ -13536,7 +13670,7 @@ index b7dbf09f04d9cc08fd3764670189563d371142a8..b0e3e4e96f1a38d71c1f50565f5c313a
      fn state_set_input_data_alias() {
          let json = json!({"scope": "s", "key": "k", "data": "hello"});
 diff --git a/engine/tests/worker_trigger_e2e.rs b/engine/tests/worker_trigger_e2e.rs
-index b9ea545ceb2c1cac752fd3d60178848682f07e15..fc6d864cb63ce372aac6173d0d0eb38b828df559 100644
+index b9ea545..fc6d864 100644
 --- a/engine/tests/worker_trigger_e2e.rs
 +++ b/engine/tests/worker_trigger_e2e.rs
 @@ -19,6 +19,8 @@
@@ -13548,3 +13682,18 @@ index b9ea545ceb2c1cac752fd3d60178848682f07e15..fc6d864cb63ce372aac6173d0d0eb38b
  use std::path::PathBuf;
  use std::time::Duration;
  
+diff --git a/sdk/packages/rust/helpers/src/stream.rs b/sdk/packages/rust/helpers/src/stream.rs
+index 1d20029..5c17209 100644
+--- a/sdk/packages/rust/helpers/src/stream.rs
++++ b/sdk/packages/rust/helpers/src/stream.rs
+@@ -92,6 +92,10 @@ pub enum UpdateOp {
+         value: Value,
+     },
+ 
++    /// Append one item and retain the newest `value.limit` array entries.
++    #[serde(rename = "append_bounded")]
++    AppendBounded { path: String, value: Value },
++
+     /// Remove a field
+     Remove { path: String },
+ }

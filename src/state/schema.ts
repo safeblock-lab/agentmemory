@@ -13,6 +13,7 @@ export const KV = {
   summaryQueueUnits: (jobId: string) => `mem:summary-queue:units:${jobId}`,
   config: "mem:config",
   metrics: "mem:metrics",
+  recentOperations: "mem:recent-operations",
   health: "mem:health",
   embeddings: (obsId: string) => `mem:emb:${obsId}`,
   bm25Index: "mem:index:bm25",

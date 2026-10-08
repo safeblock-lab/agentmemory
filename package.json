@@ -1,6 +1,6 @@
 {
   "name": "@agentmemory/agentmemory",
-  "version": "0.9.85",
+  "version": "0.9.86",
   "description": "Persistent memory for AI coding agents, powered by iii-engine's three primitives",
   "type": "module",
   "main": "dist/index.mjs",
@@ -72,6 +72,8 @@
     "docs/operations/agentmemory-0.9.82-release.md",
     "docs/operations/agentmemory-0.9.84-release.md",
     "docs/operations/agentmemory-0.9.85-release.md",
+    "docs/operations/agentmemory-0.9.86-release.md",
+    "docs/operations/recent-operations.md",
     "docs/operations/dashboard-native-health.md",
     "docs/operations/agentmemory-status.md",
     "docs/operations/export-contract.md",

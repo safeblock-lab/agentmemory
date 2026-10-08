@@ -12,6 +12,7 @@ import { validateOutput } from "../eval/validator.js";
 import { scoreSummary } from "../eval/quality.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import { safeAudit } from "./audit.js";
+import { recordOperation } from "./dashboard-activity.js";
 import { logger } from "../logger.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
 import { getSummaryBudgetConfig } from "../config.js";
@@ -29,6 +30,7 @@ export function registerSummarizeFunction(
     async (data: { sessionId: string } | undefined) => {
       const startMs = Date.now();
       if (!data || typeof data.sessionId !== "string" || !data.sessionId.trim()) {
+        await recordOperation(kv, "mem::summarize", "failed", { summariesCreated: 0 });
         return { success: false, error: "sessionId is required" };
       }
       const sessionId = data.sessionId.trim();
@@ -38,6 +40,7 @@ export function registerSummarizeFunction(
         logger.warn("Session not found for summarize", {
           sessionId,
         });
+        await recordOperation(kv, "mem::summarize", "failed", { summariesCreated: 0 });
         return { success: false, error: "session_not_found" };
       }
 
@@ -50,10 +53,12 @@ export function registerSummarizeFunction(
         logger.info("No observations to summarize", {
           sessionId,
         });
+        await recordOperation(kv, "mem::summarize", "skipped", { observationsProcessed: 0, summariesCreated: 0 }, session.agentId);
         return { success: false, error: "no_observations" };
       }
 
       if (provider.name === "noop") {
+        await recordOperation(kv, "mem::summarize", "skipped", { observationsProcessed: 0, summariesCreated: 0 }, session.agentId);
         logger.info("Summarize skipped — no LLM provider configured", {
           sessionId,
         });
@@ -107,6 +112,7 @@ export function registerSummarizeFunction(
           if (metricsStore) {
             await metricsStore.record("mem::summarize", latencyMs, false);
           }
+          await recordOperation(kv, "mem::summarize", "failed", { observationsProcessed: compressed.length, summariesCreated: 0 }, session.agentId);
           return { success: false, error: "empty_provider_response" };
         }
 
@@ -115,6 +121,7 @@ export function registerSummarizeFunction(
           if (metricsStore) {
             await metricsStore.record("mem::summarize", latencyMs, false);
           }
+          await recordOperation(kv, "mem::summarize", "failed", { observationsProcessed: compressed.length, summariesCreated: 0 }, session.agentId);
           return { success: false, error: "parse_failed" };
         }
 
@@ -140,6 +147,7 @@ export function registerSummarizeFunction(
             sessionId,
             errorCount: validation.result.errors.length,
           });
+          await recordOperation(kv, "mem::summarize", "failed", { observationsProcessed: compressed.length, summariesCreated: 0 }, session.agentId);
           return { success: false, error: "validation_failed" };
         }
 
@@ -168,6 +176,7 @@ export function registerSummarizeFunction(
           valid: validation.valid,
         });
 
+        await recordOperation(kv, "mem::summarize", "completed", { observationsProcessed: compressed.length, summariesCreated: 1 }, session.agentId);
         return { success: true, summary, qualityScore };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -179,6 +188,7 @@ export function registerSummarizeFunction(
           sessionId,
           reason: "summary_failed",
         });
+        await recordOperation(kv, "mem::summarize", "failed", { observationsProcessed: compressed.length }, session.agentId);
         return { success: false, error: msg };
       }
     },

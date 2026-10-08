@@ -4,10 +4,10 @@
   "sourceRepository": "https://github.com/iii-hq/iii.git",
   "sourceCommit": "e7de3820d1e558f3762edf95e4440552444d48d3",
   "patchPath": "patches/iii-engine/0.22.1-state-pagination.patch",
-  "patchSha256": "b44287f964e7443327776307169329cc6327b0dd059d95d562a6eb0362b59611",
-  "artifactPath": ".iii-engine-build/cargo-target/x86_64-pc-windows-msvc/release/iii.exe",
-  "artifactSha256": "30ddeb002245965825094d7eea5a63bde4356b24eb9c73b5905029bde8bb40a2",
-  "artifactBytes": 29297664,
+  "patchSha256": "44d06e9dbf9492aaa84863999c456843b28b9f033081cfe90238f1fb6272eafe",
+  "artifactPath": ".codex-task/bounded-engine/cargo-target/x86_64-pc-windows-msvc/release/iii.exe",
+  "artifactSha256": "7bcb34ac9779d031a3c58b6884d4fd058c7ceb4589f37b45f3e2b291a6d5a84b",
+  "artifactBytes": 29126656,
   "buildTarget": "x86_64-pc-windows-msvc",
   "verifiedPlatform": "win32-x64",
   "capabilities": [
@@ -42,18 +42,18 @@
     "jobs": 1,
     "incremental": false,
     "locked": true,
-    "offline": true,
+    "offline": false,
     "noDefaultFeatures": true,
     "target": "x86_64-pc-windows-msvc",
-    "targetSelection": "explicit x86_64-pc-windows-msvc target with direct workspace-local Rust 1.96.0",
-    "command": "D:\\agentmemory\\.iii-engine-build\\rustup-home\\toolchains\\1.96.0-x86_64-pc-windows-msvc\\bin\\cargo.exe build --offline --locked --no-default-features --package iii --bin iii --jobs 1 --release --target x86_64-pc-windows-msvc -v"
+    "targetSelection": "explicit x86_64-pc-windows-msvc target from the bounded engine source checkout",
+    "command": "C:\\Users\\harus\\.cargo\\bin\\cargo.exe build --locked --release --no-default-features --jobs 1 --package iii --bin iii --target x86_64-pc-windows-msvc"
   },
   "deploymentReady": true,
   "rustToolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)",
-  "builtAt": "2026-10-07T13:37:18.345Z",
+  "builtAt": "2026-10-08T13:20:44.3759648Z",
   "validation": {
     "canonicalCandidateReceipt": "artifacts/private/release-0.9.83/native-candidate/native-candidate-receipt.json",
-    "patchApplyCheck": "previously accepted; source patch unchanged",
+    "patchApplyCheck": "not rerun for this version",
     "nativeChecks": {
       "evidenceKind": "external-exact-body",
       "assertionsPassed": true,
@@ -65,8 +65,10 @@
     },
     "optimizedBuild": {
       "exitCode": 0,
-      "command": "D:\\agentmemory\\.iii-engine-build\\rustup-home\\toolchains\\1.96.0-x86_64-pc-windows-msvc\\bin\\cargo.exe build --offline --locked --no-default-features --package iii --bin iii --jobs 1 --release --target x86_64-pc-windows-msvc -v",
-      "receipt": "artifacts/private/release-0.9.83/native-candidate/cargo-build-sustained-06.receipt.json"
+      "command": "C:\\Users\\harus\\.cargo\\bin\\cargo.exe build --locked --release --no-default-features --jobs 1 --package iii --bin iii --target x86_64-pc-windows-msvc",
+      "log": ".codex-task/bounded-engine/build.log",
+      "exitEvidence": ".codex-task/bounded-engine/build-exit.txt",
+      "scope": "Compilation only; append_bounded behavior was not runtime exercised."
     },
     "capabilityProbe": {
       "exitCode": 0,

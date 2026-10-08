@@ -22,6 +22,7 @@ import { scoreCompression } from "../eval/quality.js";
 import { compressWithRetry } from "../eval/self-correct.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import { logger } from "../logger.js";
+import { recordOperation } from "./dashboard-activity.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
 
 const VALID_TYPES = new Set<string>([
@@ -163,6 +164,7 @@ export function registerCompressFunction(
             obsId: data.observationId,
             retried,
           });
+          await recordOperation(kv, "mem::compress", "failed", { observationsProcessed: 1, observationsCompressed: 0 }, data.raw.agentId);
           return { success: false, error: "parse_failed" };
         }
 
@@ -273,6 +275,7 @@ export function registerCompressFunction(
           retried,
         });
 
+        await recordOperation(kv, "mem::compress", "completed", { observationsProcessed: 1, observationsCompressed: 1 }, data.raw.agentId);
         return { success: true, compressed, qualityScore };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -284,6 +287,7 @@ export function registerCompressFunction(
           obsId: data.observationId,
           error: msg,
         });
+        await recordOperation(kv, "mem::compress", "failed", { observationsProcessed: 1 }, data.raw.agentId);
         return { success: false, error: "compression_failed" };
       }
     },

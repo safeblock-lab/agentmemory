@@ -1564,20 +1564,22 @@
 
     function renderRecentActivity(report, error) {
       var activity = report && report.activity;
-      var available = activity && activity.source === 'runtime-writes' && Array.isArray(activity.items);
-      var html = '<div class="card"><div class="card-title">Recent Activity</div>';
+      var available = activity && activity.source === 'native-operation-feed' && Array.isArray(activity.items);
+      var html = '<div class="card"><div class="card-title">Recent Operations</div>';
       if (error) html += '<p role="status" style="font-size:12px;color:var(--ink-muted);">Activity could not refresh.' + (available ? ' Showing the last result.' : '') + '</p>';
-      if (!available) return html + '<div class="empty-state"><p>Runtime activity is unavailable. Retry the status check.</p></div></div>';
-      html += '<p style="font-size:12px;color:var(--ink-muted);">Recent writes since service start' +
-        (activity.availableSince ? ' (' + esc(formatTime(activity.availableSince)) + ')' : '') +
-        '. Bounded runtime feed; earlier history is not included.</p>';
-      if (!activity.items.length) html += '<div class="empty-state"><p>No session or observation writes recorded since service start.</p></div>';
-      activity.items.slice(0, 10).forEach(function(item) {
+      if (!available) return html + '<div class="empty-state"><p>Recent operations are unavailable. Retry the status check.</p></div></div>';
+      html += '<p style="font-size:12px;color:var(--ink-muted);">Last 30 compression, summary and graph extraction outcomes. Saved across service restarts. Counts describe each operation, not corpus totals.</p>';
+      if (!activity.items.length) html += '<div class="empty-state"><p>No operation outcomes recorded yet.</p></div>';
+      var countLabels = { observationsProcessed: 'observations processed', observationsCompressed: 'observations compressed', summariesCreated: 'summaries written', nodesAdded: 'nodes added', edgesAdded: 'edges added', unitsQueued: 'units queued' };
+      activity.items.slice(0, 30).forEach(function(item) {
+        var counts = item.counts || {};
+        var details = Object.keys(countLabels).filter(function(key) { return typeof counts[key] === 'number' && Number.isSafeInteger(counts[key]) && counts[key] >= 0; }).map(function(key) { return esc(String(counts[key])) + ' ' + countLabels[key]; });
         html += '<div style="padding:6px 0;border-bottom:1px solid var(--border-light);font-size:13px;overflow-wrap:anywhere;">' +
-          '<span class="badge ' + (item.kind === 'session' ? 'badge-blue' : 'badge-green') + '">' + esc(item.kind) + '</span> ' +
-          '<span>' + esc(item.title) + '</span>' +
+          '<span class="badge badge-blue">' + esc(item.outcome) + '</span> ' +
+          '<span>' + esc(item.functionId) + '</span>' +
+          '<div style="font-size:12px;color:var(--ink-muted);">' + (details.length ? details.join(' · ') : 'Result counts unavailable') + '</div>' +
           '<div style="font-size:11px;color:var(--ink-muted);font-family:var(--font-mono);">' +
-          'ID: ' + esc(item.id) + ' · Session: ' + esc(item.sessionId) +
+          'ID: ' + esc(item.id) +
           (item.agentId ? ' · Agent: ' + esc(item.agentId) : '') + ' · ' + esc(formatTime(item.timestamp)) + '</div></div>';
       });
       return html + '</div>';

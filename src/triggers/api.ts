@@ -354,7 +354,7 @@ export function registerApiTriggers(
     }
   }
 
-  const activity = createDashboardActivity();
+  const activity = createDashboardActivity(kv);
   const sharedUnindexedScan = singleFlight(() => findUnindexedObservations(kv), UNINDEXED_SCAN_REUSE_MS);
 
   sdk.registerFunction("api::status",
@@ -362,7 +362,7 @@ export function registerApiTriggers(
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
       const idx = kv.indexedRetrieval ? null : getSearchIndex();
-      const [health, functionMetrics, graph, native, unindexed] = await Promise.all([
+      const [health, functionMetrics, graph, native, unindexed, recentActivity] = await Promise.all([
         valueWithin(getLatestHealth(kv), STATUS_CHECK_TIMEOUT_MS),
         metricsStore ? valueWithin(metricsStore.getAll(), STATUS_CHECK_TIMEOUT_MS) : Promise.resolve([]),
         valueWithin(
@@ -371,6 +371,7 @@ export function registerApiTriggers(
         ),
         kv.indexedRetrieval ? valueWithin(readNativeIndexStatus(kv, getEmbeddingProvider()), STATUS_CHECK_TIMEOUT_MS) : Promise.resolve(null),
         kv.indexedRetrieval ? Promise.resolve(null) : valueWithin(sharedUnindexedScan(), STATUS_CHECK_TIMEOUT_MS),
+        valueWithin(activity.snapshot(isAgentScopeIsolated() ? getAgentId() : undefined), STATUS_CHECK_TIMEOUT_MS),
       ]);
       const observationsIndexed = idx ? [...idx.observationCountsBySession().values()].reduce((a, n) => a + n, 0) : null;
       const circuit =
@@ -400,7 +401,7 @@ export function registerApiTriggers(
         provider: detectLlmProviderKind(),
         embeddingProvider: detectEmbeddingProvider() ? "embeddings" : "none",
         flags: buildConfigFlags(),
-        activity: activity.snapshot(isAgentScopeIsolated() ? getAgentId() : undefined),
+        activity: recentActivity,
         index: {
           mode: kv.indexedRetrieval ? "native" : "legacy",
           bm25Documents: kv.indexedRetrieval ? native?.lexicalCount ?? null : idx?.size ?? null,

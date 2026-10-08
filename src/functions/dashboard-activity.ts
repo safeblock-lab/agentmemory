@@ -1,57 +1,72 @@
-import { subscribeStateWrites } from "../state/kv.js";
-import { KV } from "../state/schema.js";
+import type { StateKV } from "../state/kv.js";
+import { KV, generateId } from "../state/schema.js";
+import type { RecentOperation, RecentOperationFeed } from "../types.js";
+import { getAgentId } from "../config.js";
 import { stripPrivateData } from "./privacy.js";
+import { logger } from "../logger.js";
 
-export interface DashboardActivityItem {
-  id: string;
-  kind: "session" | "observation";
-  sessionId: string;
-  timestamp: string;
-  title: string;
-  agentId?: string;
-}
-
+export type DashboardActivityItem = RecentOperation;
 export interface DashboardActivity {
-  source: "runtime-writes";
-  availableSince: string;
-  partial: true;
-  items: DashboardActivityItem[];
+  source: "native-operation-feed";
+  limit: 30;
+  items: RecentOperation[];
 }
 
-function safeText(value: unknown, maxLength: number): string | undefined {
-  if (typeof value !== "string" || !value || value.length > 4096) return undefined;
-  return stripPrivateData(value).replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, maxLength);
-}
+const FUNCTIONS = new Set(["mem::compress", "mem::summarize", "mem::graph-extract"]);
+const OUTCOMES = new Set(["completed", "failed", "skipped", "queued", "partial"]);
+const COUNTS = ["observationsProcessed", "observationsCompressed", "summariesCreated", "nodesAdded", "edgesAdded", "unitsQueued"] as const;
 
-export function createDashboardActivity() {
-  const availableSince = new Date().toISOString();
-  const recent = new Map<string, DashboardActivityItem>();
-  subscribeStateWrites(({ scope, key, value }) => {
-    const session = scope === KV.sessions;
-    if (!session && !scope.startsWith("mem:obs:")) return;
-    if (key.length > 256 || scope.length > 512 || !value || typeof value !== "object") return;
-    const record = value as Record<string, unknown>;
-    const sessionId = safeText(session ? key : record.sessionId ?? scope.slice("mem:obs:".length), 256);
-    const id = safeText(key, 256);
-    if (!sessionId || !id) return;
-    const agentId = safeText(record.agentId, 128);
-    const title = session
-      ? `Session ${record.status === "completed" ? "completed" : record.status === "abandoned" ? "abandoned" : "updated"}`
-      : safeText(record.title, 160) ?? "Observation captured";
-    const dedupKey = `${scope}\u0000${key}`;
-    recent.delete(dedupKey);
-    recent.set(dedupKey, {
-      id, kind: session ? "session" : "observation", sessionId,
-      timestamp: new Date().toISOString(), title, ...(agentId ? { agentId } : {}),
-    });
-    if (recent.size > 50) recent.delete(recent.keys().next().value!);
-  });
+function sanitizedOperation(value: unknown): RecentOperation | null {
+  if (!value || typeof value !== "object") return null;
+  const entry = value as Record<string, unknown>;
+  if (typeof entry.id !== "string" || !/^op_[a-z0-9_]{1,80}$/.test(entry.id)
+    || typeof entry.timestamp !== "string" || !Number.isFinite(Date.parse(entry.timestamp))
+    || typeof entry.functionId !== "string" || !FUNCTIONS.has(entry.functionId)
+    || typeof entry.outcome !== "string" || !OUTCOMES.has(entry.outcome)) return null;
+  const counts: RecentOperation["counts"] = {};
+  const raw = entry.counts && typeof entry.counts === "object" ? entry.counts as Record<string, unknown> : {};
+  for (const key of COUNTS) {
+    const count = raw[key];
+    if (typeof count === "number" && Number.isSafeInteger(count) && count >= 0) counts[key] = count;
+  }
+  const agentId = typeof entry.agentId === "string"
+    ? stripPrivateData(entry.agentId).replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 128) : undefined;
   return {
-    snapshot(agentId?: string): DashboardActivity {
-      return {
-        source: "runtime-writes", availableSince, partial: true,
-        items: [...recent.values()].reverse().filter(item => !agentId || item.agentId === agentId).slice(0, 10).map(item => ({ ...item })),
-      };
+    id: entry.id, timestamp: new Date(entry.timestamp).toISOString(),
+    functionId: entry.functionId as RecentOperation["functionId"],
+    outcome: entry.outcome as RecentOperation["outcome"], counts,
+    ...(agentId ? { agentId } : {}),
+  };
+}
+
+export async function recordOperation(
+  kv: StateKV,
+  functionId: RecentOperation["functionId"],
+  outcome: RecentOperation["outcome"],
+  counts: RecentOperation["counts"],
+  agentId = getAgentId(),
+): Promise<void> {
+  try {
+    const item = sanitizedOperation({ id: generateId("op"), timestamp: new Date().toISOString(), functionId, outcome, counts, agentId });
+    if (!item) throw new Error("Invalid operation metadata");
+    // Native append and eviction share one state mutation; never read/modify/set.
+    const result = await kv.update<{ errors?: unknown }>(KV.recentOperations, "current", [
+      { type: "append_bounded", path: "items", value: { item, limit: 30 } },
+    ]);
+    if (Array.isArray(result?.errors) && result.errors.length > 0) throw new Error("Operation feed update rejected");
+  } catch {
+    logger.warn("Recent operation could not be persisted", { functionId, outcome });
+  }
+}
+
+export function createDashboardActivity(kv: StateKV) {
+  return {
+    async snapshot(agentId?: string): Promise<DashboardActivity> {
+      const feed = await kv.get<RecentOperationFeed>(KV.recentOperations, "current");
+      const items = (Array.isArray(feed?.items) ? feed.items.slice(-30) : [])
+        .map(sanitizedOperation).filter((item): item is RecentOperation => item !== null)
+        .reverse().filter(item => !agentId || item.agentId === agentId);
+      return { source: "native-operation-feed", limit: 30, items };
     },
   };
 }
