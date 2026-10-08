@@ -34,6 +34,19 @@ function Resolve-LatestReleaseTag {
   return $tag
 }
 
+function Invoke-ReleaseAssetDownload([string]$Uri, [string]$Destination) {
+  try {
+    Invoke-WebRequest -Uri $Uri -OutFile $Destination -MaximumRedirection 5 -TimeoutSec 60 -UseBasicParsing
+    return $true
+  } catch {
+    $response = $_.Exception.Response
+    if ($null -ne $response -and $null -ne $response.StatusCode -and [int]$response.StatusCode -eq 404) {
+      return $false
+    }
+    throw
+  }
+}
+
 $requestedRelease = if ($Version) { $Version } else { "the latest release" }
 if (-not $PSCmdlet.ShouldProcess("the global npm installation", "Install agentmemory $requestedRelease")) {
   return
@@ -43,8 +56,12 @@ if (-not $Version) {
   $Version = Resolve-LatestReleaseTag
 }
 
-$TarballName = "agentmemory-$Version.tgz"
-$ReleaseBase = "https://$ReleaseHost/$Repository/releases/download/$Version"
+$ReleaseTag = if ($Version.StartsWith("v", [System.StringComparison]::Ordinal)) { $Version } else { "v$Version" }
+$VersionNumber = $ReleaseTag.Substring(1)
+$CanonicalTarballName = "agentmemory-agentmemory-$VersionNumber.tgz"
+$LegacyTarballName = "agentmemory-$ReleaseTag.tgz"
+$TarballName = $CanonicalTarballName
+$ReleaseBase = "https://$ReleaseHost/$Repository/releases/download/$ReleaseTag"
 
 $node = Get-Command node -ErrorAction SilentlyContinue
 $npm = Get-Command npm -ErrorAction SilentlyContinue
@@ -65,7 +82,18 @@ $tarballPath = Join-Path $temporaryDirectory $TarballName
 
 try {
   New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
-  Invoke-WebRequest -Uri "$ReleaseBase/$TarballName" -OutFile $tarballPath -MaximumRedirection 5 -TimeoutSec 60 -UseBasicParsing
+  $downloaded = Invoke-ReleaseAssetDownload "$ReleaseBase/$CanonicalTarballName" $tarballPath
+  if (-not $downloaded) {
+    if (Test-Path -LiteralPath $tarballPath) {
+      Remove-Item -LiteralPath $tarballPath -Force
+    }
+    $TarballName = $LegacyTarballName
+    $tarballPath = Join-Path $temporaryDirectory $TarballName
+    $downloaded = Invoke-ReleaseAssetDownload "$ReleaseBase/$LegacyTarballName" $tarballPath
+    if (-not $downloaded) {
+      throw "AgentMemory release $ReleaseTag has no package asset in a supported format."
+    }
+  }
   & $npm.Source install --global $tarballPath
   if ($LASTEXITCODE -ne 0) {
     throw "npm global installation failed with exit code $LASTEXITCODE."

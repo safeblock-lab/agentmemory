@@ -151,7 +151,7 @@ async function boundedFetch(url: string, maxBytes: number, allowedHosts: Set<str
   throw new Error("Release download redirected too many times.");
 }
 
-async function latestRelease(): Promise<{ info: ReleaseInfo; assetUrl: string; sumsUrl: string }> {
+async function latestRelease(): Promise<{ info: ReleaseInfo; filename: string; assetUrl: string; sumsUrl: string }> {
   const raw = await boundedFetch(RELEASE_API, MAX_METADATA_BYTES, new Set(["api.github.com"]), "application/vnd.github+json");
   let release: GithubRelease;
   try {
@@ -164,18 +164,35 @@ async function latestRelease(): Promise<{ info: ReleaseInfo; assetUrl: string; s
     throw new Error("Latest GitHub release is not a supported stable version.");
   }
   const available = isNewerRelease(tag);
-  const filename = `agentmemory-${tag}.tgz`;
+  const canonicalFilename = `agentmemory-agentmemory-${tag.slice(1)}.tgz`;
+  const canonicalSumsFilename = "SHA256SUMS";
+  const legacyFilename = `agentmemory-${tag}.tgz`;
+  const legacySumsFilename = "SHA256SUMS.txt";
   const expected = `${RELEASE_BASE}${tag}/`;
   const assets = Array.isArray(release.assets) ? release.assets : [];
-  function asset(name: string): string {
-    const matching = assets.filter((entry) => entry.name === name && entry.browser_download_url === `${expected}${name}`);
-    if (matching.length !== 1) throw new Error(`GitHub release is missing verified asset ${name}.`);
+  function asset(name: string): string | undefined {
+    const matching = assets.filter((entry) => entry.name === name);
+    if (matching.length > 1) throw new Error(`GitHub release contains duplicate asset ${name}.`);
+    if (matching.length === 0) return undefined;
+    if (matching[0].browser_download_url !== `${expected}${name}`) {
+      throw new Error(`GitHub release contains an invalid URL for asset ${name}.`);
+    }
     return `${expected}${name}`;
   }
+  const canonicalAssetUrl = asset(canonicalFilename);
+  const canonicalSumsUrl = asset(canonicalSumsFilename);
+  const hasCanonicalAssets = canonicalAssetUrl !== undefined || canonicalSumsUrl !== undefined;
+  const filename = hasCanonicalAssets ? canonicalFilename : legacyFilename;
+  const sumsFilename = hasCanonicalAssets ? canonicalSumsFilename : legacySumsFilename;
+  const assetUrl = hasCanonicalAssets ? canonicalAssetUrl : asset(legacyFilename);
+  const sumsUrl = hasCanonicalAssets ? canonicalSumsUrl : asset(legacySumsFilename);
+  if (!assetUrl) throw new Error(`GitHub release is missing verified asset ${filename}.`);
+  if (!sumsUrl) throw new Error(`GitHub release is missing verified asset ${sumsFilename}.`);
   return {
     info: { currentVersion: VERSION, version: tag.slice(1), tag, available },
-    assetUrl: asset(filename),
-    sumsUrl: asset("SHA256SUMS.txt"),
+    filename,
+    assetUrl,
+    sumsUrl,
   };
 }
 
@@ -184,14 +201,14 @@ export async function checkForUpdate(): Promise<ReleaseInfo> {
 }
 
 export async function downloadVerifiedRelease(): Promise<VerifiedRelease> {
-  const { info, assetUrl, sumsUrl } = await latestRelease();
+  const { info, filename, assetUrl, sumsUrl } = await latestRelease();
   if (!info.available) throw new Error("AgentMemory is already up to date.");
-  const filename = `agentmemory-${info.tag}.tgz`;
   const [tarball, sums] = await Promise.all([
     boundedFetch(assetUrl, MAX_PACKAGE_BYTES, ALLOWED_DOWNLOAD_HOSTS, "application/octet-stream"),
     boundedFetch(sumsUrl, MAX_CHECKSUM_BYTES, ALLOWED_DOWNLOAD_HOSTS, "application/octet-stream"),
   ]);
-  const line = sums.toString("utf8").split(/\r?\n/).find((entry) => entry.endsWith(`  ${filename}`) || entry.endsWith(` *${filename}`));
+  const lines = sums.toString("utf8").split(/\r?\n/).filter((entry) => entry.endsWith(`  ${filename}`) || entry.endsWith(` *${filename}`));
+  const line = lines.length === 1 ? lines[0] : undefined;
   const match = line && /^([0-9a-fA-F]{64})\s+\*?(.+)$/.exec(line);
   if (!match || match[2] !== filename) throw new Error("Release checksums do not contain the expected package.");
   const sha256 = createHash("sha256").update(tarball).digest("hex");
