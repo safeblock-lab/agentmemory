@@ -10,6 +10,15 @@ import type { Action, Crystal, MemoryProvider } from "../src/types.js";
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
   return {
+    retrieval: vi.fn(async (input: Record<string, unknown>): Promise<unknown> => {
+      if (input.action !== "crystals_page") throw new Error("Unexpected native action");
+      const rows = Array.from(store.get("mem:crystals")?.values() ?? []) as Crystal[];
+      const crystals = rows.filter(row => (input.project === undefined || row.project === input.project) &&
+        (input.session_id === undefined || row.sessionId === input.session_id))
+        .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt) || a.id.localeCompare(b.id))
+        .slice(0, Number(input.limit ?? 16));
+      return { success: true, crystals, partial: false, nextCursor: null, total: null, countScope: "page" };
+    }),
     get: async <T>(scope: string, key: string): Promise<T | null> => {
       return (store.get(scope)?.get(key) as T) ?? null;
     },
@@ -332,6 +341,59 @@ describe("Crystallize Functions", () => {
       expect(result.crystals.length).toBe(1);
       expect(result.crystals[0].id).toBe("crys_3");
     });
+
+    it("passes exact scope and opaque continuation to native paging without list hydration", async () => {
+      const list = vi.spyOn(kv, "list");
+      const crystal = { ...(await kv.get<Crystal>("mem:crystals", "crys_3"))!, provenance: { source: "retained" } };
+      const envelope = { success: true, crystals: [crystal], partial: true, nextCursor: "opaque-next", total: null, countScope: "page" };
+      kv.retrieval.mockResolvedValueOnce(envelope);
+      const result = await sdk.trigger("mem::crystal-list", {
+        project: "alpha", sessionId: "sess_a", cursor: "opaque-current", limit: 16, ignored: "never-forward",
+      });
+      expect(kv.retrieval).toHaveBeenCalledExactlyOnceWith({
+        action: "crystals_page", project: "alpha", session_id: "sess_a", cursor: "opaque-current", limit: 16, max_bytes: 65_536,
+      });
+      expect(result).toEqual(envelope);
+      expect(list).not.toHaveBeenCalled();
+      expect(provider.summarize).not.toHaveBeenCalled();
+    });
+
+    it("preserves native preparing and partial envelopes without retry", async () => {
+      const preparing = { success: false, crystals: [], partial: true, nextCursor: null, total: null, countScope: "page", reason: "crystal_index_preparing" };
+      kv.retrieval.mockResolvedValueOnce(preparing);
+      expect(await sdk.trigger("mem::crystal-list", {})).toEqual(preparing);
+      expect(kv.retrieval).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+      { success: true, crystals: [] },
+      { success: true, crystals: Array(17).fill({}), partial: false, nextCursor: null, total: null, countScope: "page" },
+      { success: true, crystals: [{ id: "broken" }], partial: false, nextCursor: null, total: null, countScope: "page" },
+      { success: true, crystals: [], partial: false, nextCursor: 3, total: null, countScope: "page" },
+    ])("rejects malformed native envelope without false empty success", async envelope => {
+      kv.retrieval.mockResolvedValueOnce(envelope);
+      expect(await sdk.trigger("mem::crystal-list", {})).toMatchObject({ success: false, crystals: [] });
+    });
+
+    it("rejects oversized full JSON without truncating provenance", async () => {
+      const crystal = { ...(await kv.get<Crystal>("mem:crystals", "crys_3"))!, narrative: "x".repeat(65_536) };
+      kv.retrieval.mockResolvedValueOnce({ success: true, crystals: [crystal], partial: false, nextCursor: null, total: null, countScope: "page" });
+      expect(await sdk.trigger("mem::crystal-list", {})).toMatchObject({ success: false, crystals: [] });
+    });
+
+    it("sanitizes native failure and never restarts a stale cursor", async () => {
+      kv.retrieval.mockRejectedValueOnce(new Error("STATE_CRYSTAL_CURSOR_STALE private-source-path"));
+      const result = await sdk.trigger("mem::crystal-list", { cursor: "opaque-stale" });
+      expect(result).toMatchObject({ success: false, crystals: [] });
+      expect(JSON.stringify(result)).not.toContain("private-source-path");
+      expect(kv.retrieval).toHaveBeenCalledOnce();
+    });
+
+    it.each([{ limit: 17 }, { limit: 0 }, { cursor: "" }, { cursor: "x".repeat(8193) }, { project: "" }])(
+      "rejects invalid paging input before native dispatch", async input => {
+        expect(await sdk.trigger("mem::crystal-list", input)).toMatchObject({ success: false });
+        expect(kv.retrieval).not.toHaveBeenCalled();
+      });
   });
 
   describe("mem::crystal-get", () => {

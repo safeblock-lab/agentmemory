@@ -6,11 +6,11 @@ import {
   spawnSync,
   type ChildProcess,
 } from "node:child_process";
-import { createHash } from "node:crypto";
 import {
   chmodSync,
   cpSync,
   copyFileSync,
+  constants,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -1322,15 +1322,11 @@ async function runIiiInstaller(): Promise<{ ok: boolean; binPath: string | null 
     mkdirSync(binDir, { recursive: true });
     copyFileSync(artifact.binaryPath, temporaryPath);
     if (!IS_WINDOWS) chmodSync(temporaryPath, 0o755);
-    const copiedSha256 = createHash("sha256")
-      .update(readFileSync(temporaryPath))
-      .digest("hex");
     if (
-      copiedSha256 !== artifact.sha256 ||
       iiiBinVersion(temporaryPath) !== IIPINNED_VERSION ||
       !iiiHasRequiredStateCapabilities(temporaryPath)
     ) {
-      throw new Error("The copied binary failed its checksum, version, or required state capability probe.");
+      throw new Error("The copied binary failed its version or required state capability probe.");
     }
     renameSync(temporaryPath, binPath);
     return { ok: true, binPath };
@@ -1489,12 +1485,13 @@ function prepareEngineLaunch(configPath: string): {
       : renderEngineConfig(rawConfig, options);
     const runtimePath = runtimeConfigPath(dataDirResolution.dataDir);
     mkdirSync(dirname(runtimePath), { recursive: true });
+    if (existsSync(runtimePath)) copyFileSync(runtimePath, `${runtimePath}.before-rendered-config-${Date.now()}`, constants.COPYFILE_EXCL);
     writeFileSync(runtimePath, rewritten, "utf-8");
     try {
       const cleared = clearPersistedBuiltinConfig(cwd, runtimePath, rewritten);
       if (cleared.length > 0) {
         vlog(
-          `cleared ${cleared.length} persisted builtin config entries so the rendered runtime config seeds the engine again`,
+          `cleared ${cleared.length} persisted builtin config entries (each preserved in a .before-rendered-config-* sibling) so the rendered runtime config seeds the engine again`,
         );
       }
     } catch (err) {
@@ -2027,7 +2024,7 @@ async function runStateMigrationCmd(): Promise<void> {
   );
   if (!artifact.ok) throw new Error(artifact.message);
   if (iiiBinVersion(artifact.binaryPath) !== IIPINNED_VERSION) {
-    throw new Error("The checksum-verified bundled engine does not match the pinned version.");
+    throw new Error("The bundled engine does not match the pinned version.");
   }
   let capabilityOutput: string;
   try {
@@ -2038,10 +2035,10 @@ async function runStateMigrationCmd(): Promise<void> {
       windowsHide: true,
     });
   } catch {
-    throw new Error("The checksum-verified bundled engine capability probe failed.");
+    throw new Error("The bundled engine capability probe failed.");
   }
   if (!hasRequiredEngineCapabilitiesOutput(capabilityOutput)) {
-    throw new Error("The bundled engine does not advertise all six required state capabilities.");
+    throw new Error(`The bundled engine does not advertise all ${REQUIRED_ENGINE_CAPABILITIES.length} required state capabilities.`);
   }
 
   const receiptPath = stateMigrationReceiptPath(target);

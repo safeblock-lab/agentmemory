@@ -6,12 +6,18 @@ export type McpToolDef = {
   inputSchema: {
     type: "object";
     properties: Record<string, {
-      type: string;
+      type: string | string[];
       description: string;
+      additionalProperties?: boolean;
+      required?: string[];
+      properties?: Record<string, { type: string | string[]; description: string; minimum?: number; maximum?: number }>;
       enum?: string[];
       minimum?: number;
       maximum?: number;
       maxLength?: number;
+      minItems?: number;
+      maxItems?: number;
+      items?: { type: string; maxLength?: number };
     }>;
     required?: string[];
   };
@@ -67,6 +73,11 @@ export const CORE_TOOLS: McpToolDef[] = [
     inputSchema: {
       type: "object",
       properties: {
+        action: { type: "string", enum: ["store", "update", "merge"], description: "Default store; update/merge require targetMemoryId and expectedVersion. Merge accepts exact content only." },
+        targetMemoryId: { type: "string", description: "Explicit canonical predecessor; similarity never selects an update target." },
+        expectedVersion: { type: "integer", minimum: 1, description: "Expected domain version of the target." },
+        sourceKind: { type: "string", enum: ["unknown", "human_source", "ai_output", "proposal", "observed_result"], description: "Evidence description, not approval or authenticated authority. Default unknown." },
+        sourceObservationIds: { type: "string", description: "Comma-separated source observation IDs to preserve." },
         content: {
           type: "string",
           description: "The insight or decision to remember",
@@ -305,6 +316,7 @@ export const V040_TOOLS: McpToolDef[] = [
     inputSchema: {
       type: "object",
       properties: {
+        project: { type: "string", description: "Project whose indexed graph should be queried", maxLength: 256 },
         startNodeId: {
           type: "string",
           description: "Starting node ID for traversal",
@@ -327,7 +339,47 @@ export const V040_TOOLS: McpToolDef[] = [
       properties: {
         tier: {
           type: "string",
-          description: "Target tier: episodic, semantic, or procedural",
+          description: "Optional tier selector: all, semantic, reflect, procedural, or decay",
+          maxLength: 32,
+        },
+        project: {
+          type: "string",
+          description: "Project to consolidate; pass the returned project unchanged when resuming a selection",
+          maxLength: 256,
+        },
+        force: {
+          type: "boolean",
+          description: "Pass through the returned force value when resuming a selection",
+        },
+        deferred: {
+          type: "boolean",
+          description: "Pass through the returned deferred value when resuming a selection",
+        },
+        batchSourceIds: {
+          type: "array",
+          description: "Exact selected source IDs to resume, bounded to 12 entries",
+          items: { type: "string", maxLength: 256 },
+          minItems: 1,
+          maxItems: 12,
+        },
+        consolidationSelectionId: {
+          type: "string",
+          description: "Exact selection continuation ID returned by a pre-capture result",
+          maxLength: 256,
+        },
+        consolidationCatalogProject: {
+          type: "boolean",
+          description: "Pass through the returned project-catalog continuation flag",
+        },
+        consolidationManifestId: {
+          type: "string",
+          description: "Exact consolidation manifest continuation ID returned by a capture result",
+          maxLength: 256,
+        },
+        decayManifestId: {
+          type: "string",
+          description: "Exact decay manifest continuation ID returned by a decay result",
+          maxLength: 256,
         },
       },
     },
@@ -876,14 +928,18 @@ export const V073_TOOLS: McpToolDef[] = [
   {
     name: "memory_reflect",
     description:
-      "Traverse the knowledge graph, group related memories by concept clusters, and synthesize higher-order insights via LLM. Returns new and reinforced insights.",
+      "Process one exact foreground reflection source unit, with at most one generation and one evidence judge. Return durable counts/status and exact continuation for remaining work.",
     inputSchema: {
       type: "object",
       properties: {
+        requestId: { type: "string", description: "Stable operation ID; reuse it with the exact continuation and original filters. Generated if omitted on first request." },
+        continuation: { type: "object", description: "Exact server continuation from the previous response", additionalProperties: false, required: ["jobId", "requestId", "project", "checkpoint", "cut"], properties: {
+          jobId: { type: "string", description: "Exact job" }, requestId: { type: "string", description: "Exact request" }, project: { type: ["string", "null"], description: "Original project filter" },
+          checkpoint: { type: "string", description: "Server checkpoint" }, cut: { type: "integer", description: "Next cut", minimum: 1, maximum: 256 } } },
         project: { type: "string", description: "Filter by project" },
         maxClusters: {
           type: "number",
-          description: "Max concept clusters to process (default 10, max 20)",
+          description: "Max concept clusters to process (default 4, max 20)",
         },
       },
     },

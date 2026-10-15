@@ -71,7 +71,7 @@ export class OpenRouterKeyPoolProvider implements MemoryProvider {
     userPrompt: string,
     options?: LlmCallOptions,
   ): Promise<string> {
-    return this.run((provider) => provider.compress(systemPrompt, userPrompt, options));
+    return this.run((provider) => provider.compress(systemPrompt, userPrompt, options), options);
   }
 
   summarize(
@@ -79,10 +79,10 @@ export class OpenRouterKeyPoolProvider implements MemoryProvider {
     userPrompt: string,
     options?: LlmCallOptions,
   ): Promise<string> {
-    return this.run((provider) => provider.summarize(systemPrompt, userPrompt, options));
+    return this.run((provider) => provider.summarize(systemPrompt, userPrompt, options), options);
   }
 
-  private async run(operation: (provider: MemoryProvider) => Promise<string>): Promise<string> {
+  private async run(operation: (provider: MemoryProvider) => Promise<string>, options?: LlmCallOptions): Promise<string> {
     const sampledAccounts = this.sampleAccounts();
     for (let attempt = 0; attempt < sampledAccounts.length; attempt += 1) {
       try {

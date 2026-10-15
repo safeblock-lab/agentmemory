@@ -1,6 +1,23 @@
 import type {
   StateCounter, StateGraphLease, StateCommitIdentity, StateGraphCheckpoint, StateBatchReceipt,
 } from "./state/state-transactions.js";
+import type { ReflectJob, ReflectPending, ReflectRequest } from "./functions/reflect-queue-types.js";
+import type { GraphDispatchIntent } from "./functions/graph-dispatch.js";
+import type { SkillLifecycleIntent, SkillLifecycleSession } from "./functions/skill-lifecycle.js";
+import type { GraphWorkCursor } from "./functions/graph-work-groups.js";
+
+export interface TemporalWorkManifest {
+  version: 1; id: string; state: "pending" | "completed"; pageCount: number; currentPage: number;
+  cursor?: GraphWorkCursor | null; nodesAdded: number; edgesAdded: number; workUnits: number;
+  activeUnitJobId?: string; createdAt: string; updatedAt: string;
+  nativeTemporalPrunedUnits?: number;
+  nativeTemporalPruneEpoch?: string;
+}
+
+export interface TemporalPendingIndex {
+  version: 1; jobId: string; state: "pending"; manifestReady: boolean;
+  pageCount: number; createdAt: string; updatedAt: string;
+}
 
 export interface Session {
   id: string;
@@ -16,6 +33,13 @@ export interface Session {
   summary?: string;
   commitShas?: string[];
   agentId?: string;
+  captureCheckpoints?: Record<string, {
+    revision: string;
+    windowStart: number;
+    end: number;
+    prefixDigest: string;
+    publishedAt: string;
+  }>;
 }
 
 export interface CommitLink {
@@ -38,6 +62,223 @@ export interface Origin {
   detail?: string;
   capturedAt: string;
 }
+
+export interface ObservationProvenance {
+  sessionId: string;
+  hookType: HookType;
+  agentId?: string;
+  origin?: { channel: Origin["channel"]; detail?: string };
+  count?: number;
+  firstSeenAt?: string;
+  lastSeenAt?: string;
+}
+
+export interface ObservationIdentityRecord {
+  observationId: string;
+  identityDigest: string;
+}
+
+export type ObservationEventRecord = ObservationIdentityRecord;
+
+export interface ObservationIndexReadyMarker {
+  version: 1;
+  ready: true;
+}
+
+export interface ObservationIdentityScope {
+  [key: string]: ObservationIdentityRecord | ObservationIndexReadyMarker;
+}
+
+export interface ObservationEventsScope {
+  [eventId: string]: ObservationEventRecord & { occurredAt?: string };
+}
+
+export interface ReflectJobsScope {
+  [jobId: string]: ReflectJob;
+}
+
+export interface ReflectPendingScope {
+  [pendingId: string]: ReflectPending & { request?: ReflectRequest };
+}
+
+export interface ReflectControlScope {
+  "recovery-cursor"?: { cursor?: string };
+}
+
+export interface GraphDispatchIntentsScope {
+  [intentId: string]: GraphDispatchIntent;
+}
+
+export interface GraphDispatchInputsScope {
+  [fragmentKey: string]: string;
+}
+
+export interface SkillLifecycleIntentsScope {
+  [intentOrSessionKey: string]: SkillLifecycleIntent | SkillLifecycleSession;
+}
+
+export interface SkillLifecycleRecoveryScope {
+  "summary-completed"?: { cursor: string | null; updatedAt: string };
+}
+
+export interface StorageCategorySample {
+  category: string;
+  rows: number;
+  logical_bytes: number;
+  stored_bytes: number;
+  tombstones: number;
+}
+
+export interface StoragePhysicalSample {
+  page_size: number;
+  page_count: number;
+  freelist_count: number;
+  reusable_bytes: number;
+  allocated_page_bytes: number;
+  auto_vacuum: 0 | 1 | 2;
+  journal_mode: string;
+  database_bytes: number;
+  wal_bytes: number;
+}
+
+export interface StorageGrowthSample {
+  sampledAt: string;
+  categoryVersion: number;
+  coverage: string;
+  rowsScanned: number;
+  categories: StorageCategorySample[];
+  physical: StoragePhysicalSample;
+}
+
+export interface StorageIndexProgress {
+  sessionsCursor: string | null;
+  sessionId: string | null;
+  nextSessionCursor: string | null;
+  observationsCursor: string | null;
+  scanned: number;
+  indexed: number;
+  unindexable: number;
+  conflicts: number;
+  readySessions: number;
+  complete: boolean;
+}
+
+export interface StorageDiagnosticProgress {
+  cursor: { scope: string; key: string } | null;
+  categoryVersion: number | null;
+  sampledAt: string | null;
+  coverage: string | null;
+  rowsScanned: number;
+  categories: StorageCategorySample[];
+  physical: StoragePhysicalSample | null;
+}
+
+export interface StorageCleanupSummary {
+  startedAt: string;
+  completedAt: string;
+  graphRowsDeleted: number;
+  technicalCandidatesProcessed: number;
+  technicalDeleted: number;
+  rawStripped: number;
+  deletedLogicalBytes: number;
+  deletedStoredBytes: number;
+  operationRowsDeleted: number;
+  skipped: number;
+  excludedUnresolved: number;
+  excludedUnknownAge: number;
+  pending: boolean;
+  exclusions: string[];
+}
+
+export type StorageReclaimStatus = "progress" | "deferred" | "migration_required" | "complete";
+
+export interface StorageCompactionProgress {
+  pending: boolean;
+  nextEligibleAt: string | null;
+  nextMaxPages: number;
+  minIntervalMs: number;
+  backoffUntil: string | null;
+  attempts: number;
+  progressCuts: number;
+  completedPolls: number;
+  deferredPolls: number;
+  failures: number;
+  overlapSkips: number;
+  lastStatus: StorageReclaimStatus | null;
+  lastReason: string | null;
+  lastErrorCode: string | null;
+  overlap: { ownerId: string; startedAt: string; expiresAt: string } | null;
+}
+
+export interface StorageMaintenanceState {
+  version: 1;
+  updatedAt: string;
+  cleanupActivatedAt?: string;
+  operationsCompactedAt?: string;
+  lastSuccessfulCompactionAt?: string;
+  compaction: StorageCompactionProgress;
+  totals: {
+    graphRowsDeleted: number;
+    technicalRowsDeleted: number;
+    rawStripped: number;
+    operationRowsDeleted: number;
+    logicalBytesDeleted: number;
+    storedBytesDeleted: number;
+    unresolvedExclusions: number;
+    unknownAgeExclusions: number;
+  };
+  observationIndex: StorageIndexProgress;
+  diagnostics: {
+    inProgress: StorageDiagnosticProgress;
+    lastComplete?: StorageGrowthSample;
+    samples: StorageGrowthSample[];
+  };
+  technical: {
+    scopeIndex: number;
+    cursors: Record<string, string | null>;
+    observationSessionsCursor: string | null;
+    observationSessionId: string | null;
+    observationNextSessionCursor: string | null;
+    observationCursor: string | null;
+    eventSessionsCursor: string | null;
+    eventSessionId: string | null;
+    eventNextSessionCursor: string | null;
+    eventCursor: string | null;
+    summaryJobsCursor: string | null;
+    summaryJobId: string | null;
+    summaryJobsNextCursor: string | null;
+    summaryUnitsCursor: string | null;
+    summaryJobReady: boolean;
+    temporal?: { cursor: string | null; jobId: string | null; pageIndex: number };
+  };
+  lastCleanup?: StorageCleanupSummary;
+  lastReclaim?: {
+    at: string; mode: "incremental" | "checkpoint_only"; pages: number;
+    checkpointBusy: boolean; before: StoragePhysicalSample; after: StoragePhysicalSample;
+    status?: StorageReclaimStatus; reason?: string; pagesReclaimed?: number;
+    physicalBytesReclaimed?: number; nextMaxPages?: number; minIntervalMs?: number;
+    checkpointPerformed?: false;
+  };
+}
+
+export interface DashboardFailureMinutesScope {
+  [agentKey: string]: {
+    schemaVersion: 1;
+    coverageSince: string;
+    coverageInvalid?: boolean;
+    [key: string]: unknown;
+  };
+}
+
+export interface StorageMaintenanceScope {
+  current: StorageMaintenanceState;
+}
+
+export type {
+  ReflectJob, ReflectPending, ReflectRequest,
+  GraphDispatchIntent, SkillLifecycleIntent, SkillLifecycleSession,
+};
+export type { SkillExtractionCapture } from "./functions/skill-lifecycle.js";
 
 export function importOrigin(
   existing: Origin | undefined,
@@ -63,6 +304,16 @@ export interface RawObservation {
   imageData?: string;
   agentId?: string;
   origin?: Origin;
+  identityDigest?: string;
+  occurrenceCount?: number;
+  firstSeenAt?: string;
+  lastSeenAt?: string;
+  provenance?: ObservationProvenance[];
+  provenanceOverflowCount?: number;
+  identityIndexedDigest?: string;
+  rawSource?: { scope: string; key: string };
+  rawRetained?: boolean;
+  rawExpiredAt?: string;
 }
 
 export interface CompressedObservation {
@@ -70,6 +321,13 @@ export interface CompressedObservation {
   sessionId: string;
   timestamp: string;
   type: ObservationType;
+  hookType?: HookType;
+  raw?: unknown;
+  toolName?: string;
+  toolInput?: unknown;
+  toolOutput?: unknown;
+  userPrompt?: string;
+  assistantResponse?: string;
   title: string;
   subtitle?: string;
   facts: string[];
@@ -84,6 +342,18 @@ export interface CompressedObservation {
   modality?: "text" | "image" | "mixed";
   agentId?: string;
   origin?: Origin;
+  identityDigest?: string;
+  occurrenceCount?: number;
+  firstSeenAt?: string;
+  lastSeenAt?: string;
+  provenance?: ObservationProvenance[];
+  provenanceOverflowCount?: number;
+  compressionMethod?: "llm";
+  identityIndexedDigest?: string;
+  rawSource?: { scope: string; key: string };
+  rawRetained?: boolean;
+  rawExpiredAt?: string;
+  sourceIdentityDigests?: string[];
 }
 
 export type ObservationType =
@@ -126,6 +396,12 @@ export interface Memory {
   agentId?: string;
   project?: string;
   origin?: Origin;
+  attribution?: {
+    sourceKind: "unknown" | "human_source" | "ai_output" | "proposal" | "observed_result";
+    actorId?: string;
+    evidenceObservationIds: string[];
+  };
+  embeddingReuse?: { sourceMemoryId: string; sourceVersion: string };
 }
 
 export interface SessionSummary {
@@ -154,6 +430,11 @@ export interface SummaryQueueJob {
   round: number;
   unitIds: string[];
   sourceProgressSize: number;
+  executionOrigin?: "selected" | "manual";
+  recoveryGeneration?: "full-originals-v2";
+  zeroSpendRecoveryOfJobId?: string;
+  recoveryMode?: "full-originals-v1";
+  recoveryOfJobId?: string;
   dispatchPending?: boolean;
   completedAt?: string;
   failedAt?: string;
@@ -381,10 +662,24 @@ export type LlmTask =
 
 export type LlmRouteTarget = "primary" | "aux";
 
+export type LlmJsonValue = string | number | boolean | null | LlmJsonValue[] | { [key: string]: LlmJsonValue };
+
+export type LlmResponseFormat =
+  | { type: "json_object" }
+  | {
+      type: "json_schema";
+      json_schema: {
+        name: string;
+        strict: boolean;
+        schema: Record<string, LlmJsonValue>;
+      };
+    };
+
 export interface LlmCallOptions {
   task?: LlmTask;
   thinking?: boolean;
   outputTokens?: number;
+  responseFormat?: LlmResponseFormat;
   onUsage?: (usage: LlmUsage) => void;
 }
 
@@ -399,6 +694,8 @@ export interface SummaryBudgetConfig {
 
 export interface LlmUsage {
   inputTokens?: number;
+  cachedInputTokens?: number;
+  cacheWriteInputTokens?: number;
   outputTokens?: number;
   totalTokens?: number;
   responseChars: number;
@@ -454,6 +751,29 @@ export interface EvalResult {
   latencyMs: number;
   functionId: string;
 }
+
+export interface ContextUsageEvent {
+  id: string;
+  timestamp: string;
+  session: string;
+  source: "session-start" | "pre-tool-use" | "pre-compact" | "mcp-response";
+  characters: number;
+  textTokens: number;
+  candidateTokens?: number;
+}
+
+export interface ContextUsageFeed { items: ContextUsageEvent[] }
+
+export interface ProcessingUsageEvent {
+  id: string;
+  timestamp: string;
+  inputTokens?: number;
+  cachedInputTokens?: number;
+  cacheWriteInputTokens?: number;
+  outputTokens?: number;
+}
+
+export interface ProcessingUsageFeed { items: ProcessingUsageEvent[] }
 
 export interface FunctionMetrics extends BatchEffectMetadata {
   functionId: string;
@@ -607,7 +927,7 @@ export interface ExportPagination {
 }
 
 export interface ExportData {
-  version: "0.3.0" | "0.4.0" | "0.5.0" | "0.6.0" | "0.6.1" | "0.7.0" | "0.7.2" | "0.7.3" | "0.7.4" | "0.7.5" | "0.7.6" | "0.7.7" | "0.7.9" | "0.8.0" | "0.8.1" | "0.8.2" | "0.8.3" | "0.8.4" | "0.8.5" | "0.8.6" | "0.8.7" | "0.8.8" | "0.8.9" | "0.8.10" | "0.8.11" | "0.8.12" | "0.8.13" | "0.9.0" | "0.9.1" | "0.9.2" | "0.9.3" | "0.9.4" | "0.9.5" | "0.9.6" | "0.9.7" | "0.9.8" | "0.9.9" | "0.9.10" | "0.9.11" | "0.9.12" | "0.9.13" | "0.9.14" | "0.9.15" | "0.9.16" | "0.9.17" | "0.9.18" | "0.9.19" | "0.9.20" | "0.9.21" | "0.9.22" | "0.9.23" | "0.9.24" | "0.9.25" | "0.9.26" | "0.9.27" | "0.9.28" | "0.9.29" | "0.9.30" | "0.9.31" | "0.9.32" | "0.9.33" | "0.9.34" | "0.9.35" | "0.9.36" | "0.9.37" | "0.9.38" | "0.9.39" | "0.9.40" | "0.9.41" | "0.9.42" | "0.9.43" | "0.9.44" | "0.9.45" | "0.9.46" | "0.9.47" | "0.9.48" | "0.9.49" | "0.9.50" | "0.9.51" | "0.9.52" | "0.9.53" | "0.9.54" | "0.9.55" | "0.9.56" | "0.9.57" | "0.9.58" | "0.9.59" | "0.9.60" | "0.9.61" | "0.9.62" | "0.9.63" | "0.9.64" | "0.9.65" | "0.9.66" | "0.9.67" | "0.9.68" | "0.9.69" | "0.9.70" | "0.9.71" | "0.9.72" | "0.9.73" | "0.9.74" | "0.9.75" | "0.9.76" | "0.9.77" | "0.9.78" | "0.9.79" | "0.9.80" | "0.9.81" | "0.9.82" | "0.9.83" | "0.9.84" | "0.9.85" | "0.9.86" | "0.9.87" | "0.9.88";
+  version: "0.3.0" | "0.4.0" | "0.5.0" | "0.6.0" | "0.6.1" | "0.7.0" | "0.7.2" | "0.7.3" | "0.7.4" | "0.7.5" | "0.7.6" | "0.7.7" | "0.7.9" | "0.8.0" | "0.8.1" | "0.8.2" | "0.8.3" | "0.8.4" | "0.8.5" | "0.8.6" | "0.8.7" | "0.8.8" | "0.8.9" | "0.8.10" | "0.8.11" | "0.8.12" | "0.8.13" | "0.9.0" | "0.9.1" | "0.9.2" | "0.9.3" | "0.9.4" | "0.9.5" | "0.9.6" | "0.9.7" | "0.9.8" | "0.9.9" | "0.9.10" | "0.9.11" | "0.9.12" | "0.9.13" | "0.9.14" | "0.9.15" | "0.9.16" | "0.9.17" | "0.9.18" | "0.9.19" | "0.9.20" | "0.9.21" | "0.9.22" | "0.9.23" | "0.9.24" | "0.9.25" | "0.9.26" | "0.9.27" | "0.9.28" | "0.9.29" | "0.9.30" | "0.9.31" | "0.9.32" | "0.9.33" | "0.9.34" | "0.9.35" | "0.9.36" | "0.9.37" | "0.9.38" | "0.9.39" | "0.9.40" | "0.9.41" | "0.9.42" | "0.9.43" | "0.9.44" | "0.9.45" | "0.9.46" | "0.9.47" | "0.9.48" | "0.9.49" | "0.9.50" | "0.9.51" | "0.9.52" | "0.9.53" | "0.9.54" | "0.9.55" | "0.9.56" | "0.9.57" | "0.9.58" | "0.9.59" | "0.9.60" | "0.9.61" | "0.9.62" | "0.9.63" | "0.9.64" | "0.9.65" | "0.9.66" | "0.9.67" | "0.9.68" | "0.9.69" | "0.9.70" | "0.9.71" | "0.9.72" | "0.9.73" | "0.9.74" | "0.9.75" | "0.9.76" | "0.9.77" | "0.9.78" | "0.9.79" | "0.9.80" | "0.9.81" | "0.9.82" | "0.9.83" | "0.9.84" | "0.9.85" | "0.9.86" | "0.9.87" | "0.9.88" | "0.9.89";
   exportedAt: string;
   sessions: Session[];
   observations: Record<string, CompressedObservation[]>;
@@ -734,6 +1054,55 @@ export interface EdgeContext {
   confidence?: number;
 }
 
+export interface GraphDisplayNode {
+  id: string;
+  type: GraphNodeType;
+  name: string;
+}
+
+export interface GraphDisplayEdge {
+  id: string;
+  type: GraphEdgeType;
+  sourceNodeId: string;
+  targetNodeId: string;
+  weight: number;
+}
+
+export interface GraphDisplayPage {
+  display: true;
+  project: string;
+  nodes: GraphDisplayNode[];
+  edges: GraphDisplayEdge[];
+  status: "ready" | "preparing" | "error";
+  reason?: string;
+  revision: string | null;
+  nextCursor: string | null;
+  hasMore: boolean;
+  edgeScope: "page";
+  crossPageEdges: "not_loaded";
+  edgesTruncated: boolean;
+  progress?: GraphBrowseProgress;
+}
+
+export interface GraphBrowseProgress {
+  phase: string;
+  processed: number;
+}
+
+export interface GraphBrowsePreparation extends GraphBrowseProgress {
+  status: "ready" | "preparing" | "error";
+  revision: string | null;
+  continue: boolean;
+  reason?: string;
+  required_bytes?: number;
+}
+
+export interface GraphDisplayPreparation {
+  display: true;
+  project: string;
+  preparation: GraphBrowsePreparation;
+}
+
 export interface GraphQueryResult {
   nodes: GraphNode[];
   edges: GraphEdge[];
@@ -815,6 +1184,10 @@ export interface GraphExtractionJob {
   logicalDeltaCount: number;
   callbackIdentity?: { destination: "graph"; effectKey: string; correlationId: string; customId: string };
   failureCode?: string;
+  nativeTemporalOrigin?: {
+    version: 1; parentId: string; pageIndex: number; unitFingerprint: string; captureDigest: string;
+  };
+  nativeTemporalPrunedFor?: string;
 }
 
 export interface GraphExtractionInput {
@@ -988,6 +1361,8 @@ export interface AuditEntry {
     | "lesson_delete"
     | "obsidian_export"
     | "reflect"
+    | "provider_approve"
+    | "provider_revoke"
     | "insight_search"
     | "skill_extract"
     | "core_add"
@@ -1188,6 +1563,16 @@ export interface Crystal {
   createdAt: string;
 }
 
+export interface CrystalListResponse {
+  success: boolean;
+  crystals: Crystal[];
+  partial: boolean;
+  nextCursor: string | null;
+  total: null;
+  countScope: "page";
+  reason?: string;
+}
+
 export interface Lesson extends BatchEffectMetadata {
   id: string;
   content: string;
@@ -1349,12 +1734,27 @@ export interface IndexedSemanticRecord {
   source_scope?: string;
   source_version?: string;
 }
+export type RecentOperationFunctionId =
+  | "mem::compress" | "mem::summarize" | "mem::graph-extract"
+  | "mem::summary-enqueue" | "mem::summary-unit" | "mem::summary-final"
+  | "mem::skill-extract" | "mem::profile" | "mem::consolidate" | "mem::consolidate-pipeline"
+  | "mem::patterns" | "mem::generate-rules" | "mem::reflect" | "mem::crystallize"
+  | "mem::reflect-unit" | "mem::skill-lifecycle-dispatch" | "mem::graph-dispatch-deliver"
+  | "mem::flow-compress" | "mem::enrich-window" | "mem::enrich-session" | "mem::compress-file"
+  | "mem::temporal-graph-extract" | "mem::retention-score" | "mem::retention-evict"
+  | "mem::auto-forget" | "mem::evict" | "mem::cascade-update" | "mem::heal"
+  | "mem::slot-reflect" | "mem::vision-embed" | "mem::migrate" | "mem::graph::import-graphify";
+
 export interface RecentOperation {
   id: string;
   timestamp: string;
-  functionId: "mem::compress" | "mem::summarize" | "mem::graph-extract";
+  functionId: RecentOperationFunctionId;
   outcome: "completed" | "failed" | "skipped" | "queued" | "partial";
-  counts: Partial<Record<"observationsProcessed" | "observationsCompressed" | "summariesCreated" | "nodesAdded" | "edgesAdded" | "unitsQueued", number>>;
+  counts: Partial<Record<"observationsProcessed" | "observationsCompressed" | "summariesCreated" | "nodesAdded" | "edgesAdded" | "unitsQueued" | "unitsCompleted" | "sessionsProcessed" | "skillsCreated" | "skillsReinforced" | "itemsProcessed" | "itemsCreated" | "itemsRemoved" | "itemsFailed", number>>;
+  name?: string;
+  durationMs?: number;
+  reason?: "cached" | "no_work" | "paused" | "deduplicated" | "stale" | "deterministic_fallback" | "fallback";
+  error?: { code: string; message: string };
   agentId?: string;
 }
 

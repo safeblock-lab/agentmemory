@@ -309,10 +309,10 @@ describe("MCP Resources", () => {
     const fn = sdk.getFunction("mcp::tools::call")!;
     const result = await fn(makeReq({
       name: "memory_export",
-      arguments: { collection: "graphNodes", offset: 4, limit: 2 },
+      arguments: { collection: "graphNodes", cursor: "opaque-cursor", limit: 2, replace: true },
     })) as { status_code: number };
     expect(result.status_code).toBe(200);
-    expect(forwarded).toEqual({ collection: "graphNodes", offset: 4, limit: 2 });
+    expect(forwarded).toEqual({ collection: "graphNodes", cursor: "opaque-cursor", limit: 2 });
 
     const invalid = await fn(makeReq({
       name: "memory_export",

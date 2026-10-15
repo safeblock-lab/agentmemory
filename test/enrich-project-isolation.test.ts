@@ -73,17 +73,26 @@ function makeBugMemory(overrides: Partial<Memory> = {}): Memory {
 describe("mem::enrich — project isolation for bug memories", () => {
   let sdk: ReturnType<typeof mockSdk>;
   let kv: ReturnType<typeof mockKV>;
+  let searchCandidateIds: string[];
 
   beforeEach(() => {
     sdk = mockSdk();
     kv = mockKV();
+    searchCandidateIds = [];
     registerEnrichFunction(sdk as never, kv as never);
     sdk.overrideTrigger("mem::file-context", async () => ({ context: "" }));
-    sdk.overrideTrigger("mem::search", async () => ({ results: [] }));
+    sdk.overrideTrigger("mem::search", async () => ({
+      results: searchCandidateIds.map((id) => ({ observation: { id, narrative: "" }, sessionId: "memory" })),
+    }));
   });
 
+  async function seedMemory(memory: Memory): Promise<void> {
+    await kv.set("mem:memories", memory.id, memory);
+    searchCandidateIds.push(memory.id);
+  }
+
   it("does not surface a scoped bug memory when caller project differs", async () => {
-    await kv.set("mem:memories", "mem_bug_1", makeBugMemory({ project: "api" }));
+    await seedMemory(makeBugMemory({ project: "api" }));
 
     const result = await sdk.trigger("mem::enrich", {
       sessionId: "sess-web-001",
@@ -96,7 +105,7 @@ describe("mem::enrich — project isolation for bug memories", () => {
   });
 
   it("surfaces a scoped bug memory when caller project matches", async () => {
-    await kv.set("mem:memories", "mem_bug_1", makeBugMemory({ project: "api" }));
+    await seedMemory(makeBugMemory({ project: "api" }));
 
     const result = await sdk.trigger("mem::enrich", {
       sessionId: "sess-api-001",
@@ -109,7 +118,7 @@ describe("mem::enrich — project isolation for bug memories", () => {
   });
 
   it("surfaces an unscoped (legacy) bug memory regardless of caller project", async () => {
-    await kv.set("mem:memories", "mem_bug_1", makeBugMemory({ project: undefined }));
+    await seedMemory(makeBugMemory({ project: undefined }));
 
     const result = await sdk.trigger("mem::enrich", {
       sessionId: "sess-web-001",
@@ -123,7 +132,7 @@ describe("mem::enrich — project isolation for bug memories", () => {
   });
 
   it("surfaces an unscoped bug memory when caller provides no project", async () => {
-    await kv.set("mem:memories", "mem_bug_1", makeBugMemory({ project: undefined }));
+    await seedMemory(makeBugMemory({ project: undefined }));
 
     const result = await sdk.trigger("mem::enrich", {
       sessionId: "sess-api-001",
@@ -134,7 +143,7 @@ describe("mem::enrich — project isolation for bug memories", () => {
   });
 
   it("surfaces a scoped bug memory when caller provides no project", async () => {
-    await kv.set("mem:memories", "mem_bug_1", makeBugMemory({ project: "api" }));
+    await seedMemory(makeBugMemory({ project: "api" }));
 
     // No project on the caller — guard does not engage, memory is visible
     const result = await sdk.trigger("mem::enrich", {
@@ -146,14 +155,14 @@ describe("mem::enrich — project isolation for bug memories", () => {
   });
 
   it("isolates multiple memories from different projects correctly", async () => {
-    await kv.set("mem:memories", "mem_api", makeBugMemory({
+    await seedMemory(makeBugMemory({
       id: "mem_api",
       project: "api",
       title: "express-jwt whitespace",
       content: "express-jwt whitespace issue",
       files: ["src/middleware/auth.ts"],
     }));
-    await kv.set("mem:memories", "mem_web", makeBugMemory({
+    await seedMemory(makeBugMemory({
       id: "mem_web",
       project: "web",
       title: "nextauth cookie",
@@ -181,7 +190,7 @@ describe("mem::enrich — project isolation for bug memories", () => {
   });
 
   it("only includes latest bug memories, respecting project scope", async () => {
-    await kv.set("mem:memories", "mem_old", makeBugMemory({
+    await seedMemory(makeBugMemory({
       id: "mem_old",
       project: "api",
       title: "old express bug",
@@ -189,7 +198,7 @@ describe("mem::enrich — project isolation for bug memories", () => {
       files: ["src/middleware/auth.ts"],
       isLatest: false,
     }));
-    await kv.set("mem:memories", "mem_new", makeBugMemory({
+    await seedMemory(makeBugMemory({
       id: "mem_new",
       project: "api",
       title: "new express bug",
@@ -215,10 +224,10 @@ describe("mem::enrich — project forwarded to mem::search", () => {
     const kv = mockKV();
     registerEnrichFunction(sdk as never, kv as never);
 
-    let capturedSearchPayload: Record<string, unknown> = {};
+    const capturedSearchPayloads: Array<Record<string, unknown>> = [];
     sdk.overrideTrigger("mem::file-context", async () => ({ context: "" }));
     sdk.overrideTrigger("mem::search", async (payload: unknown) => {
-      capturedSearchPayload = payload as Record<string, unknown>;
+      capturedSearchPayloads.push(payload as Record<string, unknown>);
       return { results: [] };
     });
 
@@ -228,7 +237,8 @@ describe("mem::enrich — project forwarded to mem::search", () => {
       project: "api",
     });
 
-    expect(capturedSearchPayload.project).toBe("api");
+    expect(capturedSearchPayloads.some((payload) => payload.project === "api")).toBe(true);
+    expect(capturedSearchPayloads.every((payload) => payload.limit === 12)).toBe(true);
   });
 
   it("does not pass project to search when caller provides none", async () => {
@@ -236,10 +246,10 @@ describe("mem::enrich — project forwarded to mem::search", () => {
     const kv = mockKV();
     registerEnrichFunction(sdk as never, kv as never);
 
-    let capturedSearchPayload: Record<string, unknown> = {};
+    const capturedSearchPayloads: Array<Record<string, unknown>> = [];
     sdk.overrideTrigger("mem::file-context", async () => ({ context: "" }));
     sdk.overrideTrigger("mem::search", async (payload: unknown) => {
-      capturedSearchPayload = payload as Record<string, unknown>;
+      capturedSearchPayloads.push(payload as Record<string, unknown>);
       return { results: [] };
     });
 
@@ -248,6 +258,6 @@ describe("mem::enrich — project forwarded to mem::search", () => {
       files: ["src/middleware/auth.ts"],
     });
 
-    expect(capturedSearchPayload.project).toBeUndefined();
+    expect(capturedSearchPayloads.every((payload) => payload.project === undefined)).toBe(true);
   });
 });

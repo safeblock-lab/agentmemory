@@ -1,0 +1,159 @@
+{
+  "unitId": "workspace-generated-cleanup",
+  "contractDigest": "4dc39a28b95dea14f329aa870b95266e9b3c8ce589b8b8b7ec2fedfdf5c068ad",
+  "status": "worker_evidence_ready_for_main_acceptance",
+  "checks": [
+    {
+      "check": "Wait for accepted activate-release and verify no active actor/process consumes any target; consolidate required compact evidence, release pins and recovery material before removal.",
+      "status": "passed",
+      "observedResult": "Main activation/publication accepted; closed own obsolete scanners; current process/path precheck found zero consumers. Compact staging JSON and generated root redirects saved before removal; primary receipts remained in place.",
+      "verificationRef": ".native-pagination-build/cleanup-after-activation/precheck.json"
+    },
+    {
+      "check": "Inventory only generated obsolete build/staging/cache/fixture outputs; exclude tracked source, .git, node_modules, real runtime data, current release assets and required recovery files; verify each resolved absolute path stays inside D:/agentmemory and contains no followed reparse point.",
+      "status": "passed",
+      "observedResult": "Explicit five-target manifest: two obsolete Cargo output trees, obsolete .iii-engine-build staging and two generated root redirects. All resolved within strict workspace boundary; zero tracked descendants and reparsepoints; current source/runtime/releases/private GPU material excluded.",
+      "verificationRef": ".native-pagination-build/cleanup-after-activation/deletion-manifest.json"
+    },
+    {
+      "check": "Delete only verified explicit manifest targets with native PowerShell LiteralPath after current-state check; preserve primary errors and record partial outcomes; no blanket root removal or computed cross-shell deletion.",
+      "status": "passed",
+      "observedResult": "Native PowerShell Remove-Item -LiteralPath removed all five exact manifest targets; every target absence confirmed; no deletion error or partial outcome.",
+      "verificationRef": ".native-pagination-build/cleanup-after-activation/deletion-results.json"
+    },
+    {
+      "check": "Verify preserved evidence/recovery paths and installed/watchdog health after cleanup; measure actual removed bytes and reclaimed drive space; report remaining intentionally retained build assets.",
+      "status": "passed",
+      "observedResult": "Current localhost health healthy v0.9.81; scheduled AgentMemory Running and watchdog enabled. Both native recovery engines and compact receipts retained; logical bytes and drive-space delta recorded.",
+      "verificationRef": ".native-pagination-build/cleanup-after-activation/postcheck.json"
+    }
+  ],
+  "removedLogicalBytes": 35497552454.0,
+  "removedGiB": 33.06,
+  "driveSpace": {
+    "beforeFreeBytes": 93152063488,
+    "afterFreeBytes": 126260002816,
+    "concurrentChangesCaveat": "Drive delta includes concurrent writes elsewhere."
+  },
+  "driveFreeDeltaBytes": 33107939328,
+  "targets": [
+    {
+      "path": "D:\\agentmemory\\.native-pagination-build\\cargo-target",
+      "beforeBytes": 30667810894,
+      "removed": true,
+      "removedBytes": 30667810894,
+      "error": null
+    },
+    {
+      "path": "D:\\agentmemory\\.native-pagination-build\\native-semantic-probe256\\cargo-target",
+      "beforeBytes": 4772041604,
+      "removed": true,
+      "removedBytes": 4772041604,
+      "error": null
+    },
+    {
+      "path": "D:\\agentmemory\\.iii-engine-build",
+      "beforeBytes": 57699744,
+      "removed": true,
+      "removedBytes": 57699744,
+      "error": null
+    },
+    {
+      "path": "D:\\agentmemory\\1",
+      "beforeBytes": 110,
+      "removed": true,
+      "removedBytes": 110,
+      "error": null
+    },
+    {
+      "path": "D:\\agentmemory\\130 interrupted after test process stopped making visible progress",
+      "beforeBytes": 102,
+      "removed": true,
+      "removedBytes": 102,
+      "error": null
+    }
+  ],
+  "retained": [
+    {
+      "path": "D:\\agentmemory\\.native-pagination-build\\native-graph-high-fanout-repair\\iii.exe",
+      "present": true,
+      "bytes": 28849152
+    },
+    {
+      "path": "D:\\agentmemory\\.native-pagination-build\\native-semantic-probe256\\iii.exe",
+      "present": true,
+      "bytes": 28849152
+    },
+    {
+      "path": "D:\\agentmemory\\.native-pagination-build\\quality-release-state.json",
+      "present": true,
+      "bytes": 347162
+    },
+    {
+      "path": "D:\\agentmemory\\.native-pagination-build\\publish-release-main.json",
+      "present": true,
+      "bytes": 3430
+    },
+    {
+      "path": "D:\\agentmemory\\.native-pagination-build\\activate-release-main.json",
+      "present": true,
+      "bytes": 8070
+    },
+    {
+      "path": "D:\\agentmemory\\.native-pagination-build\\llm-config-restoration-main.json",
+      "present": true,
+      "bytes": 21376
+    },
+    {
+      "path": "D:\\agentmemory\\artifacts\\agentmemory-v0.9.81",
+      "present": true,
+      "bytes": null
+    },
+    {
+      "path": "D:\\agentmemory\\artifacts\\activation-rollback",
+      "present": true,
+      "bytes": null
+    },
+    {
+      "path": "D:\\agentmemory\\artifacts\\private",
+      "present": true,
+      "bytes": null
+    },
+    {
+      "path": "D:\\agentmemory\\.git",
+      "present": true,
+      "bytes": null
+    },
+    {
+      "path": "D:\\agentmemory\\node_modules",
+      "present": true,
+      "bytes": null
+    },
+    {
+      "path": "D:\\agentmemory\\dist",
+      "present": true,
+      "bytes": null
+    },
+    {
+      "path": "D:\\agentmemory\\.native-pagination-build\\iii-source",
+      "present": true,
+      "bytes": null
+    },
+    {
+      "path": "D:\\agentmemory\\.native-pagination-build\\activate-release-scope",
+      "present": true,
+      "bytes": null
+    },
+    {
+      "path": "D:\\agentmemory\\.native-pagination-build\\publish-release",
+      "present": true,
+      "bytes": null
+    }
+  ],
+  "compactEvidenceRef": ".native-pagination-build/cleanup-after-activation/compact-evidence",
+  "remainingConcerns": [
+    "Drive delta includes concurrent filesystem activity; retained compiler downloads/source trees, small historical receipts/fixtures, current release and private GPU assets intentionally preserved.",
+    "No build-navigation directory was observed in workspace root, artifacts or native build directory listing."
+  ],
+  "processesLaunchedStillRunning": []
+}

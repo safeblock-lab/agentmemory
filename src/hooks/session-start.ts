@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { resolveProject, hookCwd } from "./_project.js";
+import { recordContextEmission } from "./_context-usage.js";
 
 // Inlined from ./sdk-guard so each hook bundles to a single self-contained
 // .mjs (matches the pattern used by every other hook entry in tsdown.config).
@@ -98,9 +99,11 @@ async function main() {
       signal: AbortSignal.timeout(INJECT_TIMEOUT_MS),
     });
     if (res.ok) {
-      const result = (await res.json()) as { context?: string };
+      const result = (await res.json()) as { context?: string; candidateTokens?: number };
       if (result.context) {
-        process.stdout.write(contextPayload(data, result.context));
+        const text = contextPayload(data, result.context);
+        process.stdout.write(text, () => recordContextEmission(REST_URL, authHeaders(), sessionId, "session-start", text,
+          text === result.context ? result.candidateTokens : undefined));
       }
     }
   } catch {

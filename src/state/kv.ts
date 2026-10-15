@@ -1,4 +1,12 @@
 import type { IIIClient } from 'iii-sdk'
+import { CanonicalMemoryIndex } from './canonical-memory.js'
+import {
+  triggerStateStorage,
+  triggerSnapshotStorage,
+  type GraphStorageMetadata,
+  type GraphStorageMetadataPrepareOptions,
+  type GraphStorageMetadataPrepareResult,
+} from './storage.js'
 import {
   commitStateBatch, getVersionedState, requestStateLease, pruneStateWork,
   type StateBatchReceipt, type StateGraphGuard, type StateGraphLease,
@@ -42,10 +50,22 @@ function notifyStateWrite(event: { scope: string; key: string; value: unknown })
 export class StateKV {
   constructor(private sdk: IIIClient) {}
 
+  snapshotTransport = (request: import("./snapshot-read-view.js").SnapshotReadRequest, timeoutMs: number): Promise<unknown> =>
+    triggerSnapshotStorage(this.sdk, request, timeoutMs)
+
+  readonly canonicalMemory = new CanonicalMemoryIndex(this)
+
   indexedRetrieval = process.env.AGENTMEMORY_RETRIEVAL_MODE !== 'legacy';
 
-  retrieval<T>(payload: Record<string, unknown>): Promise<T> {
-    return this.sdk.trigger<Record<string, unknown>, T>({ function_id: 'state::retrieval', payload });
+  retrieval<T>(payload: Record<string, unknown>, options?: { timeoutMs?: number }): Promise<T> {
+    const timeoutMs = options?.timeoutMs;
+    if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)) {
+      throw new RangeError('state_retrieval_invalid_timeout');
+    }
+    return this.sdk.trigger<Record<string, unknown>, T>({
+      function_id: 'state::retrieval', payload,
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    });
   }
 
   private transactionTrigger: StateTransactionTrigger = (functionId, payload) =>
@@ -72,10 +92,11 @@ export class StateKV {
   }
 
   async get<T = unknown>(scope: string, key: string): Promise<T | null> {
-    return this.sdk.trigger<{ scope: string; key: string }, T | null>({
+    const value = await this.sdk.trigger<{ scope: string; key: string }, T | null | undefined>({
       function_id: 'state::get',
       payload: { scope, key },
     })
+    return value === undefined ? null : value
   }
 
   async set<T = unknown>(scope: string, key: string, value: T): Promise<T> {
@@ -139,6 +160,16 @@ export class StateKV {
     return this.sdk.trigger<{ scope: string; prefix: boolean }, StateScopeRevision>({
       function_id: 'state::scope_revision_v1',
       payload: { scope, prefix },
+    })
+  }
+
+  graphStorageMetadata(): Promise<GraphStorageMetadata> {
+    return triggerStateStorage<GraphStorageMetadata>(this.sdk, { action: 'graph_metadata' })
+  }
+
+  prepareGraphStorageMetadata(options: GraphStorageMetadataPrepareOptions): Promise<GraphStorageMetadataPrepareResult> {
+    return triggerStateStorage<GraphStorageMetadataPrepareResult>(this.sdk, {
+      action: 'graph_metadata_prepare', ...options,
     })
   }
 

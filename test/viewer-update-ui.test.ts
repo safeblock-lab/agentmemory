@@ -97,14 +97,15 @@ describe("viewer release update controls", () => {
     expect(ui.dialogs).toHaveLength(0);
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(fetcher.mock.calls[0][0]).toBe("/update/check");
-    expect(fetcher.mock.calls[0][1]?.headers).not.toHaveProperty("X-AgentMemory-Update-Secret");
+    expect(new Headers(fetcher.mock.calls[0][1]?.headers).has("X-AgentMemory-Update-Secret")).toBe(false);
     expect(ui.renderUpdateCard()).toContain("Release v0.9.59 is available (currently v0.9.58)");
     expect(ui.renderUpdateCard()).toContain('data-action="confirm-update"');
     expect(ui.focus).toHaveBeenCalled();
+    ui.update.csrfToken = "stale-token";
     await ui.startReleaseUpdateFromViewer();
     expect(ui.dialogs).toHaveLength(0);
     expect(fetcher).toHaveBeenCalledTimes(3);
-    expect(fetcher.mock.calls[1][1]?.headers).not.toHaveProperty("X-AgentMemory-Update-Secret");
+    expect(new Headers(fetcher.mock.calls[1][1]?.headers).has("X-AgentMemory-Update-Secret")).toBe(false);
     const [path, request] = fetcher.mock.calls[2];
     expect(path).toBe("/update/start");
     expect(request).toMatchObject({ method: "POST", mode: "same-origin", credentials: "same-origin", headers: { "X-AgentMemory-Update-Token": "fresh-token" } });

@@ -23,7 +23,68 @@ function mockKV() {
       const m = store.get(scope);
       return m ? (Array.from(m.values()) as T[]) : [];
     },
+    async *pages<T>(scope: string, options: { limit: number; fields?: string[] }) {
+      const rows = Array.from(store.get(scope)?.entries() ?? [], ([id, value]) =>
+        options.fields?.length ? { id, ...Object.fromEntries(options.fields.filter((field) => field !== "id").map((field) => [field, (value as Record<string, unknown>)[field]])) } : value,
+      );
+      for (let offset = 0; offset < rows.length; offset += options.limit) {
+        yield { items: rows.slice(offset, offset + options.limit) as T[] };
+      }
+    },
   };
+}
+
+function registerObservationAdmission(sdk: ReturnType<typeof mockSdk>, kv: ReturnType<typeof mockKV>) {
+  sdk.registerFunction("state::observation_admit_v1", async (input: unknown) => {
+    const request = input as Record<string, any>;
+    const sessionId = request.session_id as string;
+    const identityScope = `mem:obs-identity:${sessionId}`;
+    const eventScope = `mem:obs-events:${sessionId}`;
+    const observationScope = `mem:obs:${sessionId}`;
+    const identity = await kv.get<{ observationId: string }>(identityScope, request.identity_digest);
+    const observationId = identity?.observationId ?? request.observation.id;
+    const current = await kv.get<Record<string, any>>(observationScope, observationId);
+    const event = await kv.get(eventScope, request.event_id);
+    if (event && current) {
+      return { created: false, duplicate_event: true, observation_id: observationId, observation: current, version: "1", occurrence_count: current.occurrenceCount ?? 1 };
+    }
+    if (identity && current) {
+      const count = (current.occurrenceCount ?? 1) + 1;
+      const updated = { ...current, occurrenceCount: count, lastSeenAt: request.occurred_at };
+      await kv.set(observationScope, observationId, updated);
+      await kv.set(eventScope, request.event_id, { observationId, identityDigest: request.identity_digest, occurredAt: request.occurred_at });
+      return { created: false, duplicate_event: false, observation_id: observationId, observation: updated, version: String(count), occurrence_count: count };
+    }
+    const session = await kv.get<Record<string, any>>("mem:sessions", sessionId) ?? request.session;
+    if (request.max_observations) {
+      if (session && (session.observationCount ?? 0) >= request.max_observations) {
+        throw new Error("STATE_OBSERVATION_LIMIT");
+      }
+      if (!session) {
+        const identityCount = Array.from(kv.store.get(identityScope)?.entries() ?? [])
+          .filter(([key, value]) => key !== "__ready__" && value !== null)
+          .slice(0, Math.min(request.max_observations, 4096)).length;
+        if (identityCount >= request.max_observations) throw new Error("STATE_OBSERVATION_LIMIT");
+        if (request.max_observations > 4096 && identityCount === 4096) throw new Error("STATE_TX_LIMIT_EXCEEDED");
+      }
+    }
+    const observation = {
+      ...request.observation,
+      identityDigest: request.identity_digest,
+      occurrenceCount: 1,
+      firstSeenAt: request.occurred_at,
+      lastSeenAt: request.occurred_at,
+      provenance: [{ ...request.provenance, count: 1, firstSeenAt: request.occurred_at, lastSeenAt: request.occurred_at }],
+    };
+    await kv.set(observationScope, observationId, observation);
+    await kv.set(identityScope, request.identity_digest, { observationId, identityDigest: request.identity_digest });
+    await kv.set(identityScope, "__ready__", { version: 1, ready: true });
+    await kv.set(eventScope, request.event_id, { observationId, identityDigest: request.identity_digest, occurredAt: request.occurred_at });
+    if (session) {
+      await kv.set("mem:sessions", sessionId, { ...session, observationCount: (session.observationCount ?? 0) + 1, updatedAt: request.occurred_at });
+    }
+    return { created: true, duplicate_event: false, observation_id: observationId, observation, version: "1", occurrence_count: 1 };
+  });
 }
 
 function mockSdk() {
@@ -92,6 +153,7 @@ describe("mem::observe auto-compress gate (#138)", () => {
     const sdk = mockSdk();
     const kv = mockKV();
     registerObserveFunction(sdk as never, kv as never);
+    registerObservationAdmission(sdk, kv);
 
     const result = (await sdk.trigger(
       "mem::observe",
@@ -110,6 +172,7 @@ describe("mem::observe auto-compress gate (#138)", () => {
     const sdk = mockSdk();
     const kv = mockKV();
     registerObserveFunction(sdk as never, kv as never);
+    registerObservationAdmission(sdk, kv);
 
     const payload = validPayload();
     await sdk.trigger("mem::observe", payload);
@@ -139,6 +202,7 @@ describe("mem::observe auto-compress gate (#138)", () => {
     const sdk = mockSdk();
     const kv = mockKV();
     registerObserveFunction(sdk as never, kv as never);
+    registerObservationAdmission(sdk, kv);
 
     await sdk.trigger("mem::observe", validPayload());
 
@@ -154,6 +218,7 @@ describe("mem::observe auto-compress gate (#138)", () => {
     const sdk = mockSdk();
     const kv = mockKV();
     registerObserveFunction(sdk as never, kv as never);
+    registerObservationAdmission(sdk, kv);
 
     await sdk.trigger("mem::observe", validPayload());
 
@@ -167,12 +232,14 @@ describe("mem::observe auto-compress gate (#138)", () => {
     const sdk = mockSdk();
     const kv = mockKV();
     registerObserveFunction(sdk as never, kv as never, undefined, 0);
+    registerObservationAdmission(sdk, kv);
 
     const scope = "mem:obs:ses_test";
     kv.store.set(scope, new Map(Array.from({ length: 500 }, (_, i) => [
       `old_${i}`,
       { id: `old_${i}` },
     ])));
+    await kv.set("mem:obs-identity:ses_test", "__ready__", { version: 1, ready: true });
     const result = await sdk.trigger("mem::observe", validPayload());
 
     expect(result).toMatchObject({ observationId: expect.any(String) });
@@ -185,9 +252,13 @@ describe("mem::observe auto-compress gate (#138)", () => {
     const sdk = mockSdk();
     const kv = mockKV();
     registerObserveFunction(sdk as never, kv as never, undefined, 1);
+    registerObservationAdmission(sdk, kv);
 
     await sdk.trigger("mem::observe", validPayload());
-    const result = await sdk.trigger("mem::observe", validPayload({ timestamp: new Date(Date.now() + 1).toISOString() }));
+    const result = await sdk.trigger("mem::observe", validPayload({
+      timestamp: new Date(Date.now() + 1).toISOString(),
+      data: { tool_name: "Read", tool_input: { file_path: "src/other.ts" }, tool_output: "different contents" },
+    }));
 
     expect(result).toMatchObject({ success: false, code: "SESSION_OBSERVATION_LIMIT" });
     expect(kv.store.get("mem:obs:ses_test")?.size).toBe(1);

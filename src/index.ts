@@ -1,4 +1,5 @@
 import { registerWorker, TriggerAction, type IIIClient } from "iii-sdk";
+import { startMemoryDiagnostics } from "./runtime/memory-diagnostics.js";
 import {
   hydrateProcessEnvFromFile,
   loadConfig,
@@ -27,11 +28,13 @@ import {
 import { TypeSafeDecisionProvider } from "./providers/typesafe.js";
 import { LlmTaskRouter } from "./providers/task-router.js";
 import { StateKV } from "./state/kv.js";
+import { createProviderAttemptBudgetTransport } from "./state/provider-attempt-budget.js";
+import { installProviderAttemptBudgetTransport } from "./providers/provider-attempt-budget.js";
 import { batchEffectKey } from "./state/batch-effects.js";
 import { KV } from "./state/schema.js";
 import { VectorIndex } from "./state/vector-index.js";
 import { getIndexedVector } from './state/indexed-vector.js';
-import { IndexedRetrievalError } from './state/indexed-retrieval.js';
+import { IndexedRetrievalError, createProjectIndexMaintenance } from './state/indexed-retrieval.js';
 import { IndexedLocalEmbedding } from './state/indexed-embedding.js';
 import { HybridSearch } from "./state/hybrid-search.js";
 import { IndexPersistence } from "./state/index-persistence.js";
@@ -58,9 +61,14 @@ import {
 import { registerContextFunction } from "./functions/context.js";
 import { registerSummarizeFunction } from "./functions/summarize.js";
 import { registerSummaryQueueFunctions } from "./functions/summary-queue.js";
+import { loadWorkflowAttemptAccounting } from "./functions/workflow-attempt-accounting.js";
+import { installOperationTracking } from "./functions/operation-tracking.js";
 import { registerMigrateFunction } from "./functions/migrate.js";
 import { registerFileIndexFunction } from "./functions/file-index.js";
 import { registerConsolidateFunction } from "./functions/consolidate.js";
+import { createProjectConsolidationSelector, createSkillObservationSelector } from "./functions/consolidation-selection.js";
+import { createConsolidationDecaySelector } from "./functions/consolidation-decay.js";
+import { replacePagedConsolidationRequest } from "./functions/consolidation-manifest.js";
 import { registerPatternsFunction } from "./functions/patterns.js";
 import { registerRememberFunction } from "./functions/remember.js";
 import { registerEvictFunction } from "./functions/evict.js";
@@ -76,6 +84,7 @@ import { registerClaudeBridgeFunction } from "./functions/claude-bridge.js";
 import { registerGraphFunction } from "./functions/graph.js";
 import { registerGraphJobRecovery } from "./functions/graph-jobs.js";
 import { pruneTerminalGraphWork } from "./functions/graph-retention.js";
+import { registerStorageMaintenance } from "./functions/storage-maintenance.js";
 import { registerGraphImportFunction } from "./functions/graph-import.js";
 import { registerConsolidationPipelineFunction } from "./functions/consolidation-pipeline.js";
 import { registerTeamFunction } from "./functions/team.js";
@@ -102,6 +111,7 @@ import { registerObsidianExportFunction } from "./functions/obsidian-export.js";
 import { registerReflectFunctions } from "./functions/reflect.js";
 import { registerWorkingMemoryFunctions } from "./functions/working-memory.js";
 import { registerSkillExtractFunctions } from "./functions/skill-extract.js";
+import { registerSkillLifecycleFunctions } from "./functions/skill-lifecycle.js";
 import { registerSlidingWindowFunction } from "./functions/sliding-window.js";
 import { registerQueryExpansionFunction } from "./functions/query-expansion.js";
 import { registerTemporalGraphFunctions } from "./functions/temporal-graph.js";
@@ -208,6 +218,32 @@ function batchCallbackFailure(
   };
 }
 
+export function isAutomaticStorageMaintenancePaused(): boolean {
+  return isBackgroundRecoveryPaused() && getEnvVar("AGENTMEMORY_STORAGE_MAINTENANCE_WHILE_PAUSED") !== "1";
+}
+
+export async function runAutomaticStorageMaintenance(
+  sdk: Pick<IIIClient, "trigger">,
+  log: (message: string) => void,
+): Promise<void> {
+  if (isAutomaticStorageMaintenancePaused()) return;
+  try {
+    const result = await sdk.trigger<{ action: string }, { success?: boolean; code?: string }>({
+      function_id: "mem::storage-maintenance", payload: { action: "tick" },
+    });
+    if (result?.success === false) log(`Storage maintenance paused (${result.code ?? "STATE_STORAGE_FAILED"}).`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    const code = message.match(/STATE_[A-Z0-9_]+/)?.[0] ?? "STATE_STORAGE_FAILED";
+    log(`Storage maintenance paused (${code}).`);
+  }
+}
+
+export async function runAutomaticTemporalRecovery(sdk: Pick<IIIClient, "trigger">): Promise<void> {
+  if (isBackgroundRecoveryPaused()) return;
+  await sdk.trigger({ function_id: "mem::temporal-work-unit", payload: { reconcile: true } });
+}
+
 export function registerFireworksBatchReplacement(sdk: IIIClient, kv: StateKV, coordinator: FireworksBatchCoordinator): void {
   sdk.registerFunction("mem::fireworks-batch-replace", async (data: unknown) => {
     if (!isRecord(data) || !Array.isArray(data.workItemIds) || data.workItemIds.length < 1 || data.workItemIds.length > 72
@@ -217,6 +253,18 @@ export function registerFireworksBatchReplacement(sdk: IIIClient, kv: StateKV, c
     }
     const results: { workItemId: string; result: unknown }[] = [];
     for (const id of data.workItemIds) {
+      const durable = await kv.get<FireworksBatchWorkItem>(KV.fireworksBatchWorkItems, id);
+      if (durable?.task === "consolidation" && durable.metadata?.tier === "durable") {
+        const manifestId = durable.metadata.consolidationManifestId;
+        const partitionId = durable.metadata.consolidationPartitionId;
+        const result = typeof manifestId !== "string" || !manifestId || Buffer.byteLength(manifestId) > 256
+          || typeof partitionId !== "string" || !partitionId || Buffer.byteLength(partitionId) > 256
+          ? { success: false, error: "Durable consolidation request identity is invalid" }
+          : await replacePagedConsolidationRequest(kv, coordinator, coordinator.canReplace.bind(coordinator),
+            { manifestId, partitionId, workItemId: id });
+        results.push({ workItemId: id, result });
+        continue;
+      }
       if (!await coordinator.canReplace(id)) {
         results.push({ workItemId: id, result: { success: false, error: "Old job has an ambiguous or ineligible effect state" } });
         continue;
@@ -361,6 +409,10 @@ export function createFireworksBatchCompletionHandler(
         batchSourceFingerprint: item.metadata?.sourceFingerprint,
         ...(item.metadata?.sourceIds ? { batchSourceIds: JSON.parse(item.metadata.sourceIds) } : {}),
         ...(item.metadata?.cohort ? { batchCohort: item.metadata.cohort } : {}),
+        ...(typeof item.metadata?.consolidationManifestId === "string"
+          ? { consolidationManifestId: item.metadata.consolidationManifestId } : {}),
+        ...(typeof item.metadata?.consolidationPartitionId === "string"
+          ? { consolidationPartitionId: item.metadata.consolidationPartitionId } : {}),
       },
     });
     const failure = batchCallbackFailure(result, "batch consolidation failed");
@@ -509,9 +561,24 @@ async function main() {
     },
   });
 
+  const stopMemoryDiagnostics = startMemoryDiagnostics(sdk);
   writeWorkerPidfile();
 
   const kv = new StateKV(sdk);
+  installProviderAttemptBudgetTransport(createProviderAttemptBudgetTransport(sdk));
+  const workflowAttemptAccounting = loadWorkflowAttemptAccounting(getEnvVar("AGENTMEMORY_WORKFLOW_ATTEMPT_ACCOUNTING"));
+  installOperationTracking(sdk, kv);
+  let foregroundRequests = 0;
+  let lastForegroundAt = 0;
+  const registerWithActivity = sdk.registerFunction.bind(sdk);
+  sdk.registerFunction = (id, handler, options) => {
+    if (!/^(api::|mcp::)/.test(id) || typeof handler !== "function") return registerWithActivity(id, handler, options);
+    return registerWithActivity(id, async (...args) => {
+      foregroundRequests++;
+      try { return await handler(...args); }
+      finally { foregroundRequests--; lastForegroundAt = Date.now(); }
+    }, options);
+  };
   metricsStore = new MetricsStore(kv);
   const fireworksBatch = new FireworksBatchCoordinator(
     kv,
@@ -545,6 +612,9 @@ async function main() {
 
   initMetrics(meterAccessor as ((name: string) => import("@opentelemetry/api").Meter) | undefined);
 
+  const selectConsolidation = createProjectConsolidationSelector(kv, embeddingProvider);
+  const canonical = kv.canonicalMemory;
+
   registerPrivacyFunction(sdk);
   registerObserveFunction(sdk, kv, dedupMap, config.maxObservationsPerSession, typeSafeDecisionProvider);
   registerImageQuotaCleanup(sdk, kv);
@@ -556,11 +626,15 @@ async function main() {
   registerCompressFunction(sdk, kv, provider, metricsStore, taskRouter);
   registerSearchFunction(sdk, kv);
   registerContextFunction(sdk, kv, config.tokenBudget);
-  registerSummarizeFunction(sdk, kv, provider, metricsStore, taskRouter);
-  registerSummaryQueueFunctions(sdk, kv, provider, taskRouter);
+  registerSummarizeFunction(sdk, kv, provider, metricsStore, taskRouter, workflowAttemptAccounting);
+  registerSummaryQueueFunctions(sdk, kv, provider, taskRouter, workflowAttemptAccounting);
   registerMigrateFunction(sdk, kv);
   registerFileIndexFunction(sdk, kv);
-  registerConsolidateFunction(sdk, kv, provider);
+  registerConsolidateFunction(sdk, kv, provider, {
+    select: selectConsolidation,
+    lookup: (project, title) => canonical.memoryLookup(project, title),
+    commit: (project, title, match, next, effect) => canonical.evolve(project, title, match.token, next, effect),
+  }, workflowAttemptAccounting);
   registerPatternsFunction(sdk, kv);
   registerRememberFunction(sdk, kv);
   registerEvictFunction(sdk, kv);
@@ -604,6 +678,17 @@ async function main() {
     config.auxiliaryProvider?.maxInputChars,
     config.fireworksBatch.enabled ? fireworksBatch : undefined,
     typeSafeDecisionProvider,
+    selectConsolidation,
+    async (scope, key) => {
+      const token = await canonical.lookup(scope, key);
+      return { status: "ready", canonicalId: token.canonicalId, version: token.rowVersion ?? token.scopeRevision, token };
+    },
+    createConsolidationDecaySelector(canonical),
+    (scope, key, match, id, effect, update) => {
+      if (!match.token) throw new Error("consolidation_canonical_token_missing");
+      return canonical.upsert(scope, key, match.token, id, effect, update);
+    },
+    workflowAttemptAccounting,
   );
   bootLog(`Consolidation pipeline: registered (CONSOLIDATION_ENABLED=${isConsolidationEnabled() ? "true" : "false"})`);
 
@@ -667,9 +752,12 @@ async function main() {
     taskRouter,
     config.fireworksBatch.enabled ? fireworksBatch : undefined,
     typeSafeDecisionProvider,
+    embeddingProvider ?? undefined,
   );
   registerWorkingMemoryFunctions(sdk, kv, config.tokenBudget);
-  registerSkillExtractFunctions(sdk, kv, provider, taskRouter, typeSafeDecisionProvider);
+  registerSkillExtractFunctions(sdk, kv, provider, taskRouter, typeSafeDecisionProvider,
+    createSkillObservationSelector(kv, embeddingProvider), workflowAttemptAccounting);
+  registerSkillLifecycleFunctions(sdk, kv);
   registerCascadeFunction(sdk, kv);
 
   registerSlidingWindowFunction(sdk, kv, provider, taskRouter);
@@ -705,7 +793,11 @@ async function main() {
           payload: {},
           action: TriggerAction.Void(),
         })
-        .catch(() => {});
+        .catch(() => {
+          logger.warn("Snapshot timer dispatch failed", {
+            code: "SNAPSHOT_TIMER_DISPATCH_FAILED",
+          });
+        });
     }, snapshotConfig.interval * 1000);
     snapshotTimer.unref();
     bootLog(
@@ -725,11 +817,12 @@ async function main() {
     graphWeight,
   );
 
-  const hybridRanker = (query: string, limit: number) =>
-    hybridSearch.search(query, limit);
+  const hybridRanker = (query: string, limit: number, project?: string) =>
+    hybridSearch.search(query, limit, project);
   registerSmartSearchFunction(sdk, kv, hybridRanker);
   setHybridRanker(hybridRanker);
   registerRecentSearchesSweepFunction(sdk, kv);
+  registerStorageMaintenance(sdk, kv);
 
   registerApiTriggers(sdk, kv, secret, metricsStore, provider);
   registerEventTriggers(sdk, kv);
@@ -872,7 +965,7 @@ async function main() {
       : `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
   );
   bootLog(
-    `REST API: 132 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
+    `REST API: 134 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
   );
   bootLog(
     `MCP surface (opt-in via \`agentmemory mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,
@@ -888,6 +981,64 @@ async function main() {
 
   const autoForgetIntervalMs = parseInt(process.env.AUTO_FORGET_INTERVAL_MS || "3600000", 10);
   const consolidationIntervalMs = parseInt(process.env.CONSOLIDATION_INTERVAL_MS || "7200000", 10);
+
+  const storageMaintenanceTick = () => runAutomaticStorageMaintenance(sdk, bootLog);
+  void storageMaintenanceTick();
+  const storageMaintenanceTimer = setInterval(() => void storageMaintenanceTick(), 60_000);
+  storageMaintenanceTimer.unref();
+
+  const projectIndexTick = createProjectIndexMaintenance(kv, isAutomaticStorageMaintenancePaused,
+    () => foregroundRequests > 0 || Date.now() - lastForegroundAt < 5_000, bootLog);
+  void projectIndexTick().catch(() => bootLog("Project index progress could not be saved."));
+  const projectIndexTimer = setInterval(() => {
+    void projectIndexTick().catch(() => bootLog("Project index progress could not be saved."));
+  }, 60_000);
+  projectIndexTimer.unref();
+  let temporalRecoveryRunning = false;
+  const temporalRecoveryTick = async () => {
+    if (isBackgroundRecoveryPaused() || temporalRecoveryRunning) return;
+    temporalRecoveryRunning = true;
+    try { await runAutomaticTemporalRecovery(sdk); }
+    catch { bootLog("Temporal recovery deferred; durable inputs retained."); }
+    finally { temporalRecoveryRunning = false; }
+  };
+  void temporalRecoveryTick();
+  const temporalRecoveryTimer = setInterval(() => void temporalRecoveryTick(), 60_000);
+  temporalRecoveryTimer.unref();
+
+  let workflowRecoveryRunning = false;
+  const recoverWorkflowQueues = async () => {
+    if (isBackgroundRecoveryPaused() || workflowRecoveryRunning) return;
+    workflowRecoveryRunning = true;
+    try {
+      const calls = await Promise.allSettled([
+        sdk.trigger({ function_id: "mem::reflect-recover", payload: {} }),
+        sdk.trigger({ function_id: "mem::skill-lifecycle-replay", payload: { limit: 8 } }),
+      ]);
+      for (let index = 0; index < calls.length; index++) {
+        const name = index === 0 ? "Reflect" : "Skill lifecycle";
+        const result = calls[index]!;
+        if (result.status === "rejected") {
+          bootLog(`${name} queue recovery deferred.`);
+          continue;
+        }
+        const value: unknown = result.value;
+        if (typeof value !== "object" || value === null ||
+            !("success" in value) || value.success !== true) {
+          bootLog(`${name} queue recovery reported no progress.`);
+        }
+      }
+    } finally {
+      workflowRecoveryRunning = false;
+    }
+  };
+  if (!backgroundRecoveryPaused) {
+    void recoverWorkflowQueues();
+    const workflowRecoveryTimer = setInterval(() => void recoverWorkflowQueues(), 60_000);
+    workflowRecoveryTimer.unref();
+  } else {
+    bootLog("Reflect and skill lifecycle queue recovery is paused by AGENTMEMORY_BACKGROUND_RECOVERY_PAUSED=1.");
+  }
 
   if (!backgroundRecoveryPaused) {
     let summaryRecoveryRunning = false;
@@ -923,7 +1074,7 @@ async function main() {
     if (isBackgroundRecoveryPaused() || graphRecoveryRunning) return;
     graphRecoveryRunning = true;
     try {
-      await sdk.trigger({ function_id: "mem::graph-recover", payload: {} });
+      await sdk.trigger({ function_id: "mem::graph-dispatch", payload: { localOnly: false } });
     } catch {
       console.warn("[agentmemory] Graph recovery paused; durable inputs retained");
     } finally {
@@ -1011,6 +1162,7 @@ async function main() {
   }
 
   const shutdown = async () => {
+    stopMemoryDiagnostics();
     console.log(`\n[agentmemory] Shutting down...`);
     const hardExit = setTimeout(() => {
       console.warn(

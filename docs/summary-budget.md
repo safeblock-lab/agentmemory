@@ -59,11 +59,11 @@ results retain source order. Reduce calls run in bounded rounds: each completed
 nonfinal round must strictly decrease the total serialized partial size plus
 per-partial framing cost. Outputs that do not shrink cause
 `summary_reduce_no_progress`. Work is limited to 4096 packed items per packing
-operation, 4096 selected-provider calls across a summarize invocation (including
-its final parse retry), and 12 adaptive/reduction levels. Provider wrappers and
+operation, 4096 LLM calls across a summarize invocation (including its final
+parse retry), and 12 adaptive/reduction levels. Provider wrappers and
 transports retain their existing bounded internal fallback/retry policies; those
-internal attempts are additional to the selected-provider call limit. These
-limits bound work, not elapsed completion time or the iii invocation deadline.
+internal attempts are additional to the workflow call limit. These limits bound
+work, not elapsed completion time or the iii invocation deadline.
 
 Explicit context or token-limit errors trigger bounded subdivision with a
 smaller input budget; each retry recalculates its output ceiling from the new

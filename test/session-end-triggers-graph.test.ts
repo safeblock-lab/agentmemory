@@ -34,12 +34,11 @@ describe("api::session::end → event::session::stopped (#666)", () => {
   });
 });
 
-// #666: viewer's "Build Graph" button used to POST /agentmemory/graph/build
-// which returned 404 because the endpoint was never registered. Backfill
-// the knowledge graph from existing compressed observations across every
-// session in batches.
+// #666: viewer's manual rebuild operates on its selected project in bounded
+// pages so one click cannot trigger a whole-corpus extraction.
 describe("api::graph-build endpoint (#666)", () => {
   const api = readFileSync("src/triggers/api.ts", "utf-8");
+  const builder = readFileSync("src/triggers/graph-build.ts", "utf-8");
 
   it("registers api::graph-build function", () => {
     expect(api).toMatch(/registerFunction\("api::graph-build"/);
@@ -51,24 +50,29 @@ describe("api::graph-build endpoint (#666)", () => {
     );
   });
 
-  it("iterates sessions and calls mem::graph-extract", () => {
-    expect(api).toMatch(/kv\.list<Session>\(KV\.sessions\)/);
-    expect(api).toMatch(/kv\.list<CompressedObservation>\(KV\.observations\(sid\)\)/);
-    expect(api).toMatch(
-      /sdk\.trigger\(\{\s*function_id:\s*"mem::graph-extract"/,
-    );
+  it("uses the selected project page and never enumerates all KV sessions", () => {
+    expect(api).toMatch(/buildScopedGraph\(sdk, kv, input\.project, input\.continuation/);
+    expect(builder).toMatch(/viewerProjectSessions\(kv, project, cursor\.sessionCursor/);
+    expect(builder).toContain("sdk.trigger<Record<string, unknown>, unknown>");
+    expect(builder).toContain('function_id: "mem::graph-extract"');
+    expect(builder).not.toMatch(/kv\.list/);
   });
 
-  it("filters observations that have a title (compressed only)", () => {
-    expect(api).toMatch(/typeof o\.title === "string" && o\.title\.length > 0/);
+  it("extracts only observations with compressed titles", () => {
+    expect(builder).toMatch(/compressedObservations\(page\.value\.items, sessionId\)/);
+    expect(builder).toMatch(/observation\.title === undefined \|\| observation\.title === null/);
   });
 
-  it("respects batchSize override with a 100-item upper bound", () => {
-    expect(api).toMatch(/Math\.min\(100,\s*Number\(.*batchSize/);
+  it("caps a rebuild unit at 25 observations and 1 MiB before extraction", () => {
+    expect(builder).toMatch(/MAX_GRAPH_BUILD_OBSERVATIONS = 25/);
+    expect(builder).toMatch(/MAX_GRAPH_BUILD_PAGE_BYTES = 1_048_576/);
+    expect(builder).toMatch(/limit: MAX_GRAPH_BUILD_OBSERVATIONS,[\s\S]*?maxBytes: MAX_GRAPH_BUILD_PAGE_BYTES/);
   });
 
-  it("response shape matches what the viewer expects (success + nodes)", () => {
-    expect(api).toMatch(/success:\s*true,\s*sessions:[\s\S]*?nodes:\s*totalNodes/);
+  it("reports honest bounded progress and replay continuation states", () => {
+    expect(builder).toMatch(/type GraphBuildStatus = "completed" \| "partial" \| "queued" \| "failed"/);
+    expect(builder).toMatch(/continuation: string \| null/);
+    expect(builder).toMatch(/expectedGraphJobId/);
   });
 });
 

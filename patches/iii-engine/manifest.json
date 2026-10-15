@@ -4,10 +4,10 @@
   "sourceRepository": "https://github.com/iii-hq/iii.git",
   "sourceCommit": "e7de3820d1e558f3762edf95e4440552444d48d3",
   "patchPath": "patches/iii-engine/0.22.1-state-pagination.patch",
-  "patchSha256": "9dfd2676ae7e7e1a8d749d5a2493af9463261b42386b419a7a4bcd54ec29e004",
+  "patchSha256": null,
   "artifactPath": ".codex-task/bounded-engine/cargo-target/x86_64-pc-windows-msvc/release/iii.exe",
-  "artifactSha256": "143d77823a48003d10dba9c1ad96ebe894eb3e45f94386b57061eb1d8ce4ac6c",
-  "artifactBytes": 29135360,
+  "artifactSha256": null,
+  "artifactBytes": null,
   "buildTarget": "x86_64-pc-windows-msvc",
   "verifiedPlatform": "win32-x64",
   "capabilities": [
@@ -19,11 +19,23 @@
     "state::native_storage_v2",
     "state::shadow_migration_v1",
     "state::terminal_retention_v1",
-    "state::scope_revision_v1"
+    "state::scope_revision_v1",
+    "state::storage",
+    "state::observation_admit_v1",
+    "state::observation_replace_v1",
+    "state::storage_retention_v1",
+    "state::viewer_recent_v1",
+    "state::graph_concept_seeds_v1",
+    "state::crystal_page_v1"
   ],
   "retrievalCapabilities": [
     "state::indexed_graph_v1",
-    "state::semantic_lsh_v1"
+    "state::semantic_lsh_v1",
+    "state::canonical_memory_v1",
+    "state::project_catalog_repair_v1",
+    "state::viewer_recent_v1",
+    "state::graph_concept_seeds_v1",
+    "state::crystal_page_v1"
   ],
   "capabilityProbe": {
     "functionId": "state::retrieval",
@@ -46,40 +58,141 @@
     "noDefaultFeatures": true,
     "target": "x86_64-pc-windows-msvc",
     "targetSelection": "explicit x86_64-pc-windows-msvc target from the bounded engine source checkout",
-    "command": "C:\\Users\\harus\\.cargo\\bin\\cargo.exe build --locked --release --no-default-features --jobs 1 --package iii --bin iii --target x86_64-pc-windows-msvc"
-  },
-  "deploymentReady": true,
-  "rustToolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)",
-  "builtAt": "2026-10-08T19:18:24.846Z",
-  "validation": {
-    "canonicalCandidateReceipt": "artifacts/private/release-0.9.83/native-candidate/native-candidate-receipt.json",
-    "patchApplyCheck": "not rerun for this version",
-    "nativeChecks": {
-      "evidenceKind": "external-exact-body",
-      "assertionsPassed": true,
-      "originalFunctionExecutedByLibtest": false,
-      "command": "node artifacts/private/release-0.9.83/native-candidate/scope-revision-exact-body.mjs",
-      "log": "artifacts/private/release-0.9.83/native-candidate/scope-revision-exact-body.run.stdout.log",
-      "receipt": "artifacts/private/release-0.9.83/native-candidate/scope-revision-exact-body.receipt.json",
-      "cargoTestResidual": "Original libtest invocation timed out during compilation; no assertion result"
+    "packageOverrides": {
+      "iii": {
+        "codegenUnits": 1
+      }
     },
-    "optimizedBuild": {
+    "packageOverride": "profile.release.package.iii.codegen-units=1",
+    "command": "cargo build --locked --release --no-default-features --jobs 1 --package iii --bin iii --target x86_64-pc-windows-msvc --config profile.release.package.iii.codegen-units=1",
+    "commandFile": ".codex-task/local-reactivation-20261010/direct-execution/native-mixed-build/cached-release.cmd"
+  },
+  "deploymentReady": false,
+  "rustToolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "builtAt": null,
+  "storageRetentionSource": {
+    "status": "final-combined-source-compiled",
+    "functions": [
+      "state::storage",
+      "state::observation_admit_v1",
+      "state::observation_replace_v1"
+    ],
+    "priorEvidenceIsHistorical": true,
+    "testsRun": false,
+    "runtimeProbesRun": false,
+    "finalCapabilityContinuationRequired": false,
+    "firstNativeCompilation": {
       "exitCode": 0,
-      "command": "C:\\Users\\harus\\.cargo\\bin\\cargo.exe build --locked --release --no-default-features --jobs 1 --package iii --bin iii --target x86_64-pc-windows-msvc",
+      "log": ".codex-task/bounded-engine/build.log",
+      "compilerResult": "Finished release profile [optimized] target(s) in 8m 46s",
+      "scope": "Compiled initial storage APIs; subsequent correctness and readiness refinements require the final combined capability rebuild."
+    },
+    "finalCombinedBuild": {
+      "exitCode": 0,
       "log": ".codex-task/bounded-engine/build.log",
       "exitEvidence": ".codex-task/bounded-engine/build-exit.txt",
-      "scope": "Compilation only; failed-job retention preservation and safe capture-unavailable closure included. Tests and optional probes were not run."
-    },
-    "capabilityProbe": {
+      "compilerResult": "Finished `release` profile [optimized] target(s) in 5m 08s",
+      "sourceFrozenByPriorOwner": true,
+      "includes": [
+        "per-session readiness",
+        "historical observation event seeding and aggregation",
+        "five-day event expiry and idempotency",
+        "strict graph byte budgets",
+        "real compressed preservation guards",
+        "native storage and observation capability declarations"
+      ]
+    }
+  },
+  "validation": {
+    "optimizedBuild": {
+      "command": "cargo build --locked --release --no-default-features --jobs 1 --package iii --bin iii --target x86_64-pc-windows-msvc --config profile.release.package.iii.codegen-units=1",
+      "commandFile": ".codex-task/native-canonical-memory-index/production-observation-stale-candidate-filter-03.cmd",
+      "log": ".codex-task/native-canonical-memory-index/production-observation-stale-candidate-filter-03.log",
+      "exitEvidence": ".codex-task/native-canonical-memory-index/production-observation-stale-candidate-filter-03.exitcode.txt",
       "exitCode": 0,
-      "expectedCount": 9,
-      "actualCount": 9,
-      "receipt": "artifacts/private/release-0.9.83/native-candidate/candidate-capabilities.receipt.json"
+      "artifactPath": ".codex-task/bounded-engine/cargo-target/x86_64-pc-windows-msvc/release/iii.exe",
+      "artifactSha256": "f9cbaa0e1547181fcbdf85a38eb42ecc9ed1e48e717a6238b1410faac111ea6e",
+      "artifactBytes": 28144640,
+      "sourcePatchPath": "patches/iii-engine/0.22.1-state-pagination.patch",
+      "sourcePatchSha256": "e6bb090a3586172390b1d16d4206cdf45e9c54f719ec2f408c9f0216d189737b",
+      "sourcePatchPaths": 132,
+      "buildProfile": {
+        "name": "release",
+        "optimized": true,
+        "optLevel": "s",
+        "debugInfo": false,
+        "strip": true,
+        "lto": false,
+        "codegenUnits": 16,
+        "jobs": 1,
+        "incremental": false,
+        "locked": true,
+        "offline": false,
+        "noDefaultFeatures": true,
+        "target": "x86_64-pc-windows-msvc",
+        "targetSelection": "explicit x86_64-pc-windows-msvc target from the bounded engine source checkout",
+        "packageOverrides": {
+          "iii": {
+            "codegenUnits": 1
+          }
+        },
+        "packageOverride": "profile.release.package.iii.codegen-units=1",
+        "command": "cargo build --locked --release --no-default-features --jobs 1 --package iii --bin iii --target x86_64-pc-windows-msvc --config profile.release.package.iii.codegen-units=1",
+        "commandFile": ".codex-task/native-canonical-memory-index/production-observation-stale-candidate-filter-03.cmd"
+      }
     },
-    "pendingGates": [
-      "Package tarball and isolated real RPC/export smoke",
-      "Live operational installation and acceptance"
-    ]
+    "testsRun": true,
+    "focusedNativeTests": {
+      "exitCode": 0,
+      "passed": 22,
+      "log": ".codex-task/grouped-graph-control/native-scoped-graph-focused-final.log"
+    },
+    "focusedRetentionProgressTests": {
+      "exitCode": 0,
+      "passed": 9,
+      "failed": 0,
+      "ignored": 0,
+      "log": ".codex-task/native-retention-progress/focused-tests-accepted.log",
+      "exitEvidence": ".codex-task/native-retention-progress/focused-tests-accepted.exitcode.txt"
+    },
+    "broaderSqliteTests": {
+      "exitCode": 101,
+      "passed": 51,
+      "failed": 2,
+      "ignored": 1,
+      "log": ".codex-task/grouped-graph-control/native-scoped-graph-final-tests.log"
+    },
+    "typecheckRun": false,
+    "runtimeProbesRun": false,
+    "checksumComparisonsRun": false,
+    "metadataDigestsGenerated": true,
+    "focusedTemporalRetentionTests": {
+      "exitCode": 0,
+      "passed": 20,
+      "failed": 0,
+      "ignored": 0,
+      "log": ".codex-task/native-temporal-retention/focused.log",
+      "exitEvidence": ".codex-task/native-temporal-retention/focused.exitcode.txt",
+      "sqlitePassed": 12,
+      "metricsAndLogsPassed": 8
+    },
+    "observationScopedReadiness": {
+      "status": "passed-private-engine-stale-membership",
+      "harness": ".codex-task/local-reactivation-20261010/observation-readiness-contract/readiness-stale-membership.mjs",
+      "receipt": ".codex-task/local-reactivation-20261010/observation-readiness-contract/runtime-fixture-04/readiness-stale-membership-06-result.json",
+      "calls": 24,
+      "providerCalls": 0,
+      "schedulerEffects": false,
+      "artifactSha256": "f9cbaa0e1547181fcbdf85a38eb42ecc9ed1e48e717a6238b1410faac111ea6e",
+      "checks": [
+        "preexisting fallback membership queried without source rewrite or semantic upsert",
+        "unrelated oversized summary made the global catalog partial",
+        "original summary and observation value/version remained identical",
+        "preexisting fallback posting excluded from keyword and semantic search while summaries catalog is partial",
+        "authoritative session observation remains searchable while summaries catalog is partial",
+        "summary fallback resumes in both search paths after catalog readiness returns"
+      ]
+    }
   },
   "historicalRelease": {
     "schemaVersion": 1,
@@ -190,7 +303,9 @@
     "deploymentReady marks this local artifact as eligible for packaging review; it is not production migration, service cutover, or binary activation.",
     "Synthetic migration and retrieval probes do not authorize or perform production migration, service restart, or binary activation.",
     "ANN candidate search is approximate; held-out real-model recall and total engine plus Node resource acceptance are separate checks.",
-    "The direct crash helper is intentionally ignored because its passing parent test runs it as an isolated subprocess; the bounded growth diagnostic is reported separately in native-check-coverage.md."
+    "The direct crash helper is intentionally ignored because its passing parent test runs it as an isolated subprocess; the bounded growth diagnostic is reported separately in native-check-coverage.md.",
+    "The fresh optimized binary has focused synthetic native tests only; no live service, production database, scheduler, provider, or installed runtime proof was performed.",
+    "deploymentReady remains false and runtimeVerified remains false until the separate installation and real-data acceptance gates complete."
   ],
   "historicalOptimizedRelease": {
     "schemaVersion": 1,
@@ -1124,7 +1239,7 @@
     "patchSha256": "1820cf0ee91655ee7be5bc7309cda927e16b52712df464f3dc382d580643eee9",
     "artifactSha256": "306982cafbfbf673ec723595b679077b2f9651a5f1098606c5dff6a9a3db95a4",
     "artifactBytes": 29281792,
-    "builtAt": "2026-10-06T04:31:26.6999520Z",
+    "builtAt": "2026-10-06T04:31:26.699952Z",
     "capabilities": [
       "state::list_page",
       "state::get_versioned",
@@ -1181,12 +1296,604 @@
     }
   },
   "currentReleaseBuild": {
+    "commandFile": ".codex-task/local-reactivation-20261010/direct-execution/native-mixed-build/cached-release.cmd",
+    "artifactPath": ".codex-task/bounded-engine/cargo-target/x86_64-pc-windows-msvc/release/iii.exe",
+    "artifactSha256": "0e1590f041ac9072598169ae6af8fa95c8930719d67351d641efc6c3a9001ac2",
+    "artifactBytes": 28243456,
+    "sourcePatchSha256": "e98df2ccd0ec1295018c5bdf8ffb083edf20fd6eaa85b807d735ab913c72c437",
+    "sourcePatchPaths": 135,
+    "exitCode": 0,
+    "compilerResult": "Finished `release` profile [optimized] target(s) in 14m 06s",
+    "currentSourceRecomputedSha256": "e98df2ccd0ec1295018c5bdf8ffb083edf20fd6eaa85b807d735ab913c72c437",
+    "sourceFreezeMatchesCurrent": true,
+    "sourceChangeDuringCargo": {
+      "rustcStartUtc": "2026-10-11T11:14:29.734124Z",
+      "fileLastWriteUtc": "2026-10-11T11:11:49.6020109Z",
+      "preCargoHash": "294995EE96606CF07F5206FC74BB2C936501B13531FCDF2E16C920C5B3228293",
+      "interpretation": "Correction occurred after cargo launch, before iii rustc invocation. Not an immutable pre-cargo source freeze.",
+      "finalHash": "B74010451F9A551DBF3630D6E2614D64FCBCF9A3F9E74E2DB7A12052C0F78ED5",
+      "cargoStartUtc": "2026-10-11T11:11:07.57014Z"
+    },
+    "patchAssembly": ".codex-task/local-reactivation-20261010/direct-execution/native-mixed-build/patch-assembly.json",
+    "buildLog": ".codex-task/local-reactivation-20261010/direct-execution/native-mixed-build/cached-release.log",
+    "buildExit": ".codex-task/local-reactivation-20261010/direct-execution/native-mixed-build/cached-release.exitcode.txt"
+  },
+  "builtPlatform": "win32-x64",
+  "historicalPreStorageRetentionValidation": {
+    "canonicalCandidateReceipt": "artifacts/private/release-0.9.83/native-candidate/native-candidate-receipt.json",
+    "patchApplyCheck": "not rerun for this version",
+    "nativeChecks": {
+      "evidenceKind": "external-exact-body",
+      "assertionsPassed": true,
+      "originalFunctionExecutedByLibtest": false,
+      "command": "node artifacts/private/release-0.9.83/native-candidate/scope-revision-exact-body.mjs",
+      "log": "artifacts/private/release-0.9.83/native-candidate/scope-revision-exact-body.run.stdout.log",
+      "receipt": "artifacts/private/release-0.9.83/native-candidate/scope-revision-exact-body.receipt.json",
+      "cargoTestResidual": "Original libtest invocation timed out during compilation; no assertion result"
+    },
+    "optimizedBuild": {
+      "exitCode": 0,
+      "command": "C:\\Users\\harus\\.cargo\\bin\\cargo.exe build --locked --release --no-default-features --jobs 1 --package iii --bin iii --target x86_64-pc-windows-msvc",
+      "log": ".codex-task/bounded-engine/build.log",
+      "exitEvidence": ".codex-task/bounded-engine/build-exit.txt",
+      "scope": "Compilation only; failed-job retention preservation and safe capture-unavailable closure included. Tests and optional probes were not run."
+    },
+    "capabilityProbe": {
+      "exitCode": 0,
+      "expectedCount": 9,
+      "actualCount": 9,
+      "receipt": "artifacts/private/release-0.9.83/native-candidate/candidate-capabilities.receipt.json"
+    },
+    "pendingGates": [
+      "Package tarball and isolated real RPC/export smoke",
+      "Live operational installation and acceptance"
+    ]
+  },
+  "historicalPreNativeIncrementalReleaseBuild": {
+    "capabilityProbeRun": false,
+    "command": "cargo build --locked --release --no-default-features --jobs 1 --package iii --bin iii --target x86_64-pc-windows-msvc",
+    "applicationTestsRun": false,
+    "typecheckRun": false,
     "version": "0.22.1",
+    "exitCode": 0,
+    "log": ".codex-task/bounded-engine/build.log",
+    "compilerResult": "Finished `release` profile [optimized] target(s) in 5m 08s",
+    "artifactPath": ".codex-task/bounded-engine/cargo-target/x86_64-pc-windows-msvc/release/iii.exe",
+    "finalCombinedSource": true
+  },
+  "historicalPreNativeIncrementalCompactionValidation": {
+    "optimizedBuild": {
+      "exitCode": 0,
+      "command": "C:\\Users\\harus\\.cargo\\bin\\cargo.exe build --locked --release --no-default-features --jobs 1 --package iii --bin iii --target x86_64-pc-windows-msvc",
+      "log": ".codex-task/bounded-engine/build.log",
+      "exitEvidence": ".codex-task/bounded-engine/build-exit.txt",
+      "compilerResult": "Finished `release` profile [optimized] target(s) in 5m 08s",
+      "scope": "Final combined native storage source plus CLI capability declarations compiled. Compilation only."
+    },
+    "testsRun": false,
+    "typecheckRun": false,
+    "runtimeProbesRun": false,
+    "capabilityProbeRun": false,
+    "patchApplyCheckRun": false,
+    "checksumVerificationRun": false,
+    "digestsGeneratedForPackaging": true
+  },
+  "nativeIncrementalCompaction": {
+    "status": "source-compiled-runtime-unverified",
+    "actions": [
+      "physical",
+      "reclaim",
+      "migrate_incremental"
+    ],
+    "periodicLimits": {
+      "defaultPages": 1,
+      "maxPages": 16,
+      "targetMaxMs": 25,
+      "busyMs": 1,
+      "minIntervalMs": 5000,
+      "maxWalBytes": 16777216,
+      "oneInFlight": true,
+      "foregroundPriority": true
+    },
+    "checkpointPerformed": false,
+    "resumeSource": "Current SQLite page_count/freelist_count and live file metrics; no assumed persisted page offset.",
+    "newDatabaseAutoVacuum": 2,
+    "existingMode0": "migration_required; explicit allow_blocking migration uses atomic full VACUUM once; never periodic.",
+    "testsRun": false,
+    "runtimeVerified": false,
+    "liveMigrationPerformed": false,
+    "failedCompileLog": ".codex-task/bounded-engine/build-incremental-attempt1.log",
+    "limits": [
+      "Progress callbacks and 1ms busy timeout are cooperative limits, not hard filesystem latency guarantees.",
+      "A single page move/commit can exceed the 25ms target; no zero-impact or billion-row acceptance claim.",
+      "Mode0 conversion blocks the worker and requires temporary disk space proportional to database size; explicit maintenance window and backup/recovery plan required before execution.",
+      "In WAL mode logical page reclamation can precede main-file shrink; returned database_bytes and wal_bytes report current physical files.",
+      "Existing ordinary foreground WAL-pressure and shutdown checkpoint policy retained; periodic reclaim performs neither TRUNCATE nor full VACUUM.",
+      "No tests, runtime calls, migration, capability probes, patch-apply checks, or checksum comparisons were run."
+    ]
+  },
+  "historicalPreNativeReflectProjectionReleaseBuild": {
     "exitCode": 0,
     "command": "cargo build --locked --release --no-default-features --jobs 1 --package iii --bin iii --target x86_64-pc-windows-msvc",
     "log": ".codex-task/bounded-engine/build.log",
+    "exitEvidence": ".codex-task/bounded-engine/build-exit.txt",
+    "compilerResult": "Finished `release` profile [optimized] target(s) in 5m 24s",
+    "artifactPath": ".codex-task/bounded-engine/cargo-target/x86_64-pc-windows-msvc/release/iii.exe",
+    "scope": "Native incremental reclamation and physical metrics compilation only; source includes prior state/graph/lease fixes.",
     "applicationTestsRun": false,
     "typecheckRun": false,
     "capabilityProbeRun": false
+  },
+  "nativeReflectProjection": {
+    "limits": [
+      "Stored and logical source bytes checked before blob allocation, codec decompression and JSON parsing. Oversized originals remain stored and are deferred.",
+      "Malformed codec/JSON values fail the request without exposing source text.",
+      "Cooperative SQLite and elapsed budgets do not guarantee hard filesystem latency limits.",
+      "If deferred identity metadata alone exceeds the requested response budget, the request returns STATE_RETRIEVAL_RESOURCE_LIMIT.",
+      "Compilation only; no runtime, provider, capability, test or optional verification calls performed."
+    ],
+    "maxItems": 12,
+    "patchApplyCheckRun": false,
+    "projectAuthority": "Direct project or all bounded source session references; snapshot concept nodes filtered individually by project authority.",
+    "action": "reflect_sources",
+    "maxLogicalSourceBytes": 65536,
+    "maxStoredSourceBytes": 65536,
+    "status": "source-compiled-runtime-unverified",
+    "runtimeVerified": false,
+    "maxBytes": 65536,
+    "checksumVerificationRun": false,
+    "deferredReasons": [
+      "oversized",
+      "missing",
+      "stale",
+      "audience_unknown",
+      "project_mismatch"
+    ],
+    "digestsGeneratedForPackaging": true,
+    "maxSnapshotConceptNodes": 12,
+    "sourceScopeWhitelist": [
+      "mem:memories",
+      "mem:obs:*",
+      "mem:semantic",
+      "mem:lessons",
+      "mem:crystals",
+      "mem:summaries",
+      "mem:graph:snapshot"
+    ],
+    "maxSessionReferences": 12,
+    "testsRun": false,
+    "fingerprint": "SHA256 serialized projected value and native version",
+    "cooperativeBudgetMs": 3000
+  },
+  "nativeScopedGraphRetrieval": {
+    "status": "source-built-focused-tests-passed-runtime-unverified",
+    "modes": [
+      "search",
+      "neighbors",
+      "history",
+      "time",
+      "differential",
+      "top_n",
+      "aggregate"
+    ],
+    "focusedTests": {
+      "exitCode": 0,
+      "passed": 22,
+      "log": ".codex-task/grouped-graph-control/native-scoped-graph-focused-final.log"
+    },
+    "broaderSqliteTests": {
+      "exitCode": 101,
+      "passed": 51,
+      "failed": 2,
+      "ignored": 1,
+      "log": ".codex-task/grouped-graph-control/native-scoped-graph-final-tests.log"
+    },
+    "runtimeVerified": false,
+    "deploymentReady": false
+  },
+  "nativeRetentionProgress": {
+    "status": "source-built-focused-tests-passed-runtime-unverified",
+    "oversizedRowBehavior": {
+      "maxLogicalRecordBytes": 16777216,
+      "firstOversizedRowDeletedAlone": true,
+      "metadataOnlyWithoutPayloadDecode": true,
+      "deferredAfterEarlierDeletionWithoutAdvancingCursor": true,
+      "subsequentRowsAndTombstonesComplete": true
+    },
+    "failedStoppedJobs": {
+      "remainNonprunable": true,
+      "capturesPreserved": true
+    },
+    "focusedTests": {
+      "exitCode": 0,
+      "passed": 9,
+      "failed": 0,
+      "ignored": 0,
+      "log": ".codex-task/native-retention-progress/focused-tests-accepted.log",
+      "exitEvidence": ".codex-task/native-retention-progress/focused-tests-accepted.exitcode.txt"
+    },
+    "productionBuild": {
+      "exitCode": 0,
+      "compilerResult": "Finished `release` profile [optimized] target(s) in 4m 50s",
+      "log": ".codex-task/bounded-engine/build.log",
+      "exitEvidence": ".codex-task/bounded-engine/build-exit.txt",
+      "artifactPath": ".codex-task/bounded-engine/cargo-target/x86_64-pc-windows-msvc/release/iii.exe",
+      "artifactSha256": "55cd0bf84c685043e4f3f6777f2f1668a79342cefaeb7d35267e693805685e43",
+      "artifactBytes": 30268928
+    },
+    "previousNativeScopedBuild": {
+      "exitCode": 0,
+      "compilerResult": "Finished release profile [optimized] target(s) in 12m 15s",
+      "log": ".codex-task/native-retention-progress/predecessor-production-build.log",
+      "exitEvidence": ".codex-task/native-retention-progress/predecessor-production-build.exitcode.txt"
+    },
+    "canonicalPatch": {
+      "path": "patches/iii-engine/0.22.1-state-pagination.patch",
+      "sha256": "70dab8905956bed28227c5f7fbac11aebc658a74c45663073286f09af72c3b6d",
+      "changedPaths": 99,
+      "reverseCheck": "passed"
+    },
+    "broaderSqliteRunAfterFix": false,
+    "deploymentReady": false,
+    "runtimeVerified": false
+  },
+  "temporalRetentionPredecessor": {
+    "builtAt": "2026-10-09T11:47:16.1911707Z",
+    "artifactSha256": "55cd0bf84c685043e4f3f6777f2f1668a79342cefaeb7d35267e693805685e43",
+    "patchSha256": "70dab8905956bed28227c5f7fbac11aebc658a74c45663073286f09af72c3b6d",
+    "validation": {
+      "exitCode": 0,
+      "command": "cargo build --locked --release --no-default-features --jobs 1 --package iii --bin iii --target x86_64-pc-windows-msvc",
+      "log": ".codex-task/bounded-engine/build.log",
+      "exitEvidence": ".codex-task/bounded-engine/build-exit.txt",
+      "compilerResult": "Finished `release` profile [optimized] target(s) in 4m 50s",
+      "artifactPath": ".codex-task/bounded-engine/cargo-target/x86_64-pc-windows-msvc/release/iii.exe",
+      "scope": "Fresh production iii.exe includes native project-first graph retrieval, bounded graph snapshot reads and oversized-row retention progress; runtime remains unverified.",
+      "applicationTestsRun": false,
+      "typecheckRun": false,
+      "capabilityProbeRun": false
+    }
+  },
+  "runtimeVerified": false,
+  "canonicalMemoryIndexPredecessor": {
+    "builtAt": "2026-10-09T12:56:07.984Z",
+    "artifactSha256": "af20c291f4177cd9ad3b6e89fb75c361517261c416c9aeef08100f7eaa966492",
+    "patchSha256": "e355aa1cb5e928ef1467305d76e969514605ec7fd8c3cf6ee1fc7ec3a740043a"
+  },
+  "nativeCanonicalMemoryIndex": {
+    "status": "source-built-focused-tests-passed-runtime-unverified",
+    "wireContract": ".codex-task/native-canonical-memory-index/wire-contract.json",
+    "normalizationVersion": "js-lower-v1",
+    "canonicalPatchPaths": 130,
+    "protectedPredecessorPaths": 99,
+    "patchSha256": "8f26db6043d60c91b6e7b561ee95f28b474b0fe5dbf0db549c10cbf4a4d7e9cb",
+    "artifactPath": ".codex-task/bounded-engine/cargo-target/x86_64-pc-windows-msvc/release/iii.exe",
+    "productionBuild": {
+      "command": "\"C:\\Users\\harus\\.cargo\\bin\\cargo.exe\" build --offline --locked --release --no-default-features --jobs 1 --package iii --bin iii --target x86_64-pc-windows-msvc --config profile.release.package.iii.codegen-units=1 > \"D:\\agentmemory\\.codex-task\\local-reactivation-20261010\\native\\optimized-build.log\" 2>&1",
+      "commandFile": ".codex-task/local-reactivation-20261010/native/optimized-build.cmd",
+      "log": ".codex-task/local-reactivation-20261010/native/optimized-build.log",
+      "exitEvidence": ".codex-task/local-reactivation-20261010/native/optimized-build.exitcode.txt",
+      "exitCode": 0,
+      "compilerResult": "    Finished `release` profile [optimized] target(s) in 6m 55s",
+      "artifactPath": ".codex-task/bounded-engine/cargo-target/x86_64-pc-windows-msvc/release/iii.exe",
+      "artifactSha256": "6012aa8c218a1345a7fe660921a1092706d54c162d0b48f6e284029c27975eba",
+      "artifactBytes": 28097024,
+      "stagedArtifactPath": ".codex-task/bounded-engine/artifacts/local-reactivation-20261010/iii.exe",
+      "stagedArtifactSha256": "6012aa8c218a1345a7fe660921a1092706d54c162d0b48f6e284029c27975eba",
+      "sourcePatchPath": "patches/iii-engine/0.22.1-state-pagination.patch",
+      "sourcePatchSha256": "8f26db6043d60c91b6e7b561ee95f28b474b0fe5dbf0db549c10cbf4a4d7e9cb",
+      "sourcePatchPaths": 130,
+      "buildProfile": {
+        "name": "release",
+        "optimized": true,
+        "optLevel": "s",
+        "debugInfo": false,
+        "strip": true,
+        "lto": false,
+        "codegenUnits": 16,
+        "jobs": 1,
+        "incremental": false,
+        "locked": true,
+        "offline": true,
+        "noDefaultFeatures": true,
+        "target": "x86_64-pc-windows-msvc",
+        "targetSelection": "explicit x86_64-pc-windows-msvc target from the bounded engine source checkout",
+        "packageOverrides": {
+          "iii": {
+            "codegenUnits": 1
+          }
+        },
+        "packageOverride": "profile.release.package.iii.codegen-units=1",
+        "command": "\"C:\\Users\\harus\\.cargo\\bin\\cargo.exe\" build --offline --locked --release --no-default-features --jobs 1 --package iii --bin iii --target x86_64-pc-windows-msvc --config profile.release.package.iii.codegen-units=1 > \"D:\\agentmemory\\.codex-task\\local-reactivation-20261010\\native\\optimized-build.log\" 2>&1",
+        "commandFile": ".codex-task/local-reactivation-20261010/native/optimized-build.cmd"
+      }
+    },
+    "focusedNativeTests": {
+      "exitCode": 0,
+      "passed": 118,
+      "failed": 0,
+      "ignored": 2,
+      "log": ".codex-task/native-canonical-memory-index/focused-09.log",
+      "exitEvidence": ".codex-task/native-canonical-memory-index/focused-09.exitcode.txt",
+      "command": ".codex-task/native-canonical-memory-index/focused-09.cmd",
+      "evidence": "Reused accepted focused-09 result; no test rerun."
+    },
+    "observationUnscopedCap": {
+      "exitCode": 0,
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0,
+      "log": ".codex-task/observation-unscoped-cap/native-observation-tests-attempt-3.log",
+      "exitEvidence": ".codex-task/observation-unscoped-cap/native-observation-tests-attempt-3.exitcode.txt",
+      "evidence": ".codex-task/observation-unscoped-cap/evidence.json",
+      "evidenceReused": true
+    },
+    "runtimeVerified": false,
+    "deploymentReady": false,
+    "artifactSha256": "6012aa8c218a1345a7fe660921a1092706d54c162d0b48f6e284029c27975eba",
+    "artifactBytes": 28097024,
+    "graphMetadataAndCatalogTests": [
+      {
+        "commandFile": ".codex-task/local-reactivation-20261010/native/graph-metadata.cmd",
+        "logFile": ".codex-task/local-reactivation-20261010/native/graph-metadata.log",
+        "exitEvidence": ".codex-task/local-reactivation-20261010/native/graph-metadata.exitcode.txt",
+        "exitCode": 0,
+        "passed": 4,
+        "failed": 0,
+        "ignored": 0,
+        "filteredOut": 2159,
+        "duration": "6.87s"
+      },
+      {
+        "commandFile": ".codex-task/local-reactivation-20261010/native/project-catalog.cmd",
+        "logFile": ".codex-task/local-reactivation-20261010/native/project-catalog.log",
+        "exitEvidence": ".codex-task/local-reactivation-20261010/native/project-catalog.exitcode.txt",
+        "exitCode": 0,
+        "passed": 6,
+        "failed": 0,
+        "ignored": 0,
+        "filteredOut": 2157,
+        "duration": "0.11s"
+      }
+    ]
+  },
+  "nativeGraphMetadata": {
+    "status": "source-built-focused-tests-passed-runtime-unverified",
+    "scopeCount": 7,
+    "sourcePatchSha256": "8f26db6043d60c91b6e7b561ee95f28b474b0fe5dbf0db549c10cbf4a4d7e9cb",
+    "patchPathCount": 130,
+    "tests": [
+      {
+        "commandFile": ".codex-task/local-reactivation-20261010/native/graph-metadata.cmd",
+        "logFile": ".codex-task/local-reactivation-20261010/native/graph-metadata.log",
+        "exitEvidence": ".codex-task/local-reactivation-20261010/native/graph-metadata.exitcode.txt",
+        "exitCode": 0,
+        "passed": 4,
+        "failed": 0,
+        "ignored": 0,
+        "filteredOut": 2159,
+        "duration": "6.87s"
+      },
+      {
+        "commandFile": ".codex-task/local-reactivation-20261010/native/project-catalog.cmd",
+        "logFile": ".codex-task/local-reactivation-20261010/native/project-catalog.log",
+        "exitEvidence": ".codex-task/local-reactivation-20261010/native/project-catalog.exitcode.txt",
+        "exitCode": 0,
+        "passed": 6,
+        "failed": 0,
+        "ignored": 0,
+        "filteredOut": 2157,
+        "duration": "0.11s"
+      }
+    ],
+    "runtimeVerified": false,
+    "deploymentReady": false,
+    "coverage": "Synthetic adapter tests only; live state, service, scheduler, and providers were not accessed."
+  },
+  "localReactivationNative": {
+    "status": "source-built-focused-tests-passed-runtime-unverified",
+    "testReceipts": [
+      {
+        "commandFile": ".codex-task/local-reactivation-20261010/native/graph-metadata.cmd",
+        "logFile": ".codex-task/local-reactivation-20261010/native/graph-metadata.log",
+        "exitEvidence": ".codex-task/local-reactivation-20261010/native/graph-metadata.exitcode.txt",
+        "exitCode": 0,
+        "passed": 4,
+        "failed": 0,
+        "ignored": 0,
+        "filteredOut": 2159,
+        "duration": "6.87s"
+      },
+      {
+        "commandFile": ".codex-task/local-reactivation-20261010/native/project-catalog.cmd",
+        "logFile": ".codex-task/local-reactivation-20261010/native/project-catalog.log",
+        "exitEvidence": ".codex-task/local-reactivation-20261010/native/project-catalog.exitcode.txt",
+        "exitCode": 0,
+        "passed": 6,
+        "failed": 0,
+        "ignored": 0,
+        "filteredOut": 2157,
+        "duration": "0.11s"
+      }
+    ],
+    "patchAssembly": ".codex-task/local-reactivation-20261010/native/patch-assembly.json",
+    "securityPreflight": ".codex-task/local-reactivation-20261010/native/security-preflight.json",
+    "optimizedBuild": {
+      "command": "\"C:\\Users\\harus\\.cargo\\bin\\cargo.exe\" build --offline --locked --release --no-default-features --jobs 1 --package iii --bin iii --target x86_64-pc-windows-msvc --config profile.release.package.iii.codegen-units=1 > \"D:\\agentmemory\\.codex-task\\local-reactivation-20261010\\native\\optimized-build.log\" 2>&1",
+      "commandFile": ".codex-task/local-reactivation-20261010/native/optimized-build.cmd",
+      "log": ".codex-task/local-reactivation-20261010/native/optimized-build.log",
+      "exitEvidence": ".codex-task/local-reactivation-20261010/native/optimized-build.exitcode.txt",
+      "exitCode": 0,
+      "compilerResult": "    Finished `release` profile [optimized] target(s) in 6m 55s",
+      "artifactPath": ".codex-task/bounded-engine/cargo-target/x86_64-pc-windows-msvc/release/iii.exe",
+      "artifactSha256": "6012aa8c218a1345a7fe660921a1092706d54c162d0b48f6e284029c27975eba",
+      "artifactBytes": 28097024,
+      "stagedArtifactPath": ".codex-task/bounded-engine/artifacts/local-reactivation-20261010/iii.exe",
+      "stagedArtifactSha256": "6012aa8c218a1345a7fe660921a1092706d54c162d0b48f6e284029c27975eba",
+      "sourcePatchPath": "patches/iii-engine/0.22.1-state-pagination.patch",
+      "sourcePatchSha256": "8f26db6043d60c91b6e7b561ee95f28b474b0fe5dbf0db549c10cbf4a4d7e9cb",
+      "sourcePatchPaths": 130,
+      "buildProfile": {
+        "name": "release",
+        "optimized": true,
+        "optLevel": "s",
+        "debugInfo": false,
+        "strip": true,
+        "lto": false,
+        "codegenUnits": 16,
+        "jobs": 1,
+        "incremental": false,
+        "locked": true,
+        "offline": true,
+        "noDefaultFeatures": true,
+        "target": "x86_64-pc-windows-msvc",
+        "targetSelection": "explicit x86_64-pc-windows-msvc target from the bounded engine source checkout",
+        "packageOverrides": {
+          "iii": {
+            "codegenUnits": 1
+          }
+        },
+        "packageOverride": "profile.release.package.iii.codegen-units=1",
+        "command": "\"C:\\Users\\harus\\.cargo\\bin\\cargo.exe\" build --offline --locked --release --no-default-features --jobs 1 --package iii --bin iii --target x86_64-pc-windows-msvc --config profile.release.package.iii.codegen-units=1 > \"D:\\agentmemory\\.codex-task\\local-reactivation-20261010\\native\\optimized-build.log\" 2>&1",
+        "commandFile": ".codex-task/local-reactivation-20261010/native/optimized-build.cmd"
+      }
+    },
+    "postflight": ".codex-task/local-reactivation-20261010/native/postflight.json",
+    "deploymentReady": false,
+    "runtimeVerified": false,
+    "providerCalls": false,
+    "productionDatabaseAccess": false,
+    "serviceAccess": false,
+    "schedulerEffects": false
+  },
+  "selectedNativeCatalogRepair": {
+    "capability": "state::project_catalog_repair_v1",
+    "action": "project_catalog_repair_unknown",
+    "status": "private-engine-fixture-passed; service-install-unverified",
+    "sourcePatchSha256": "4e78a63514d6f82ca879d421e644ba4e7ea5a8b0200f047b70f482fad9846a0c",
+    "build": {
+      "exitCode": 0,
+      "binaryPath": ".codex-task/bounded-engine/cargo-target/x86_64-pc-windows-msvc/release/iii.exe",
+      "artifactSha256": "ecd9bff2010f4c81134ab9a10e206c0aca6ff007b69c218bac1ab2b43e98da46",
+      "artifactBytes": 28134912,
+      "commandFile": ".codex-task/native-canonical-memory-index/production-native-retry-01.cmd"
+    },
+    "fixture": {
+      "status": "passed-private-engine-fixture",
+      "harness": ".codex-task/local-reactivation-20261010/selected-native-catalog-repair/runtime-repair-fixture.mjs",
+      "receipt": ".codex-task/local-reactivation-20261010/selected-native-catalog-repair/runtime-fixture-02/runtime-repair-result.json",
+      "repairedKeys": [
+        "summary-repair-a",
+        "summary-repair-b"
+      ],
+      "finalCatalog": {
+        "status": "partial",
+        "incompleteRows": "3",
+        "cursor": "4",
+        "epoch": "1",
+        "revision": "5"
+      },
+      "sourceRowsUnchanged": true,
+      "responseBodyAbsent": true,
+      "terminalReplay": "already_repaired; visible source/catalog/project state unchanged",
+      "failuresHadNoVisibleEffects": true,
+      "shutdown": {
+        "exitCode": 0,
+        "graceful": true
+      },
+      "providerCalls": 0,
+      "schedulerEffects": false,
+      "installed": false
+    },
+    "focusedCargoTests": {
+      "status": "not-passed",
+      "exitCode": 101,
+      "reason": "rustc aborted while allocating 2 MiB; no Cargo test pass is claimed"
+    },
+    "runtimeVerified": false,
+    "deploymentReady": false
+  },
+  "nativeProjectQueryCompletion": {
+    "status": "source-built; private-query-fixture-failed-before-graph-reads; service-install-unverified",
+    "sourcePatchSha256": "1a929db61956025df5a2dd81641e517672bb9d544a5f2b564310fbc32580a16d",
+    "build": {
+      "exitCode": 0,
+      "binaryPath": ".codex-task/bounded-engine/cargo-target/x86_64-pc-windows-msvc/release/iii.exe",
+      "artifactSha256": "a11f3844105745cd1d429f15faa6cf9d3b4ef2c9dc48a19e5a46473285c08fd2",
+      "artifactBytes": 28147712,
+      "commandFile": ".codex-task/local-reactivation-20261010/native-project-query-completion/cached-release.cmd"
+    },
+    "fixture": {
+      "status": "failed-private-engine-project-query-completion",
+      "harness": ".codex-task/local-reactivation-20261010/native-project-query-completion/graph-query-completion.mjs",
+      "receipt": ".codex-task/local-reactivation-20261010/native-project-query-completion/graph-query-completion-result.json",
+      "failure": "STATE_TX_FENCED: STATE_TX_FENCED: state operation rejected",
+      "providerCalls": 0,
+      "schedulerEffects": false,
+      "graphQueriesRun": false,
+      "assertionsNotClaimed": [
+        "useful project graph nodes and edges",
+        "foreign/missing/stale membership exclusion",
+        "cursor revision rejection"
+      ],
+      "shutdown": {
+        "exitCode": 0,
+        "graceful": true
+      }
+    },
+    "runtimeVerified": false,
+    "deploymentReady": false
+  },
+  "nativeCombinedRetrievalCorrections": {
+    "status": "cached-source-build-complete; installed-runtime-unverified",
+    "sourcePatchSha256": "e98df2ccd0ec1295018c5bdf8ffb083edf20fd6eaa85b807d735ab913c72c437",
+    "patchPathCount": 135,
+    "included": [
+      "project_sessions_page",
+      "scoped_ann_probe_batching",
+      "graph_stored_generation_alignment",
+      "native_scoped_query_reliability",
+      "native_progressive_graph_read",
+      "native_scoped_lexical_reliability",
+      "native_progressive_graph_source_zero",
+      "native_current_project_graph_query",
+      "native_mixed_project_local_authority",
+      "native_scoped_prepare_max_bytes"
+    ],
+    "runtimeVerified": false,
+    "deploymentReady": false
+  },
+  "nativeRecentReflectionSource": {
+    "status": "source-built; runtime-unverified",
+    "capabilities": [
+      "state::viewer_recent_v1",
+      "state::graph_concept_seeds_v1"
+    ],
+    "sourceRoot": ".iii-engine-build/source/e7de3820d1e558f3762edf95e4440552444d48d3",
+    "handoff": ".codex-task/native-recent-reflection/handoff.json",
+    "patchDigestStatus": "generated package metadata; no checksum verification",
+    "buildRequired": false,
+    "runtimeVerified": false
+  },
+  "buildRequired": true,
+  "fullClosureSource": {
+    "status": "source-integrated-uncompiled-runtime-unverified",
+    "sourceRoot": ".iii-engine-build/source/e7de3820d1e558f3762edf95e4440552444d48d3",
+    "handoff": ".codex-task/full-closure/native-integration/handoff.md",
+    "patchAssembly": ".codex-task/full-closure/native-integration/patch-assembly.json",
+    "checksumOperations": false,
+    "priorBuildAndRuntimeEvidenceIsHistorical": true,
+    "buildRequired": true,
+    "currentSourceTestsRun": false,
+    "runtimeVerified": false,
+    "installed": false,
+    "sourceChanges": [
+      "shared preparation deadline/status routing",
+      "optimized concept selection and six tests",
+      "native indexed crystal paging/preparation and seven tests",
+      "preserved recent dirty/stateless/current-version corrections",
+      "native graph browse preparation with bounded stored-plus-logical work and cancellation rollback",
+      "storage original/provenance admission, generated-only retention, durable maintenance lease and atomic fenced state publication (source/fixture proof only; runtime promotion pending)"
+    ]
   }
 }

@@ -1,4 +1,4 @@
-import { lstatSync, readFileSync, rmSync } from "node:fs";
+import { lstatSync, readFileSync, rmSync, copyFileSync, constants } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 
 const SEEDED_BUILTIN_WORKERS = [
@@ -68,6 +68,8 @@ export function clearPersistedBuiltinConfig(
     try {
       const content = readFileSync(path, "utf8");
       if (!isPersistedBuiltinEntry(content, basename(path, ".yaml"))) continue;
+      const backup = `${path}.before-rendered-config-${Date.now()}`;
+      copyFileSync(path, backup, constants.COPYFILE_EXCL);
       rmSync(path);
       cleared.push(path);
     } catch (err) {
@@ -322,20 +324,28 @@ function setBuiltinStateStore(lines: string[], dataDir: string): void {
   );
 }
 
+function setVolatileStreamStore(lines: string[]): void {
+  const worker = workerBlock(lines, "iii-stream");
+  if (!worker) throw new Error("AgentMemory live notifications require an iii-stream worker");
+  const adapter = lines.findIndex((line, index) => index > worker.start && index < worker.end && line.trim() === "adapter:");
+  if (adapter < 0) throw new Error("AgentMemory live notifications require a multiline iii-stream adapter");
+  const depth = lines[adapter]!.length - lines[adapter]!.trimStart().length;
+  let end = adapter + 1;
+  while (end < worker.end && (!lines[end]!.trim() || lines[end]!.length - lines[end]!.trimStart().length > depth)) end++;
+  lines.splice(adapter + 1, end - adapter - 1,
+    `${" ".repeat(depth + 2)}name: kv`, `${" ".repeat(depth + 2)}config:`, `${" ".repeat(depth + 4)}store_method: in_memory`);
+}
+
 export function renderEngineConfig(
   template: string,
   options: EngineConfigOptions,
 ): string {
-  const rendered = template
-    .replace(
-      "file_path: ./data/stream_store",
-      `file_path: ${yamlSingleQuote(join(options.dataDir, "stream_store"))}`,
-    )
-    .replace(
-      "file_path: ./data/queue_store",
-      `file_path: ${yamlSingleQuote(resolve(options.dataDir, "queue_store"))}`,
-    );
+  const rendered = template.replace(
+    "file_path: ./data/queue_store",
+    `file_path: ${yamlSingleQuote(resolve(options.dataDir, "queue_store"))}`,
+  );
   const lines = rendered.split("\n");
+  setVolatileStreamStore(lines);
   setBuiltinStateStore(lines, options.dataDir);
   setBuiltinQueueStore(lines, options.dataDir);
   if (options.ports) {

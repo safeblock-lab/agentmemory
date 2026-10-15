@@ -6,6 +6,8 @@ import { batchEffectKey } from "../state/batch-effects.js";
 import { FireworksBatchError, type FireworksBatchRemoteStatus, type FireworksBatchTransport } from "../providers/fireworks-batch.js";
 import { logger } from "../logger.js";
 import { batchTaskLlmTask, taskOutputTokens } from "../providers/task-output-limits.js";
+import { retrievalRequest } from "../state/indexed-retrieval.js";
+import { REFLECT_CONTROL, REFLECT_JOBS, type ReflectJob, type ConceptCluster } from "./reflect-queue-types.js";
 
 export interface FireworksBatchQueue {
   enqueue(request: FireworksBatchRequest): Promise<{ queued: boolean; workItemId?: string; reason?: string }>;
@@ -485,6 +487,7 @@ function remoteStatusBelongsToJob(
 }
 
 export class FireworksBatchCoordinator implements FireworksBatchQueue {
+  private readonly payloadVersions = new WeakMap<FireworksBatchWorkItem, { version: string; fingerprint: string }>();
   async canReplace(workItemId: string): Promise<boolean> {
     const old = await this.kv.get<FireworksBatchWorkItem>(KV.fireworksBatchWorkItems, workItemId);
     if (!old || old.id !== workItemId || !old.batchJobId || old.state !== "dead-letter") return false;
@@ -629,22 +632,66 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
   }
 
   private async readActiveWorkItems(): Promise<FireworksBatchWorkItem[]> {
-    return withKeyedLock(`fireworks-batch:index:${KV.fireworksBatchActiveWork}`, async () => {
-      const ids = await this.readActiveIds(KV.fireworksBatchActiveWork);
-      const loaded = await Promise.all(ids.map(async (id) => ({
-        id,
-        item: await this.kv.get<FireworksBatchWorkItem>(KV.fireworksBatchWorkItems, id),
-      })));
-      const activeIds: string[] = [];
-      const items: FireworksBatchWorkItem[] = [];
-      for (const entry of loaded) {
-        if (!entry.item || entry.item.id !== entry.id || !ACTIVE_WORK_STATES.has(entry.item.state)) continue;
-        activeIds.push(entry.id);
-        items.push(entry.item);
+    const ids = await this.readActiveIds(KV.fireworksBatchActiveWork);
+    const saved = await this.kv.get<{ offset: number }>(KV.fireworksBatchActiveWork, "payload-cursor");
+    const offset = saved && Number.isSafeInteger(saved.offset) && saved.offset < ids.length ? saved.offset : 0;
+    const selected = ids.slice(offset, offset + 12);
+    const keys: string[] = [];
+    for (const id of selected) if (!await this.consumeReflectBridge(id)) keys.push(id);
+    await this.kv.set(KV.fireworksBatchActiveWork, "payload-cursor", { offset: offset + selected.length >= ids.length ? 0 : offset + selected.length });
+    if (!keys.length) return [];
+    const page = await retrievalRequest<{ items: Array<{ key: string; version: string; fingerprint: string; value: FireworksBatchWorkItem }>; deferred: Array<{ key: string; reason: string }> }>(this.kv,
+      { action: "batch_work_payload", keys, max_items: 12, max_bytes: 65536 });
+    if (!Array.isArray(page.items) || page.items.length > 12 || Buffer.byteLength(JSON.stringify(page)) > 65536) throw new Error("Invalid bounded batch payload page");
+    const items: FireworksBatchWorkItem[] = [];
+    for (const entry of page.items) {
+      if (!keys.includes(entry.key) || entry.value?.id !== entry.key || typeof entry.version !== "string" || typeof entry.fingerprint !== "string") throw new Error("Invalid bounded batch payload identity");
+      if (ACTIVE_WORK_STATES.has(entry.value.state)) {
+        this.payloadVersions.set(entry.value, { version: entry.version, fingerprint: entry.fingerprint }); items.push(entry.value);
       }
-      if (activeIds.length !== ids.length) await this.writeActiveIds(KV.fireworksBatchActiveWork, activeIds);
-      return items;
-    });
+      else await this.removeActiveId(KV.fireworksBatchActiveWork, entry.key);
+    }
+    for (const deferred of page.deferred ?? []) if (deferred.reason === "missing") await this.removeActiveId(KV.fireworksBatchActiveWork, deferred.key);
+    return items;
+  }
+
+  private async consumeReflectBridge(workId: string): Promise<boolean> {
+    if (await this.kv.get(REFLECT_CONTROL, `legacy-ack:${workId}`)) return true;
+    const pointer = await this.kv.get<{ jobId: string; correlationId: string; sourceFingerprint: string }>(REFLECT_CONTROL, `legacy-bridge:${workId}`);
+    if (!pointer) return false;
+    const job = await this.kv.get<ReflectJob>(REFLECT_JOBS, pointer.jobId);
+    const legacy = job?.legacy;
+    if (!job || !legacy || legacy.workId !== workId || legacy.correlationId !== pointer.correlationId || legacy.sourceFingerprint !== pointer.sourceFingerprint ||
+      job.status !== "completed" || job.manifest || job.sourcePage || !job.continuation || legacy.offset !== legacy.refs.length) return true;
+    const verificationKey = `${job.id}:bridge-verification`;
+    const verification = await this.kv.get<{ ordinal: number; fingerprint: string; sources: Array<[string, string]> }>(REFLECT_CONTROL, verificationKey)
+      ?? { ordinal: 0, fingerprint: "", sources: [] };
+    if (!Number.isSafeInteger(verification.ordinal) || verification.ordinal < 0 || verification.ordinal > (job.unitSequence ?? 0) || verification.sources.length > 512) throw new Error("Invalid reflection continuation verification cursor");
+    const through = Math.min(verification.ordinal + 12, job.unitSequence ?? 0);
+    while (verification.ordinal < through) {
+      const result = await this.kv.get<{ manifestId: string; effectKey: string; legacyWorkId: string; cluster: ConceptCluster }>(REFLECT_CONTROL, `${job.id}:result:${verification.ordinal}`);
+      if (!result || result.legacyWorkId !== workId || !result.cluster ||
+        (await this.kv.get<{ state: string }>(KV.batchCallbacks, `reflect:${result.effectKey}`))?.state !== "completed") return true;
+      verification.fingerprint = batchEffectKey(JSON.stringify([verification.fingerprint, result.manifestId, result.effectKey]));
+      for (const [scope, ids] of [[KV.semantic, result.cluster.factIds], [KV.lessons, result.cluster.lessonIds], [KV.crystals, result.cluster.crystalIds]] as const) {
+        if (!Array.isArray(ids) || ids.length > 12) throw new Error("Invalid reflection continuation source coverage");
+        for (const id of ids) if (!verification.sources.some(source => source[0] === scope && source[1] === id)) verification.sources.push([scope, id]);
+      }
+      if (verification.sources.length > 512 || Buffer.byteLength(JSON.stringify(verification)) > 65536) throw new Error("Reflection continuation verification exceeds budget");
+      verification.ordinal++;
+    }
+    await this.kv.set(REFLECT_CONTROL, verificationKey, verification);
+    const continuation = job.continuation;
+    if (verification.ordinal !== job.unitSequence || verification.fingerprint !== continuation.resultFingerprint ||
+      verification.sources.length !== continuation.requiredSources || continuation.completedSources !== continuation.requiredSources ||
+      batchEffectKey(JSON.stringify(verification.sources.sort())) !== continuation.sourceIdsFingerprint) return true;
+    const receiptKey = `legacy-adoption:${workId}`;
+    await this.kv.set(REFLECT_CONTROL, receiptKey, { ...continuation, verified: true });
+    const acknowledgment = await retrievalRequest<{ acknowledged?: boolean; stale?: boolean }>(this.kv,
+      { action: "batch_work_bridge_ack", key: workId, expected_version: legacy.workVersion,
+        expected_fingerprint: legacy.workFingerprint, receipt_key: receiptKey });
+    if (acknowledgment.acknowledged) await this.removeActiveId(KV.fireworksBatchActiveWork, workId);
+    return true;
   }
 
   private async readActiveJobs(): Promise<FireworksBatchJob[]> {
@@ -668,6 +715,7 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
 
   async repairKnownWorkItem(workItemId: string): Promise<boolean> {
     if (typeof workItemId !== "string" || workItemId.length === 0) return false;
+    if (await this.consumeReflectBridge(workItemId)) return true;
     const item = await this.kv.get<FireworksBatchWorkItem>(KV.fireworksBatchWorkItems, workItemId);
     if (!item || !ACTIVE_WORK_STATES.has(item.state)) return false;
     await this.readActiveWorkItems();
@@ -1032,7 +1080,7 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
             : { queued: false, reason: "Batch queue is full" };
         }
       }
-      const pending = await this.readActiveWorkItems();
+      const pending = await this.readActiveIds(KV.fireworksBatchActiveWork);
       if (pending.length >= this.activeIndexCapacity(KV.fireworksBatchActiveWork)) {
         return { queued: false, reason: "Batch queue is full" };
       }
@@ -1092,7 +1140,6 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
     if (this.processInFlight) return this.processInFlight;
     const run = (async () => {
       await this.recoverEnqueueIntents();
-      for (const item of await this.readActiveWorkItems()) await this.quarantineLegacyWork(item);
       await this.repairRecentRemoteJobs();
       await this.pollSubmitted();
       await this.submitQueued();
@@ -1188,12 +1235,20 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
           updatedAt: now,
         };
         if (!await this.persistIndexedJob(job)) return;
-        await Promise.all(compatible.map(async (item) => {
-          item.state = "submitted";
-          item.batchJobId = job.id;
-          item.updatedAt = now;
-          await this.kv.set(KV.fireworksBatchWorkItems, item.id, item);
-        }));
+        const patch = await retrievalRequest<{ applied: boolean; reason?: string }>(this.kv, {
+          action: "batch_work_submission_patch", batch_job_id: job.id, updated_at: now,
+          items: compatible.map(item => {
+            const binding = this.payloadVersions.get(item);
+            if (!binding) throw new Error("Missing bounded batch payload binding");
+            return { key: item.id, expected_version: binding.version, expected_fingerprint: binding.fingerprint };
+          }),
+        });
+        if (!patch.applied) {
+          job.state = "dead-letter"; job.lastError = "Batch submission sources changed before admission"; job.updatedAt = now;
+          await this.kv.set(KV.fireworksBatchJobs, job.id, job);
+          await this.removeActiveId(KV.fireworksBatchActiveJobs, job.id);
+          return;
+        }
         logger.info("Fireworks Batch submitting work", { jobId, task: first.task, itemCount: compatible.length });
         let submissionAccepted = false;
         try {

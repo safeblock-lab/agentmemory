@@ -1,0 +1,165 @@
+{
+  "schemaVersion": 1,
+  "reviewDate": "2026-10-10",
+  "unit": "native-diagnostics-freeze",
+  "status": "source-reviewed; patch-packaging-and-final-build-pending",
+  "sourceRoot": ".codex-task/bounded-engine/source",
+  "reviewedPaths": [
+    {
+      "path": "engine/src/workers/state/adapters/sqlite/retrieval/dispatch.rs",
+      "checkoutStatus": "staged addition",
+      "diagnosticDelta": "Adds the project catalog unknowns dispatch branch with a three-second SQLite budget."
+    },
+    {
+      "path": "engine/src/workers/state/adapters/sqlite/retrieval/mod.rs",
+      "checkoutStatus": "staged addition",
+      "diagnosticDelta": "Registers the request as a bounded retrieval operation."
+    },
+    {
+      "path": "engine/src/workers/state/adapters/sqlite/retrieval/request.rs",
+      "checkoutStatus": "staged addition",
+      "diagnosticDelta": "Defines the unknowns request and 32 KiB cursor limit."
+    },
+    {
+      "path": "engine/src/workers/state/adapters/sqlite/retrieval/request_validate.rs",
+      "checkoutStatus": "staged addition",
+      "diagnosticDelta": "Restricts logical sources, page rows, response bytes, and cursor size."
+    },
+    {
+      "path": "engine/src/workers/state/adapters/sqlite/retrieval/project_catalog/mod.rs",
+      "checkoutStatus": "untracked addition",
+      "diagnosticDelta": "Maps logical sessions/summaries to physical mem:sessions/mem:summaries and delegates unknown diagnostics."
+    },
+    {
+      "path": "engine/src/workers/state/adapters/sqlite/retrieval/project_catalog/diagnostics.rs",
+      "checkoutStatus": "untracked addition",
+      "diagnosticDelta": "Implements bounded keyset paging, v2 stale-snapshot cursor checks, metadata-only responses, and bounded decoding."
+    },
+    {
+      "path": "engine/src/workers/state/adapters/sqlite/retrieval/tests/graph_read_tests.rs",
+      "checkoutStatus": "untracked addition",
+      "diagnosticDelta": "Registers the focused catalog diagnostics test module."
+    },
+    {
+      "path": "engine/src/workers/state/adapters/sqlite/retrieval/tests/project_catalog_diagnostics_tests.rs",
+      "checkoutStatus": "untracked addition",
+      "diagnosticDelta": "Contains the six focused native diagnostic cases."
+    }
+  ],
+  "sourceInvariants": {
+    "logicalToPhysicalScopes": {
+      "sessions": "mem:sessions",
+      "summaries": "mem:summaries"
+    },
+    "pagination": {
+      "keyset": "source_key > last_key ordered by source_key",
+      "offset": false,
+      "lookahead": 1,
+      "maxUsefulRows": 16
+    },
+    "cursor": {
+      "version": 2,
+      "bindsSourceStatusIndexedRevisionEpochCatalogCursorAndIncompleteRows": true,
+      "rejectsCatalogRevisionDifferentFromCurrentSourceRevision": true,
+      "maxKeyBytes": 4096,
+      "maxCursorBytes": 32768
+    },
+    "maxResponseBytes": 65536,
+    "maxLogicalAndStoredRecordBytesBeforeDecode": 65536,
+    "sqliteBudgetMs": 3000,
+    "responseIncludesRawSourceValues": false
+  },
+  "focusedReceipt": {
+    "command": ".codex-task/native-project-catalog-diagnostics/focused-native-catalog-03-keyset-tests.cmd",
+    "log": ".codex-task/native-project-catalog-diagnostics/focused-native-catalog-03-keyset-tests.log",
+    "exitCodeFile": ".codex-task/native-project-catalog-diagnostics/focused-native-catalog-03-keyset-tests.exitcode.txt",
+    "exitCode": 0,
+    "passed": 6,
+    "failed": 0,
+    "ignored": 0,
+    "filteredOut": 2153,
+    "profile": "debug test profile; not optimized release",
+    "installed": false
+  },
+  "discardedReceipts": [
+    {
+      "attempt": "focused-native-catalog-01",
+      "exitCode": -1,
+      "reason": "Interrupted during compilation; not passing evidence."
+    },
+    {
+      "attempt": "focused-native-catalog-02-source-reason",
+      "exitCode": 0,
+      "selectedTests": 0,
+      "reason": "Binary test target selected zero tests; not passing evidence."
+    }
+  ],
+  "predecessorEvidence": {
+    "optimizedBuild": {
+      "command": ".codex-task/native-canonical-memory-index/production-native-retry-01.cmd",
+      "log": ".codex-task/native-canonical-memory-index/production-native-retry-01.log",
+      "exitCodeFile": ".codex-task/native-canonical-memory-index/production-native-retry-01.exitcode.txt",
+      "exitCode": 0,
+      "compilerDuration": "9m 57s",
+      "logLastWritten": "2026-10-09T23:23 local time",
+      "coversCatalogDiagnostics": false,
+      "installationOrRuntimeProof": false
+    },
+    "nativeTests": {
+      "receipt": ".codex-task/native-canonical-memory-index/focused-09.log",
+      "passed": 118,
+      "failed": 0,
+      "ignored": 2,
+      "coversCatalogDiagnostics": false,
+      "reuse": "Predecessor receipt only; broad shared retrieval paths are not accepted as unaffected by the new request/dispatch/validation changes."
+    },
+    "observationCapTests": {
+      "receipt": ".codex-task/observation-unscoped-cap/native-observation-tests-attempt-3.log",
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0,
+      "reuse": "May be reused for the unchanged observation-cap behavior; not diagnostics coverage."
+    }
+  },
+  "packaging": {
+    "patch": "patches/iii-engine/0.22.1-state-pagination.patch",
+    "currentChangedPathCount": 126,
+    "containsDiagnosticRequestOrDispatch": false,
+    "containsDiagnosticModule": false,
+    "containsDiagnosticTestRegistration": false,
+    "manifest": "patches/iii-engine/manifest.json",
+    "catalogDiagnosticsEntryPresent": false,
+    "requiredBeforeFinalBuild": [
+      "Regenerate the patch with all eight reviewed paths from the frozen source.",
+      "Update the engine manifest from the same source snapshot.",
+      "Include the separately accepted bounded graph_metadata change over the seven graph record scopes."
+    ]
+  },
+  "nextGate": {
+    "conditions": [
+      "Memory incident resolved.",
+      "Explicit service reactivation authorization received.",
+      "Complete source and package patch/manifest frozen together."
+    ],
+    "buildRecipe": ".codex-task/native-canonical-memory-index/production-native-retry-01.cmd",
+    "runOnce": true,
+    "priority": "BelowNormal",
+    "target": "x86_64-pc-windows-msvc",
+    "locked": true,
+    "jobs": 1,
+    "iiiCodegenUnits": 1,
+    "optLevel": "s",
+    "strip": true,
+    "debugInfo": false,
+    "lto": false,
+    "incremental": false,
+    "buildPerformedByThisUnit": false,
+    "installedProof": false
+  },
+  "additionalPendingNativeDelta": {
+    "component": "native graph_metadata scoped bytes",
+    "recordScopes": 7,
+    "owner": "dashboard-real-graph-bytes",
+    "includedInThisSourceReview": false
+  }
+}

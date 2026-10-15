@@ -5,6 +5,7 @@ import {
 } from "../config.js";
 
 export const TYPESAFE_API_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
+type UnknownCompactionFetchPermit = (provider: { endpoint: string; model: string; timeoutMs: number; maxStateChars: number }) => void;
 
 export interface TypeSafeNoulQuestion {
   type: "noul";
@@ -289,11 +290,15 @@ export class TypeSafeDecisionProvider {
     feature: TypeSafeFeature,
     state: unknown,
     questions: Readonly<Record<string, TypeSafeQuestion>>,
+    repeatPermission?: UnknownCompactionFetchPermit,
   ): Promise<Record<string, TypeSafeAnswer> | undefined> {
+    const repeatUnknownCompaction = repeatPermission !== undefined;
     const startedAt = Date.now();
     const ids = Object.keys(questions);
     try {
+      if (repeatUnknownCompaction && feature !== "compaction") throw new Error("Strict compaction feature mismatch");
       if (!this.config.enabled || !this.config.features[feature] || !this.config.apiKey || !this.fetcher) {
+        if (repeatUnknownCompaction) throw new Error("Strict compaction provider unavailable");
         return undefined;
       }
       if (
@@ -331,9 +336,10 @@ export class TypeSafeDecisionProvider {
           resolve(undefined);
         }, this.config.timeoutMs);
       });
-      const request = this.fetchAndValidate(body, questions, controller.signal);
+      const request = this.fetchAndValidate(body, questions, controller.signal, repeatPermission);
       try {
         const result = await Promise.race([request, timeout]);
+        if (repeatUnknownCompaction && !result) throw new Error("Strict compaction outcome unavailable");
         this.emit({
           feature,
           outcome: result ? "success" : controller.signal.aborted ? "timeout" : "unavailable",
@@ -344,8 +350,9 @@ export class TypeSafeDecisionProvider {
       } finally {
         if (timer !== undefined) clearTimeout(timer);
       }
-    } catch {
+    } catch (error) {
       this.emit({ feature, outcome: "error", questionCount: ids.length, latencyMs: Date.now() - startedAt });
+      if (repeatUnknownCompaction) throw error;
       return undefined;
     }
   }
@@ -401,9 +408,15 @@ export class TypeSafeDecisionProvider {
     body: string,
     questions: Readonly<Record<string, TypeSafeQuestion>>,
     signal: AbortSignal,
+    repeatPermission?: UnknownCompactionFetchPermit,
   ): Promise<Record<string, TypeSafeAnswer> | undefined> {
+    const repeatUnknownCompaction = repeatPermission !== undefined;
     try {
-      const response = await this.fetcher!(TYPESAFE_API_ENDPOINT, {
+      const fetcher = repeatUnknownCompaction ? globalThis.fetch?.bind(globalThis) : this.fetcher;
+      if (!fetcher) throw new Error("Strict compaction transport unavailable");
+      if (repeatUnknownCompaction && signal.aborted) throw new Error("Strict compaction transport aborted");
+      repeatPermission?.({ endpoint: TYPESAFE_API_ENDPOINT, model: "jev-latest", timeoutMs: this.config.timeoutMs, maxStateChars: this.config.maxStateChars });
+      const response = await fetcher(TYPESAFE_API_ENDPOINT, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${this.config.apiKey}`,
@@ -412,12 +425,14 @@ export class TypeSafeDecisionProvider {
         },
         body,
         signal,
+        ...(repeatUnknownCompaction ? { redirect: "error" as const } : {}),
       });
       if (!response.ok) return undefined;
       const responseText = await readBoundedResponse(response);
       if (responseText === undefined) return undefined;
       return validateResponse(JSON.parse(responseText) as unknown, questions);
-    } catch {
+    } catch (error) {
+      if (repeatUnknownCompaction) throw error;
       return undefined;
     }
   }

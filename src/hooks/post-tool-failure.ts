@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { resolveProject, hookCwd } from "./_project.js";
+import { boundCapture, TOOL_INPUT_BYTES, TOOL_OUTPUT_BYTES } from "./_capture-bounds.js";
 
 function isSdkChildContext(payload: unknown): boolean {
   if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -51,14 +52,8 @@ async function main() {
       timestamp: new Date().toISOString(),
       data: {
         tool_name: toolName,
-        tool_input:
-          typeof toolInput === "string"
-            ? toolInput.slice(0, 4000)
-            : JSON.stringify(toolInput ?? "").slice(0, 4000),
-        error:
-          typeof error === "string"
-            ? error.slice(0, 4000)
-            : JSON.stringify(error ?? "").slice(0, 4000),
+        tool_input: boundCapture(toolInput, TOOL_INPUT_BYTES),
+        error: boundCapture(error, TOOL_OUTPUT_BYTES),
       },
     }),
     signal: AbortSignal.timeout(3000),

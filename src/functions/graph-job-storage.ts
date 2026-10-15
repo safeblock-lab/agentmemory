@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
+import { logger } from "../logger.js";
 import type { StateKV } from "../state/kv.js";
 import { isGuardedGraphRecord, KV } from "../state/schema.js";
 import type { GraphControlState, GraphWorkingSnapshot, GraphSnapshot } from "../types.js";
@@ -347,6 +348,7 @@ export class GraphJobStorage {
 
   async apply(delta: GraphDeltaPreparation): Promise<void> {
     if (delta.templateCount === undefined || delta.applyOrdinal === undefined) throw new StateTransactionError("STATE_TX_INVALID_RESPONSE");
+    logger.info("Graph apply prepared range", { jobId: this.jobId, deltaOrdinal: delta.ordinal, templateCount: delta.templateCount, applyOrdinal: delta.applyOrdinal, nextChunkOrdinal: this.checkpoint?.next_chunk_ordinal, at: new Date().toISOString() });
     for (let ordinal = 0; ordinal < delta.templateCount; ordinal++) {
       const key = this.preparedKey(delta, ordinal);
       const reference = await this.get<PreparedReference>(KV.graphPrepared(this.jobId), key);
@@ -361,7 +363,12 @@ export class GraphJobStorage {
       const prepared: StatePreparedBatch = { payload_json, payload_digest: reference.digest };
       const expected = delta.applyOrdinal + ordinal;
       if (this.checkpoint?.logical_delta_id === delta.id && this.checkpoint.next_chunk_ordinal > expected) continue;
+      const startedAt = Date.now();
       await this.commit(prepared);
+      const elapsedMs = Date.now() - startedAt;
+      if (elapsedMs >= 30_000 || (ordinal + 1) % 16 === 0 || ordinal + 1 === delta.templateCount) {
+        logger.info("Graph apply checkpoint committed", { jobId: this.jobId, deltaOrdinal: delta.ordinal, completedTemplates: ordinal + 1, templateCount: delta.templateCount, nextChunkOrdinal: this.checkpoint?.next_chunk_ordinal, elapsedMs, payloadBytes: Buffer.byteLength(prepared.payload_json), at: new Date().toISOString() });
+      }
     }
     delta.phase = "completed";
   }

@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { StateKV } from "../../src/state/kv.js";
 import { isGuardedGraphRecord, KV } from "../../src/state/schema.js";
+import { registerGraphJobRecovery } from "../../src/functions/graph-jobs.js";
+import { statePageFixture } from "../state-page-fixture.js";
 import {
   prepareStateCommitBatch,
   type StateBatchReceipt,
@@ -25,7 +27,7 @@ type KvLike = {
   lease(request: StateLeaseRequest): Promise<StateGraphLease | { released: true }>;
   commitBatch(guard: StateGraphGuard, prepared: StatePreparedBatch): Promise<StateBatchReceipt>;
   values<T = unknown>(scope: string): AsyncGenerator<T>;
-  pages<T = unknown>(scope: string, options?: { cursor?: string; limit?: number; fields?: string[] }): AsyncGenerator<{ items: T[]; next_cursor: string | null }>;
+  pages<T = unknown>(scope: string, options?: { cursor?: string; limit?: number; maxBytes?: number; fields?: string[] }): AsyncGenerator<{ items: T[]; next_cursor: string | null }>;
   scopeRevision(scope: string, prefix?: boolean): Promise<{ generation: string; revision: string }>;
   [key: string]: unknown;
 };
@@ -45,6 +47,7 @@ export interface GraphStateHarness {
   rows: Map<string, Row>;
   receipts: Map<string, StateBatchReceipt>;
   scopedCommitFailures: number;
+  drainDeliveries(limit?: number): Promise<unknown[]>;
   seed(scope: string, key: string, value: StateJsonValue | null, exists?: boolean, version?: StateCounter): void;
   failCommitBeforeApply(): void;
   loseAcknowledgment(): void;
@@ -64,10 +67,22 @@ export function installGraphStateWire(sdk: SdkLike | undefined, kv: KvLike): Gra
     },
   };
   const originalTrigger = attachedSdk.trigger.bind(attachedSdk);
+  const subscribers = new Map<string, string[]>();
+  const deliveries: Array<{ function_id: string; payload: unknown }> = [];
+  let initialization: Promise<unknown> | undefined;
+  attachedSdk.registerTrigger = (input: unknown) => {
+    const trigger = input as { type: string; function_id: string; config: { topic: string } };
+    if (trigger.type !== "durable:subscriber") throw new Error(`Unsupported harness trigger: ${trigger.type}`);
+    const ids = subscribers.get(trigger.config.topic) ?? [];
+    if (!ids.includes(trigger.function_id)) ids.push(trigger.function_id);
+    subscribers.set(trigger.config.topic, ids);
+  };
   const rawGet = kv.get.bind(kv);
   const rawSet = kv.set.bind(kv);
   const rawDelete = kv.delete.bind(kv);
   const rawList = kv.list.bind(kv);
+  const revisions = new Map<string, bigint>();
+  const bumpRevision = (scope: string) => revisions.set(scope, (revisions.get(scope) ?? 0n) + 1n);
   const rows = new Map<string, Row>();
   const receipts = new Map<string, StateBatchReceipt>();
   const checkpoints = new Map<string, { version: StateCounter; value: StateCommitBatchInput["checkpoint"] | null }>();
@@ -190,6 +205,7 @@ export function installGraphStateWire(sdk: SdkLike | undefined, kv: KvLike): Gra
         if (updated.exists) await rawSet(op.scope, op.key, copy(updated.value));
         else await rawDelete(op.scope, op.key);
         rows.set(address(op.scope, op.key), updated);
+        bumpRevision(op.scope);
         applied.push({ scope: op.scope, key: op.key, row: current });
       }
     } catch (error) {
@@ -224,7 +240,8 @@ export function installGraphStateWire(sdk: SdkLike | undefined, kv: KvLike): Gra
     if (request.function_id === "state::get_versioned") {
       const query = request.payload as { scope: string; key: string; guard?: StateGraphGuard };
       if (query.guard) authorize(query.guard);
-      else if (recovery && isGuardedGraphRecord(query.scope, query.key)) fail("STATE_GRAPH_RECOVERY_REQUIRED");
+      else if (recovery && isGuardedGraphRecord(query.scope, query.key)
+        && !(query.scope === KV.graphControl && query.key === "current")) fail("STATE_GRAPH_RECOVERY_REQUIRED");
       return copy(await row(query.scope, query.key));
     }
     if (request.function_id === "state::lease") return acquire(request.payload as StateLeaseRequest);
@@ -235,6 +252,17 @@ export function installGraphStateWire(sdk: SdkLike | undefined, kv: KvLike): Gra
   const sdkTrigger = async (...args: unknown[]): Promise<unknown> => {
     const call = args[0];
     const id = typeof call === "string" ? call : (call as { function_id?: string } | null)?.function_id;
+    if (id === "iii::durable::publish") {
+      const payload = (call as { payload: { topic: string; data: unknown } }).payload;
+      const ids = subscribers.get(payload.topic);
+      if (!ids?.length) throw new Error(`No subscriber for ${payload.topic}`);
+      for (const function_id of ids) deliveries.push({ function_id, payload: copy(payload.data) });
+      return { published: true };
+    }
+    if (id === "mem::graph-extract" && !await rawGet(KV.config, "graph-dispatch:active")) {
+      initialization ??= originalTrigger({ function_id: "mem::graph-recover", payload: { localOnly: true } });
+      await initialization;
+    }
     if (id === "state::get_versioned" || id === "state::lease" || id === "state::commit_batch") {
       return nativeTrigger({ function_id: id, payload: typeof call === "string" ? args[1] : (call as { payload?: unknown }).payload });
     }
@@ -246,35 +274,46 @@ export function installGraphStateWire(sdk: SdkLike | undefined, kv: KvLike): Gra
   };
   attachedSdk.trigger = sdkTrigger;
   Object.assign(kv, {
+    ...(!kv.scopeRevision ? { async scopeRevision(scope: string, prefix = false) {
+      const scopes = prefix ? [...revisions.keys()].filter((candidate) => candidate.startsWith(scope)) : [scope];
+      return { generation, revision: String(scopes.reduce((sum, candidate) => sum + (revisions.get(candidate) ?? 0n), 0n)) };
+    } } : {}),
     getVersioned: adapter.getVersioned.bind(adapter),
     lease: adapter.lease.bind(adapter),
     commitBatch: adapter.commitBatch.bind(adapter),
     async *values(scope: string) { for (const value of await rawList(scope)) yield value; },
-    async *pages<T>(scope: string, options: { cursor?: string; limit?: number; fields?: string[] } = {}) {
+    async *pages<T>(scope: string, options: { cursor?: string; limit?: number; maxBytes?: number; fields?: string[] } = {}) {
       const rows = await rawList(scope);
       const limit = options.limit ?? 256;
       let start = options.cursor === undefined ? 0 : Number(options.cursor);
       for (;;) {
-        const end = Math.min(rows.length, start + limit);
-        const items = rows.slice(start, end).map((row) => {
-          if (!options.fields) return copy(row) as T;
-          const source = row && typeof row === "object" ? row as Record<string, unknown> : {};
-          return Object.fromEntries(options.fields.flatMap((field) =>
-            Object.hasOwn(source, field) ? [[field, source[field]]] : [],
-          )) as T;
-        });
-        const next_cursor = end < rows.length ? String(end) : null;
+        const { items, next_cursor } = statePageFixture(rows.map((value, index) => [`${scope}:${index}`, value] as const), {
+          scope, cursor: String(start), limit, max_bytes: options.maxBytes ?? 4 * 1024 * 1024,
+          ...(options.fields ? { fields: options.fields } : {}),
+        }) as { items: T[]; next_cursor: string | null };
         yield { items, next_cursor };
         if (next_cursor === null) return;
-        start = end;
+        start = Number(next_cursor);
       }
     },
   });
+  registerGraphJobRecovery(attachedSdk as never, kv as never);
   return {
     sdk: attachedSdk, kv, rows, receipts,
+    async drainDeliveries(limit = 256) {
+      const results: unknown[] = [];
+      while (deliveries.length && results.length < limit) {
+        const delivery = deliveries.shift()!;
+        try { results.push(await attachedSdk.trigger(delivery)); }
+        catch (error) { deliveries.unshift(delivery); throw error; }
+      }
+      if (deliveries.length) throw new Error("Harness delivery budget exceeded");
+      return results;
+    },
     get scopedCommitFailures() { return scopedCommitFailures; },
     seed(scope, key, value, exists = true, version = "1") {
       rows.set(address(scope, key), { exists, value: exists ? copy(value) : null, version });
+      bumpRevision(scope);
       if (exists) void rawSet(scope, key, copy(value)); else void rawDelete(scope, key);
       if (scope === KV.graphCheckpoints) {
         checkpoints.set(key, {

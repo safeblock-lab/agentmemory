@@ -55,6 +55,27 @@ successful source read, not observation content.
 
 ## Provider boundary and observed status
 
+Recovery interprets each job using its captured extraction switches and limits.
+Enabling optional TypeSafe, batch, or local-compaction capabilities for new work
+does not change an older job's disabled switches. Recovery still rejects a
+different provider identity, changed auxiliary routing, malformed captured
+limits, or an unavailable capability required by the capture.
+
+The scheduled dispatcher requests normal recovery, including missing provider
+work. Explicit `localOnly: true` and selected foreground replay retain their
+no-new-provider semantics. A provider intent is persisted under the native
+fence before an external frozen-value operation. Captured results take priority;
+an intended operation without a captured outcome remains unknown and cannot be
+automatically dispatched again. The intent ID is a duplicate-prevention identity,
+not a provider-budget reservation. Live execution still requires the operator's
+fresh authorized and accounted provider envelope.
+
+Legacy unfinished slots without an intent are uncertain. Internal iii recovery
+may accept `providerContinuation` with the exact job ID, generation, checkpoint
+version and chunk ordinal only after the operator proves that the specific slot
+was never dispatched. Stale identities fail before provider execution. This
+transition cannot override an existing intended operation or a captured outcome.
+
 The extraction request has no per-request heuristic-only switch. Its existing
 local branch is selected when `GRAPH_EXTRACTION_ENABLED` is not `true`, or when
 the provider is a noop provider with no auxiliary provider and no deferred batch

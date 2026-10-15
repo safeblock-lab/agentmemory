@@ -1,7 +1,8 @@
-import type { IIIClient } from "iii-sdk";
+import { validManualReflectContinuation } from "../functions/reflect-queue-types.js";
+import { InvocationError, type IIIClient } from "iii-sdk";
 import type { HttpRequest } from "@iii-dev/helpers/http";
 import { randomBytes } from "node:crypto";
-import type { Session, CompressedObservation, HookPayload, CommitLink, SessionSummary } from "../types.js";
+import type { Session, CompressedObservation, HookPayload, CommitLink } from "../types.js";
 import { EXPORT_COLLECTIONS, type ExportCollection, type GraphEdge, type GraphNode } from "../types.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { KV } from "../state/schema.js";
@@ -11,10 +12,14 @@ import { getLatestHealth } from "../health/monitor.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import type { ResilientProvider } from "../providers/resilient.js";
 import { III_PINNED_VERSION, VERSION } from "../version.js";
-import { CONSOLIDATION_COUNTS_REUSE_MS, CONSOLIDATION_LAST_RUN_KEY, PROCEDURAL_MIN_SESSIONS_PER_PATTERN, describeConsolidation, type ConsolidationRunRecord } from "../functions/consolidation-status.js";
+import { CONSOLIDATION_COUNTS_REUSE_MS, CONSOLIDATION_LAST_RUN_KEY, describeConsolidation, type ConsolidationRunRecord } from "../functions/consolidation-status.js";
+import { readConsolidationCounts } from "./consolidation-counts.js";
 import { UNINDEXED_SCAN_REUSE_MS, evaluateStatus, prefersHtml, renderStatusHtml, singleFlight, type GraphStatsInput } from "../functions/status.js";
-import { readNativeIndexStatus } from "../state/indexed-retrieval.js";
+import { IndexedRetrievalError, readNativeIndexStatus } from "../state/indexed-retrieval.js";
 import { createDashboardActivity } from "../functions/dashboard-activity.js";
+import { buildWorkflowStatus, createDashboardOperationalMetrics } from "../functions/dashboard-operational-metrics.js";
+import { createEngineMemoryReader } from "../functions/engine-memory.js";
+import { readSavingsReport } from "../functions/savings.js";
 import {
   getEmbeddingProvider,
   findUnindexedObservations,
@@ -29,8 +34,12 @@ import { isSlotsEnabled, isReflectEnabled } from "../functions/slots.js";
 import { renderViewerDocument } from "../viewer/document.js";
 import { getBoundViewerPort, getViewerSkipped } from "../viewer/server.js";
 import { MAX_FILES_UPPER_BOUND } from "../functions/replay.js";
+import { validManualSummaryContinuation } from "../functions/summary-queue.js";
 import { logger } from "../logger.js";
+import { buildScopedGraph, graphBuildHttpStatus, MAX_GRAPH_BUILD_CONTINUATION_BYTES } from "./graph-build.js";
 import { collectProjectedRecords } from "../functions/projected-record-reader.js";
+import { viewerMemories, viewerPage, viewerRecentPage, viewerPageOptions, VIEWER_SESSION_FIELDS, VIEWER_OBSERVATION_FIELDS } from "../functions/viewer-memory-page.js";
+import { StatePageError } from "../state/state-pages.js";
 import {
   isGraphExtractionEnabled,
   isConsolidationEnabled,
@@ -40,7 +49,10 @@ import {
   detectLlmProviderKind,
   getAgentId,
   isAgentScopeIsolated,
+  isBackgroundRecoveryPaused,
+  getEnvVar,
   loadConfig,
+  loadSnapshotConfig,
 } from "../config.js";
 
 type Response = {
@@ -102,6 +114,22 @@ function graphDisabledResponse(): Response {
   });
 }
 
+function graphReadFailureResponse(operation: "query" | "stats", error: unknown): Response {
+  const nativeResourceCode = "STATE_RETRIEVAL_RESOURCE_LIMIT";
+  const wrappedResourcePrefix = "invocation_failed: STATE_RETRIEVAL_RESOURCE_LIMIT:";
+  const hasNativeResourceCode = error && typeof error === "object" && "code" in error
+    && error.code === nativeResourceCode;
+  const hasWrappedResourceCode = error instanceof InvocationError && error.code === "invocation_failed"
+    && error.message.startsWith(wrappedResourcePrefix);
+  const code = hasNativeResourceCode || hasWrappedResourceCode ? nativeResourceCode : undefined;
+  logger.warn(`graph-${operation} failed`, { code: code ?? "unknown" });
+  if (code) {
+    return { status_code: 503, body: { error: `graph_${operation}_resource_limit`, code } };
+  }
+  if (!isGraphExtractionEnabled()) return graphDisabledResponse();
+  return { status_code: 502, body: { error: `graph_${operation}_failed` } };
+}
+
 function consolidationDisabledResponse(): Response {
   return flagDisabledResponse({
     error: "Consolidation pipeline not enabled",
@@ -156,6 +184,23 @@ function parseOptionalPositiveInt(value: unknown): number | undefined | null {
 
 function buildConfigFlags() {
   return [
+    {
+      key: "AGENTMEMORY_BACKGROUND_RECOVERY_PAUSED", label: "Background workflow recovery",
+      enabled: !isBackgroundRecoveryPaused(), default: true, affects: ["Dashboard"], needsLlm: false,
+      description: "Allows queued summaries, skills, graphs and reflection to recover and dispatch.",
+      enableHow: "Set AGENTMEMORY_BACKGROUND_RECOVERY_PAUSED=0 and restart.",
+    },
+    {
+      key: "SNAPSHOT_ENABLED", label: "Automatic snapshots", enabled: loadSnapshotConfig().enabled,
+      default: false, affects: ["Dashboard"], needsLlm: false,
+      description: "Periodically saves the durable memory snapshot.", enableHow: "Set SNAPSHOT_ENABLED=true and restart.",
+    },
+    {
+      key: "AGENTMEMORY_REFLECT", label: "Automatic reflection", enabled: isReflectEnabled(),
+      default: false, affects: ["Dashboard"], needsLlm: true,
+      description: "Reflects into editable memory slots when slots and background recovery are enabled.",
+      enableHow: "Set AGENTMEMORY_REFLECT=true and AGENTMEMORY_SLOTS=true and restart.",
+    },
     {
       key: "GRAPH_EXTRACTION_ENABLED",
       label: "Knowledge graph extraction",
@@ -355,14 +400,19 @@ export function registerApiTriggers(
   }
 
   const activity = createDashboardActivity(kv);
+  const engineMemory = createEngineMemoryReader({ getEngineUrl: () => loadConfig().engineUrl });
+  const operationalMetrics = createDashboardOperationalMetrics(kv, engineMemory);
   const sharedUnindexedScan = singleFlight(() => findUnindexedObservations(kv), UNINDEXED_SCAN_REUSE_MS);
 
   sdk.registerFunction("api::status",
     async (req: HttpRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
+      const checkedAt = new Date();
       const idx = kv.indexedRetrieval ? null : getSearchIndex();
-      const [health, functionMetrics, graph, native, unindexed, recentActivity] = await Promise.all([
+      const automaticMaintenancePaused = isBackgroundRecoveryPaused()
+        && getEnvVar("AGENTMEMORY_STORAGE_MAINTENANCE_WHILE_PAUSED") !== "1";
+      const [health, functionMetrics, graph, native, unindexed, recentActivity, operational] = await Promise.all([
         valueWithin(getLatestHealth(kv), STATUS_CHECK_TIMEOUT_MS),
         metricsStore ? valueWithin(metricsStore.getAll(), STATUS_CHECK_TIMEOUT_MS) : Promise.resolve([]),
         valueWithin(
@@ -372,14 +422,29 @@ export function registerApiTriggers(
         kv.indexedRetrieval ? valueWithin(readNativeIndexStatus(kv, getEmbeddingProvider()), STATUS_CHECK_TIMEOUT_MS) : Promise.resolve(null),
         kv.indexedRetrieval ? Promise.resolve(null) : valueWithin(sharedUnindexedScan(), STATUS_CHECK_TIMEOUT_MS),
         valueWithin(activity.snapshot(isAgentScopeIsolated() ? getAgentId() : undefined), STATUS_CHECK_TIMEOUT_MS),
+        valueWithin(operationalMetrics.read(
+          checkedAt, automaticMaintenancePaused, getAgentId(),
+        ), STATUS_CHECK_TIMEOUT_MS),
       ]);
+      const savings = await valueWithin(readSavingsReport(kv, functionMetrics ?? []), 6000);
       const observationsIndexed = idx ? [...idx.observationCountsBySession().values()].reduce((a, n) => a + n, 0) : null;
       const circuit =
         provider && "circuitState" in provider
           ? (provider.circuitState as { state?: string; failures?: number } | null)
           : null;
+      if (operational) operational.workflows = buildWorkflowStatus({
+        backgroundRecoveryPaused: isBackgroundRecoveryPaused(),
+        providerAvailable: Boolean(provider), providerCircuitOpen: circuit?.state === "open",
+        nativeAvailable: kv.indexedRetrieval ? native !== null && native !== undefined : false,
+        slotsAvailable: isSlotsEnabled(),
+        activity: recentActivity,
+        configured: {
+          graph: isGraphExtractionEnabled(), consolidation: isConsolidationEnabled(), compression: isAutoCompressEnabled(),
+          reflection: isReflectEnabled(), snapshots: loadSnapshotConfig().enabled, maintenance: !automaticMaintenancePaused,
+        },
+      });
       const report = evaluateStatus({
-        now: new Date(),
+        now: checkedAt,
         version: VERSION,
         engineVersion: III_PINNED_VERSION,
         uptimeSeconds: Math.round(process.uptime()),
@@ -402,6 +467,8 @@ export function registerApiTriggers(
         embeddingProvider: detectEmbeddingProvider() ? "embeddings" : "none",
         flags: buildConfigFlags(),
         activity: recentActivity,
+        operationalMetrics: operational,
+        savings,
         index: {
           mode: kv.indexedRetrieval ? "native" : "legacy",
           bm25Documents: kv.indexedRetrieval ? native?.lexicalCount ?? null : idx?.size ?? null,
@@ -817,9 +884,18 @@ export function registerApiTriggers(
       }
       const endedAt = new Date().toISOString();
       try {
+        const existingIntent = await kv.get<{
+          sessionId?: string;
+          createdAt?: string;
+          executionOrigin?: unknown;
+        }>(KV.summaryQueueIntents, sessionId);
+        const preserveSelectedOrigin = existingIntent?.sessionId === sessionId &&
+          existingIntent.executionOrigin === "selected";
         await kv.set(KV.summaryQueueIntents, sessionId, {
           sessionId,
-          createdAt: endedAt,
+          createdAt: preserveSelectedOrigin && typeof existingIntent?.createdAt === "string"
+            ? existingIntent.createdAt : endedAt,
+          ...(preserveSelectedOrigin && { executionOrigin: "selected" as const }),
         });
       } catch {
         logger.warn("session end summary intent write failed", {
@@ -868,14 +944,29 @@ export function registerApiTriggers(
   });
 
   sdk.registerFunction("api::summarize", 
-    async (req: HttpRequest<{ sessionId: string }>): Promise<Response> => {
-      const sessionId = asNonEmptyString((req.body as Record<string, unknown>)?.sessionId);
+    async (req: HttpRequest<{ sessionId: string; continuation?: unknown; zeroSpendRecoveryOfJobId?: unknown }>): Promise<Response> => {
+      const body = req.body as Record<string, unknown> | undefined;
+      const sessionId = asNonEmptyString(body?.sessionId);
       if (!sessionId) {
         return { status_code: 400, body: { error: "sessionId is required" } };
       }
+      const { continuation, zeroSpendRecoveryOfJobId } = body!;
+      if (zeroSpendRecoveryOfJobId !== undefined && (typeof zeroSpendRecoveryOfJobId !== "string" ||
+          !zeroSpendRecoveryOfJobId.trim() || zeroSpendRecoveryOfJobId !== zeroSpendRecoveryOfJobId.trim() ||
+          zeroSpendRecoveryOfJobId.length > 128 || ["continuation", "selected", "manual"]
+            .some(key => Object.hasOwn(body!, key))))
+        return { status_code: 400, body: { error: "invalid_manual_summary_request" } };
+      if (continuation !== undefined && (!validManualSummaryContinuation(continuation) || continuation.sessionId !== sessionId))
+        return { status_code: 400, body: { error: "invalid_manual_summary_request" } };
       const result = await sdk.trigger({
         function_id: "mem::summarize",
-        payload: { sessionId },
+        timeoutMs: 360_000,
+        payload: { sessionId, manual: true, ...(zeroSpendRecoveryOfJobId !== undefined && { zeroSpendRecoveryOfJobId }), ...(continuation !== undefined && { continuation: {
+          operationId: continuation.operationId, step: continuation.step, jobId: continuation.jobId,
+          project: continuation.project, sessionId: continuation.sessionId, sourceFingerprint: continuation.sourceFingerprint,
+          round: continuation.round, unitId: continuation.unitId, deliveryId: continuation.deliveryId,
+          ...(continuation.recoveryGeneration !== undefined && { recoveryGeneration: continuation.recoveryGeneration }),
+        } }) },
       });
       return { status_code: 200, body: result };
     },
@@ -1022,7 +1113,7 @@ export function registerApiTriggers(
     async (req: HttpRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      const sessions = await kv.list<Session>(KV.sessions);
+      try { viewerPageOptions(req.query_params ?? {}); } catch { return { status_code: 400, body: { error: "invalid_viewer_page" } }; }
       const normalizedAgentId =
         typeof req.query_params?.["agentId"] === "string"
           ? req.query_params["agentId"].trim()
@@ -1034,28 +1125,24 @@ export function registerApiTriggers(
         ? undefined
         : explicitAgentId ??
           (isAgentScopeIsolated() ? getAgentId() : undefined);
-      const filtered = filterAgentId
-        ? sessions.filter((s) => s.agentId === filterAgentId)
-        : sessions;
-      // Bounded fan-out: each kv.get is a full engine invocation, so
-      // Promise.all over hundreds of sessions saturates the invocation
-      // pool. Batch in chunks of 10 (parallel within a chunk, sequential
-      // across chunks); the summaries array stays index-aligned with
-      // `filtered`.
-      const summaries: Array<SessionSummary | null> = [];
-      for (let batch = 0; batch < filtered.length; batch += 10) {
-        const chunk = filtered.slice(batch, batch + 10);
-        const results = await Promise.all(
-          chunk.map((s) =>
-            kv.get<SessionSummary>(KV.summaries, s.id).catch(() => null),
-          ),
-        );
-        summaries.push(...results);
+      if (filterAgentId) return { status_code: 400, body: { error: "viewer_agent_filter_requires_native_selector" } };
+      try {
+        const query = { limit: req.query_params?.["limit"], cursor: req.query_params?.["cursor"], latest: req.query_params?.["latest"] };
+        if (query.latest === "true") {
+          const { items, ...metadata } = await viewerRecentPage(kv, "sessions", query);
+          return { status_code: 200, body: { sessions: items, ...metadata } };
+        }
+        const page = await viewerPage(kv, KV.sessions, query, VIEWER_SESSION_FIELDS);
+        return { status_code: 200, body: { sessions: page.items, partial: page.partial, nextCursor: page.nextCursor, total: page.partial ? null : page.items.length } };
+      } catch (error) {
+        if (error instanceof StatePageError && error.code === "STATE_PAGE_CURSOR_STALE" || error instanceof IndexedRetrievalError && error.code === "STATE_RECENT_CURSOR_STALE") {
+          return { status_code: 409, body: { error: "viewer_cursor_stale", restartRequired: true } };
+        }
+        if (error instanceof StatePageError && error.code === "STATE_PAGE_CURSOR_INVALID" || error instanceof IndexedRetrievalError && error.code === "STATE_TX_INVALID_REQUEST") {
+          return { status_code: 400, body: { error: "invalid_viewer_cursor" } };
+        }
+        throw error;
       }
-      const withSummary = filtered.map((s, i) =>
-        summaries[i] ? { ...s, summary: summaries[i] } : s,
-      );
-      return { status_code: 200, body: { sessions: withSummary } };
     },
   );
   sdk.registerTrigger({
@@ -1068,12 +1155,10 @@ export function registerApiTriggers(
     async (req: HttpRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
+      try { viewerPageOptions(req.query_params ?? {}); } catch { return { status_code: 400, body: { error: "invalid_viewer_page" } }; }
       const sessionId = asNonEmptyString(req.query_params?.["sessionId"]);
-      if (!sessionId)
+      if (!sessionId && req.query_params?.["latest"] !== "true")
         return { status_code: 400, body: { error: "sessionId required" } };
-      const observations = await kv.list<CompressedObservation>(
-        KV.observations(sessionId),
-      );
       const normalizedAgentId =
         typeof req.query_params?.["agentId"] === "string"
           ? req.query_params["agentId"].trim()
@@ -1085,10 +1170,22 @@ export function registerApiTriggers(
         ? undefined
         : explicitAgentId ??
           (isAgentScopeIsolated() ? getAgentId() : undefined);
-      const filtered = filterAgentId
-        ? observations.filter((o) => o.agentId === filterAgentId)
-        : observations;
-      return { status_code: 200, body: { observations: filtered } };
+      if (filterAgentId) return { status_code: 400, body: { error: "viewer_agent_filter_requires_native_selector" } };
+      try {
+        const query = { limit: req.query_params?.["limit"], cursor: req.query_params?.["cursor"], latest: req.query_params?.["latest"] };
+        if (query.latest === "true") {
+          const { items, ...metadata } = await viewerRecentPage(kv, "observations", query, sessionId);
+          return { status_code: 200, body: { observations: items, ...metadata } };
+        }
+        const page = await viewerPage(kv, KV.observations(sessionId!), query, VIEWER_OBSERVATION_FIELDS);
+        return { status_code: 200, body: { observations: page.items, partial: page.partial, nextCursor: page.nextCursor, total: page.partial ? null : page.items.length } };
+      } catch (error) {
+        if (error instanceof IndexedRetrievalError && error.code === "STATE_RECENT_CURSOR_STALE")
+          return { status_code: 409, body: { error: "viewer_cursor_stale", restartRequired: true } };
+        if (error instanceof IndexedRetrievalError && error.code === "STATE_TX_INVALID_REQUEST")
+          return { status_code: 400, body: { error: "invalid_viewer_cursor" } };
+        throw error;
+      }
     },
   );
   sdk.registerTrigger({
@@ -1188,6 +1285,10 @@ export function registerApiTriggers(
         sourceObservationIds?: string[];
         project?: string;
         agentId?: string;
+        action?: "store" | "update" | "merge";
+        targetMemoryId?: string;
+        expectedVersion?: number;
+        sourceKind?: "unknown" | "human_source" | "ai_output" | "proposal" | "observed_result";
       }>,
     ): Promise<Response> => {
       const authErr = checkAuth(req, secret);
@@ -1214,6 +1315,10 @@ export function registerApiTriggers(
           ...(req.body.files !== undefined && { files: req.body.files }),
           ...(req.body.ttlDays !== undefined && { ttlDays: req.body.ttlDays }),
           ...(req.body.sourceObservationIds !== undefined && { sourceObservationIds: req.body.sourceObservationIds }),
+          ...(req.body.action !== undefined && { action: req.body.action }),
+          ...(req.body.targetMemoryId !== undefined && { targetMemoryId: req.body.targetMemoryId }),
+          ...(req.body.expectedVersion !== undefined && { expectedVersion: req.body.expectedVersion }),
+          ...(req.body.sourceKind !== undefined && { sourceKind: req.body.sourceKind }),
           ...(req.body.project !== undefined && { project: req.body.project }),
           ...(typeof req.body.agentId === "string" && req.body.agentId.trim()
             ? { agentId: req.body.agentId.trim() }
@@ -1681,7 +1786,11 @@ export function registerApiTriggers(
   sdk.registerFunction("api::graph-query",
     async (
       req: HttpRequest<{
+        display?: boolean;
+        prepare?: boolean;
+        cursor?: string;
         startNodeId?: string;
+        project?: string;
         nodeType?: string;
         maxDepth?: number;
         query?: string;
@@ -1693,7 +1802,26 @@ export function registerApiTriggers(
       if (authErr) return authErr;
       // Whitelist payload fields explicitly; AGENTS.md security rule:
       // REST endpoints never pass raw req.body through to sdk.trigger.
+      const project = req.body?.project;
+      if (project !== undefined && (typeof project !== "string" || !project.trim() || Buffer.byteLength(project) > 256)) {
+        return { status_code: 400, body: { error: "Invalid project" } };
+      }
+      const display = req.body?.display;
+      const prepare = req.body?.prepare;
+      const cursor = req.body?.cursor;
+      if (display !== undefined && typeof display !== "boolean" ||
+        prepare !== undefined && (typeof prepare !== "boolean" || display !== true) ||
+        prepare === true && (cursor !== undefined || req.body?.limit !== undefined) ||
+        cursor !== undefined && (display !== true || typeof cursor !== "string" || !cursor || Buffer.byteLength(cursor) > 4096) ||
+        display === true && (!project || [req.body?.startNodeId, req.body?.nodeType, req.body?.query, req.body?.offset, req.body?.maxDepth].some(value => value !== undefined)) ||
+        display === true && req.body?.limit !== undefined && (!Number.isInteger(req.body.limit) || req.body.limit < 1 || req.body.limit > 128)) {
+        return { status_code: 400, body: { error: "Invalid graph display request" } };
+      }
       const payload = {
+        display,
+        prepare,
+        cursor,
+        project: project?.trim(),
         startNodeId: req.body?.startNodeId,
         nodeType: req.body?.nodeType,
         maxDepth: req.body?.maxDepth,
@@ -1704,8 +1832,8 @@ export function registerApiTriggers(
       try {
         const result = await sdk.trigger({ function_id: "mem::graph-query", payload });
         return { status_code: 200, body: result };
-      } catch {
-        return graphDisabledResponse();
+      } catch (error) {
+        return graphReadFailureResponse("query", error);
       }
     },
   );
@@ -1719,11 +1847,15 @@ export function registerApiTriggers(
     async (req: HttpRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
+      const project = req.query_params?.project;
+      if (project !== undefined && (typeof project !== "string" || !project.trim() || Buffer.byteLength(project) > 256)) {
+        return { status_code: 400, body: { error: "Invalid project" } };
+      }
       try {
-        const result = await sdk.trigger({ function_id: "mem::graph-stats", payload: {} });
+        const result = await sdk.trigger({ function_id: "mem::graph-stats", payload: project ? { project: project.trim() } : {} });
         return { status_code: 200, body: result };
-      } catch {
-        return graphDisabledResponse();
+      } catch (error) {
+        return graphReadFailureResponse("stats", error);
       }
     },
   );
@@ -1733,19 +1865,18 @@ export function registerApiTriggers(
     config: { api_path: "/agentmemory/graph/stats", http_method: "GET" },
   });
 
-  // #814: explicit snapshot rebuild endpoint. Pays the full graph
-  // enumeration once and persists a top-degree subgraph + aggregate
-  // counts so subsequent /graph/query and /graph/stats calls skip the
-  // unbounded kv.list. Operator-grade endpoint exposed for the viewer
-  // banner action and CLI repair.
   sdk.registerFunction("api::graph-snapshot-rebuild",
     async (req: HttpRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
+      const project = (req.body as { project?: unknown } | undefined)?.project;
+      if (project !== undefined && (typeof project !== "string" || !project.trim() || Buffer.byteLength(project) > 256)) {
+        return { status_code: 400, body: { error: "Invalid project" } };
+      }
       try {
         const result = await sdk.trigger({
           function_id: "mem::graph-snapshot-rebuild",
-          payload: {},
+          payload: project ? { project: project.trim() } : {},
         });
         return { status_code: 200, body: result };
       } catch {
@@ -1811,62 +1942,34 @@ export function registerApiTriggers(
     config: { api_path: "/agentmemory/graph/extract", http_method: "POST" },
   });
 
-  // Backfill the knowledge graph from existing compressed observations.
-  // Viewer calls this when the graph is empty (#666). Iterates every
-  // session, collects observations that have a `title` (compressed only),
-  // and feeds them through `mem::graph-extract` in batches.
+  // Build one bounded graph unit for the project selected in the viewer.
   sdk.registerFunction("api::graph-build",
-    async (req: HttpRequest<{ batchSize?: number }>): Promise<Response> => {
+    async (req: HttpRequest<unknown>): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      const batchSize = Math.max(
-        1,
-        Math.min(100, Number((req.body as { batchSize?: number })?.batchSize) || 25),
-      );
+      const body = req.body;
+      if (!body || typeof body !== "object" || Array.isArray(body)) {
+        return { status_code: 400, body: { error: "invalid_graph_build_request" } };
+      }
+      const input = body as Record<string, unknown>;
+      if (Object.keys(input).some(key => key !== "project" && key !== "continuation")
+        || typeof input.project !== "string" || !input.project.trim() || input.project.length > 4096
+        || input.continuation !== undefined && (typeof input.continuation !== "string" || !input.continuation
+          || input.continuation.length > MAX_GRAPH_BUILD_CONTINUATION_BYTES)) {
+        return { status_code: 400, body: { error: "invalid_graph_build_request" } };
+      }
       try {
-        const sessions = await kv.list<Session>(KV.sessions);
-        let totalNodes = 0;
-        let totalEdges = 0;
-        let batchesRun = 0;
-        for (const session of sessions) {
-          const sid = session?.id;
-          if (typeof sid !== "string" || sid.length === 0) continue;
-          const observations = await kv.list<CompressedObservation>(KV.observations(sid));
-          const compressed = observations.filter((o) => o && typeof o.title === "string" && o.title.length > 0);
-          if (compressed.length === 0) continue;
-          for (let i = 0; i < compressed.length; i += batchSize) {
-            const batch = compressed.slice(i, i + batchSize);
-            try {
-              const result = (await sdk.trigger({
-                function_id: "mem::graph-extract",
-                payload: { observations: batch },
-              })) as { success?: boolean; nodesAdded?: number; edgesAdded?: number };
-              if (result?.success) {
-                totalNodes += Number(result.nodesAdded) || 0;
-                totalEdges += Number(result.edgesAdded) || 0;
-              }
-              batchesRun++;
-            } catch (err) {
-              logger.warn("graph-build batch failed", {
-                sessionId: sid,
-                batchIndex: Math.floor(i / batchSize),
-                error: err instanceof Error ? err.message : String(err),
-              });
-            }
-          }
-        }
+        const result = await buildScopedGraph(sdk, kv, input.project, input.continuation as string | undefined);
+        return { status_code: graphBuildHttpStatus(result), body: result };
+      } catch (error) {
+        logger.warn("graph-build request failed", { project: input.project, errorType: error instanceof Error ? error.name : "unknown" });
         return {
-          status_code: 200,
+          status_code: 502,
           body: {
-            success: true,
-            sessions: sessions.length,
-            batches: batchesRun,
-            nodes: totalNodes,
-            edges: totalEdges,
+            status: "failed", project: input.project, sessionsProcessed: 0, observationsProcessed: 0,
+            nodesAdded: 0, edgesAdded: 0, continuation: input.continuation ?? null, error: "graph_extraction_failed",
           },
         };
-      } catch {
-        return graphDisabledResponse();
       }
     },
   );
@@ -2132,8 +2235,7 @@ export function registerApiTriggers(
     async (req: HttpRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      const memories = await kv.list<import("../types.js").Memory>(KV.memories);
-      const latest = req.query_params?.["latest"] === "true";
+      try { viewerPageOptions(req.query_params ?? {}); } catch { return { status_code: 400, body: { error: "invalid_viewer_page" } }; }
       // agentId filter. Request param wins, env AGENT_ID (when
       // scope=isolated) is the fallback. Shared mode keeps the tag but
       // does not restrict the list endpoint. Pass agentId=* to opt out
@@ -2146,69 +2248,14 @@ export function registerApiTriggers(
       const wildcardAgent = normalizedAgentId === "*";
       const explicitAgentId =
         normalizedAgentId && !wildcardAgent ? normalizedAgentId : undefined;
-      const includeOrphans =
-        req.query_params?.["includeOrphans"] === "true";
       const filterAgentId = wildcardAgent
         ? undefined
         : explicitAgentId ?? (isAgentScopeIsolated() ? getAgentId() : undefined);
-      let filtered = latest ? memories.filter((m) => m.isLatest) : memories;
-      if (filterAgentId) {
-        filtered = filtered.filter(
-          (m) =>
-            m.agentId === filterAgentId ||
-            (includeOrphans && m.agentId === undefined),
-        );
-      }
-
-      // viewer + `agentmemory status` were hitting this endpoint to
-      // count memories. On a real corpus (8K+ memories) the unbounded
-      // response either timed out at the iii engine boundary ("Invocation
-      // stopped") or arrived too large for the viewer to render — so the
-      // UI showed 0 memories despite a healthy store. Two opt-in modes:
-      //   ?count=true       — totals only, no payload
-      //   ?limit=N&offset=M — page slice (default unlimited for back-compat)
-      if (req.query_params?.["count"] === "true") {
-        // Match the SAME scope that the list path applies — returning
-        // unfiltered totals here would leak cross-agent counts to a
-        // caller that's blocked from the underlying rows.
-        return {
-          status_code: 200,
-          body: {
-            total: filtered.length,
-            latestCount: filtered.filter((m) => m.isLatest).length,
-          },
-        };
-      }
-
-      const rawLimit = req.query_params?.["limit"];
-      const rawOffset = req.query_params?.["offset"];
-      const parsedLimit =
-        typeof rawLimit === "string" ? Number(rawLimit) : Number.NaN;
-      const parsedOffset =
-        typeof rawOffset === "string" ? Number(rawOffset) : Number.NaN;
-      const limit =
-        Number.isInteger(parsedLimit) && parsedLimit > 0
-          ? Math.min(parsedLimit, 5000)
-          : undefined;
-      const offset =
-        Number.isInteger(parsedOffset) && parsedOffset >= 0 ? parsedOffset : 0;
-      filtered.sort((a, b) =>
-        (b.updatedAt || b.createdAt || "").localeCompare(
-          a.updatedAt || a.createdAt || "",
-        ),
-      );
-      const sliced =
-        limit !== undefined ? filtered.slice(offset, offset + limit) : filtered;
-
-      return {
-        status_code: 200,
-        body: {
-          memories: sliced,
-          total: filtered.length,
-          offset,
-          limit: limit ?? null,
-        },
-      };
+      if (filterAgentId) return { status_code: 400,
+        body: { error: "viewer_scoped_memory_filter_requires_native_selector" } };
+      if (req.query_params?.["project"] && req.query_params?.["latest"] !== "true") return { status_code: 400,
+        body: { error: "viewer_project_history_requires_native_selector" } };
+      return { status_code: 200, body: await viewerMemories(kv, req.query_params ?? {}) };
     },
   );
   sdk.registerTrigger({
@@ -2266,27 +2313,10 @@ export function registerApiTriggers(
     config: { api_path: "/agentmemory/procedural", http_method: "GET" },
   });
 
-  const sharedConsolidationCounts = singleFlight(async () => {
-    const [summaries, memories, semantic, procedural, relations] = await Promise.all([
-      kv.list(KV.summaries).catch(() => []),
-      kv.list<import("../types.js").Memory>(KV.memories).catch(() => []),
-      kv.list(KV.semantic).catch(() => []),
-      kv.list(KV.procedural).catch(() => []),
-      kv.list(KV.relations).catch(() => []),
-    ]);
-    return {
-      summaries: summaries.length,
-      recurringPatterns: memories.filter(
-        (m) =>
-          m.isLatest &&
-          m.type === "pattern" &&
-          (m.sessionIds?.length ?? 0) >= PROCEDURAL_MIN_SESSIONS_PER_PATTERN,
-      ).length,
-      semanticFacts: semantic.length,
-      procedures: procedural.length,
-      relations: relations.length,
-    };
-  }, CONSOLIDATION_COUNTS_REUSE_MS);
+  const sharedConsolidationCounts = singleFlight(
+    () => readConsolidationCounts(kv),
+    CONSOLIDATION_COUNTS_REUSE_MS,
+  );
 
   sdk.registerFunction("api::consolidation-status",
     async (req: HttpRequest): Promise<Response> => {
@@ -3320,13 +3350,23 @@ export function registerApiTriggers(
     if (denied) return denied;
     const params = req.query_params || {};
     const limit = parseOptionalPositiveInt(params.limit);
-    if (limit === null) {
+    if (limit === null || (limit !== undefined && limit > 16)) {
       return {
         status_code: 400,
         body: { error: "invalid numeric parameter: limit" },
       };
     }
-    const result = await sdk.trigger({ function_id: "mem::crystal-list", payload: { project: params.project, sessionId: params.sessionId, limit } });
+    const cursor = params.cursor;
+    if (cursor !== undefined && (typeof cursor !== "string" || !cursor || Buffer.byteLength(cursor, "utf8") > 8_192)) {
+      return { status_code: 400, body: { error: "invalid cursor" } };
+    }
+    for (const field of ["project", "sessionId"] as const) {
+      const value = params[field];
+      if (value !== undefined && (typeof value !== "string" || !value.trim() || Buffer.byteLength(value, "utf8") > 256)) {
+        return { status_code: 400, body: { error: `invalid ${field}` } };
+      }
+    }
+    const result = await sdk.trigger({ function_id: "mem::crystal-list", payload: { project: params.project, sessionId: params.sessionId, limit, cursor } });
     return { status_code: 200, body: result };
   });
   sdk.registerTrigger({ type: "http", function_id: "api::crystal-list", config: { api_path: "/agentmemory/crystals", http_method: "GET" } });
@@ -3534,9 +3574,16 @@ export function registerApiTriggers(
     const denied = checkAuth(req, secret);
     if (denied) return denied;
     const body = (req.body as Record<string, unknown>) || {};
-    const result = await sdk.trigger({ function_id: "mem::reflect", payload: {
+    if (body.requestId !== undefined && typeof body.requestId !== "string" || body.continuation !== undefined && !validManualReflectContinuation(body.continuation)) {
+      return { status_code: 400, body: { error: "invalid_manual_reflect_request" } };
+    }
+    const result = await sdk.trigger({ function_id: "mem::reflect", timeoutMs: 180_000, payload: {
       project: typeof body.project === "string" ? body.project : undefined,
       maxClusters: typeof body.maxClusters === "number" ? body.maxClusters : undefined,
+      manual: true, requestId: body.requestId ?? randomBytes(16).toString("hex"),
+      ...(body.continuation !== undefined && { continuation: { jobId: body.continuation.jobId,
+        requestId: body.continuation.requestId, project: body.continuation.project,
+        checkpoint: body.continuation.checkpoint, cut: body.continuation.cut } }),
     } });
     return { status_code: 200, body: result };
   });
@@ -3583,4 +3630,44 @@ export function registerApiTriggers(
     return { status_code: 200, body: result };
   });
   sdk.registerTrigger({ type: "http", function_id: "api::insight-search", config: { api_path: "/agentmemory/insights/search", http_method: "POST" } });
+
+  sdk.registerFunction("api::storage-maintenance", async (req: HttpRequest) => {
+    const denied = checkAuth(req, secret);
+    if (denied) return denied;
+    const body = req.body && typeof req.body === "object" && !Array.isArray(req.body)
+      ? req.body as Record<string, unknown> : {};
+    const action = typeof body.action === "string" ? body.action : "status";
+    if (!["status", "diagnostics", "activate", "run", "reclaim", "migrate_incremental", "graph_metadata_prepare"].includes(action)) {
+      return { status_code: 400, body: { error: "action must be status, diagnostics, activate, run, reclaim, migrate_incremental, or graph_metadata_prepare" } };
+    }
+    if (action === "graph_metadata_prepare") {
+      const limit = body.limit === undefined ? 256 : body.limit;
+      const maxBytes = body.max_bytes === undefined ? 262_144 : body.max_bytes;
+      const maxMs = body.max_ms === undefined ? 3000 : body.max_ms;
+      if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > 1024
+        || typeof maxBytes !== "number" || !Number.isInteger(maxBytes) || maxBytes < 8192 || maxBytes > 1_048_576
+        || typeof maxMs !== "number" || !Number.isInteger(maxMs) || maxMs < 1 || maxMs > 3000) {
+        return { status_code: 400, body: { error: "graph_metadata_prepare requires limit 1-1024, max_bytes 8192-1048576, and max_ms 1-3000" } };
+      }
+      const result = await kv.prepareGraphStorageMetadata({ limit, max_bytes: maxBytes, max_ms: maxMs });
+      return { status_code: 200, body: result };
+    }
+    if (action === "migrate_incremental") {
+      if (body.allow_blocking !== true || typeof body.max_ms !== "number"
+        || !Number.isInteger(body.max_ms) || body.max_ms < 1 || body.max_ms > 86_400_000) {
+        return { status_code: 400, body: { error: "migrate_incremental requires allow_blocking=true and max_ms from 1 through 86400000" } };
+      }
+      const result = await sdk.trigger({
+        function_id: "mem::storage-maintenance",
+        payload: { action, allow_blocking: true, max_ms: body.max_ms },
+      });
+      return { status_code: 200, body: result };
+    }
+    const result = await sdk.trigger({
+      function_id: "mem::storage-maintenance",
+      payload: { action: action === "run" ? "tick" : action },
+    });
+    return { status_code: 200, body: result };
+  });
+  sdk.registerTrigger({ type: "http", function_id: "api::storage-maintenance", config: { api_path: "/agentmemory/storage/maintenance", http_method: "POST" } });
 }

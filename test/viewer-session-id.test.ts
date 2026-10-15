@@ -177,7 +177,7 @@ function loadViewerSandbox() {
 }
 
 describe("viewer session rendering", () => {
-  it("loads only the latest 20 timeline operations into view state", async () => {
+  it("paginates the retained timeline observations locally", async () => {
     const { sandbox, getElement } = loadViewerSandbox();
     const observations = Array.from({ length: 30 }, (_, i) => ({
       id: `operation_${i}`,
@@ -188,24 +188,32 @@ describe("viewer session rendering", () => {
     }));
     sandbox.state.timeline.sessionId = "ses_1";
     sandbox.state.timeline.page = 3;
-    sandbox.apiGet = async () => ({ observations });
+    sandbox.liveSubscriptionResolve();
+    sandbox.AbortSignal = AbortSignal;
+    sandbox.api = async () => ({ status: "ready", observations });
 
     await sandbox.loadObservations();
 
-    expect(sandbox.state.timeline.observations.map((o: { id: string }) => o.id)).toEqual(
-      Array.from({ length: 20 }, (_, i) => `operation_${29 - i}`),
-    );
+    expect(sandbox.state.timeline.observations).toHaveLength(30);
     expect(observations).toHaveLength(30);
     expect(observations[0].id).toBe("operation_0");
     expect(sandbox.state.timeline.page).toBe(0);
     expect(getElement("tl-content").innerHTML.match(/class="timeline-item /g)).toHaveLength(20);
-    expect(getElement("tl-content").innerHTML).toContain("Latest 20 operations");
-    expect(getElement("tl-content").innerHTML).not.toContain('data-action="timeline-page"');
+    expect(getElement("tl-content").innerHTML).toContain("Page 1 of 2 (30 total)");
+    expect(getElement("tl-content").innerHTML).toContain('data-action="timeline-page" data-page="1">Next');
+
+    sandbox.tlPage(1);
+    expect(getElement("tl-content").innerHTML.match(/class="timeline-item /g)).toHaveLength(10);
+    expect(getElement("tl-content").innerHTML).toContain("Page 2 of 2 (30 total)");
+    expect(getElement("tl-content").innerHTML).toContain("Operation 0");
+    expect(getElement("tl-content").innerHTML).not.toContain("Operation 10");
 
     sandbox.state.timeline.minImportance = 9;
+    sandbox.state.timeline.page = 0;
     sandbox.renderObservations();
-    expect(getElement("tl-content").innerHTML).toContain("No observations match the filter (20 total)");
-    expect(getElement("tl-content").innerHTML).not.toContain("Operation 0");
+    expect(getElement("tl-content").innerHTML.match(/class="timeline-item /g)).toHaveLength(10);
+    expect(getElement("tl-content").innerHTML).toContain("10 matching observations in this bounded source window");
+    expect(getElement("tl-content").innerHTML).toContain("Operation 0");
   });
 
   it("keeps malformed dates behind the latest valid timeline operations", () => {

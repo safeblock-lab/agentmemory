@@ -76,8 +76,12 @@ export class LlmTaskRouter {
     const startedAt = Date.now();
     const usage: LlmUsage[] = [];
     try {
-      const candidate = await operation(this.withTask(this.auxiliary, task, usage));
-      await this.emitUsage(task, "aux", this.auxiliary.model, usage);
+      let candidate: T;
+      try {
+        candidate = await operation(this.withTask(this.auxiliary, task, usage));
+      } finally {
+        await this.emitUsage(task, "aux", this.auxiliary.model, usage);
+      }
       const failureReason = this.getCandidateFailure(candidate, validate);
       if (!failureReason) {
         this.emit({
@@ -104,8 +108,12 @@ export class LlmTaskRouter {
   ): Promise<T> {
     const startedAt = Date.now();
     const usage: LlmUsage[] = [];
-    const candidate = await operation(this.withTask(this.primary, task, usage));
-    await this.emitUsage(task, "primary", this.primary.model, usage);
+    let candidate: T;
+    try {
+      candidate = await operation(this.withTask(this.primary, task, usage));
+    } finally {
+      await this.emitUsage(task, "primary", this.primary.model, usage);
+    }
     const primaryFailure = this.getCandidateFailure(candidate, validate);
     if (primaryFailure) {
       throw new Error(`LLM ${task} response failed deterministic validation`);

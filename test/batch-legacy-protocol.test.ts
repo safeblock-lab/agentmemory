@@ -42,6 +42,11 @@ describe("batch callback protocol upgrade", () => {
     const h = setup(); const queued = await h.create().enqueue(request);
     const item = (await h.kv.get<FireworksBatchWorkItem>(KV.fireworksBatchWorkItems, queued.workItemId!))!;
     delete item.callbackProtocolVersion; item.state = state;
+    if (state !== "queued") {
+      item.batchJobId = "legacy-job";
+      await h.kv.set(KV.fireworksBatchJobs, "legacy-job", { id: "legacy-job", remoteJobId: "remote", outputDatasetId: "output", inputDatasetId: "input", workItemIds: [item.id], state: "polling", attempts: 0, nextAttemptAt: new Date(0).toISOString() });
+      await h.kv.set(KV.fireworksBatchActiveJobs, "current", { version: 1, ids: ["legacy-job"] });
+    }
     item.completionIntent = { key: batchEffectKey(item.id), resultHash: batchEffectKey("ambiguous") };
     await h.kv.set(KV.fireworksBatchWorkItems, item.id, item);
     await h.create().process();
@@ -71,6 +76,11 @@ describe("batch callback protocol upgrade", () => {
     const h = setup(); const queued = await h.create().enqueue(request);
     const item = (await h.kv.get<FireworksBatchWorkItem>(KV.fireworksBatchWorkItems, queued.workItemId!))!;
     delete item.callbackProtocolVersion; item.state = state;
+    if (state !== "queued") {
+      item.batchJobId = "legacy-job";
+      await h.kv.set(KV.fireworksBatchJobs, "legacy-job", { id: "legacy-job", remoteJobId: "remote", outputDatasetId: "output", inputDatasetId: "input", workItemIds: [item.id], state: "polling", attempts: 0, nextAttemptAt: new Date(0).toISOString() });
+      await h.kv.set(KV.fireworksBatchActiveJobs, "current", { version: 1, ids: ["legacy-job"] });
+    }
     await h.kv.set(KV.fireworksBatchWorkItems, item.id, item);
     await h.create().process(); await h.create().enqueue(request);
     expect(await h.kv.get(KV.fireworksBatchWorkItems, item.id)).toEqual(item);

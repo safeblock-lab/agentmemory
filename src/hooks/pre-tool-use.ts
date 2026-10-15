@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { recordContextEmission } from "./_context-usage.js";
 
 function isSdkChildContext(payload: unknown): boolean {
   if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -114,9 +115,10 @@ async function main() {
     });
 
     if (res.ok) {
-      const result = (await res.json()) as { context?: string };
+      const result = (await res.json()) as { context?: string; candidateTokens?: number };
       if (result.context) {
-        process.stdout.write(result.context);
+        const text = result.context;
+        process.stdout.write(text, () => recordContextEmission(REST_URL, authHeaders(), sessionId, "pre-tool-use", text, result.candidateTokens));
       }
     }
   } catch {

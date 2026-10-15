@@ -1,7 +1,9 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { GraphRetrieval } from "../src/functions/graph-retrieval.js";
 import type { GraphNode, GraphEdge } from "../src/types.js";
 import { installGraphStateWire } from "./helpers/graph-state-harness.js";
+
+vi.mock("iii-sdk", () => ({ InvocationError: class InvocationError extends Error { code = "TEST_INVOCATION_ERROR"; } }));
 
 function mockKV(
   nodes: GraphNode[] = [],
@@ -19,21 +21,43 @@ function mockKV(
   const kv = {
     indexedRetrieval: true,
     retrieval: async (payload: Record<string, unknown>) => {
-      if (payload.action === 'graph_seeds') {
-        const names = payload.entity_names as string[];
-        const observations = new Set(payload.observation_ids as string[]);
-        return { generation: '1', items: nodes.flatMap((node, position) => {
-          const name = node.name.toLowerCase();
-          const entity = names.some(query => payload.match === 'exact' ? name === query.toLowerCase() : name.includes(query.toLowerCase()) || query.toLowerCase().includes(name));
-          const observation = node.sourceObservationIds.some(id => observations.has(id));
-          return !node.stale && (entity || observation) ? [{ key: node.id, id: node.id, position: String(position), entity, observation }] : [];
-        }) };
+      const project = typeof payload.project === "string" ? payload.project : "";
+      if (payload.action !== "graph_read" || project !== "project-a") {
+        return { status: "partial", reason: project ? "index_not_ready" : "project_required", project, items: [], has_more: false };
       }
-      if (payload.action === 'graph_edges') {
-        const ids = new Set(payload.node_ids as string[]);
-        return { generation: '1', items: edges.flatMap((value, position) => !value.stale && (ids.has(value.sourceNodeId) || ids.has(value.targetNodeId)) ? [{ key: value.id, position: String(position), value }] : []) };
+      const mode = payload.mode;
+      const limit = typeof payload.limit === "number" ? Math.min(16, payload.limit) : 16;
+      const cursor = typeof payload.cursor === "string" ? Number(payload.cursor) : 0;
+      let matches: Array<Record<string, unknown>> = [];
+      if (mode === "search") {
+        const query = typeof payload.query === "string" ? payload.query.toLowerCase() : "";
+        const observationIds = new Set(Array.isArray(payload.observation_ids) ? payload.observation_ids : []);
+        matches = nodes.flatMap((node, position) => {
+          const entity = Boolean(query && node.name.toLowerCase().includes(query));
+          const observation = node.sourceObservationIds.some((id) => observationIds.has(id));
+          return !node.stale && (entity || observation)
+            ? [{ key: node.id, id: node.id, position: String(position), entity, observation }]
+            : [];
+        });
+      } else if (mode === "neighbors") {
+        const ids = new Set(Array.isArray(payload.node_ids) ? payload.node_ids : []);
+        matches = edges.flatMap((value, position) => !value.stale &&
+          nodes.some((node) => node.id === value.sourceNodeId) && nodes.some((node) => node.id === value.targetNodeId) &&
+          (ids.has(value.sourceNodeId) || ids.has(value.targetNodeId))
+          ? [{ key: value.id, id: value.id, position: String(position), value }]
+          : []);
+      } else if (mode === "history") {
+        const ids = new Set(Array.isArray(payload.edge_ids) ? payload.edge_ids : []);
+        matches = edges.flatMap((value, position) => ids.has(value.id)
+          ? [{ key: value.id, id: value.id, position: String(position), value }]
+          : []);
       }
-      throw new Error('Unexpected indexed request');
+      const items = matches.slice(cursor, cursor + limit);
+      const hasMore = cursor + items.length < matches.length;
+      return {
+        status: "ready", project, items, has_more: hasMore,
+        ...(hasMore ? { next_cursor: String(cursor + items.length) } : {}),
+      };
     },
     get: async <T>(scope: string, key: string): Promise<T | null> => {
       return (store.get(scope)?.get(key) as T) ?? null;
@@ -99,7 +123,7 @@ describe("GraphRetrieval", () => {
     const kv = mockKV(nodes, []);
     const retrieval = new GraphRetrieval(kv as never);
 
-    const results = await retrieval.searchByEntities(["React"]);
+    const results = await retrieval.searchByEntities(["React"], 2, 20, "project-a");
     expect(results.length).toBeGreaterThan(0);
     expect(results[0].obsId).toBe("obs_1");
   });
@@ -109,7 +133,7 @@ describe("GraphRetrieval", () => {
     const kv = mockKV(nodes, []);
     const retrieval = new GraphRetrieval(kv as never);
 
-    const results = await retrieval.searchByEntities(["auth"]);
+    const results = await retrieval.searchByEntities(["auth"], 2, 20, "project-a");
     expect(results.length).toBeGreaterThan(0);
   });
 
@@ -122,7 +146,7 @@ describe("GraphRetrieval", () => {
     const kv = mockKV(nodes, edges);
     const retrieval = new GraphRetrieval(kv as never);
 
-    const results = await retrieval.searchByEntities(["React"], 2);
+    const results = await retrieval.searchByEntities(["React"], 2, 20, "project-a");
     const obsIds = results.map((r) => r.obsId);
     expect(obsIds).toContain("obs_1");
     expect(obsIds).toContain("obs_2");
@@ -131,8 +155,22 @@ describe("GraphRetrieval", () => {
   it("returns empty for no matches", async () => {
     const kv = mockKV([], []);
     const retrieval = new GraphRetrieval(kv as never);
-    const results = await retrieval.searchByEntities(["nonexistent"]);
+    const results = await retrieval.searchByEntities(["nonexistent"], 2, 20, "project-a");
     expect(results).toEqual([]);
+  });
+
+  it("does not turn an unavailable scoped index into graph seeds or writes", async () => {
+    const nodes = [makeNode("n1", "React", "library", ["obs_1"])];
+    const kv = mockKV(nodes, []);
+    kv.indexedRetrieval = false;
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const result = await retrieval.searchByEntitiesAndChunks(
+      ["React"], [], 2, 1, 20, 10, undefined, "project-a",
+    );
+
+    expect(result).toMatchObject({ entities: [], chunks: [], partial: true, reason: "index_not_ready" });
+    expect(await kv.list("mem:graph:nodes")).toEqual(nodes);
   });
 
   it("expands from existing chunks", async () => {
@@ -144,7 +182,7 @@ describe("GraphRetrieval", () => {
     const kv = mockKV(nodes, edges);
     const retrieval = new GraphRetrieval(kv as never);
 
-    const results = await retrieval.expandFromChunks(["obs_1"]);
+    const results = await retrieval.expandFromChunks(["obs_1"], 1, 10, "project-a");
     const obsIds = results.map((r) => r.obsId);
     expect(obsIds).toContain("obs_2");
   });
@@ -154,7 +192,7 @@ describe("GraphRetrieval", () => {
     const kv = mockKV(nodes, []);
     const retrieval = new GraphRetrieval(kv as never);
 
-    const results = await retrieval.expandFromChunks(["obs_1"]);
+    const results = await retrieval.expandFromChunks(["obs_1"], 1, 10, "project-a");
     const obsIds = results.map((r) => r.obsId);
     expect(obsIds).not.toContain("obs_1");
   });
@@ -172,7 +210,7 @@ describe("GraphRetrieval", () => {
     const kv = mockKV(nodes, edges);
     const retrieval = new GraphRetrieval(kv as never);
 
-    const result = await retrieval.temporalQuery("Alice");
+    const result = await retrieval.temporalQuery("Alice", undefined, undefined, "project-a");
     expect(result.entity).toBeDefined();
     expect(result.entity!.name).toBe("Alice");
     expect(result.currentState.length).toBeGreaterThan(0);
@@ -181,7 +219,7 @@ describe("GraphRetrieval", () => {
   it("returns null entity for unknown name", async () => {
     const kv = mockKV([], []);
     const retrieval = new GraphRetrieval(kv as never);
-    const result = await retrieval.temporalQuery("Unknown");
+    const result = await retrieval.temporalQuery("Unknown", undefined, undefined, "project-a");
     expect(result.entity).toBeNull();
   });
 
@@ -198,7 +236,7 @@ describe("GraphRetrieval", () => {
     const kv = mockKV(nodes, edges);
     const retrieval = new GraphRetrieval(kv as never);
 
-    const results = await retrieval.searchByEntities(["React"], 3);
+    const results = await retrieval.searchByEntities(["React"], 3, 20, "project-a");
     const directScore = results.find((r) => r.obsId === "obs_1")?.score ?? 0;
     const indirectScore = results.find((r) => r.obsId === "obs_3")?.score ?? 0;
     expect(directScore).toBeGreaterThan(indirectScore);
@@ -227,7 +265,7 @@ describe("GraphRetrieval", () => {
     const kv = mockKV(nodes, edges);
     const retrieval = new GraphRetrieval(kv as never);
 
-    const results = await retrieval.searchByEntities(["Start"], 3);
+    const results = await retrieval.searchByEntities(["Start"], 3, 20, "project-a");
     const endResult = results.find((r) => r.obsId === "obs_end");
     expect(endResult).toBeDefined();
     // Path is [Start → Mid → End] (length 3) — Dijkstra picked the
@@ -247,7 +285,7 @@ describe("GraphRetrieval", () => {
     const kv = mockKV(nodes, edges);
     const retrieval = new GraphRetrieval(kv as never);
 
-    const results = await retrieval.searchByEntities(["A"], 5);
+    const results = await retrieval.searchByEntities(["A"], 5, 20, "project-a");
     expect(results.find((r) => r.obsId === "obs_a")).toBeDefined();
     expect(results.find((r) => r.obsId === "obs_b")).toBeDefined();
     expect(results.find((r) => r.obsId === "obs_lonely")).toBeUndefined();
@@ -265,7 +303,7 @@ describe("GraphRetrieval", () => {
     const kv = mockKV(nodes, edges);
     const retrieval = new GraphRetrieval(kv as never);
 
-    const results = await retrieval.searchByEntities(["Anchor"], 2);
+    const results = await retrieval.searchByEntities(["Anchor"], 2, 20, "project-a");
     const weak = results.find((r) => r.obsId === "obs_weak");
     expect(weak).toBeDefined();
     expect(Number.isFinite(weak!.score)).toBe(true);
@@ -287,7 +325,7 @@ describe("GraphRetrieval", () => {
     const kv = mockKV(nodes, edges);
     const retrieval = new GraphRetrieval(kv as never);
 
-    const results = await retrieval.searchByEntities(["React"], 2);
+    const results = await retrieval.searchByEntities(["React"], 2, 20, "project-a");
     const root = results.find((r) => r.obsId === "obs_root");
     expect(root).toBeDefined();
     expect(root!.score).toBe(1.0);
@@ -311,7 +349,7 @@ describe("GraphRetrieval", () => {
     const kv = mockKV(nodes, edges);
     const retrieval = new GraphRetrieval(kv as never);
 
-    const results = await retrieval.searchByEntities(["Start"], 2);
+    const results = await retrieval.searchByEntities(["Start"], 2, 20, "project-a");
     expect(results.find((r) => r.obsId === "obs_3")).toBeDefined();
     expect(results.find((r) => r.obsId === "obs_4")).toBeUndefined();
   });

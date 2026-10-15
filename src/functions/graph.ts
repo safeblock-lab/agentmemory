@@ -1,4 +1,5 @@
 import type { IIIClient } from "iii-sdk";
+import { IndexedRetrievalError } from "../state/indexed-retrieval.js";
 import type {
   GraphNode,
   GraphEdge,
@@ -22,6 +23,7 @@ import { recordAudit } from "./audit.js";
 import { recordOperation } from "./dashboard-activity.js";
 import { logger } from "../logger.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
+import { withStrictGraphResponse } from "../providers/openai.js";
 import type { TypeSafeDecisionProvider, TypeSafeQuestion } from "../providers/typesafe.js";
 import {
   getGraphExtractionInputTargetChars,
@@ -32,8 +34,10 @@ import {
 import { stripPrivateData } from "./privacy.js";
 import type { FireworksBatchQueue } from "./fireworks-batch.js";
 import { selectCompactionCandidates } from "./typesafe-compaction.js";
-import { freezeGraphHandledValue, freezeGraphSessionObservations, freezeGraphValue, graphCapturedAt, graphJobId, graphKV, hasGraphDelta, registerGraphJobHandler, runGraphJob, withCompletedGraphRead, withGraphDelta, graphTransactionFailure } from "./graph-jobs.js";
-import { collectProjectedRecords, countProjectedRecordIds } from "./projected-record-reader.js";
+import { graphStrictProviderResponse, freezeGraphInputUnits, freezeGraphHandledValue, freezeGraphSessionObservations, freezeGraphValue, graphCapturedAt, graphJobId, graphJobNextDeltaOrdinal, graphKV, hasGraphDelta, isGraphJobYield, readGraphJobContinuation, registerGraphJobHandler, runGraphJob, withGraphDelta, writeGraphJobContinuation, yieldGraphJob, graphTransactionFailure, graphUnknownCompactionRepeatProvider, graphUnknownCompactionRepeatFetchPermit, type GraphJobYield } from "./graph-jobs.js";
+import { prepareGraphBrowse, readScopedGraphPage } from "./graph-retrieval-read.js";
+import { GRAPH_STATISTICS_SAMPLE_LIMIT, readProjectGraphStatistics } from "./graph-statistics.js";
+import { registerGraphDispatch, selectedGraphGeneration, type GraphDispatchRequest } from "./graph-dispatch.js";
 import {
   estimateGraphObservationChars,
   isProtectedGraphObservation,
@@ -41,8 +45,49 @@ import {
   toGraphPromptObservation,
   type GraphExtractionUnit,
 } from "./graph-input.js";
+import { createNextGraphWorkUnit, GRAPH_WORK_LIMITS, type GraphWorkCursor } from "./graph-work-groups.js";
 
 const PROTECTED_GRAPH_SIGNAL = /\b(?:error|failed|failure|decision|instruction|prompt|security|secret|token|password|credential|api[-_ ]?key|auth|permission|mutation|write|edit|patch|delete|move|rename|commit|push|reset|deploy|install|shell|terminal|bash|powershell|environment|env|(?:AGENTS|CLAUDE|GEMINI|COPILOT)\.md)\b/i;
+
+function* splitGraphWorkContent(value: string, maxBytes: number): Generator<string> {
+  let part = "", bytes = 0;
+  for (const character of value) {
+    const size = Buffer.byteLength(character, "utf8");
+    if (part && bytes + size > maxBytes) { yield part; part = ""; bytes = 0; }
+    part += character;
+    bytes += size;
+  }
+  if (part) yield part;
+}
+
+function graphWorkObservationContent(observation: GraphExtractionUnit["promptObservations"][number]): string {
+  return `Type: ${observation.type}\nTitle: ${observation.title}\nNarrative: ${observation.narrative}\nConcepts: ${observation.concepts.join(", ")}\nFiles: ${observation.files.join(", ")}`;
+}
+
+interface GraphExtractionOptions {
+  graphEnabled: boolean; llmEnabled: boolean; auxiliary: boolean; targetChars: number;
+  typeSafe: boolean; batchQueue: boolean; providerName: string; localCompactor: boolean;
+  typeSafeCompaction: boolean; typeSafeMaxStateChars: number;
+}
+export function graphExtractionOptionsCompatible(saved: GraphExtractionOptions, current: GraphExtractionOptions): boolean {
+  return saved.providerName === current.providerName
+    && saved.auxiliary === current.auxiliary
+    && ["graphEnabled", "llmEnabled", "typeSafe", "batchQueue", "localCompactor", "typeSafeCompaction"].every(key =>
+      typeof saved[key as keyof GraphExtractionOptions] === "boolean"
+      && (!saved[key as keyof GraphExtractionOptions] || current[key as keyof GraphExtractionOptions] === true))
+    && Number.isSafeInteger(saved.targetChars) && saved.targetChars > 0
+    && Number.isSafeInteger(saved.typeSafeMaxStateChars) && saved.typeSafeMaxStateChars > 0;
+}
+interface ProjectGraphWorkPage {
+  version: 2; project: string; sources: Array<{ id: string; version: string; content: string }>;
+}
+interface ProjectGraphWorkProgress {
+  version: 2; pageCount: number; pageIndex: number; cursor: GraphWorkCursor | null;
+  nodesAdded: number; edgesAdded: number; workUnits: number;
+  extractionSystem: string; envelopeSuffix: string; options: GraphExtractionOptions;
+  activeUnit?: { id: string; pageIndex: number; resultOrdinal: number };
+}
+const MAX_PROJECT_GRAPH_PLAN_BYTES = 64 * 1024 * 1024;
 
 function hasProtectedGraphSignal(text: string): boolean {
   return PROTECTED_GRAPH_SIGNAL.test(text) || stripPrivateData(text) !== text;
@@ -51,8 +96,10 @@ function hasProtectedGraphSignal(text: string): boolean {
 async function compactGraphObservations(
   observations: CompressedObservation[],
   typeSafe?: TypeSafeDecisionProvider,
+  options?: Pick<GraphExtractionOptions, "typeSafeCompaction" | "typeSafeMaxStateChars">,
 ): Promise<CompressedObservation[]> {
-  if (!typeSafe || !isTypeSafeFeatureEnabled("compaction")) return observations;
+  const repeat = graphUnknownCompactionRepeatProvider();
+  if (!typeSafe || !(options?.typeSafeCompaction ?? isTypeSafeFeatureEnabled("compaction"))) return observations;
   const observationsByRecency = [...observations].sort((left, right) => {
     const leftTimestamp = Date.parse(left.timestamp);
     const rightTimestamp = Date.parse(right.timestamp);
@@ -96,6 +143,7 @@ async function compactGraphObservations(
     return { id: observation.id, value: observation, disposition: "ambiguous" as const, state };
   });
 
+  let repeatDecisionFailed = false;
   try {
     const selected = await selectCompactionCandidates(
       candidates,
@@ -112,7 +160,16 @@ async function compactGraphObservations(
                 },
               };
             }
-            const answers = await typeSafe.evaluate("compaction", { candidates: batch }, questions);
+            let answers: Awaited<ReturnType<TypeSafeDecisionProvider["evaluate"]>>;
+            try {
+              const permission = repeat ? graphUnknownCompactionRepeatFetchPermit() : undefined;
+              if (repeat && !permission) throw new Error("Unknown compaction repetition has no admitted fetch permission");
+              answers = await typeSafe.evaluate("compaction", { candidates: batch }, questions, permission);
+              if (repeat && !answers) throw new Error("Unknown compaction repetition has no valid response");
+            } catch (error) {
+              repeatDecisionFailed = true;
+              throw error;
+            }
             if (!answers) return undefined;
             const decisions: Record<string, { choice: "keep" | "drop"; confidence: number }> = {};
             for (const item of batch) {
@@ -124,16 +181,19 @@ async function compactGraphObservations(
             return decisions;
           }
         : undefined,
-      { maxStateChars: getTypeSafeConfig().maxStateChars },
+      { maxStateChars: options?.typeSafeMaxStateChars ?? getTypeSafeConfig().maxStateChars },
     );
+    if (repeat && repeatDecisionFailed) throw new Error("Unknown compaction repetition outcome unavailable");
     const decisionFailures = selected.fallbackReasons.filter((reason) =>
       reason === "decision-error" || reason === "decision-unavailable" || reason === "invalid-answer",
     );
+    if (repeat && decisionFailures.length > 0) throw new Error("Unknown compaction repetition response was not valid");
     if (decisionFailures.length > 0) {
       logger.warn("TypeSafe graph compaction failed open", { reasons: decisionFailures });
     }
     return selected.kept.map((candidate) => candidate.value);
   } catch (error) {
+    if (repeat) throw error;
     logger.warn("TypeSafe graph compaction failed open", {
       errorType: error instanceof Error ? error.name : "unknown",
     });
@@ -279,6 +339,68 @@ async function prepareGraphExtractionInputs(
   return packGraphInputUnits(compactedUnits, targetChars).map(mergeGraphInputUnits);
 }
 
+async function captureProjectGraphWorkPages(
+  kv: StateKV,
+  observations: CompressedObservation[],
+  targetChars: number,
+): Promise<number> {
+  const jobId = graphJobId();
+  if (!jobId) throw new Error("Grouped graph work requires a durable root job");
+  const byProject = new Map<string, { observations: CompressedObservation[]; ids: Set<string> }>();
+  const observationProjects = new Map<string, string>();
+  for (const observation of observations) {
+    const session = observation.sessionId ? await kv.get<{ project?: string }>(KV.sessions, observation.sessionId) : null;
+    const project = session?.project?.trim();
+    if (!project) throw new Error("GRAPH_PROJECT_SCOPE_UNAVAILABLE");
+    const priorProject = observationProjects.get(observation.id);
+    if (priorProject && priorProject !== project) throw new Error("GRAPH_PROJECT_SCOPE_MISMATCH");
+    observationProjects.set(observation.id, project);
+    if (!byProject.has(project)) byProject.set(project, { observations: [], ids: new Set() });
+    const group = byProject.get(project)!;
+    if (!group.ids.has(observation.id)) {
+      group.ids.add(observation.id);
+      group.observations.push(observation);
+    }
+  }
+
+  let pageIndex = 0;
+  let planBytes = 0;
+  for (const [project, group] of byProject) {
+    const units = await prepareGraphExtractionInputs(group.observations, targetChars, undefined, true);
+    for (const unit of units) {
+      let sources: ProjectGraphWorkPage["sources"] = [];
+      let sourceBytes = 0;
+      const persistPage = async () => {
+        if (!sources.length) return;
+        const page: ProjectGraphWorkPage = { version: 2, project, sources };
+        const serializedBytes = Buffer.byteLength(JSON.stringify(page), "utf8");
+        planBytes += serializedBytes;
+        if (planBytes > MAX_PROJECT_GRAPH_PLAN_BYTES) throw new Error("Project graph work plan exceeds the 64 MiB capture limit");
+        await withGraphDelta(kv, () => kv.set(KV.graphProviderResults(jobId), `project-work-page:v3:${pageIndex}`, page));
+        pageIndex++;
+        sources = [];
+        sourceBytes = 0;
+      };
+      for (let index = 0; index < unit.promptObservations.length; index++) {
+        const observation = unit.promptObservations[index]!;
+        const source = unit.sourceObservations[index];
+        if (!source) throw new Error("Graph prompt source mapping is incomplete");
+        let fragment = 0;
+        for (const content of splitGraphWorkContent(graphWorkObservationContent(observation), GRAPH_WORK_LIMITS.maxPageBytes - 512)) {
+          const entry = { id: source.id, version: `${source.timestamp || "unknown"}:${fragment++}`, content };
+          const bytes = Buffer.byteLength(entry.id, "utf8") + Buffer.byteLength(entry.version, "utf8") + Buffer.byteLength(entry.content, "utf8");
+          if (bytes > GRAPH_WORK_LIMITS.maxPageBytes) throw new Error("Project graph source exceeds its bounded page budget");
+          if (sources.length >= GRAPH_WORK_LIMITS.maxPageSources || sourceBytes + bytes > GRAPH_WORK_LIMITS.maxPageBytes) await persistPage();
+          sources.push(entry);
+          sourceBytes += bytes;
+        }
+      }
+      await persistPage();
+    }
+  }
+  return pageIndex;
+}
+
 // #753: keep the response payload below the iii state channel ceiling.
 // 500 nodes + their incident edges hold well under the limit on the
 // reported 11k-node / 28k-edge corpus, and 5,000 is the upper bound a
@@ -297,32 +419,6 @@ const SNAPSHOT_TOP_NODES = DEFAULT_GRAPH_QUERY_LIMIT;
 const SNAPSHOT_MAX_OBSERVATIONS_PER_RECORD = 64;
 const MAX_GRAPH_SNAPSHOT_BYTES = 4 * 1024 * 1024;
 const SNAPSHOT_KEY = "current";
-
-// `state::list` over a 75K-node scope can exceed the iii invocation
-// timeout. The query handler races the enumeration against this budget
-// and falls back to the snapshot (or a warning envelope) when the live
-// path is too slow. 6000ms leaves headroom under the default 8s engine
-// invocation deadline.
-const LIVE_ENUMERATION_BUDGET_MS = 6000;
-
-function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const t = setTimeout(
-      () => reject(new Error(`${label}: exceeded ${ms}ms budget`)),
-      ms,
-    );
-    p.then(
-      (v) => {
-        clearTimeout(t);
-        resolve(v);
-      },
-      (err) => {
-        clearTimeout(t);
-        reject(err);
-      },
-    );
-  });
-}
 
 function emptySnapshot(): GraphSnapshot {
   return {
@@ -492,95 +588,8 @@ async function writeGraphSnapshot(
   );
 }
 
-function buildSnapshotFromArrays(
-  nodes: GraphNode[],
-  edges: GraphEdge[],
-): GraphSnapshot {
-  const liveNodes = nodes.filter((n) => !n.stale);
-  const liveEdges = edges.filter((e) => !e.stale);
-  // Build the global degree map once so we can both rank by it AND
-  // snapshot the per-top-node values into topDegrees for synchronous
-  // re-sort after incremental edge writes.
-  const degree = new Map<string, number>();
-  for (const e of liveEdges) {
-    degree.set(e.sourceNodeId, (degree.get(e.sourceNodeId) ?? 0) + 1);
-    degree.set(e.targetNodeId, (degree.get(e.targetNodeId) ?? 0) + 1);
-  }
-  const ranked = [...liveNodes]
-    .sort((a, b) => (degree.get(b.id) ?? 0) - (degree.get(a.id) ?? 0))
-    .slice(0, SNAPSHOT_TOP_NODES);
-  const rankedIds = new Set(ranked.map((n) => n.id));
-  const topEdges = liveEdges.filter(
-    (e) => rankedIds.has(e.sourceNodeId) && rankedIds.has(e.targetNodeId),
-  );
-  const topDegrees: Record<string, number> = {};
-  for (const n of ranked) {
-    topDegrees[n.id] = degree.get(n.id) ?? 0;
-  }
-  const nodesByType: Record<string, number> = {};
-  for (const n of liveNodes) {
-    nodesByType[n.type] = (nodesByType[n.type] || 0) + 1;
-  }
-  const edgesByType: Record<string, number> = {};
-  for (const e of liveEdges) {
-    edgesByType[e.type] = (edgesByType[e.type] || 0) + 1;
-  }
-  return {
-    version: 1,
-    topNodes: ranked,
-    topEdges,
-    topDegrees,
-    stats: {
-      totalNodes: liveNodes.length,
-      totalEdges: liveEdges.length,
-      nodesByType,
-      edgesByType,
-    },
-    updatedAt: graphCapturedAt(),
-    dirty: false,
-  };
-}
-
-function paginateFromSnapshot(
-  snap: GraphSnapshot,
-  filterType: string | undefined,
-  limit: number,
-  offset: number,
-): GraphQueryResult {
-  const filteredNodes = filterType
-    ? snap.topNodes.filter((n) => n.type === filterType)
-    : snap.topNodes;
-  const total = filterType
-    ? snap.stats.nodesByType[filterType] ?? 0
-    : snap.stats.totalNodes;
-  const pageNodes = filteredNodes.slice(offset, offset + limit);
-  const pageIds = new Set(pageNodes.map((n) => n.id));
-  const pageEdges = snap.topEdges.filter(
-    (e) => pageIds.has(e.sourceNodeId) && pageIds.has(e.targetNodeId),
-  );
-  return {
-    nodes: pageNodes,
-    edges: pageEdges,
-    depth: 0,
-    totalNodes: total,
-    totalEdges: snap.stats.totalEdges,
-    truncated: total > pageNodes.length,
-    limit,
-    offset,
-    fromSnapshot: true,
-  };
-}
-
-// #814 v2: the rebuild path won't terminate on corpora large enough
-// that kv.list returns a payload too big to JSON.parse without
-// starving the iii heartbeat. We don't actually know the corpus size
-// without enumerating, but we can refuse to start a rebuild if the
-// snapshot's recorded `totalNodes` already exceeds this threshold —
-// the rebuild path is unreliable above it, and an incremental
-// extract-driven snapshot is the right approach for those corpora.
-// Operators above the threshold should use mem::graph-reset and let
-// future extracts rebuild incrementally.
-const REBUILD_SAFE_NODE_CEILING = 25000;
+// Legacy global snapshot enumeration is disabled; bounded project reads
+// use native candidate selectors instead.
 
 function nameIndexKey(type: string, name: string): string {
   return `${type}|${name}`;
@@ -592,6 +601,78 @@ function edgeIndexKey(
   type: string,
 ): string {
   return `${sourceNodeId}|${targetNodeId}|${type}`;
+}
+
+function scopedGraphItemId(item: unknown): string | undefined {
+  if (!item || typeof item !== "object") return undefined;
+  const record = item as Record<string, unknown>;
+  return typeof record.id === "string" ? record.id :
+    typeof record.key === "string" ? record.key : undefined;
+}
+
+function scopedGraphEdge(item: unknown): GraphEdge | undefined {
+  if (!item || typeof item !== "object") return undefined;
+  const record = item as Record<string, unknown>;
+  const value = record.value && typeof record.value === "object"
+    ? record.value as GraphEdge
+    : record as unknown as GraphEdge;
+  return typeof value.id === "string" && typeof value.sourceNodeId === "string" &&
+    typeof value.targetNodeId === "string" ? value : undefined;
+}
+
+async function hydrateScopedGraphNodes(
+  kv: StateKV,
+  ids: readonly string[],
+): Promise<{ nodes: GraphNode[]; incomplete: boolean }> {
+  const nodes: GraphNode[] = [];
+  let incomplete = false;
+  for (let offset = 0; offset < ids.length; offset += 12) {
+    const batch = ids.slice(offset, offset + 12);
+    const rows = await Promise.all(batch.map((id) => kv.get<GraphNode>(KV.graphNodes, id)));
+    for (const [index, node] of rows.entries()) {
+      if (!node || node.id !== batch[index] || node.stale) {
+        incomplete = true;
+        continue;
+      }
+      nodes.push(node);
+    }
+  }
+  return { nodes, incomplete };
+}
+
+async function readScopedGraphEdges(
+  kv: StateKV,
+  project: string,
+  nodeIds: readonly string[],
+): Promise<{ edges: GraphEdge[]; partial: boolean; reason?: string }> {
+  const edges: GraphEdge[] = [];
+  let partial = false;
+  let reason: string | undefined;
+  for (let offset = 0; offset < nodeIds.length && edges.length < 16; offset += 12) {
+    const selected = nodeIds.slice(offset, offset + 12);
+    const page = await readScopedGraphPage<{ id?: string; key?: string; value?: GraphEdge }>(kv, {
+      project, mode: "neighbors", node_ids: selected, limit: 16, max_bytes: 64 * 1024,
+    });
+    if (page.status !== "ready" || page.has_more) {
+      partial = true;
+      reason ??= page.reason;
+    }
+    for (const item of page.items) {
+      const edge = scopedGraphEdge(item);
+      if (!edge || edge.stale || edges.some((existing) => existing.id === edge.id) ||
+        !nodeIds.includes(edge.sourceNodeId) || !nodeIds.includes(edge.targetNodeId)) continue;
+      edges.push(edge);
+      if (edges.length === 16) {
+        partial = true;
+        break;
+      }
+    }
+  }
+  return { edges, partial, ...(reason ? { reason } : {}) };
+}
+
+function scopedGraphWarning(reason: string | undefined, fallback: string): string {
+  return reason ? `${fallback} (${reason}).` : `${fallback}.`;
 }
 
 // Mutates `snap` to apply a +1 (or -1) degree delta for nodeId,
@@ -1241,8 +1322,125 @@ export function registerGraphFunction(
   typeSafe?: TypeSafeDecisionProvider,
 ): void {
   kv = graphKV(kv);
-  type ExtractionRequest = { observations?: CompressedObservation[]; sessionId?: string; batchResponse?: string; deferred?: boolean; force?: boolean; batchEffectKey?: string; replacementOf?: string; graphJobId?: string; graphProvenanceVersion?: 2 };
+  type ExtractionRequest = GraphDispatchRequest & { graphWorkGroupsVersion?: 2 };
+  const currentExtractionOptions = (): GraphExtractionOptions => ({
+    graphEnabled: isGraphExtractionEnabled(), llmEnabled: isGraphExtractionEnabled() && !provider.name.includes("noop"),
+    auxiliary: llmRouter?.hasAuxiliaryProvider === true, targetChars: getGraphExtractionInputTargetChars(),
+    typeSafe: Boolean(typeSafe), batchQueue: Boolean(batchQueue), providerName: provider.name,
+    localCompactor: Boolean(localCompactor), typeSafeCompaction: isTypeSafeFeatureEnabled("compaction"),
+    typeSafeMaxStateChars: getTypeSafeConfig().maxStateChars,
+  });
+  const processProjectWorkStep = async (progress: ProjectGraphWorkProgress) => {
+    const jobId = graphJobId();
+    if (!jobId || progress.version !== 2 || !Number.isSafeInteger(progress.pageCount) || progress.pageCount < 0
+      || !Number.isSafeInteger(progress.pageIndex) || progress.pageIndex < 0 || progress.pageIndex > progress.pageCount
+      || !Number.isSafeInteger(progress.workUnits) || progress.workUnits < 0
+      || !Number.isSafeInteger(progress.nodesAdded) || progress.nodesAdded < 0
+      || !Number.isSafeInteger(progress.edgesAdded) || progress.edgesAdded < 0
+      || typeof progress.extractionSystem !== "string" || typeof progress.envelopeSuffix !== "string") {
+      throw new Error("Grouped graph continuation state is invalid");
+    }
+    const liveOptions = currentExtractionOptions();
+    if (!progress.options || !graphExtractionOptionsCompatible(progress.options, liveOptions)) {
+      throw new Error("Graph job configuration changed; restore the captured provider/compaction configuration before recovery");
+    }
+    if (progress.pageIndex >= progress.pageCount) return {
+      success: true, nodesAdded: progress.nodesAdded, edgesAdded: progress.edgesAdded, workUnits: progress.workUnits,
+    };
+    const page = await kv.get<ProjectGraphWorkPage>(KV.graphProviderResults(jobId), `project-work-page:v3:${progress.pageIndex}`);
+    if (!page || page.version !== 2 || !page.project || !Array.isArray(page.sources)
+      || page.sources.length < 1 || page.sources.length > GRAPH_WORK_LIMITS.maxPageSources) {
+      throw new Error("Captured project graph work page is unavailable");
+    }
+    const workInput = {
+      audience: { scope: "project" as const, project: page.project }, sources: page.sources,
+      systemPrompt: progress.extractionSystem,
+      envelopePrefix: "Extract entities and relationships from these project-scoped observations:\n\n",
+      envelopeSuffix: progress.envelopeSuffix,
+    };
+    const next = createNextGraphWorkUnit({ ...workInput, cursor: progress.cursor });
+    if (!next.unit) {
+      const updated: ProjectGraphWorkProgress = { ...progress, pageIndex: progress.pageIndex + 1, cursor: null, activeUnit: undefined };
+      await writeGraphJobContinuation(kv, updated);
+      return updated.pageIndex >= updated.pageCount
+        ? { success: true, nodesAdded: updated.nodesAdded, edgesAdded: updated.edgesAdded, workUnits: updated.workUnits }
+        : yieldGraphJob({ success: true, queued: true, ...updated });
+    }
+    const unitId = fingerprintId("graphunit", `${jobId}:${progress.pageIndex}:${next.unit.fingerprint}`);
+    let activeUnit = progress.activeUnit;
+    if (activeUnit) {
+      if (activeUnit.pageIndex !== progress.pageIndex || activeUnit.id !== unitId
+        || activeUnit.resultOrdinal !== graphJobNextDeltaOrdinal(kv)) {
+        throw new Error("Grouped graph active unit does not match its durable cursor");
+      }
+    } else {
+      await writeGraphJobContinuation(kv, undefined, (resultOrdinal) => ({
+        ...progress, activeUnit: { id: unitId, pageIndex: progress.pageIndex, resultOrdinal },
+      } satisfies ProjectGraphWorkProgress));
+      activeUnit = { id: unitId, pageIndex: progress.pageIndex, resultOrdinal: graphJobNextDeltaOrdinal(kv) };
+    }
+    const sourceIds = [...new Set(next.unit.fragments.map((fragment) => fragment.sourceId))];
+    const prompt = `${workInput.envelopePrefix}${next.unit.fragments.map((fragment, index) =>
+      `[${index + 1}] Source ID: ${fragment.sourceId}\n${fragment.content}`).join("\n\n")}${workInput.envelopeSuffix}`;
+    if (Buffer.byteLength(JSON.stringify({ systemPrompt: progress.extractionSystem, userPrompt: prompt }), "utf8") > GRAPH_WORK_LIMITS.maxInputBytes) {
+      throw new Error("Graph work prompt exceeds its bounded input budget");
+    }
+    let parsed: ParsedGraphExtraction;
+    try {
+      const response = await freezeGraphHandledValue(kv, `project-work-response:v3:${activeUnit.id}`, async () => {
+        const execute = () => llmRouter
+          ? llmRouter.run("graph_extraction",
+            selectedProvider => selectedProvider.compress(progress.extractionSystem, prompt),
+            candidate => parseGraphExtractionResponse(candidate, sourceIds, true) !== null)
+          : provider.compress(progress.extractionSystem, prompt);
+        const candidate = await execute();
+        if (Buffer.byteLength(candidate, "utf8") > GRAPH_WORK_LIMITS.maxResponseBytes) {
+          throw new Error("Graph extraction response exceeds its bounded 16 KiB result budget");
+        }
+        return candidate;
+      });
+      if (Buffer.byteLength(response, "utf8") > GRAPH_WORK_LIMITS.maxResponseBytes) {
+        throw new Error("Captured graph response exceeds its bounded 16 KiB result budget");
+      }
+      parsed = await freezeGraphHandledValue(kv, `project-work-parsed:v3:${activeUnit.id}`, () => {
+        const result = parseGraphExtractionResponse(response, sourceIds, true);
+        if (!result) throw new Error(EMPTY_GRAPH_EXTRACTION_ERROR);
+        return result;
+      });
+    } catch (error) {
+      if (graphTransactionFailure(error)) throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error("Graph extraction failed", { error: message });
+      return {
+        success: false, incomplete: true, terminalFailure: true, failureCode: "GRAPH_WORK_UNIT_FAILED",
+        nodesAdded: progress.nodesAdded, edgesAdded: progress.edgesAdded, workUnits: progress.workUnits, error: message,
+      };
+    }
+    const unitResult = await withGraphDelta(kv, async () => {
+      const applied = await persistGraphDelta(kv, parsed.nodes, parsed.edges, []);
+      await recordAudit(kv, "observe", "mem::graph-extract", sourceIds, {
+        nodesExtracted: parsed.nodes.length, edgesExtracted: parsed.edges.length, project: page.project,
+      }, undefined, undefined, `graph-extraction:${jobId}:provider:v3:${activeUnit!.id}`);
+      return { nodesAdded: applied.newNodeCount, edgesAdded: applied.newEdgeCount };
+    });
+    const updated: ProjectGraphWorkProgress = {
+      ...progress,
+      pageIndex: next.complete ? progress.pageIndex + 1 : progress.pageIndex,
+      cursor: next.complete ? null : next.cursor,
+      nodesAdded: progress.nodesAdded + unitResult.nodesAdded,
+      edgesAdded: progress.edgesAdded + unitResult.edgesAdded,
+      workUnits: progress.workUnits + 1,
+      activeUnit: undefined,
+    };
+    await writeGraphJobContinuation(kv, updated);
+    if (updated.pageIndex >= updated.pageCount) return {
+      success: true, nodesAdded: updated.nodesAdded, edgesAdded: updated.edgesAdded, workUnits: updated.workUnits,
+    };
+    return yieldGraphJob({ success: true, queued: true, ...updated });
+  };
   const extract = async (request: ExtractionRequest, durableId?: string) => {
+    const startMs = Date.now();
+    try {
     const preflight = request.batchEffectKey === undefined
       ? undefined
       : createGraphBatchCallbackPreflight(request.batchEffectKey, (state) =>
@@ -1253,31 +1451,37 @@ export function registerGraphFunction(
     const input = durableId || request.graphJobId || request.batchEffectKey
       ? request
       : { ...request, graphProvenanceVersion: 2 as const };
-    try {
-      const result = await runGraphJob(kv, request.batchEffectKey ? "batch_callback" : "extraction", input, async (frozen) => {
+      const executionResult = await runGraphJob(kv, request.batchEffectKey ? "batch_callback" : "extraction", input, async (frozen) => {
     const captured = frozen as ExtractionRequest;
     const auditEffectKey = (phase: string): string | undefined => {
       const jobId = graphJobId();
       return jobId ? `graph-extraction:${jobId}:${phase}` : undefined;
     };
-    const data = { ...captured, observations: captured.observations ?? (captured.sessionId ? await freezeGraphSessionObservations(kv, captured.sessionId) : []) };
-    const strictProvenance = data.graphProvenanceVersion === 2;
+    const strictProvenance = captured.graphProvenanceVersion === 2;
+    const useProjectWorkGroups = strictProvenance && captured.graphWorkGroupsVersion === 2 && !captured.batchResponse && !captured.deferred;
     const extractionSystem = strictProvenance
       ? GRAPH_EXTRACTION_SYSTEM_WITH_PROVENANCE
       : GRAPH_EXTRACTION_SYSTEM;
-    const options = await freezeGraphValue(kv, "options", () => ({
-      graphEnabled: isGraphExtractionEnabled(), llmEnabled: isGraphExtractionEnabled() && !provider.name.includes("noop"),
-      auxiliary: llmRouter?.hasAuxiliaryProvider === true, targetChars: getGraphExtractionInputTargetChars(),
-      typeSafe: Boolean(typeSafe), batchQueue: Boolean(batchQueue), providerName: provider.name,
-      localCompactor: Boolean(localCompactor), typeSafeCompaction: isTypeSafeFeatureEnabled("compaction"),
-      typeSafeMaxStateChars: getTypeSafeConfig().maxStateChars,
-    }));
-    if (options.providerName !== provider.name || options.typeSafe !== Boolean(typeSafe) || options.batchQueue !== Boolean(batchQueue) || options.localCompactor !== Boolean(localCompactor) || options.typeSafeCompaction !== isTypeSafeFeatureEnabled("compaction") || options.typeSafeMaxStateChars !== getTypeSafeConfig().maxStateChars) {
-      throw new Error("Graph job configuration changed; restore the captured provider/compaction configuration before recovery");
-    }
-    return runBatchCallback(kv, "graph", data.batchEffectKey, async (_resuming, admit) => {
+    let auditObservationIds: string[] = [];
+    let yieldedProjectWork: GraphJobYield<unknown> | undefined;
+    const callbackResult = await runBatchCallback(kv, "graph", captured.batchEffectKey, async (_resuming, admit) => {
+      if (useProjectWorkGroups) {
+        const savedProgress = await readGraphJobContinuation<ProjectGraphWorkProgress>(kv);
+        if (savedProgress) {
+          const result = await processProjectWorkStep(savedProgress);
+          if (isGraphJobYield(result)) { yieldedProjectWork = result; return { success: false }; }
+          return result;
+        }
+      }
+      const data = { ...captured, observations: captured.observations ?? (captured.sessionId ? await freezeGraphSessionObservations(kv, captured.sessionId) : []) };
+      auditObservationIds = data.observations.map((observation) => observation.id);
       if (!data.observations || data.observations.length === 0) {
         return { success: false, error: "No observations provided" };
+      }
+      const liveOptions = currentExtractionOptions();
+      const options = await freezeGraphValue(kv, "options", () => liveOptions);
+      if (!graphExtractionOptionsCompatible(options, liveOptions)) {
+        throw new Error("Graph job configuration changed; restore the captured provider/compaction configuration before recovery");
       }
       if (data.batchResponse !== undefined && data.batchEffectKey) {
         const obsIds = data.observations.map((o) => o.id);
@@ -1298,7 +1502,10 @@ export function registerGraphFunction(
       let heuristicNodesAdded = 0;
       let heuristicEdgesAdded = 0;
       if (heuristic.nodes.length || heuristic.edges.length) {
-        const persisted = await persistGraphDelta(kv, heuristic.nodes, heuristic.edges, strictProvenance ? [] : data.observations.map((o) => o.id));
+        const persistHeuristic = () => persistGraphDelta(kv, heuristic.nodes, heuristic.edges, strictProvenance ? [] : data.observations!.map((o) => o.id));
+        const persisted = useProjectWorkGroups
+          ? await freezeGraphValue(kv, "heuristic-persisted:v2", persistHeuristic)
+          : await persistHeuristic();
         heuristicNodesAdded = persisted.newNodeCount;
         heuristicEdgesAdded = persisted.newEdgeCount;
         await recordAudit(kv, "observe", "mem::graph-extract", data.observations.map((o) => o.id), {
@@ -1306,13 +1513,19 @@ export function registerGraphFunction(
         }, undefined, undefined, auditEffectKey("heuristic"));
       }
       if (!data.batchResponse && (!options.graphEnabled ||
-        (!options.llmEnabled && !options.auxiliary && !(data.deferred && batchQueue)))) {
+        (!options.llmEnabled && !options.auxiliary && !(data.deferred && options.batchQueue)))) {
         return { success: true, nodesAdded: heuristicNodesAdded, edgesAdded: heuristicEdgesAdded };
       }
 
       let observationsForGraph = data.observations;
       if (!data.force && data.batchResponse === undefined && !data.batchEffectKey && !data.replacementOf) {
-        observationsForGraph = await freezeGraphValue(kv, "compaction", () => compactGraphObservations(observationsForGraph, typeSafe));
+        if (graphUnknownCompactionRepeatProvider()) {
+          const typeSafeConfig = getTypeSafeConfig();
+          graphUnknownCompactionRepeatProvider({ typeSafe: Boolean(options.typeSafe && typeSafe), compaction: options.typeSafeCompaction,
+            runtimeEnabled: typeSafeConfig.enabled && typeSafeConfig.features.compaction && Boolean(typeSafeConfig.apiKey), timeoutMs: typeSafeConfig.timeoutMs,
+            maxStateChars: options.typeSafeMaxStateChars, runtimeMaxStateChars: typeSafeConfig.maxStateChars });
+        }
+        observationsForGraph = await freezeGraphValue(kv, "compaction", () => compactGraphObservations(observationsForGraph, options.typeSafe ? typeSafe : undefined, options));
         if (observationsForGraph.length === 0) {
           return {
             success: true,
@@ -1326,7 +1539,7 @@ export function registerGraphFunction(
       }
 
       if (
-        typeSafe &&
+        options.typeSafe && typeSafe &&
         data.deferred &&
         !data.force &&
         data.batchResponse === undefined &&
@@ -1379,26 +1592,57 @@ export function registerGraphFunction(
         }
       }
 
-      const inputUnits = await freezeGraphValue(kv, "input-units", async () => data.batchResponse
-        ? [{
-          sourceObservations: observationsForGraph,
-          promptObservations: observationsForGraph.map(toGraphPromptObservation),
-        } satisfies GraphExtractionUnit]
-        : await prepareGraphExtractionInputs(
-          observationsForGraph,
-          data.deferred ? Math.min(8000, options.targetChars) : options.targetChars,
-          data.replacementOf ? undefined : localCompactor,
-          strictProvenance,
-        ));
+      let inputUnits: GraphExtractionUnit[] = [];
+      if (!useProjectWorkGroups) {
+        inputUnits = await freezeGraphInputUnits(kv, options.localCompactor, async () => data.batchResponse
+          ? [{
+            sourceObservations: observationsForGraph,
+            promptObservations: observationsForGraph.map(toGraphPromptObservation),
+          } satisfies GraphExtractionUnit]
+          : await prepareGraphExtractionInputs(
+            observationsForGraph,
+            data.deferred ? Math.min(8000, options.targetChars) : options.targetChars,
+            data.replacementOf || !options.localCompactor ? undefined : localCompactor,
+            strictProvenance,
+          ));
+      }
 
       let totalNodesAdded = heuristicNodesAdded;
       let totalEdgesAdded = heuristicEdgesAdded;
+      const workItemIds: string[] = [];
       try {
-        if (!data.batchResponse && data.deferred && batchQueue) {
-          const workItemIds: string[] = [];
+        if (useProjectWorkGroups) {
+          let pageCount: number;
+          try {
+            pageCount = await captureProjectGraphWorkPages(kv, observationsForGraph, options.targetChars);
+          } catch (error) {
+            if (error instanceof Error && error.message === "GRAPH_PROJECT_SCOPE_UNAVAILABLE") return {
+              success: false, partial: true, reason: "waiting_scope", error: "Graph extraction requires a verified source project for every observation.",
+            };
+            if (error instanceof Error && error.message === "GRAPH_PROJECT_SCOPE_MISMATCH") return {
+              success: false, partial: true, reason: "project_scope_mismatch", error: "An observation has conflicting project authority.",
+            };
+            throw error;
+          }
+          const progress: ProjectGraphWorkProgress = {
+            version: 2, pageCount, pageIndex: 0, cursor: null,
+            nodesAdded: heuristicNodesAdded, edgesAdded: heuristicEdgesAdded, workUnits: 0,
+            extractionSystem, envelopeSuffix: process.env.AGENTMEMORY_LLM_NOTHINK === "1" ? "\n/no_think" : "",
+            options,
+          };
+          await writeGraphJobContinuation(kv, progress);
+          const result = await processProjectWorkStep(progress);
+          if (isGraphJobYield(result)) { yieldedProjectWork = result; return { success: false }; }
+          return result;
+        }
+        if (!data.batchResponse && data.deferred && options.batchQueue && batchQueue) {
           for (const unit of inputUnits) {
             const prompt = buildGraphExtractionPrompt(unit.promptObservations);
-            if (prompt.length > 10000) return { success: false, error: "Graph source exceeds the bounded batch input; source retained locally" };
+            if (prompt.length > 10000) return {
+              success: false, queuedWorkItemIds: workItemIds,
+              nodesAdded: heuristicNodesAdded, edgesAdded: heuristicEdgesAdded,
+              error: "Graph source exceeds the bounded batch input; source retained locally",
+            };
             const queued = await freezeGraphHandledValue(kv, `queued:${workItemIds.length}`, () => batchQueue.enqueue({
               replacementOf: data.replacementOf,
               correlationId: generateId("fwbgraph"),
@@ -1412,7 +1656,7 @@ export function registerGraphFunction(
                 queuedUnits: workItemIds.length,
                 totalUnits: inputUnits.length,
                 reason: queued.reason,
-              });
+    });
               return {
                 success: false,
                 deferred: true,
@@ -1443,7 +1687,10 @@ export function registerGraphFunction(
         }
         for (const [unitOrdinal, unit] of inputUnits.entries()) {
           const prompt = buildGraphExtractionPrompt(unit.promptObservations);
-          const response = await freezeGraphHandledValue(kv, "provider-response", async () => data.batchResponse ?? (llmRouter
+          const response = await freezeGraphHandledValue(kv, "provider-response", async () => {
+            const strict = graphStrictProviderResponse();
+            if (strict) return withStrictGraphResponse(strict.provider, strict.admit, () => provider.compress(extractionSystem, prompt, { task: "graph_extraction" }));
+            return data.batchResponse ?? (llmRouter
             ? await llmRouter.run(
               "graph_extraction",
               (selectedProvider) => selectedProvider.compress(
@@ -1458,7 +1705,8 @@ export function registerGraphFunction(
                 ) !== null;
               },
             )
-            : provider.compress(extractionSystem, prompt)));
+            : provider.compress(extractionSystem, prompt));
+          });
 
           const obsIds = unit.sourceObservations.map((o) => o.id);
           const parsed = await freezeGraphHandledValue(kv, "parsed-response", () => parseGraphExtractionResponse(response, obsIds, strictProvenance));
@@ -1493,11 +1741,18 @@ export function registerGraphFunction(
         const msg = err instanceof Error ? err.message : String(err);
         logger.error("Graph extraction failed", { error: msg });
         return heuristic.nodes.length || heuristic.edges.length || totalNodesAdded || totalEdgesAdded
-          ? { success: true, nodesAdded: totalNodesAdded, edgesAdded: totalEdgesAdded, llmError: msg }
-          : { success: false, error: msg };
+          ? { success: true, nodesAdded: totalNodesAdded, edgesAdded: totalEdgesAdded, queuedWorkItemIds: workItemIds, llmError: msg }
+          : { success: false, queuedWorkItemIds: workItemIds, error: msg };
       }
-    }, () => recordAudit(kv, "observe", "mem::graph-extract", data.observations.map((o) => o.id), {}, undefined, undefined, data.batchEffectKey));
+    }, () => recordAudit(kv, "observe", "mem::graph-extract", auditObservationIds, {}, undefined, undefined, captured.batchEffectKey));
+    return yieldedProjectWork ?? callbackResult;
     }, durableId ?? request.graphJobId ?? (request.batchEffectKey ? `graphcallback:${request.batchEffectKey}` : undefined), preflight);
+      const yielded = isGraphJobYield(executionResult);
+      const progress = yielded && executionResult.progress && typeof executionResult.progress === "object"
+        ? executionResult.progress as Record<string, unknown> : undefined;
+      const result = yielded
+        ? { ...progress, graphContinuation: true, queued: true }
+        : executionResult;
       const outcome = result && typeof result === "object" ? result as Record<string, unknown> : {};
       const counts: RecentOperation["counts"] = {};
       if (typeof outcome.nodesAdded === "number") counts.nodesAdded = outcome.nodesAdded;
@@ -1507,17 +1762,28 @@ export function registerGraphFunction(
       const madeProgress = Object.values(counts).some(count => count > 0);
       let status: RecentOperation["outcome"] = "completed";
       if (outcome.success !== true) status = madeProgress ? "partial" : "failed";
+      else if (outcome.llmError) status = "partial";
       else if (outcome.queued === true) status = "queued";
       else if (outcome.skipped === true || outcome.stale === true) status = "skipped";
-      else if (outcome.llmError) status = "partial";
-      await recordOperation(kv, "mem::graph-extract", status, counts);
+      await recordOperation(kv, "mem::graph-extract", status, counts, undefined, {
+        durationMs: Date.now() - startMs,
+        ...((outcome.success !== true || outcome.llmError) ? { errorCode: "graph_extraction_failed" } : {}),
+      });
       return result;
     } catch (error) {
-      await recordOperation(kv, "mem::graph-extract", "failed", {});
+      await recordOperation(kv, "mem::graph-extract", "failed", {}, undefined, {
+        durationMs: Date.now() - startMs, errorCode: "graph_extraction_failed",
+      });
       throw error;
     }
   };
-  sdk.registerFunction("mem::graph-extract", (input: ExtractionRequest) => extract(input));
+  const intake = registerGraphDispatch(sdk, kv, extract);
+  sdk.registerFunction("mem::graph-extract", (input: ExtractionRequest) => {
+    if (input?.graphWorkGroupsVersion !== undefined && input.graphWorkGroupsVersion !== 2) throw new Error("Unsupported graph work-group version");
+    const request = input && !input.graphJobId && !input.batchEffectKey && input.batchResponse === undefined
+      ? { ...input, graphWorkGroupsVersion: 2 as const } : input;
+    return intake(request);
+  });
   registerGraphJobHandler(kv, "extraction", (data, id) => extract(data as ExtractionRequest, id));
   registerGraphJobHandler(kv, "batch_callback", (data, id) => extract(data as ExtractionRequest, id));
   registerGraphJobHandler(kv, "import", (input, id) => runGraphJob(kv, "import", input, async (frozen) => {
@@ -1533,348 +1799,350 @@ export function registerGraphFunction(
   // graph tab silently blank.
   sdk.registerFunction("mem::graph-query",
     async (data: {
+      display?: boolean;
+      prepare?: boolean;
+      cursor?: string;
       startNodeId?: string;
       nodeType?: string;
+      project?: string;
       maxDepth?: number;
       query?: string;
       limit?: number;
       offset?: number;
-    }): Promise<GraphQueryResult> => {
+    }): Promise<GraphQueryResult | import("../types.js").GraphDisplayPage | import("../types.js").GraphDisplayPreparation> => {
+      if (data.display !== undefined && typeof data.display !== "boolean" ||
+        data.prepare !== undefined && (typeof data.prepare !== "boolean" || data.display !== true) ||
+        data.cursor !== undefined && data.display !== true) {
+        throw new IndexedRetrievalError("STATE_TX_INVALID_REQUEST", "Invalid graph display request.");
+      }
+      if (data.display === true) {
+        const project = typeof data.project === "string" ? data.project.trim() : "";
+        if (!project || typeof data.project !== "string" || Buffer.byteLength(data.project) > 256 ||
+          [data.startNodeId, data.query, data.nodeType, data.offset, data.maxDepth].some(value => value !== undefined)) {
+          throw new IndexedRetrievalError("STATE_TX_INVALID_REQUEST", "Display browsing requires an exact project without walk or offset selectors.");
+        }
+        if (data.cursor !== undefined && (typeof data.cursor !== "string" || !data.cursor || Buffer.byteLength(data.cursor) > 4096)) {
+          throw new IndexedRetrievalError("STATE_TX_INVALID_REQUEST", "Invalid graph display cursor.");
+        }
+        if (data.limit !== undefined && (!Number.isInteger(data.limit) || data.limit < 1 || data.limit > 128)) {
+          throw new IndexedRetrievalError("STATE_TX_INVALID_REQUEST", "Invalid graph display page limit.");
+        }
+        if (data.prepare === true) {
+          if (data.cursor !== undefined || data.limit !== undefined) {
+            throw new IndexedRetrievalError("STATE_TX_INVALID_REQUEST", "Graph Browse preparation does not accept pagination selectors.");
+          }
+          const result: import("../types.js").GraphDisplayPreparation = {
+            display: true, project, preparation: await prepareGraphBrowse(kv, project),
+          };
+          if (Buffer.byteLength(JSON.stringify(result), "utf8") > 64 * 1024) {
+            throw new IndexedRetrievalError("STATE_RETRIEVAL_RESOURCE_LIMIT", "Graph preparation response exceeded its byte limit.");
+          }
+          return result;
+        }
+        const page = await readScopedGraphPage<import("../types.js").GraphDisplayNode>(kv, {
+          project, mode: "browse", limit: data.limit ?? 128, cursor: data.cursor,
+          max_bytes: 64 * 1024 - 256,
+        });
+        if (page.status !== "ready" && page.status !== "preparing" && page.status !== "error" ||
+          page.revision !== null && typeof page.revision !== "string") {
+          throw new IndexedRetrievalError("STATE_TX_INVALID_RESPONSE", "Native graph Browse returned an unsupported status.");
+        }
+        const result: import("../types.js").GraphDisplayPage = {
+          display: true, project,
+          nodes: page.items.map(({ id, type, name }) => ({ id, type, name })),
+          edges: (page.edges ?? []).map(({ id, type, sourceNodeId, targetNodeId, weight }) => ({ id, type, sourceNodeId, targetNodeId, weight })),
+          status: page.status, ...(page.reason ? { reason: page.reason } : {}),
+          revision: page.revision, nextCursor: page.next_cursor ?? null, hasMore: page.has_more,
+          edgeScope: "page", crossPageEdges: "not_loaded",
+          edgesTruncated: page.edgesTruncated === true,
+          ...(page.progress ? { progress: page.progress } : {}),
+        };
+        if (Buffer.byteLength(JSON.stringify(result), "utf8") > 64 * 1024) {
+          throw new IndexedRetrievalError("STATE_RETRIEVAL_RESOURCE_LIMIT", "Graph display response exceeded its byte limit.");
+        }
+        return result;
+      }
       const maxDepth = Math.min(data.maxDepth || 3, 5);
-      const { limit, offset } = resolvePagination(data.limit, data.offset);
+      const requested = resolvePagination(data.limit, data.offset);
+      const limit = Math.min(requested.limit, 16);
+      const offset = requested.offset;
+      const offsetLimit = 128;
 
-      // #814 v2: the empty-body / nodeType-only path NEVER enumerates.
-      // It reads the snapshot exclusively. The snapshot is updated
-      // inline by graph-extract, so for newly-built corpora it's
-      // always current. For legacy corpora missing a snapshot the
-      // operator must run mem::graph-snapshot-rebuild (safe under
-      // REBUILD_SAFE_NODE_CEILING) or mem::graph-reset to wipe and
-      // rebuild incrementally from new observations.
+      // Project membership is applied before native candidates are hydrated.
       const noWalk = !data.query && !data.startNodeId;
       if (noWalk) {
-        const snap = await readSnapshot(kv);
-        if (snap && snap.stats.totalNodes > 0) {
-          return paginateFromSnapshot(snap, data.nodeType, limit, offset);
-        }
-        return {
-          nodes: [],
-          edges: [],
-          depth: 0,
-          totalNodes: 0,
-          totalEdges: 0,
-          truncated: false,
-          limit,
-          offset,
-          warning:
-            "No graph snapshot available. Either no graph has been " +
-            "extracted yet, or you are on a legacy corpus from a pre-#814 " +
-            "agentmemory build. Run POST /agentmemory/graph/snapshot-rebuild " +
-            "(safe up to ~25K nodes) or POST /agentmemory/graph/reset to " +
-            "wipe and let future extracts repopulate.",
+        const project = data.project?.trim();
+        if (project && offset > offsetLimit) return {
+          nodes: [], edges: [], depth: 0, totalNodes: 0, totalEdges: 0,
+          truncated: true, limit, offset,
+          warning: "Project graph offset exceeds the bounded native cursor window.",
         };
-      }
-
-      // Query / startNodeId paths still need broader access. Race the
-      // live enumeration against a wall-clock budget so a long
-      // kv.list doesn't block the worker indefinitely. On timeout the
-      // caller gets a snapshot-backed approximation instead of a 500.
-      let allNodes: GraphNode[];
-      let allEdges: GraphEdge[];
-      try {
-        const [rawNodes, rawEdges] = await withCompletedGraphRead(kv, () => withTimeout(
-          Promise.all([
-            collectProjectedRecords<GraphNode>(kv, KV.graphNodes),
-            kv.list<GraphEdge>(KV.graphEdges),
-          ]),
-          LIVE_ENUMERATION_BUDGET_MS,
-          "graph-query enumeration",
-        ));
-        allNodes = rawNodes.filter((n) => !n.stale);
-        allEdges = rawEdges.filter((e) => !e.stale);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (graphTransactionFailure(err)) throw err;
-        logger.warn("Graph query enumeration timed out, using snapshot", {
-          error: msg,
-        });
-        const snap = await readSnapshot(kv);
-        if (snap) {
+        if (project) {
+          const nodes: GraphNode[] = [];
+          let cursor: string | undefined;
+          let remainingOffset = offset;
+          let partial = requested.limit > 16;
+          let reason: string | undefined;
+          let hasMore = false;
+          for (let pageIndex = 0; pageIndex < 9 && nodes.length < limit; pageIndex++) {
+            const page = await readScopedGraphPage<{ id?: string; key?: string; value?: GraphNode }>(kv, {
+              project, mode: "top_n", limit: 16, top_n: 16,
+              ...(cursor ? { cursor } : {}),
+            });
+            reason ??= page.reason;
+            if (page.status !== "ready") partial = true;
+            const ids = page.items.map(scopedGraphItemId).filter((id): id is string => Boolean(id));
+            const hydrated = await hydrateScopedGraphNodes(kv, ids);
+            if (hydrated.incomplete || hydrated.nodes.length !== ids.length) partial = true;
+            const selected = data.nodeType
+              ? hydrated.nodes.filter((node) => node.type === data.nodeType)
+              : hydrated.nodes;
+            if (remainingOffset > 0) {
+              const skipped = Math.min(remainingOffset, selected.length);
+              remainingOffset -= skipped;
+              selected.splice(0, skipped);
+            }
+            nodes.push(...selected.slice(0, limit - nodes.length));
+            if (!page.has_more || !page.next_cursor) {
+              if (remainingOffset > 0) partial = true;
+              break;
+            }
+            hasMore = true;
+            cursor = page.next_cursor;
+            if (pageIndex === 8) partial = true;
+          }
+          if (hasMore && nodes.length >= limit) partial = true;
+          const edgePage = await readScopedGraphEdges(kv, project, nodes.map((node) => node.id));
+          partial ||= edgePage.partial;
+          reason ??= edgePage.reason;
           return {
-            ...paginateFromSnapshot(snap, data.nodeType, limit, offset),
-            warning:
-              "Live graph enumeration exceeded budget. Query / " +
-              "startNodeId paths degrade on >25K-node corpora until a " +
-              "per-node edge index lands. Result reflects top-degree " +
-              "snapshot, not the requested walk.",
+            nodes, edges: edgePage.edges, depth: 0,
+            totalNodes: nodes.length, totalEdges: edgePage.edges.length,
+            truncated: partial, limit, offset,
+            ...(partial ? {
+              warning: scopedGraphWarning(reason, "Project graph page is bounded and may be incomplete"),
+            } : {}),
           };
         }
         return {
-          nodes: [],
-          edges: [],
-          depth: 0,
-          totalNodes: 0,
-          totalEdges: 0,
-          truncated: false,
-          limit,
-          offset,
-          warning:
-            "Graph enumeration exceeded budget and no snapshot is available.",
+          nodes: [], edges: [], depth: 0, totalNodes: 0, totalEdges: 0,
+          truncated: true, limit, offset,
+          warning: "Project scope is required for graph browse; no global graph or snapshot read was run.",
+        };
+      }
+
+      const project = data.project?.trim();
+      if (!project) {
+        return {
+          nodes: [], edges: [], depth: 0, totalNodes: 0, totalEdges: 0,
+          truncated: true, limit, offset,
+          warning: "Project scope is required for graph search and traversal; no global graph query was run.",
         };
       }
 
       if (data.query) {
-        const lower = data.query.toLowerCase();
-        const matchingNodes = allNodes.filter(
-          (n) =>
-            n.name.toLowerCase().includes(lower) ||
-            Object.values(n.properties).some(
-              (v) => typeof v === "string" && v.toLowerCase().includes(lower),
-            ),
-        );
-        return paginate(matchingNodes, allEdges, 0, limit, offset);
+        if (Buffer.byteLength(data.query, "utf8") > 512) {
+          return { nodes: [], edges: [], depth: 0, totalNodes: 0, totalEdges: 0,
+            truncated: true, limit, offset, warning: "Graph query exceeds 512 UTF-8 bytes." };
+        }
+        if (offset > offsetLimit) return {
+          nodes: [], edges: [], depth: 0, totalNodes: 0, totalEdges: 0,
+          truncated: true, limit, offset,
+          warning: "Graph search offset exceeds the bounded native cursor window.",
+        };
+        const nodes: GraphNode[] = [];
+        let cursor: string | undefined;
+        let remainingOffset = offset;
+        let partial = requested.limit > 16;
+        let reason: string | undefined;
+        let hasMore = false;
+        for (let pageIndex = 0; pageIndex < 9 && nodes.length < limit; pageIndex++) {
+          const page = await readScopedGraphPage<{ id?: string; key?: string; entity?: boolean; observation?: boolean }>(kv, {
+            project, mode: "search", query: data.query, limit: 16, max_bytes: 64 * 1024,
+            ...(cursor ? { cursor } : {}),
+          });
+          reason ??= page.reason;
+          if (page.status !== "ready") partial = true;
+          const ids = page.items.map(scopedGraphItemId).filter((id): id is string => Boolean(id));
+          const hydrated = await hydrateScopedGraphNodes(kv, ids);
+          if (hydrated.incomplete) partial = true;
+          const selected = data.nodeType
+            ? hydrated.nodes.filter((node) => node.type === data.nodeType)
+            : hydrated.nodes;
+          if (selected.length !== ids.length) partial = true;
+          if (remainingOffset > 0) {
+            const skipped = Math.min(remainingOffset, selected.length);
+            remainingOffset -= skipped;
+            selected.splice(0, skipped);
+          }
+          nodes.push(...selected.slice(0, limit - nodes.length));
+          if (!page.has_more || !page.next_cursor) {
+            if (remainingOffset > 0) partial = true;
+            break;
+          }
+          hasMore = true;
+          cursor = page.next_cursor;
+          if (pageIndex === 8) partial = true;
+        }
+        if (hasMore && nodes.length >= limit) partial = true;
+        const edgePage = await readScopedGraphEdges(kv, project, nodes.map((node) => node.id));
+        partial ||= edgePage.partial;
+        reason ??= edgePage.reason;
+        return {
+          nodes, edges: edgePage.edges, depth: 0, totalNodes: nodes.length, totalEdges: edgePage.edges.length,
+          truncated: partial, limit, offset,
+          ...(partial ? { warning: scopedGraphWarning(reason, "Project graph search is partial") } : {}),
+        };
       }
 
       if (data.startNodeId) {
+        const proof = await readScopedGraphPage<never>(kv, {
+          project, mode: "aggregate", node_ids: [data.startNodeId], limit: 1,
+        });
+        const proofCount = Number((proof.aggregate as { node_count?: unknown } | undefined)?.node_count);
+        if (proof.status !== "ready" || proofCount !== 1) return {
+          nodes: [], edges: [], depth: 0, totalNodes: 0, totalEdges: 0,
+          truncated: true, limit, offset,
+          warning: scopedGraphWarning(proof.reason ?? "project_authority_incomplete",
+            "Starting node is not proven in the requested project"),
+        };
         const visited = new Set<string>();
         const visitedEdges = new Set<string>();
         const resultNodes: GraphNode[] = [];
         const resultEdges: GraphEdge[] = [];
-        const queue: Array<{ nodeId: string; depth: number }> = [
-          { nodeId: data.startNodeId, depth: 0 },
-        ];
-
-        while (queue.length > 0) {
-          const { nodeId, depth } = queue.shift()!;
-          if (visited.has(nodeId) || depth > maxDepth) continue;
-          visited.add(nodeId);
-
-          const node = allNodes.find((n) => n.id === nodeId);
-          if (node) {
-            if (!data.nodeType || node.type === data.nodeType) {
-              resultNodes.push(node);
+        let frontier = [{ nodeId: data.startNodeId, depth: 0 }];
+        let partial = requested.limit > 16 || offset > 0;
+        let reason: string | undefined;
+        while (frontier.length > 0 && resultNodes.length < limit && resultEdges.length < 16) {
+          const nextFrontier: Array<{ nodeId: string; depth: number }> = [];
+          for (let index = 0; index < frontier.length && resultNodes.length < limit && resultEdges.length < 16; index += 12) {
+            const batch = frontier.slice(index, index + 12);
+            const fresh = batch.filter(({ nodeId }) => !visited.has(nodeId));
+            if (fresh.length === 0) continue;
+            const { nodes: hydrated, incomplete } = await hydrateScopedGraphNodes(kv, fresh.map(({ nodeId }) => nodeId));
+            if (incomplete) partial = true;
+            for (const node of hydrated) {
+              visited.add(node.id);
+              if (!data.nodeType || node.type === data.nodeType) resultNodes.push(node);
             }
+            const page = await readScopedGraphPage<{ id?: string; key?: string; value?: GraphEdge }>(kv, {
+              project, mode: "neighbors", node_ids: fresh.map(({ nodeId }) => nodeId), limit: 16,
+            });
+            if (page.status !== "ready" || page.has_more) {
+              partial = true;
+              reason ??= page.reason;
+            }
+            for (const item of page.items) {
+              const edge = scopedGraphEdge(item);
+              if (!edge || edge.stale) continue;
+              if (!visitedEdges.has(edge.id) && resultEdges.length < 16) {
+                visitedEdges.add(edge.id);
+                resultEdges.push(edge);
+              }
+              const current = fresh.find(({ nodeId }) => nodeId === edge.sourceNodeId || nodeId === edge.targetNodeId);
+              if (!current) continue;
+              const nextId = current.nodeId === edge.sourceNodeId ? edge.targetNodeId : edge.sourceNodeId;
+              if (current.depth < maxDepth && !visited.has(nextId)) nextFrontier.push({ nodeId: nextId, depth: current.depth + 1 });
+            }
+            if (resultEdges.length >= 16) partial = true;
           }
-
-          const neighborEdges = allEdges.filter(
-            (e) => e.sourceNodeId === nodeId || e.targetNodeId === nodeId,
-          );
-          for (const edge of neighborEdges) {
-            if (!visitedEdges.has(edge.id)) {
-              visitedEdges.add(edge.id);
-              resultEdges.push(edge);
-            }
-            const nextId =
-              edge.sourceNodeId === nodeId
-                ? edge.targetNodeId
-                : edge.sourceNodeId;
-            if (!visited.has(nextId)) {
-              queue.push({ nodeId: nextId, depth: depth + 1 });
-            }
-          }
+          frontier = nextFrontier;
         }
-
-        return paginate(resultNodes, resultEdges, maxDepth, limit, offset);
+        return {
+          nodes: resultNodes.slice(0, limit), edges: resultEdges, depth: maxDepth,
+          totalNodes: resultNodes.length, totalEdges: resultEdges.length,
+          truncated: partial || frontier.length > 0, limit, offset,
+          ...((partial || frontier.length > 0) ? { warning: scopedGraphWarning(reason, "Project graph traversal is partial") } : {}),
+        };
       }
 
-      // Unreachable — noWalk branch handles the rest.
       return paginate([], [], 0, limit, offset);
     },
   );
 
-  // Native index metadata has revisions but no live aggregate counts.
-  // Snapshot totals retain their own provenance rather than claiming freshness.
-  sdk.registerFunction("mem::graph-stats", async () => {
-    const snap = await readSnapshot(kv);
-    if (snap) {
-      return {
-        ...snap.stats,
-        fromSnapshot: true,
-        provenance: "snapshot",
-        countsAreCurrent: false,
-        updatedAt: snap.updatedAt,
-        dirty: snap.dirty === true,
-        ...(snap.dirty
-          ? {
-              warning:
-                "Snapshot is marked dirty (write was in-flight when read). " +
-                "Counts are eventually consistent.",
-            }
-          : {}),
-      };
-    }
-    return {
-      totalNodes: null,
-      totalEdges: null,
-      nodesByType: {},
-      edgesByType: {},
-      fromSnapshot: false,
-      provenance: "unavailable",
-      countsAreCurrent: false,
-      warning:
-        "No graph snapshot available; live graph totals are unknown. " +
-        "Snapshot rebuilding is an explicit operation and may be unsafe for a large corpus.",
-    };
+  // Global counts come from identified historical metadata, never a graph traversal.
+  sdk.registerFunction("mem::graph-stats", async (data?: { project?: string }) => {
+    const project = typeof data?.project === "string" ? data.project.trim() : "";
+    return readProjectGraphStatistics(kv, project || undefined, (selectedProject) => sdk.trigger({
+      function_id: "mem::graph-query",
+      payload: { project: selectedProject, maxDepth: 1, limit: GRAPH_STATISTICS_SAMPLE_LIMIT },
+    }));
   });
 
-  // #814 v2: explicit rebuild backfills the snapshot AND the name /
-  // edge-key / degree indexes from existing graphNodes/graphEdges
-  // scopes. This is the path operators run once after upgrading to a
-  // post-#814 build to bring legacy corpora online. It enumerates via
-  // kv.list — the same pair that breaks at 75K+ — so we refuse to
-  // run on corpora large enough that the response payload would
-  // block the worker heartbeat. Above the ceiling the only safe path
-  // is mem::graph-reset followed by incremental re-extraction.
-  const rebuild = async (request?: { force?: boolean }, durableId?: string) => runGraphJob(kv, "rebuild", request ?? {}, async (input) => runBatchCallback(kv, "graph", undefined, () => withGraphDelta(kv, async () => {
-      const data = input as { force?: boolean };
+  const rebuild = async (request?: { force?: boolean; project?: string }, durableId?: string) =>
+    runGraphJob(kv, "rebuild", request ?? {}, async (input) => {
+      const project = (input as { project?: string }).project?.trim();
+      if (!project) return {
+        success: false, partial: true, reason: "project_required",
+        error: "Snapshot rebuild requires a project-scoped native index; global graph enumeration is disabled.",
+      };
       const started = Date.now();
-      // #825: pre-flight refusal for legacy corpora. The old guard
-      // checked node count AFTER kv.list, but the heartbeat dies at
-      // ~0.35s on a 75K-node response — long before the wall-clock
-      // budget can fire. We can't safely enumerate to discover size.
-      //
-      // Heuristic: if no snapshot exists, the corpus is either empty
-      // or legacy. The empty case has nothing to rebuild; the legacy
-      // case will crash. Refuse both unless `force: true` is passed
-      // (operator opt-in to attempt rebuild on a corpus they know is
-      // small enough — typically under 10K nodes on the default iii
-      // state adapter).
-      // Strict boolean check on force — accept only literal `true`,
-      // never truthy strings/numbers, so a hand-crafted JSON payload
-      // can't accidentally bypass the legacy-corpus safeguard.
-      const forceRebuild = data?.force === true;
       try {
-        const existing = await readSnapshot(kv);
-        if (existing?.batchInProgress) {
-          return { success: false, error: "A batch graph application must be recovered first" };
-        }
-        if (!existing && !forceRebuild) {
-          logger.warn("Graph snapshot rebuild refused: no prior snapshot", {
-            hint: "legacy corpus or empty store",
+        const candidates = await readScopedGraphPage<{ id?: string; key?: string }>(kv, {
+          project, mode: "top_n", top_n: 16, limit: 16,
+        });
+        const ids = candidates.items.map(scopedGraphItemId).filter((id): id is string => Boolean(id));
+        if (candidates.status === "waiting_scope" || ids.length === 0) return {
+          success: false, partial: true, project,
+          reason: candidates.reason ?? "index_not_ready", sampledNodes: 0, sampledEdges: 0,
+        };
+        const { nodes, incomplete } = await hydrateScopedGraphNodes(kv, ids);
+        const edges: GraphEdge[] = [];
+        let partial = candidates.status !== "ready" || candidates.has_more || incomplete;
+        let reason = candidates.reason;
+        for (let offset = 0; offset < ids.length && edges.length < 16; offset += 12) {
+          const page = await readScopedGraphPage<{ id?: string; key?: string; value?: GraphEdge }>(kv, {
+            project, mode: "neighbors", node_ids: ids.slice(offset, offset + 12), limit: 16,
           });
-          return {
-            success: false,
-            legacyCorpus: true,
-            error:
-              "No prior snapshot found. Rebuild must enumerate graph nodes " +
-              "and edges, which exceeds the safe rebuild ceiling on large " +
-              "corpora (~25K nodes). " +
-              "Either (a) call POST /agentmemory/graph/reset to drop into " +
-              "incremental-only mode and rebuild from new extracts, or " +
-              "(b) re-send with `force: true` if you're certain the " +
-              "corpus is small.",
-          };
+          if (page.status !== "ready" || page.has_more) {
+            partial = true;
+            reason ??= page.reason;
+          }
+          for (const item of page.items) {
+            const edge = scopedGraphEdge(item);
+            if (!edge || edge.stale || !ids.includes(edge.sourceNodeId) || !ids.includes(edge.targetNodeId)) continue;
+            if (!edges.some((existing) => existing.id === edge.id)) edges.push(edge);
+            if (edges.length >= 16) { partial = true; break; }
+          }
         }
+        const sampleAggregate = { node_count: 0, edge_count: 0 };
+        let aggregateAvailable = ids.length > 0;
+        for (let offset = 0; offset < ids.length && aggregateAvailable; offset += 12) {
+          const page = await readScopedGraphPage<never>(kv, {
+            project, mode: "aggregate", node_ids: ids.slice(offset, offset + 12), limit: 1,
+          }).catch(() => undefined);
+          const counts = page?.aggregate as { node_count?: unknown; edge_count?: unknown } | undefined;
+          const nodeCount = Number(counts?.node_count);
+          const edgeCount = Number(counts?.edge_count ?? 0);
+          if (page?.status !== "ready" || !Number.isSafeInteger(nodeCount) || nodeCount < 0 ||
+            !Number.isSafeInteger(edgeCount) || edgeCount < 0) {
+            aggregateAvailable = false;
+            break;
+          }
+          sampleAggregate.node_count += nodeCount;
+          sampleAggregate.edge_count += edgeCount;
+        }
+        partial ||= !aggregateAvailable || candidates.status !== "ready";
+        return {
+          success: true, partial: true, approximate: true,
+          reason: reason ?? "candidate_top_n",
+          project,
+          sampledNodes: nodes.length,
+          sampledEdges: edges.length,
+          nodes,
+          edges,
+          ...(aggregateAvailable ? { aggregate: sampleAggregate } : {}),
+          tookMs: Date.now() - started,
+          ...(partial ? { warning: "Native project top_n is a bounded candidate sample; this did not rebuild a complete snapshot." } : {}),
+        };
       } catch (err) {
         if (graphTransactionFailure(err)) throw err;
-        const msg = err instanceof Error ? err.message : String(err);
-        logger.warn("Graph snapshot pre-flight read failed", { error: msg });
-        return { success: false, error: msg };
+        return { success: false, partial: true, project, reason: "bounded_native_index_unavailable",
+          error: err instanceof Error ? err.message : String(err) };
       }
-
-      try {
-        const enumeration = await withCompletedGraphRead(kv, async () => {
-          const nodeCount = await withTimeout(
-            countProjectedRecordIds(kv, KV.graphNodes),
-            LIVE_ENUMERATION_BUDGET_MS,
-            "graph-snapshot-rebuild node count",
-          );
-          if (nodeCount > REBUILD_SAFE_NODE_CEILING) return { nodeCount };
-          const [nodes, edges] = await withTimeout(
-            Promise.all([
-              collectProjectedRecords<GraphNode>(kv, KV.graphNodes),
-              kv.list<GraphEdge>(KV.graphEdges),
-            ]),
-            LIVE_ENUMERATION_BUDGET_MS,
-            "graph-snapshot-rebuild enumeration",
-          );
-          if (nodes.length !== nodeCount) throw new Error("Graph changed during snapshot rebuild scan");
-          return { nodeCount, nodes, edges };
-        });
-
-      if (enumeration.nodeCount > REBUILD_SAFE_NODE_CEILING) {
-        logger.warn("Graph snapshot rebuild aborted: corpus too large", {
-          totalNodes: enumeration.nodeCount,
-          ceiling: REBUILD_SAFE_NODE_CEILING,
-        });
-        return {
-          success: false,
-          tooLarge: true,
-          totalNodes: enumeration.nodeCount,
-          ceiling: REBUILD_SAFE_NODE_CEILING,
-          error:
-            `Corpus has ${enumeration.nodeCount} graph nodes; safe-rebuild ceiling ` +
-            `is ${REBUILD_SAFE_NODE_CEILING}. Run POST /agentmemory/graph/reset ` +
-            `to wipe and let future extracts rebuild incrementally.`,
-        };
-      }
-      if (!enumeration.nodes || !enumeration.edges) {
-        throw new Error("Graph snapshot rebuild scan did not return complete records");
-      }
-      const { nodes, edges } = enumeration;
-
-      // Backfill the targeted-lookup indexes so post-rebuild
-      // graph-extract calls hit the O(1) path instead of falling
-      // through to the (already-removed) full-scope scan. Batch
-      // writes via Promise.all to avoid N sequential round-trips —
-      // BATCH_SIZE bounds in-flight writes so we don't open thousands
-      // of concurrent state channels on huge corpora.
-      const liveNodes = nodes.filter((n) => !n.stale);
-      const liveEdges = edges.filter((e) => !e.stale);
-      const degree = new Map<string, number>();
-      for (const e of liveEdges) {
-        degree.set(e.sourceNodeId, (degree.get(e.sourceNodeId) ?? 0) + 1);
-        degree.set(e.targetNodeId, (degree.get(e.targetNodeId) ?? 0) + 1);
-      }
-      const BATCH_SIZE = 100;
-      for (let i = 0; i < liveNodes.length; i += BATCH_SIZE) {
-        const batch = liveNodes.slice(i, i + BATCH_SIZE);
-        await Promise.all(
-          batch.flatMap((n) => [
-            kv.set(KV.graphNameIndex, nameIndexKey(n.type, n.name), n.id),
-            kv.set(KV.graphNodeDegree, n.id, degree.get(n.id) ?? 0),
-          ]),
-        );
-      }
-      for (let i = 0; i < liveEdges.length; i += BATCH_SIZE) {
-        const batch = liveEdges.slice(i, i + BATCH_SIZE);
-        await Promise.all(
-          batch.map((e) =>
-            kv.set(
-              KV.graphEdgeKey,
-              edgeIndexKey(e.sourceNodeId, e.targetNodeId, e.type),
-              e.id,
-            ),
-          ),
-        );
-      }
-
-      const snap = buildSnapshotFromArrays(nodes, edges);
-      await writeGraphSnapshot(kv, snap);
-      const tookMs = Date.now() - started;
-      logger.info("Graph snapshot rebuilt", {
-        totalNodes: snap.stats.totalNodes,
-        totalEdges: snap.stats.totalEdges,
-        topNodes: snap.topNodes.length,
-        topEdges: snap.topEdges.length,
-        tookMs,
-      });
-      return {
-        success: true,
-        ...snap.stats,
-        topNodes: snap.topNodes.length,
-        topEdges: snap.topEdges.length,
-        updatedAt: snap.updatedAt,
-        tookMs,
-      };
-    } catch (err) {
-      if (graphTransactionFailure(err)) throw err;
-      const msg = err instanceof Error ? err.message : String(err);
-      logger.error("Graph snapshot rebuild failed", { error: msg });
-      return { success: false, error: msg };
-    }
-  })), durableId);
-  sdk.registerFunction("mem::graph-snapshot-rebuild", (input?: { force?: boolean }) => rebuild(input));
-  registerGraphJobHandler(kv, "rebuild", (input, id) => rebuild(input as { force?: boolean }, id));
+    }, durableId);
+  sdk.registerFunction("mem::graph-snapshot-rebuild", (input?: { force?: boolean; project?: string }) => rebuild(input));
+  registerGraphJobHandler(kv, "rebuild", (input, id) => rebuild(input as { force?: boolean; project?: string }, id));
 
   // #814 v2 + #825: clean-restart escape hatch for corpora of any
   // size, including the legacy 75K+ case that crashes kv.list.

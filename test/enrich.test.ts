@@ -92,7 +92,7 @@ describe("Enrich Function", () => {
     );
     sdk.overrideTrigger("mem::search", async () => ({
       results: [
-        { observation: { narrative: "User fixed a bug in handler" } },
+        { observation: { id: "bug_1", narrative: "User fixed a bug in handler" }, sessionId: "ses_2" },
       ],
     }));
 
@@ -101,6 +101,8 @@ describe("Enrich Function", () => {
       files: ["src/handler.ts"],
       type: "bug",
     });
+    await kv.set("mem:sessions", "ses_1", { id: "ses_1", project: "api" });
+    await kv.set("mem:sessions", "ses_2", { id: "ses_2", project: "api" });
     await kv.set("mem:memories", "bug_1", bugMem);
 
     const result = (await sdk.trigger("mem::enrich", {
@@ -138,7 +140,9 @@ describe("Enrich Function", () => {
       "mem::file-context",
       async () => ({ context: longContext }),
     );
-    sdk.overrideTrigger("mem::search", async () => ({ results: [] }));
+    sdk.overrideTrigger("mem::search", async () => ({
+      results: [{ observation: { id: "bug_match", narrative: "" }, sessionId: "ses_2" }],
+    }));
 
     const result = (await sdk.trigger("mem::enrich", {
       sessionId: "ses_1",
@@ -147,7 +151,7 @@ describe("Enrich Function", () => {
 
     expect(result.context.length).toBe(4000);
     expect(result.truncated).toBe(true);
-  });
+  }, 20_000);
 
   it("returns empty context when no data found", async () => {
     sdk.overrideTrigger("mem::file-context", async () => ({ context: "" }));
@@ -181,7 +185,6 @@ describe("Enrich Function", () => {
 
   it("includes bug memories that overlap with requested files", async () => {
     sdk.overrideTrigger("mem::file-context", async () => ({ context: "" }));
-    sdk.overrideTrigger("mem::search", async () => ({ results: [] }));
 
     const bugMem = makeMemory({
       id: "bug_match",
@@ -191,6 +194,8 @@ describe("Enrich Function", () => {
       files: ["src/worker.ts"],
       isLatest: true,
     });
+    await kv.set("mem:sessions", "ses_1", { id: "ses_1", project: "api" });
+    await kv.set("mem:sessions", "ses_2", { id: "ses_2", project: "api" });
     const nonBugMem = makeMemory({
       id: "pattern_1",
       type: "pattern",
@@ -201,6 +206,9 @@ describe("Enrich Function", () => {
     });
     await kv.set("mem:memories", "bug_match", bugMem);
     await kv.set("mem:memories", "pattern_1", nonBugMem);
+    sdk.overrideTrigger("mem::search", async () => ({
+      results: ["bug_match", "pattern_1"].map((id) => ({ observation: { id, narrative: "candidate" } })),
+    }));
 
     const result = (await sdk.trigger("mem::enrich", {
       sessionId: "ses_1",

@@ -1,12 +1,14 @@
-import { TriggerAction, type IIIClient } from "iii-sdk";
+import type { IIIClient } from "iii-sdk";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
-import { deleteImage, touchImage } from "../utils/image-store.js";
+import { touchImage } from "../utils/image-store.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 
 export async function getImageRefCount(kv: StateKV, filePath: string): Promise<number> {
   const count = await kv.get<number>(KV.imageRefs, filePath);
-  return count ? Number(count) : 0;
+  if (count === null) return 0;
+  if (!Number.isSafeInteger(count) || count < 0) throw new Error("IMAGE_REF_COUNT_INVALID");
+  return count;
 }
 
 export async function incrementImageRef(kv: StateKV, filePath: string): Promise<void> {
@@ -17,22 +19,11 @@ export async function incrementImageRef(kv: StateKV, filePath: string): Promise<
   });
 }
 
-export async function decrementImageRef(kv: StateKV, sdk: IIIClient, filePath: string): Promise<void> {
+export async function decrementImageRef(kv: StateKV, _sdk: IIIClient, filePath: string): Promise<void> {
   return withKeyedLock(`imgRef:${filePath}`, async () => {
     const current = await getImageRefCount(kv, filePath);
-    if (current <= 1) {
-      await kv.delete(KV.imageEmbeddings, filePath);
-      await kv.delete(KV.imageRefs, filePath);
-      const { deletedBytes } = await deleteImage(filePath);
-      if (deletedBytes > 0) {
-        sdk.trigger({
-          function_id: "mem::disk-size-delta",
-          payload: { deltaBytes: -deletedBytes },
-          action: TriggerAction.Void(),
-        });
-      }
-    } else {
-      await kv.set(KV.imageRefs, filePath, current - 1);
-    }
+    // A zero refcount does not prove absence of replay, version, or rollback roots.
+    // Preserve source bytes and embeddings until an authorized reachability collector owns reclamation.
+    if (current > 0) await kv.set(KV.imageRefs, filePath, current - 1);
   });
 }

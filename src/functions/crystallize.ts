@@ -1,7 +1,8 @@
+import { Buffer } from "node:buffer";
 import type { IIIClient } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
 import { KV, fingerprintId, generateId } from "../state/schema.js";
-import type { Action, ActionEdge, Crystal, MemoryProvider } from "../types.js";
+import type { Action, ActionEdge, Crystal, CrystalListResponse, MemoryProvider } from "../types.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
 import type { FireworksBatchQueue } from "./fireworks-batch.js";
 import { batchEffectKey, runBatchCallback, withBatchRecordLocks } from "../state/batch-effects.js";
@@ -11,6 +12,90 @@ interface CrystalDigest {
   keyOutcomes: string[];
   filesAffected: string[];
   lessons: string[];
+}
+
+const CRYSTAL_PAGE_LIMIT = 16;
+const CRYSTAL_PAGE_MAX_BYTES = 65_536;
+const CRYSTAL_CURSOR_MAX_BYTES = 8_192;
+
+function crystalListFailure(reason: string): CrystalListResponse {
+  return {
+    success: false,
+    crystals: [],
+    partial: false,
+    nextCursor: null,
+    total: null,
+    countScope: "page",
+    reason,
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isCrystalRecord(value: unknown): value is Crystal {
+  if (!isRecord(value)) return false;
+  return typeof value.id === "string" && value.id.length > 0 &&
+    Buffer.byteLength(value.id, "utf8") <= 1_024 && typeof value.narrative === "string" &&
+    Array.isArray(value.keyOutcomes) && value.keyOutcomes.every((item) => typeof item === "string") &&
+    Array.isArray(value.filesAffected) && value.filesAffected.every((item) => typeof item === "string") &&
+    Array.isArray(value.lessons) && value.lessons.every((item) => typeof item === "string") &&
+    Array.isArray(value.sourceActionIds) && value.sourceActionIds.every((item) => typeof item === "string") &&
+    isRfc3339Timestamp(value.createdAt) &&
+    isCrystalScope(value.project) && isCrystalScope(value.sessionId);
+}
+
+function isCrystalScope(value: unknown): value is string | undefined {
+  return value === undefined || (typeof value === "string" && value.length > 0 &&
+    Buffer.byteLength(value, "utf8") <= 256);
+}
+
+function isRfc3339Timestamp(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|([+-])(\d{2}):(\d{2}))$/.exec(value);
+  if (!match || match[0] !== value) return false;
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const offsetHour = match[8] === undefined ? 0 : Number(match[8]);
+  const offsetMinute = match[9] === undefined ? 0 : Number(match[9]);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+  return month >= 1 && month <= 12 && day >= 1 && day <= daysInMonth[month - 1]! &&
+    hour <= 23 && minute <= 59 && second <= 60 && offsetHour <= 23 && offsetMinute <= 59;
+}
+
+function isCrystalListResponse(value: unknown, limit: number): value is CrystalListResponse {
+  if (!isRecord(value) || typeof value.success !== "boolean" || !Array.isArray(value.crystals) ||
+    value.crystals.length > limit || !value.crystals.every(isCrystalRecord) ||
+    typeof value.partial !== "boolean" || value.total !== null || value.countScope !== "page" ||
+    (value.reason !== undefined && (typeof value.reason !== "string" || !value.reason))) {
+    return false;
+  }
+  const validCursor = value.nextCursor === null ||
+    (typeof value.nextCursor === "string" && value.nextCursor.length > 0 &&
+      Buffer.byteLength(value.nextCursor, "utf8") <= CRYSTAL_CURSOR_MAX_BYTES);
+  if (!validCursor) return false;
+  if (!value.success) {
+    return typeof value.reason === "string" && value.crystals.length === 0 && value.nextCursor === null;
+  }
+  if (typeof value.reason === "string" && !value.partial) return false;
+  return true;
+}
+
+function crystalListResponseBytes(response: CrystalListResponse): number | null {
+  try {
+    const serialized = JSON.stringify(response);
+    return serialized === undefined ? null : Buffer.byteLength(serialized, "utf8");
+  } catch {
+    return null;
+  }
 }
 
 const CRYSTALLIZE_SYSTEM = `You are summarizing a completed chain of agent actions into a compact digest.
@@ -196,23 +281,45 @@ export function registerCrystallizeFunction(
       project?: string;
       sessionId?: string;
       limit?: number;
+      cursor?: string;
     }) => {
-      const limit = data.limit ?? 20;
-      let crystals = await kv.list<Crystal>(KV.crystals);
-
-      if (data.project) {
-        crystals = crystals.filter((c) => c.project === data.project);
+      if (!data || typeof data !== "object" || Array.isArray(data)) {
+        return crystalListFailure("invalid_request");
       }
-      if (data.sessionId) {
-        crystals = crystals.filter((c) => c.sessionId === data.sessionId);
+      if ((data.project !== undefined && (typeof data.project !== "string" || !data.project ||
+          Buffer.byteLength(data.project, "utf8") > 256)) ||
+        (data.sessionId !== undefined && (typeof data.sessionId !== "string" || !data.sessionId ||
+          Buffer.byteLength(data.sessionId, "utf8") > 256)) ||
+        (data.limit !== undefined && (!Number.isSafeInteger(data.limit) || data.limit < 1 ||
+          data.limit > CRYSTAL_PAGE_LIMIT))) {
+        return crystalListFailure("invalid_request");
+      }
+      if (data.cursor !== undefined && (typeof data.cursor !== "string" || !data.cursor ||
+          Buffer.byteLength(data.cursor, "utf8") > CRYSTAL_CURSOR_MAX_BYTES)) {
+        return crystalListFailure("invalid_cursor");
       }
 
-      crystals.sort(
-        (a, b) =>
-          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
-      );
-
-      return { success: true, crystals: crystals.slice(0, limit) };
+      const limit = data.limit ?? CRYSTAL_PAGE_LIMIT;
+      try {
+        const response = await kv.retrieval<unknown>({
+          action: "crystals_page",
+          ...(data.project === undefined ? {} : { project: data.project }),
+          ...(data.sessionId === undefined ? {} : { session_id: data.sessionId }),
+          ...(data.cursor === undefined ? {} : { cursor: data.cursor }),
+          limit,
+          max_bytes: CRYSTAL_PAGE_MAX_BYTES,
+        });
+        if (!isCrystalListResponse(response, limit)) {
+          return crystalListFailure("source_response_invalid");
+        }
+        const responseBytes = crystalListResponseBytes(response);
+        if (responseBytes === null || responseBytes > CRYSTAL_PAGE_MAX_BYTES) {
+          return crystalListFailure("page_budget_exceeded");
+        }
+        return response;
+      } catch {
+        return crystalListFailure("source_unavailable");
+      }
     },
   );
 

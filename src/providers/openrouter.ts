@@ -70,7 +70,7 @@ export class OpenRouterProvider implements MemoryProvider {
           { role: "user", content: userPrompt },
         ],
       }),
-      });
+      }, undefined, options);
     } catch (error) {
       telemetry.failure({ errorKind: error instanceof Error && error.name === "AbortError" ? "timeout" : "network" });
       throw error;

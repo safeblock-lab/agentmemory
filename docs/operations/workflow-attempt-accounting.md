@@ -1,0 +1,33 @@
+# Workflow provider attempt accounting
+
+This source candidate adds private daemon dispatch bindings for summary, skill extraction and consolidation. It is not installed. Native State admission and daemon wiring are separate mandatory integration gates.
+
+Daemon startup reads `AGENTMEMORY_WORKFLOW_ATTEMPT_ACCOUNTING` through the existing private environment loader. Its bounded JSON shape is `{ "version": 1, "scopes": [...], "bindings": [...] }`: scopes contain exactly `workflow`, `project`, `sourceId`; bindings contain those plus `functionId`, `sourceFingerprint`, `jobId`, `unitId`, `phase`, `continuation`, `operationId`, `windowId`, `ceiling`. Unknown fields, malformed values, duplicate scopes or operation identities, and declarations over 64 KiB or 256 entries fail startup with a fixed sanitized error. Absent configuration preserves ordinary unscoped behavior and refuses retained scoped assertions. Startup injects one accounting object into all five affected registrations. Environment assertions grant no authority: every dispatch still requires exact context equality and a fresh committed claim from the native fixed private grant file. No grant is created by startup.
+
+## Private authority and exact assertions
+
+The same configuration accepts `workflow: "graph"` for the separately integrated graph raw-owner hunk. Its generation phase identifies the exact job, delta ordinal, frozen value name and durable provider-intent ID in `continuation`; `continuationId` in the native grant must be the exact `fingerprintId("workflow-continuation", continuation)`. Graph saved-value replay bypasses dispatch accounting, and existing intended/unknown outcomes cannot reopen. Scoped deferred graph queue calls remain unavailable until accounting exists at the batch executor. This declaration alone does not install the graph hunk.
+
+The daemon constructs one `WorkflowAttemptAccounting` from validated private configuration and injects it into the registration functions. Function payloads, selected execution controls, persisted queue rows and continuations cannot configure authority. A scope selects an entire workflow/project/source identity, across function names; every provider dispatch in that scope must match exactly one configured binding. Bindings assert workflow, functionId, project, sourceId, sourceFingerprint, jobId, unitId, phase and continuation, plus an independently approved operationId/windowId/ceiling. Distinct dispatch identities cannot reuse an operationId. No new MCP tool or REST authority is added.
+
+The actual daemon executor calls `withProviderAttemptBudget({operationId, windowId, ceiling, context}, run)`. Context has exactly workflow/functionId/sourceId/jobId/unitId/phase/continuationId. `continuationId` is `fingerprintId("workflow-continuation", continuation)`, preserving compound round/stage identities within the StateModule identity alphabet and length limit. Native private grants must configure these exact seven keys and values. Context-free grants cannot authorize these scoped calls. Project and sourceFingerprint remain additional exact private caller checks.
+
+The scope surrounds the router operation in the executing process, retaining retries, fallback and capture within one operation. Actual raw provider fetch admission remains the StateModule budget owner's responsibility. Enqueue and external SDK calls are not accounting boundaries. The additive third `ConsolidationRequests` callback argument supplies its durable request id and manifest id, preserving two-argument callbacks.
+
+## Durable continuation and replay
+
+Assertions are retained through the existing iii StateKV transport under `KV.state`; they are never grants. Every generation/publication dispatch reconstructs identity from the durable source, job, unit and continuation and rechecks private configuration. Retained assertion changes or private configuration removal fail closed. Scopes span direct summary and summary-unit execution for the same source, preventing an alternate function name from escaping a selected scope.
+
+Existing raw captures and canonical receipts are read before entering a provider scope. Captured replay performs no claim and no provider call. Existing intended/started/unknown records remain reconciliation-only; a new delivery or unit cannot obtain a new identity without another exact private approval. There is no refund, claim reopening or unknown-effect regeneration. In particular, refusal after an existing intended marker conservatively retains that unknown boundary.
+
+Generation and publication judges have different unit identities and separately approved operations. Summary queue identity uses the persisted snapshot, job, unit, round and stage; manual continuation follows the same unit executor. Skill fragment identity uses the durable fragment request key and cursor tuple. Consolidation generation uses its exact request checkpoint id; publication uses its judge request id and manifest lineage.
+
+## Deferred consolidation
+
+Normal unscoped deferred Fireworks queues remain unchanged. Scoped deferred consolidation is refused with `workflow_scoped_batch_dispatch_unavailable` before enqueue because this candidate does not own the batch process's actual provider executor. Scoped direct consolidation and summary durable subscribers use actual daemon wrappers. Supporting scoped Fireworks dispatch requires an additional approved source unit that persists assertions on the work item and enters scope at the actual batch HTTP executor; wrapping enqueue would not satisfy accounting.
+
+## Integration and evidence limits
+
+The candidate also repairs an existing pipeline callsite: publication/judge/recovery callbacks were accidentally passed to `ConsolidationRequests`, leaving `runPagedCut` without its required publish callback. The recorded canonical baseline returned `publish is not a function` in eleven fixtures. Closing the request constructor at its sixth argument restores the intended runner callbacks. All 37 pipeline fixtures subsequently pass in the mirror.
+
+Focused mocked proofs establish caller boundaries, identities, capture/replay behavior and unchanged unscoped behavior. They do not prove native atomic admission, persistence across actual daemon restarts, lost-ACK accounting, raw provider fetch admission or installation. The copied canonical filesystem-based budget helper is an unchanged support dependency only, excluded from the integration patch and invalid as a proposed accounting backend. Tests for scoped execution mock the agreed future State budget contract. The sole integrator must replace that backend with the independently accepted native StateModule candidate before any scoped runtime execution.

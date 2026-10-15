@@ -19,6 +19,7 @@ Configuration is read from the environment and from `~/.agentmemory/.env` (no `e
 - `AGENTMEMORY_AUX_LLM_PROVIDER`
 - `AGENTMEMORY_AUX_LLM_REASONING_EFFORT`
 - `AGENTMEMORY_AUX_LLM_TIMEOUT_MS`
+- `AGENTMEMORY_BACKGROUND_RECOVERY_PAUSED`
 - `AGENTMEMORY_CLASSIFICATION_LLM`
 - `AGENTMEMORY_COMMIT_SHA`
 - `AGENTMEMORY_COMPRESSION_LLM`
@@ -106,7 +107,6 @@ Configuration is read from the environment and from `~/.agentmemory/.env` (no `e
 - `AGENTMEMORY_TYPESAFE_SCORING_ENABLED`
 - `AGENTMEMORY_TYPESAFE_TIMEOUT_MS`
 - `AGENTMEMORY_UPDATE_RESTART`
-- Local viewer updates require no separate update secret; loopback checks and one-use update tokens apply.
 - `AGENTMEMORY_URL`
 - `AGENTMEMORY_USE_DOCKER`
 - `AGENTMEMORY_VECTOR_BACKFILL`

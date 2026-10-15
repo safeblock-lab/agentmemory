@@ -62,7 +62,9 @@ export class AnthropicProvider implements MemoryProvider {
       })
 
       const content = response.content.find((b) => b.type === 'text')?.text ?? ''
-      telemetry.success({ usage: extractLlmTokenUsage(response.usage), responseChars: content.length })
+      const usage = extractLlmTokenUsage(response.usage)
+      telemetry.success({ usage, responseChars: content.length })
+      options?.onUsage?.({ ...usage, responseChars: content.length })
       return content
     } catch (error) {
       telemetry.failure({ errorKind: error instanceof Error && error.name === 'AbortError' ? 'timeout' : 'network' })

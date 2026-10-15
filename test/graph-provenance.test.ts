@@ -52,6 +52,7 @@ const observations = [observation("obs-a"), observation("obs-b")];
 async function extract(xml: string, legacy = false, callback = false) {
   const sdk = mockSdk();
   const kv = mockKV();
+  await kv.set(KV.sessions, "ses-provenance", { id: "ses-provenance", project: "test-project" });
   installGraphStateWire(sdk as never, kv as never);
   registerGraphFunction(sdk as never, kv as never, {
     name: "test",
@@ -87,7 +88,7 @@ describe("graph observation provenance", () => {
       <relationship type="uses" source="Beta" target="beta.ts" observations="2"/>
     </relationships>`;
     const { result, nodes, edges } = await extract(xml);
-    expect(result).toMatchObject({ success: true, nodesAdded: 4, edgesAdded: 2 });
+    expect(result, JSON.stringify(result)).toMatchObject({ success: true, nodesAdded: 4, edgesAdded: 2 });
     expect(Object.fromEntries(nodes.map((node) => [node.name, node.sourceObservationIds]))).toEqual({
       Alpha: ["obs-a"], "alpha.ts": ["obs-a"], Beta: ["obs-b"], "beta.ts": ["obs-b"],
     });
@@ -107,7 +108,7 @@ describe("graph observation provenance", () => {
     </relationships>`;
     for (const callback of [false, true]) {
       const { result, edges } = await extract(xml, false, callback);
-      expect(result).toMatchObject({ success: true });
+      expect(result, JSON.stringify(result)).toMatchObject({ success: true });
       expect(edges).toHaveLength(1);
       expect(edges[0].sourceObservationIds).toEqual(["obs-a", "obs-b"]);
     }
@@ -118,7 +119,7 @@ describe("graph observation provenance", () => {
     async (references) => {
       const attribute = references === undefined ? "" : ` observations="${references}"`;
       const { result, nodes, edges } = await extract(`<entities><entity type="concept" name="Alpha"${attribute}/></entities>`);
-      expect(result).toMatchObject({ success: false });
+      expect(result, JSON.stringify(result)).toMatchObject({ success: false });
       expect(nodes).toEqual([]);
       expect(edges).toEqual([]);
     },
@@ -126,14 +127,14 @@ describe("graph observation provenance", () => {
 
   it("keeps the frozen legacy response path for an existing job", async () => {
     const { result, nodes } = await extract('<entities><entity type="concept" name="Legacy"/></entities>', true);
-    expect(result).toMatchObject({ success: true, nodesAdded: 1 });
+    expect(result, JSON.stringify(result)).toMatchObject({ success: true, nodesAdded: 1 });
     expect(nodes[0].sourceObservationIds).toEqual(["obs-a", "obs-b"]);
   });
 
   it("keeps exact references in a versioned deferred callback", async () => {
     const xml = '<entities><entity type="concept" name="Only A" observations="1"/><entity type="concept" name="Only B" observations="2"/></entities>';
     const { result, nodes } = await extract(xml, false, true);
-    expect(result).toMatchObject({ success: true });
+    expect(result, JSON.stringify(result)).toMatchObject({ success: true });
     expect(Object.fromEntries(nodes.map((node) => [node.name, node.sourceObservationIds]))).toEqual({
       "Only A": ["obs-a"], "Only B": ["obs-b"],
     });

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { stableObservationJson } from "./observation-identity.js";
 
 const TTL_MS = 5 * 60 * 1000;
 const CLEANUP_INTERVAL_MS = 60_000;
@@ -20,9 +21,9 @@ export class DedupMap {
   computeHash(sessionId: string, toolName: string, toolInput: unknown): string {
     const input =
       typeof toolInput === "string"
-        ? toolInput.slice(0, 500)
-        : JSON.stringify(toolInput ?? "").slice(0, 500);
-    const raw = `${sessionId}:${toolName}:${input}`;
+        ? toolInput
+        : stableObservationJson(toolInput ?? "");
+    const raw = JSON.stringify([sessionId, toolName, input]);
     return createHash("sha256").update(raw).digest("hex");
   }
 

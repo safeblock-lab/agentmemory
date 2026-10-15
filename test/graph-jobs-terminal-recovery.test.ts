@@ -15,11 +15,20 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 describe("terminal graph staging failures", () => {
+  async function admittedHarness() {
+    const harness = graphStateHarness();
+    const revision = await harness.kv.scopeRevision(KV.graphJobs);
+    await harness.kv.set(KV.config, "graph-dispatch:active", {
+      jobId: null, generation: "1", fence: "0", baselineComplete: true,
+      revision: revision.revision, revisionGeneration: revision.generation,
+    });
+    return harness;
+  }
   it.each([
     ["state record limit", new StateTransactionError("STATE_RECORD_TOO_LARGE"), "STATE_RECORD_TOO_LARGE"],
     ["HTTP 413", Object.assign(new Error("payload too large"), { status: 413 }), "HTTP_413"],
   ])("stops automatic recovery after a %s before graph rows are applied", async (_label, failure, failureCode) => {
-    const harness = graphStateHarness();
+    const harness = await admittedHarness();
     const graph = graphKV(harness.kv as never);
     const jobId = "oversized-extraction-job";
     const publishedSnapshot = { version: 1, marker: "published-before-failure" };
@@ -53,7 +62,7 @@ describe("terminal graph staging failures", () => {
   });
 
   it("persists bounded backoff without counting deferred retries as failures", async () => {
-    const harness = graphStateHarness();
+    const harness = await admittedHarness();
     const graph = graphKV(harness.kv as never);
     const jobId = "temporarily-failing-extraction-job";
     const input = { source: "frozen" };
@@ -84,7 +93,7 @@ describe("terminal graph staging failures", () => {
   });
 
   it("terminalizes an extraction whose durable staging checkpoint exceeds the limit", async () => {
-    const harness = graphStateHarness();
+    const harness = await admittedHarness();
     const nativeRead = harness.kv.getVersioned.bind(harness.kv);
     harness.kv.getVersioned = async function <T>(scope: string, key: string, guard?: never) {
       if (scope === KV.graphControl && key === "current" && !guard) {

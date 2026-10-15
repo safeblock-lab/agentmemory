@@ -19,7 +19,58 @@ vi.mock("../src/functions/search.js", () => ({
   scheduleIndexSave: vi.fn(),
 }));
 
-const mockTrigger = vi.fn().mockResolvedValue(undefined);
+const observationVersions = new Map<string, string>();
+const versionKey = (scope: string, key: string) => `${scope}\u0000${key}`;
+const mockTrigger = vi.fn(async (input: any) => {
+  const functionId = input?.function_id;
+  const payload = input?.payload ?? {};
+  if (functionId === "state::observation_admit_v1") {
+    const sessionId = payload.session_id as string;
+    const identityScope = `mem:obs-identity:${sessionId}`;
+    const eventScope = `mem:obs-events:${sessionId}`;
+    const observationScope = `mem:obs:${sessionId}`;
+    const identity = await kv.get(identityScope, payload.identity_digest) as { observationId: string } | null;
+    const observationId = identity?.observationId ?? payload.observation.id;
+    const current = await kv.get(observationScope, observationId) as Record<string, any> | null;
+    const event = await kv.get(eventScope, payload.event_id);
+    if (event && current) return { created: false, duplicate_event: true, observation_id: observationId, observation: current, version: observationVersions.get(versionKey(observationScope, observationId)) ?? "1", occurrence_count: current.occurrenceCount ?? 1 };
+    if (identity && current) {
+      const count = (current.occurrenceCount ?? 1) + 1;
+      const updated = { ...current, occurrenceCount: count, lastSeenAt: payload.occurred_at };
+      await kv.set(observationScope, observationId, updated);
+      await kv.set(eventScope, payload.event_id, { observationId, identityDigest: payload.identity_digest, occurredAt: payload.occurred_at });
+      const version = String(Number(observationVersions.get(versionKey(observationScope, observationId)) ?? "1") + 1);
+      observationVersions.set(versionKey(observationScope, observationId), version);
+      return { created: false, duplicate_event: false, observation_id: observationId, observation: updated, version, occurrence_count: count };
+    }
+    const observation = { ...payload.observation, identityDigest: payload.identity_digest, occurrenceCount: 1, firstSeenAt: payload.occurred_at, lastSeenAt: payload.occurred_at, provenance: [{ ...payload.provenance, count: 1, firstSeenAt: payload.occurred_at, lastSeenAt: payload.occurred_at }] };
+    await kv.set(observationScope, observationId, observation);
+    await kv.set(identityScope, payload.identity_digest, { observationId, identityDigest: payload.identity_digest });
+    await kv.set(identityScope, "__ready__", { version: 1, ready: true });
+    await kv.set(eventScope, payload.event_id, { observationId, identityDigest: payload.identity_digest, occurredAt: payload.occurred_at });
+    observationVersions.set(versionKey(observationScope, observationId), "1");
+    return { created: true, duplicate_event: false, observation_id: observationId, observation, version: "1", occurrence_count: 1 };
+  }
+  if (functionId === "state::get_versioned") {
+    const value = await kv.get(payload.scope, payload.key);
+    return { value, version: value ? observationVersions.get(versionKey(payload.scope, payload.key)) ?? "1" : "0" };
+  }
+  if (functionId === "state::observation_replace_v1") {
+    const scope = `mem:obs:${payload.session_id}`;
+    const current = await kv.get(scope, payload.observation_id) as Record<string, any> | null;
+    const version = observationVersions.get(versionKey(scope, payload.observation_id)) ?? "0";
+    if (!current || version !== payload.expected_version) throw new Error("STATE_TX_CONFLICT");
+    const observation = { ...payload.observation };
+    for (const field of ["identityDigest", "occurrenceCount", "firstSeenAt", "lastSeenAt", "provenance", "provenanceOverflowCount"]) {
+      if (field in current) observation[field] = current[field];
+      else delete observation[field];
+    }
+    await kv.set(scope, payload.observation_id, observation);
+    observationVersions.set(versionKey(scope, payload.observation_id), String(Number(version) + 1));
+    return { observation };
+  }
+  return undefined;
+});
 const mockSdk = { trigger: mockTrigger } as any;
 
 function mockKV() {
@@ -39,6 +90,12 @@ function mockKV() {
     list: async <T>(scope: string): Promise<T[]> => {
       if (!store.has(scope)) return [];
       return Array.from(store.get(scope)!.values()) as T[];
+    },
+    async *pages<T>(scope: string, options: { limit: number; fields?: string[] }) {
+      const rows = Array.from(store.get(scope)?.entries() ?? [], ([id, value]) => options.fields?.length ? { id } : value);
+      for (let offset = 0; offset < rows.length; offset += options.limit) {
+        yield { items: rows.slice(offset, offset + options.limit) as T[] };
+      }
     },
     getStore: () => store,
   };

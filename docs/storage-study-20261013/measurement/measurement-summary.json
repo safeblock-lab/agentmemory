@@ -1,0 +1,191 @@
+{
+  "identity": {
+    "runtime_config": "C:/Users/harus/.agentmemory/iii-config.yaml",
+    "state_module_adapter": "sqlite",
+    "configured_path": "./data/state_store.sqlite3",
+    "authoritative_file": "C:/Users/harus/.agentmemory/data/state_store.sqlite3",
+    "identity_observed_utc": "2026-10-13T21:39:39Z",
+    "initial_db_file_bytes": 7641169920,
+    "initial_wal_bytes": 6880432,
+    "initial_shm_bytes": 32768,
+    "initial_data_tree_files": 1108,
+    "initial_data_tree_bytes": 9039641152,
+    "other_data_files_bytes": 14392
+  },
+  "native_cut": {
+    "start_utc": "2026-10-13T22:34:58.327648Z",
+    "elapsed_seconds": 136.6363182067871,
+    "data_version_before": 2,
+    "data_version_after": 164,
+    "schema_version": 169,
+    "page_count_before": 1870092,
+    "page_count_after": 1870139,
+    "freelist_pages_before": 1,
+    "freelist_pages_after": 5,
+    "db_file_bytes_after": 7660089344,
+    "wal_before": 8796232,
+    "wal_after": 17151592,
+    "shm_before": 32768,
+    "shm_after": 65536,
+    "auto_vacuum_later_observed": 2,
+    "page_size": 4096
+  },
+  "perimeters_temporal": {
+    "sqlite_plus_wal_shm": 7677306472,
+    "data_tree_including_streams_queue_other": 9068864504,
+    "data_plus_retained_snapshots": 14297356649,
+    "warning": "Perimeters combine sequential temporal measurements; not a coherent snapshot."
+  },
+  "decoded_census": {
+    "rows": 1501092,
+    "batches": 11728,
+    "stored_bytes": 2457958599,
+    "decoded_bytes": 6377996436,
+    "declared_bytes": 6377996436,
+    "nulls": 49960,
+    "compressed_rows": 808403,
+    "raw_rows": 642729,
+    "codec_errors": 0,
+    "json_errors": 0,
+    "zlib6_per_record": 2439065273,
+    "zlib6_framed_namespace_chunks": 1913291116,
+    "framed_chunk_input": 6389605492,
+    "chunks": 13022,
+    "value_byteproof_duplicate_rows_lower_bound": 152479,
+    "value_duplicate_stored_lower_bound": 8568584,
+    "field_raw_bytes": 4514838853,
+    "field_byteproof_duplicate_raw_lower_bound": 1388850830,
+    "peak_working_set": 211820544,
+    "sql_retries": 3,
+    "seconds": 1469.4808478355408
+  },
+  "global_encoded_fingerprints": {
+    "rows": 1499193,
+    "unique_sha256": 1291649,
+    "candidate_duplicate_rows": 207544,
+    "candidate_duplicate_stored_bytes": 92623320,
+    "warning": "Complete fingerprint candidates only; not global byte-equality proof."
+  },
+  "vectors": {
+    "rows": 232592,
+    "raw_bytes": 357261312,
+    "unique_sha256_groups": 219860,
+    "byte_confirmed_duplicate_rows": 12732,
+    "byte_confirmed_duplicate_bytes": 19556352,
+    "unique_float32_payload_bytes": 337704960,
+    "representative_or_current_drift": 0,
+    "hash_collisions": 0,
+    "epochs": {
+      "1": 232592
+    },
+    "zlib6_per_vector": 344048043,
+    "zlib6_framed_1MiB_chunks": 330765028,
+    "batches": 228,
+    "peak_working_set": 124096512,
+    "sql_retries": 4,
+    "seconds": 123.8410542011261
+  },
+  "provenance": {
+    "node_rows": 76069,
+    "edge_rows": 121451,
+    "node_items": 37766686,
+    "edge_items": 36431114,
+    "within_list_duplicate_items": 0,
+    "canonical_array_bytes": 2077735920,
+    "global_fingerprint_groups": 39299,
+    "global_unique_array_bytes": 786629215,
+    "global_fingerprint_repeated_array_bytes": 1291106705,
+    "byteproof_duplicate_rows_lower_bound": 148630,
+    "byteproof_duplicate_array_bytes_lower_bound": 1189515606,
+    "byteproof_cache_evictions": 40470,
+    "unique_ids": 96798,
+    "unique_id_bytes": 2419950,
+    "all_unique_id_lengths": 25,
+    "unique_list_item_incidences": 28092497,
+    "node_unique_groups": 30208,
+    "edge_unique_groups": 18679,
+    "cross_family_groups": 9588,
+    "packed_item_3byte_refs": 84277491,
+    "dictionary_with_4byte_lengths": 2807142,
+    "list_8byte_offsets": 314392,
+    "row_4byte_list_refs": 790080,
+    "packed_model_total_before_reverse_indexes_headers_format_metadata": 88189105,
+    "remaining_nonarray_graph_decoded_bytes": 43619512,
+    "codec_errors": 0,
+    "invalid_lists": 0,
+    "peak_working_set": 99643392,
+    "seconds": 51.15727400779724
+  },
+  "sidecars": {
+    "files": 1158,
+    "bytes": 6620035785,
+    "zlib6_per_file_bytes": 2884589050,
+    "changed_files": 0,
+    "byte_confirmed_duplicate_files": 2,
+    "byte_confirmed_duplicate_file_bytes": 2093,
+    "seconds": 708.611380815506,
+    "observed_peak_working_set": 22532096,
+    "streaming_buffer": 1048576,
+    "groups": [
+      {
+        "name": "streams",
+        "files": 662,
+        "bytes": 1391161564,
+        "zlib_file": 185492792,
+        "zlib_1MiB": 187447388,
+        "mtime_bytes": {
+          "1-7d": 1165198056,
+          "7-30d": 166807876,
+          "30-90d": 59155632
+        }
+      },
+      {
+        "name": "queue",
+        "files": 434,
+        "bytes": 382076,
+        "zlib_file": 166530,
+        "zlib_1MiB": 166522,
+        "mtime_bytes": {
+          "future": 161012,
+          "<1d": 8,
+          "1-7d": 85952,
+          "7-30d": 135104
+        }
+      },
+      {
+        "name": "snapshot_tmp",
+        "files": 2,
+        "bytes": 1560929329,
+        "zlib_file": 280087856,
+        "zlib_1MiB": 281881060,
+        "mtime_bytes": {
+          "1-7d": 1560929329
+        }
+      },
+      {
+        "name": "snapshot_state_json",
+        "files": 1,
+        "bytes": 1674744481,
+        "zlib_file": 458482014,
+        "zlib_1MiB": 460085000,
+        "mtime_bytes": {
+          "1-7d": 1674744481
+        }
+      },
+      {
+        "name": "snapshot_git_plus_reinstall",
+        "files": 59,
+        "bytes": 1992818335,
+        "zlib_file": 1960359858,
+        "zlib_1MiB": 1960907221,
+        "mtime_bytes": {
+          "1-7d": 1992515055,
+          "7-30d": 9910,
+          "30-90d": 293370
+        }
+      }
+    ]
+  },
+  "ttl_limits": "Filesystem mtime is not embedded event age, Git commit/ref age, meaningful last use, terminality, replay protection or live references. Stream bytes idle >1d=1391161564, >7d=225963508, >30d=59155632; snapshot files >30d only293370. These are not deletion savings. Existing TTL/sliding-use behavior was not assessed; this study activated none.",
+  "future_constraint": "NOT INSTALLED engine_provider_budget_{windows,grants,operations,attempts} are outside current census/savings; future migration must preserve private spend/monotonic budget state and must not reset/prune/export-import or restore older spend state."
+}

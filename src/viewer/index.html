@@ -150,7 +150,10 @@
       .app-header { flex-wrap: wrap; row-gap: 6px; padding: 10px 16px; }
       .app-header .dateline { display: none; }
       .view { overflow-x: auto; }
+      .toolbar label { max-width: 100%; }
+      .toolbar input, .toolbar select { max-width: 100%; min-width: 0; }
     }
+    button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     .ws-status {
       font-size: 10px;
       padding: 3px 10px;
@@ -273,6 +276,23 @@
       color: var(--ink-faint);
       margin-top: 2px;
       font-family: var(--font-ui);
+    }
+
+    .metric-rows { margin: 0; }
+    .metric-row { display: grid; grid-template-columns: minmax(190px, 1fr) minmax(0, 2fr); gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border-light); font-size: 12px; }
+    .metric-row:last-child { border-bottom: none; }
+    .metric-row dt { color: var(--ink-muted); }
+    .metric-row dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+    .metric-row .value { font-weight: 700; }
+    .metric-detail { display: block; color: var(--ink-faint); font-size: 11px; font-weight: 400; margin-top: 3px; overflow-wrap: anywhere; }
+    .metric-note { color: var(--ink-muted); font-size: 11px; line-height: 1.5; }
+    .pricing-scroll { overflow-x: auto; }
+    .pricing-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .model-pricing table { width: 100%; min-width: 640px; font-size: 12px; }
+    .model-pricing th, .model-pricing td { text-align: left; vertical-align: top; line-height: 1.6; }
+    .model-pricing th[scope="row"] { max-width: 220px; overflow-wrap: anywhere; }
+    @media (max-width: 600px) {
+      .metric-row { grid-template-columns: minmax(0, 1fr); gap: 4px; }
     }
 
     .card {
@@ -421,6 +441,7 @@
       margin: -24px;
       border-top: 1px solid var(--border-light);
     }
+    #view-graph .graph-container { margin-top: 0; height: calc(100vh - 250px); }
     .graph-canvas-wrap {
       flex: 1;
       position: relative;
@@ -1176,7 +1197,7 @@
     var state = {
       activeTab: 'dashboard',
       dashboard: { loaded: false, health: null, sessions: [], memories: [], status: null, statusError: null, lessons: [], crystals: [] },
-      graph: { loaded: false, nodes: [], edges: [], stats: null, filters: {}, selectedNode: null, queryError: null, truncated: false, totalNodes: 0, totalEdges: 0 },
+      graph: { loaded: false, projects: [], selectedProject: '', projectsLoaded: false, requestId: 0, nodes: [], edges: [], stats: null, filters: {}, selectedNode: null, queryError: null, truncated: false, totalNodes: 0, totalEdges: 0 },
       memories: { loaded: false, items: [], search: '', typeFilter: '', selectedId: null },
       timeline: { loaded: false, observations: [], sessionId: '', minImportance: 0, page: 0, pageSize: 20 },
       sessions: { loaded: false, items: [], selectedId: null },
@@ -1445,6 +1466,7 @@
     function switchTab(tab, opts) {
       opts = opts || {};
       tab = normalizeTab(tab);
+      if (state.activeTab === 'graph' && tab !== 'graph') cancelGraphBrowse();
       if (state.activeTab === 'replay' && tab !== 'replay' && typeof stopReplayTimer === 'function') {
         stopReplayTimer();
       }
@@ -1477,7 +1499,7 @@
 
     async function loadTab(tab) {
       var now = Date.now();
-      if (tab !== 'replay' && tabFetchedAt[tab] && now - tabFetchedAt[tab] < TAB_FRESH_MS) {
+      if (tab !== 'replay' && tab !== 'graph' && tabFetchedAt[tab] && now - tabFetchedAt[tab] < TAB_FRESH_MS) {
         return;
       }
       tabFetchedAt[tab] = now;
@@ -1562,27 +1584,36 @@
       return typeof value === 'number' && Number.isFinite(value) ? String(value) : 'unknown';
     }
 
-    function renderRecentActivity(report, error) {
+    function renderRecentActivity(report, error, limit) {
+      limit = limit === 10 ? 10 : 30;
       var activity = report && report.activity;
       var available = activity && activity.source === 'native-operation-feed' && Array.isArray(activity.items);
       var html = '<div class="card"><div class="card-title">Recent Operations</div>';
       if (error) html += '<p role="status" style="font-size:12px;color:var(--ink-muted);">Activity could not refresh.' + (available ? ' Showing the last result.' : '') + '</p>';
       if (!available) return html + '<div class="empty-state"><p>Recent operations are unavailable. Retry the status check.</p></div></div>';
-      html += '<p style="font-size:12px;color:var(--ink-muted);">Last 30 compression, summary and graph extraction outcomes. Saved across service restarts. Counts describe each operation, not corpus totals.</p>';
+      html += '<p style="font-size:12px;color:var(--ink-muted);">Last ' + limit + ' processing outcomes. Saved across service restarts. Counts describe each operation, not corpus totals.</p>';
       if (!activity.items.length) html += '<div class="empty-state"><p>No operation outcomes recorded yet.</p></div>';
-      var countLabels = { observationsProcessed: 'observations processed', observationsCompressed: 'observations compressed', summariesCreated: 'summaries written', nodesAdded: 'nodes added', edgesAdded: 'edges added', unitsQueued: 'units queued' };
-      activity.items.slice(0, 30).forEach(function(item) {
+      var countLabels = { observationsProcessed: 'observations processed', observationsCompressed: 'observations compressed', summariesCreated: 'summaries written', nodesAdded: 'nodes added', edgesAdded: 'edges added', unitsQueued: 'units queued', unitsCompleted: 'units completed', sessionsProcessed: 'sessions processed', skillsCreated: 'skills created', skillsReinforced: 'skills reinforced', itemsProcessed: 'items processed', itemsCreated: 'items created', itemsRemoved: 'items removed', itemsFailed: 'items failed' };
+      activity.items.slice(0, limit).forEach(function(item) {
         var counts = item.counts || {};
         var details = Object.keys(countLabels).filter(function(key) { return typeof counts[key] === 'number' && Number.isSafeInteger(counts[key]) && counts[key] >= 0; }).map(function(key) { return esc(String(counts[key])) + ' ' + countLabels[key]; });
         html += '<div style="padding:6px 0;border-bottom:1px solid var(--border-light);font-size:13px;overflow-wrap:anywhere;">' +
           '<span class="badge badge-blue">' + esc(item.outcome) + '</span> ' +
           '<span>' + esc(item.functionId) + '</span>' +
+          (item.reason ? '<div style="font-size:12px;color:var(--ink-muted);">' + esc(item.reason.replace(/_/g, ' ')) + '</div>' : '') +
+          (item.error ? '<div style="font-size:12px;color:var(--ink-muted);">' + esc(item.error.message) + '</div>' : '') +
           '<div style="font-size:12px;color:var(--ink-muted);">' + (details.length ? details.join(' · ') : 'Result counts unavailable') + '</div>' +
           '<div style="font-size:11px;color:var(--ink-muted);font-family:var(--font-mono);">' +
           'ID: ' + esc(item.id) +
           (item.agentId ? ' · Agent: ' + esc(item.agentId) : '') + ' · ' + esc(formatTime(item.timestamp)) + '</div></div>';
       });
       return html + '</div>';
+    }
+
+    function dashboardRecentNotice(health, sessionsState) {
+      if (sessionsState === 'preparing') return 'The API is reachable. Recent session history is still preparing. Retrying automatically.';
+      if (health) return 'The API is reachable, but recent session history could not refresh. Retrying automatically.';
+      return 'Could not reach the agentmemory API. Retrying automatically.';
     }
 
     async function loadDashboard() {
@@ -1599,7 +1630,7 @@
       try {
         var results = await Promise.all([
           api('health', { readErrorBody: true }),
-          apiGet('sessions'),
+          recentViewerPage('sessions'),
           apiGet('memories?latest=true&count=true'),
           loadViewerStatus(),
           apiGet('semantic'),
@@ -1610,18 +1641,19 @@
           apiGet('consolidation/status')
         ]);
         var sessionsOk = !!(results[1] && Array.isArray(results[1].sessions));
+        d.sessionsUnavailable = !sessionsOk;
+        d.sessionsNotice = sessionsOk ? '' : dashboardRecentNotice(results[0], recentHistoryStates.sessions);
+        d.stale = !sessionsOk || results.some(function(r) { return r === null; });
+        if (d.stale) scheduleStaleRetry();
         if (!sessionsOk && !d.loaded) {
           el.innerHTML =
-            '<div class="loading" style="color:var(--accent);">Could not reach the agentmemory API. ' +
-            'The server may be restarting.<br><br>' +
+            '<div class="loading" role="status" style="color:var(--accent);">' + esc(d.sessionsNotice) + '<br><br>' +
             '<button class="btn btn-primary" data-action="refresh-dashboard">Retry</button></div>';
           return;
         }
-        d.stale = results.some(function(r) { return r === null; });
-        if (d.stale) scheduleStaleRetry();
         if (results[0]) d.health = results[0];
         if (sessionsOk) d.sessions = replaySessionEvents(results[1].sessions, seqAtStart);
-        if (countToken === memoryCountRequest && results[2] && typeof results[2].total === 'number') {
+        if (countToken === memoryCountRequest && results[2]) {
           d.memoryTotal = results[2].total;
         }
         d.semantic = listOr(d.semantic, results[4], 'facts', 'semantic');
@@ -1657,19 +1689,6 @@
           scheduleDashboardReload();
         }
       }
-    }
-
-    function estimateTokenSavings(sessions, tokenBudget) {
-      var full = 0;
-      var injected = 0;
-      sessions.forEach(function(s) {
-        var sessionFull = (s.observationCount || 0) * 80;
-        if (sessionFull <= 0) return;
-        full += sessionFull;
-        injected += Math.min(tokenBudget, sessionFull);
-      });
-      var saved = Math.max(0, full - injected);
-      return { percent: full > 0 ? Math.round((saved / full) * 100) : 0, saved: saved };
     }
 
     var LAYER_STATE_BADGES = { off: 'badge-muted', waiting: 'badge-yellow', ready: 'badge-blue', ran: 'badge-green', error: 'badge-red' };
@@ -1715,6 +1734,162 @@
       return html;
     }
 
+    function savingsNumber(value) {
+      return typeof value === 'number' && Number.isFinite(value) ? Math.round(value).toLocaleString() : 'unknown';
+    }
+
+    function measuredNumber(value) {
+      return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+    }
+
+    function metricDate(value) {
+      return typeof value === 'string' && Number.isFinite(Date.parse(value)) ? new Date(value).toISOString() : 'Unavailable';
+    }
+
+    function metricRow(label, value, detail) {
+      return '<div class="metric-row"><dt>' + esc(label) + '</dt><dd><span class="value">' + esc(String(value)) + '</span><span class="metric-detail">' + esc(detail || '') + '</span></dd></div>';
+    }
+
+    function cacheMetric(label, usage) {
+      var u = usage || {};
+      var ratio = measuredNumber(u.cacheHitRatio) && u.cacheHitRatio <= 1 ? (u.cacheHitRatio * 100).toFixed(2) + '%' : 'Unavailable';
+      var empty = u.requests === 0 && !u.unavailable;
+      return metricRow(label, empty ? 'No local usage' : ratio,
+        (empty ? 'No responses in this local sample' : savingsNumber(u.cachedInputTokens) + ' cached / ' + savingsNumber(u.inputTokens) + ' input tokens') +
+        ' · last 7 days' + (u.partial ? ' · partial sample' : '') + (u.unavailable ? ' · source unavailable' : ''));
+    }
+
+    function renderSavingsStats(report) {
+      if (!report) return metricRow('Memory context emitted', 'Unavailable', 'Usage data could not load. Refresh to retry.');
+      var c = report.context || {}, u = report.agentUsage || {}, clients = u.clients || {};
+      var hasEmissions = c.emissions > 0 && measuredNumber(c.meanTokensPerObservedSession);
+      var html = metricRow('Memory context emitted', hasEmissions ? '~' + savingsNumber(c.meanTokensPerObservedSession) : 'No hook telemetry',
+        hasEmissions ? 'text tokens per observed session · ' + savingsNumber(c.emissions) + ' hook emissions' : 'No measured hook emissions in this sample; stored memories are separate.');
+      html += cacheMetric('Codex input cache hits', clients.codex || report.codex);
+      html += cacheMetric('Claude input cache hits', clients.claude);
+      html += cacheMetric('Combined input cache hits', report.agentUsage);
+      var reduction = c.candidateTokens > 0 && c.pairedEmissions > 0 && measuredNumber(c.selectionReductionTokens) ? c.selectionReductionTokens / c.candidateTokens * 100 : null;
+      html += metricRow('Context selection reduction', reduction !== null ? reduction.toFixed(1) + '%' : 'No paired telemetry',
+        reduction !== null ? 'eligible context versus emitted text · not net savings' : 'No paired eligible/emitted context measurements; stored memories do not measure savings.');
+      return html;
+    }
+
+    function renderOperationalStats(metrics) {
+      var m = metrics || {}, failures = m.failures24h || {}, graph = m.graphStorage || {}, ram = m.engineMemory || {}, automatic = m.automaticCompaction || {};
+      var html = metricRow('Failures · last 24 hours', failures.complete === true && Number.isSafeInteger(failures.count) && failures.count >= 0 ? savingsNumber(failures.count) : 'Unavailable',
+        'Completed minutes: ' + metricDate(failures.intervalStart) + ' → ' + metricDate(failures.intervalEnd) +
+        (failures.complete ? '' : ' · incomplete coverage' + (failures.coverageSince ? ' since ' + metricDate(failures.coverageSince) : '')));
+      var graphMeasured = graph.source === 'native_scoped_metadata' && graph.complete === true && measuredNumber(graph.storedBytes);
+      html += metricRow('Graph stored size · GB', graphMeasured ? (graph.storedBytes / 1e9).toFixed(3) + ' GB' : 'Unavailable',
+        graphMeasured ? 'Stored durable graph payload · sample ' + metricDate(graph.sampleAt) + ' · ' + (typeof graph.coverage === 'string' ? graph.coverage : 'coverage unavailable')
+          : graph.reason === 'scoped_metadata_unavailable' ? 'Native metadata for graph scopes is unavailable; total state storage is not graph size.' : 'No complete native measurement for graph scopes.');
+      html += metricRow('Engine RAM · iii.exe', ram.source === 'iii.exe' && measuredNumber(ram.residentBytes) ? (ram.residentBytes / 1048576).toFixed(1) + ' MiB' : 'Unavailable',
+        'Resident working set · sampled ' + metricDate(ram.sampledAt));
+      html += metricRow('Last successful graph compaction', metricDate(m.lastSuccessfulCompactionAt),
+        m.lastSuccessfulCompactionAt ? 'Last effective page reclamation' : 'No successful compaction recorded');
+      var states = { enabled: 'Enabled', paused: 'Paused', requires_migration: 'Requires migration', unsupported_mode: 'Unsupported mode', unknown: 'Unavailable' };
+      html += metricRow('Automatic graph compaction', Object.prototype.hasOwnProperty.call(states, automatic.state) ? states[automatic.state] : 'Unavailable',
+        'Configured: ' + (automatic.enabled === true ? 'enabled' : automatic.enabled === false ? 'disabled' : 'unavailable') +
+        (Number.isInteger(automatic.autoVacuumMode) && automatic.autoVacuumMode >= 0 && automatic.autoVacuumMode <= 2 ? ' · auto_vacuum ' + automatic.autoVacuumMode : ''));
+      var maintenance = m.maintenance || {};
+      var maintenanceStates = { progress: 'Physical reduction measured', no_progress: 'No physical reduction', deferred: 'Deferred', dependency_failure: 'Dependency failure', unavailable: 'Unavailable' };
+      var maintenanceReasons = { storage_error: 'Storage operation failed or its result is unknown', migration_required: 'Storage mode requires migration', foreground_pressure: 'Waiting for foreground workload to settle', maintenance_deferred: 'Waiting for the next eligible maintenance cycle', physical_measurement_unavailable: 'No physical measurement available', physical_bytes_reclaimed: 'Storage file reduction measured', no_physical_reduction: 'This cycle did not shrink the storage file', maintenance_state_unavailable: 'Maintenance state unavailable' };
+      html += metricRow('Latest storage maintenance', Object.prototype.hasOwnProperty.call(maintenanceStates, maintenance.state) ? maintenanceStates[maintenance.state] : 'Unavailable',
+        (Object.prototype.hasOwnProperty.call(maintenanceReasons, maintenance.reason) ? maintenanceReasons[maintenance.reason] : 'No maintenance evidence') +
+        (measuredNumber(maintenance.physicalBytesReclaimed) ? ' · ' + savingsNumber(maintenance.physicalBytesReclaimed) + ' physical bytes reclaimed' : ''));
+      return html;
+    }
+
+    function renderWorkflowStatus(metrics) {
+      var workflows = metrics && metrics.workflows;
+      var html = '<div class="card"><div class="card-title">Automatic workflows</div>';
+      if (!workflows || !Array.isArray(workflows.items)) return html + '<p class="metric-note">Workflow status unavailable.</p></div>';
+      html += '<p class="metric-note">Background recovery: ' + (workflows.backgroundRecoveryPaused === true ? 'Paused' : workflows.backgroundRecoveryPaused === false ? 'Enabled' : 'Unavailable') +
+        '. Enabled means eligible; successful execution requires recorded results. Last 30 operations only.</p><dl class="metric-rows">';
+      var labels = { enabled: 'Enabled', paused: 'Paused', disabled: 'Disabled', unavailable: 'Unavailable', dependency_failure: 'Dependency failure', failed: 'Failed' };
+      var reasons = { eligible_execution_not_proven: 'Eligible to run; no success inferred', configuration_disabled: 'Disabled in configuration', background_recovery_paused: 'Background recovery is paused', provider_unavailable: 'No LLM provider is available', provider_circuit_open: 'Provider circuit is open after failures', slots_disabled: 'Memory slots are disabled', native_state_unavailable: 'Native state measurement is unavailable', last_observed_execution_failed: 'Latest recorded execution failed', execution_evidence_unavailable: 'Execution evidence is unavailable' };
+      workflows.items.slice(0, 8).forEach(function(item) {
+        if (!item || typeof item.label !== 'string') return;
+        var status = Object.prototype.hasOwnProperty.call(labels, item.state) ? labels[item.state] : 'Unavailable';
+        html += metricRow(item.label, status, 'Configured: ' + (item.configured === true ? 'enabled' : item.configured === false ? 'disabled' : 'unavailable') +
+          ' · ' + (Object.prototype.hasOwnProperty.call(reasons, item.reason) ? reasons[item.reason] : 'Evidence unavailable') +
+          (item.lastObservedAt ? ' · Last result: ' + (typeof item.lastOutcome === 'string' ? item.lastOutcome : 'unavailable') + ' · ' + metricDate(item.lastObservedAt) : ' · No execution recorded in this sample'));
+      });
+      return html + '</dl></div>';
+    }
+
+    function usagePercent(value) {
+      return measuredNumber(value) && value <= 1 ? (value * 100).toFixed(1) + '%' : 'Unavailable';
+    }
+
+    function usageMoney(value) {
+      return measuredNumber(value) ? '$' + (value > 0 && value < .0001 ? value.toPrecision(4) : value.toFixed(4)) : 'Unpriced';
+    }
+
+    function pricingSource(source) {
+      try {
+        var url = new URL(source);
+        if (url.protocol === 'https:' && ['developers.openai.com', 'platform.claude.com'].indexOf(url.hostname) !== -1 && !url.username && !url.password)
+          return '<a href="' + esc(url.href) + '" target="_blank" rel="noopener noreferrer">Official tariffs</a>';
+      } catch (_) {}
+      return 'Tariff unavailable';
+    }
+
+    function renderModelPricing(usage) {
+      var u = usage || {}, rows = Array.isArray(u.modelUsage) ? u.modelUsage : [], pricing = u.pricing || {};
+      var html = '<div class="card model-pricing"><div class="card-title">Observed model usage and pricing</div>';
+      html += '<p class="metric-note">Local 7-day sample' + (u.partial ? ' · partial sample' : '') + ' · current direct API equivalent in USD; not an invoice. Shares include unpriced models.</p>';
+      if (!rows.length) return html + '<p class="metric-note">No model usage available in this sample.</p></div>';
+      html += '<div class="pricing-scroll" role="region" aria-label="Observed model pricing" tabindex="0"><table><thead><tr><th scope="col">Model / client</th><th scope="col">Usage share</th><th scope="col">USD / 1M tokens</th><th scope="col">Category costs · USD</th></tr></thead><tbody>';
+      rows.forEach(function(row) {
+        if (!row || typeof row !== 'object') return;
+        var p = row.pricing || {}, rates = p.weightedRatesUsdPerMillion || {}, costs = p.costsUsd || {};
+        html += '<tr><th scope="row">' + esc(typeof row.model === 'string' ? row.model : 'Unknown model') + '<div class="metric-detail">' + esc(typeof row.client === 'string' ? row.client : 'Unknown client') + ' · ' + savingsNumber(row.requests) + ' responses</div></th>';
+        html += '<td>Requests ' + usagePercent(row.requestShare) + '<br>Input ' + usagePercent(row.inputTokenShare) + '<br>Output ' + usagePercent(row.outputTokenShare) + '<br>Total tokens ' + usagePercent(row.totalTokenShare) + '</td>';
+        html += '<td>Input ' + usageMoney(rates.input) + '<br>Cache hit ' + usageMoney(rates.cacheRead) + '<br>Cache write ' + usageMoney(rates.cacheWrite) + '<br>Output ' + usageMoney(rates.output) + '</td>';
+        html += '<td>Input ' + usageMoney(costs.input) + '<br>Cache hit ' + usageMoney(costs.cacheRead) + '<br>Cache write ' + usageMoney(costs.cacheWrite) + '<br>Output ' + usageMoney(costs.output) + '<br>Total ' + usageMoney(costs.total);
+        html += '<div class="metric-detail">' + pricingSource(p.source) + ' · checked ' + esc(typeof p.checkedAt === 'string' ? p.checkedAt : 'Unavailable') +
+          (p.unpricedRequests > 0 ? ' · ' + savingsNumber(p.unpricedRequests) + ' responses partly/unpriced' : '') + (p.scenarioRequests > 0 ? ' · ' + savingsNumber(p.scenarioRequests) + ' responses use standard direct API assumptions' : '') + '</div></td></tr>';
+      });
+      html += '</tbody></table></div><p class="metric-note">Priced subtotal ' + usageMoney(pricing.pricedSubtotalUsd) + ' · total ' + usageMoney((pricing.costsUsd || {}).total) +
+        '. Rates are weighted by observed category tokens; unused or unknown categories are unpriced.</p></div>';
+      return html;
+    }
+
+    function graphCountAvailable(value) {
+      return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+    }
+
+    function renderGraphSampleStats(gs) {
+      if (!gs.coverage) return '';
+      var nodes = graphCountAvailable(gs.sampleNodes) ? String(gs.sampleNodes) : 'Unavailable';
+      var edges = graphCountAvailable(gs.sampleEdges) ? String(gs.sampleEdges) : 'Unavailable';
+      var html = '<div role="status" style="font-size:11px;line-height:1.5;overflow-wrap:anywhere;">';
+      html += '<strong>Bounded project sample</strong><div>Sample nodes: ' + nodes + ' · Sample edges: ' + edges + '</div>';
+      [['Sample node types', gs.sampleNodesByType], ['Sample edge types', gs.sampleEdgesByType]].forEach(function(entry) {
+        var types = entry[1] || {};
+        var labels = Object.keys(types).filter(function(type) { return graphCountAvailable(types[type]); }).map(function(type) { return type + ': ' + types[type]; });
+        if (labels.length) html += '<div>' + entry[0] + ': ' + esc(labels.join(', ')) + '</div>';
+      });
+      html += '<div>Sample only; full totals unavailable.' + (gs.coverage.truncated ? ' Query returned partial results.' : '') + '</div>';
+      if (gs.coverage.warning) html += '<div>' + esc(gs.coverage.warning) + '</div>';
+      return html + '</div>';
+    }
+
+    function renderGraphStat(graph, error) {
+      var gs = graph || {};
+      var hasNodes = typeof gs.totalNodes === 'number' && Number.isSafeInteger(gs.totalNodes) && gs.totalNodes >= 0;
+      var hasEdges = typeof gs.totalEdges === 'number' && Number.isSafeInteger(gs.totalEdges) && gs.totalEdges >= 0;
+      var historical = (hasNodes || hasEdges) && (gs.countsAreCurrent === false || (gs.fromSnapshot && gs.countsAreCurrent !== true));
+      var label = historical ? 'Graph snapshot nodes' : 'Graph nodes';
+      var detail = hasEdges ? String(gs.totalEdges) + (historical ? ' snapshot edges' : ' edges') : 'Edge count unavailable';
+      if (!hasNodes && !hasEdges) detail = 'Graph counts unavailable';
+      if (historical && (hasNodes || hasEdges)) detail += ' · historical counts';
+      if (gs.updatedAt && (hasNodes || hasEdges)) detail += ' · ' + formatTime(gs.updatedAt);
+      if (error) detail += ' · refresh failed; retrying';
+      return '<div class="stat-card" data-action="goto-tab" data-tab="graph" role="link" tabindex="0"><div class="label">' + label + '</div><div class="value">' + (hasNodes ? String(gs.totalNodes) : 'Unavailable') + '</div><div class="sub">' + esc(detail) + renderGraphSampleStats(gs) + '</div></div>';
+    }
+
     function renderDashboard() {
       var el = document.getElementById('view-dashboard');
       var d = state.dashboard;
@@ -1724,15 +1899,13 @@
       var dotClass = healthStatus === 'healthy' ? 'healthy' : healthStatus === 'degraded' ? 'degraded' : healthStatus === 'critical' ? 'critical' : '';
       var activeSessions = d.sessions.filter(function(s) { return s.status === 'active'; }).length;
       var gs = (d.status && d.status.graph) || {};
-      var nodeCount = knownCount(gs.totalNodes);
-      var edgeCount = knownCount(gs.totalEdges);
       var fMetrics = h.functionMetrics || [];
       var cb = h.circuitBreaker || null;
       var workers = snap.workers || [];
 
       var html = '';
       // First-run hero: empty dashboard = guided next step
-      if (d.sessions.length === 0) {
+      if (d.sessions.length === 0 && !d.sessionsUnavailable) {
         html += '<div class="card" style="margin-bottom:14px;padding:24px 28px;background:var(--bg-subtle);border-left:3px solid var(--accent);">' +
           '<div style="font-family:var(--font-ui);font-size:11px;letter-spacing:0.15em;text-transform:uppercase;color:var(--accent);font-weight:700;margin-bottom:8px;">First run &rarr; magical moment in 10 seconds</div>' +
           '<div style="font-family:var(--font-display,Lora,Georgia,serif);font-size:22px;font-weight:700;color:var(--ink);margin-bottom:8px;">Seed sample data + prove semantic recall works</div>' +
@@ -1742,17 +1915,17 @@
           '</div>';
       }
       if (d.stale) {
-        html += '<div class="card" style="margin-bottom:14px;padding:10px 16px;font-size:12px;color:var(--ink-muted);border-left:3px solid var(--yellow);">' +
-          'Some panels could not refresh; showing the last data that loaded. Retrying automatically.</div>';
+        html += '<div class="card" role="status" style="margin-bottom:14px;padding:10px 16px;font-size:12px;color:var(--ink-muted);border-left:3px solid var(--yellow);">' +
+          esc(d.sessionsNotice || 'Some panels could not refresh; showing the last data that loaded. Retrying automatically.') +
+          (d.sessionsUnavailable ? ' Showing retained session data.' : '') + '</div>';
       }
       html += '<div class="stats-grid">';
       html += '<div class="stat-card" data-action="goto-tab" data-tab="sessions" role="link" tabindex="0"><div class="label">Sessions</div><div class="value">' + d.sessions.length + '</div><div class="sub">' + activeSessions + ' active</div></div>';
-      html += '<div class="stat-card" data-action="goto-tab" data-tab="memories" role="link" tabindex="0"><div class="label">Memories</div><div class="value">' + (d.memoryTotal || 0) + '</div><div class="sub">latest versions</div></div>';
+      html += '<div class="stat-card" data-action="goto-tab" data-tab="memories" role="link" tabindex="0"><div class="label">Memories</div><div class="value">' + (typeof d.memoryTotal === 'number' ? d.memoryTotal : '—') + '</div><div class="sub">latest versions; total unavailable for partial results</div></div>';
       var lessonCount = (d.lessons || []).length;
-      var crystalCount = (d.crystals || []).length;
       html += '<div class="stat-card" data-action="goto-tab" data-tab="lessons" role="link" tabindex="0"><div class="label">Lessons</div><div class="value">' + lessonCount + '</div><div class="sub">confidence-scored</div></div>';
-      html += '<div class="stat-card" data-action="goto-tab" data-tab="crystals" role="link" tabindex="0"><div class="label">Crystals</div><div class="value">' + crystalCount + '</div><div class="sub">action digests</div></div>';
-      html += '<div class="stat-card" data-action="goto-tab" data-tab="graph" role="link" tabindex="0"><div class="label">Graph snapshot nodes</div><div class="value">' + nodeCount + '</div><div class="sub">' + edgeCount + ' snapshot edges' + (gs.fromSnapshot && gs.updatedAt ? ' · ' + esc(formatTime(gs.updatedAt)) : '') + (gs.countsAreCurrent === false ? ' · historical counts' : '') + (d.statusError ? ' · stale / unavailable' : '') + '</div></div>';
+      html += renderGraphStat(gs, d.statusError);
+      html += '<div class="stat-card" data-action="goto-tab" data-tab="crystals" role="link" tabindex="0"><div class="label">Crystals</div><div class="value">' + (d.crystals || []).length + '</div><div class="sub">frozen work snapshots</div></div>';
       html += '<div class="stat-card"><div class="label">Health</div><div class="value"><div class="health-bar"><span class="health-dot ' + dotClass + '"></span> ' + esc(healthStatus) + '</div></div>';
       html += '<div class="sub">' + esc(snap.connectionState || 'unknown') + '</div></div>';
       var totalCalls = fMetrics.reduce(function(a, m) { return a + (m.totalCalls || 0); }, 0);
@@ -1762,16 +1935,11 @@
         html += '<div class="stat-card"><div class="label">Circuit Breaker</div><div class="value"><span class="cb-indicator ' + cbClass + '">' + esc(cb.state) + '</span></div>';
         html += '<div class="sub">' + (cb.failures || 0) + ' failures</div></div>';
       }
-      var tokenBudget = parseInt(new URLSearchParams(window.location.search).get('tokenBudget') || '2000', 10) || 2000;
-      var tokenEstimate = estimateTokenSavings(d.sessions, tokenBudget);
-      var savings = tokenEstimate.percent;
-      var tokensSaved = tokenEstimate.saved;
-      // Rate: $0.30 per 1K tokens (mid-tier model baseline)
-      var costDollars = tokensSaved / 1000 * 0.3;
-      var costCents = Math.round(costDollars * 100);
-      var costStr = costCents >= 100 ? '$' + (costCents / 100).toFixed(2) : costCents + 'ct';
-      html += '<div class="stat-card"><div class="label">Token Savings</div><div class="value">' + savings + '%</div><div class="sub">~' + tokensSaved.toLocaleString() + ' tokens · ' + costStr + ' saved</div></div>';
+      var savingsReport = d.status && d.status.savings;
       html += '</div>';
+      html += '<div class="card"><dl class="metric-rows">' + renderSavingsStats(savingsReport) + renderOperationalStats(d.status && d.status.operationalMetrics) + '</dl></div>';
+      html += renderWorkflowStatus(d.status && d.status.operationalMetrics);
+      html += renderModelPricing(savingsReport && savingsReport.agentUsage);
 
       if (snap.memory || snap.cpu) {
         html += '<div class="card" style="margin-bottom:16px"><div class="card-title">System Resources</div>';
@@ -1844,13 +2012,13 @@
       }
       html += '</div>';
 
-      html += renderRecentActivity(d.status, d.statusError);
+      html += renderRecentActivity(d.status, d.statusError, 10);
 
       html += '</div>';
 
       if (fMetrics.length > 0) {
         var sorted = fMetrics.slice().sort(function(a, b) { return (b.totalCalls || 0) - (a.totalCalls || 0); });
-        html += '<div class="card" style="margin-top:16px"><div class="card-title">Function Metrics (OTel)</div>';
+        html += '<div class="card" style="margin-top:16px;overflow-x:auto"><div class="card-title">Function Metrics (OTel)</div><p>Recorded function calls across projects. Counters describe this telemetry sample; uncalled functions are not listed.</p>';
         html += '<table class="metric-table"><tr><th>Function</th><th style="text-align:right">Calls</th><th style="text-align:right">Success</th><th style="text-align:right">Fail</th><th style="text-align:right">Avg Latency</th><th style="text-align:right">Quality</th></tr>';
         sorted.forEach(function(m) {
           var successRate = m.totalCalls > 0 ? Math.round((m.successCount / m.totalCalls) * 100) : 0;
@@ -1934,73 +2102,129 @@
     // with no signal. Now we pass an explicit `limit`, distinguish
     // server error from empty-corpus, and render an actionable banner
     // when the request itself fails instead of falling silent.
-    var GRAPH_INITIAL_LIMIT = 500;
+    var GRAPH_INITIAL_LIMIT = 128;
+
+    function cancelGraphBrowse() {
+      state.graph.requestId = (state.graph.requestId || 0) + 1;
+    }
 
     async function loadGraph() {
+      if (!state.graph.pageCursors) state.graph.pageCursors = [null];
+      if (!state.graph.pageIndex) state.graph.pageIndex = 0;
+      var pageCursor = state.graph.pageCursors[state.graph.pageIndex];
       var el = document.getElementById('view-graph');
-      el.innerHTML = '<div class="graph-container"><div class="graph-canvas-wrap"><canvas id="graph-canvas"></canvas><div class="graph-controls"><button title="Zoom In" data-action="zoom-graph" data-dir="1">+</button><button title="Zoom Out" data-action="zoom-graph" data-dir="-1">&minus;</button><div class="ctrl-divider"></div><button title="Recenter" data-action="recenter-graph">⌖</button></div><div class="graph-tooltip" id="graph-tooltip"></div></div><div class="graph-sidebar" id="graph-sidebar"></div></div>';
-
-      var results = await Promise.all([
-        apiPost('graph/query', { limit: GRAPH_INITIAL_LIMIT }),
-        api('graph/stats', { readErrorBody: true })
-      ]);
-      var queryResult = results[0];
-      var statsResult = results[1];
-      if (statsResult && statsResult.error && statsResult.flag) {
-        // 503 with a structured body = the feature is off, not broken.
-        // Rendering this as "query failed / Retry" sends users hunting
-        // through server logs for an error that isn't one.
-        state.graph.disabledInfo = statsResult;
-        state.graph.queryError = null;
-        state.graph.nodes = [];
-        state.graph.edges = [];
-        state.graph.stats = {};
-        state.graph.loaded = true;
-        renderGraphSidebar();
-        return;
-      }
+      var requestId = state.graph.requestId = (state.graph.requestId || 0) + 1;
+      state.graph.queryWarning = '';
+      state.graph.queryPartial = false;
+      state.graph.browseStatus = 'loading';
       state.graph.disabledInfo = null;
-      if (queryResult === null) {
-        // api() returns null only on non-2xx or a transport error; an
-        // empty graph would come back as { nodes: [], edges: [] }.
-        // Surface as an error state so #753-class failures don't read
-        // as "no data yet" — and so "Rebuild Graph" stays available.
-        state.graph.queryError = 'graph/query failed (check server logs for HTTP error)';
-        state.graph.nodes = [];
-        state.graph.edges = [];
-        state.graph.stats = results[1] || {};
+      state.graph.queryError = null;
+      state.graph.nextCursor = null;
+      state.graph.nodes = [];
+      state.graph.edges = [];
+      state.graph.selectedNode = null;
+      el.innerHTML = '<div id="graph-project-toolbar" class="toolbar"></div><div class="graph-container"><div class="graph-canvas-wrap"><canvas id="graph-canvas"></canvas><div class="graph-controls"><button title="Zoom In" data-action="zoom-graph" data-dir="1">+</button><button title="Zoom Out" data-action="zoom-graph" data-dir="-1">&minus;</button><div class="ctrl-divider"></div><button title="Recenter" data-action="recenter-graph">⌖</button></div><div class="graph-tooltip" id="graph-tooltip"></div></div><div class="graph-sidebar" id="graph-sidebar"></div></div>';
+      if (!state.graph.projectsLoaded) await loadGraphProjects();
+      if (requestId !== state.graph.requestId) return;
+      renderGraphProjectPicker();
+      var project = state.graph.selectedProject;
+      if (!project) {
         state.graph.loaded = true;
-        renderGraphSidebar();
+        document.getElementById('graph-sidebar').innerHTML = '<p role="status">Choose a project to view its graph. Browse more projects if this session page is empty.</p>';
         return;
       }
-      state.graph.queryError = null;
-      state.graph.nodes = queryResult.nodes || [];
-      state.graph.edges = queryResult.edges || [];
-      state.graph.truncated = queryResult.truncated === true;
-      state.graph.totalNodes = typeof queryResult.totalNodes === 'number' ? queryResult.totalNodes : state.graph.nodes.length;
-      state.graph.totalEdges = typeof queryResult.totalEdges === 'number' ? queryResult.totalEdges : state.graph.edges.length;
-      state.graph.stats = results[1] || {};
+      document.getElementById('graph-sidebar').innerHTML = '<p role="status">Loading graph...</p>';
 
-      if (state.graph.nodes.length === 0 && (state.graph.stats.totalNodes || state.graph.stats.nodes || 0) === 0) {
-        var sb = document.getElementById('graph-sidebar');
-        if (sb) sb.innerHTML = '<h3>Graph</h3><p style="font-size:12px;color:var(--ink-faint);margin:8px 0;font-style:italic;">No graph data yet. Building from observations and memories...</p>';
-        var buildResult = await apiPost('graph/build', {});
-        if (buildResult && buildResult.success && buildResult.nodes > 0) {
-          var freshResults = await Promise.all([
-            apiPost('graph/query', { limit: GRAPH_INITIAL_LIMIT }),
-            apiGet('graph/stats')
-          ]);
-          var freshQuery = freshResults[0];
-          if (freshQuery) {
-            state.graph.nodes = freshQuery.nodes || [];
-            state.graph.edges = freshQuery.edges || [];
-            state.graph.truncated = freshQuery.truncated === true;
-            state.graph.totalNodes = typeof freshQuery.totalNodes === 'number' ? freshQuery.totalNodes : state.graph.nodes.length;
-            state.graph.totalEdges = typeof freshQuery.totalEdges === 'number' ? freshQuery.totalEdges : state.graph.edges.length;
+      function current() {
+        return requestId === state.graph.requestId && project === state.graph.selectedProject && state.activeTab === 'graph';
+      }
+      function fail(reason) {
+        state.graph.browseStatus = 'error';
+        state.graph.queryPartial = false;
+        state.graph.queryError = reason || 'graph/query failed (check server logs for HTTP error)';
+        state.graph.loaded = true;
+        renderGraphSidebar();
+        initGraph();
+      }
+      var refreshedStale = false;
+      while (current()) {
+        var queryResult = await api('graph/query', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ project: project, display: true, cursor: pageCursor || undefined, limit: GRAPH_INITIAL_LIMIT }), readErrorBody: true });
+        if (!current()) return;
+        if (queryResult && queryResult.error && queryResult.flag) {
+          state.graph.disabledInfo = queryResult;
+          state.graph.browseStatus = 'error';
+          state.graph.loaded = true;
+          renderGraphSidebar();
+          initGraph();
+          return;
+        }
+        if (!queryResult || queryResult.error || queryResult.status === 'error') {
+          fail(queryResult && (queryResult.reason || (queryResult.code === 'STATE_TX_INVALID_REQUEST' ? 'The graph changed or the page cursor is invalid. Reload from the first page.' : '')));
+          return;
+        }
+        state.graph.queryWarning = queryResult.reason || '';
+        if (queryResult.reason === 'stale_graph_revision') {
+          state.graph.pageCursors = [null];
+          state.graph.pageIndex = 0;
+          pageCursor = null;
+          if (refreshedStale) { fail('stale_graph_revision. Retry from the first page.'); return; }
+          refreshedStale = true;
+          state.graph.browseStatus = 'preparing';
+          state.graph.queryPartial = true;
+          renderGraphSidebar();
+          await new Promise(function(resolve) { setTimeout(resolve, 0); });
+          continue;
+        }
+        if (queryResult.status === 'ready') break;
+        if (queryResult.status !== 'preparing') { fail('Invalid graph Browse response.'); return; }
+        state.graph.browseStatus = 'preparing';
+        state.graph.queryPartial = true;
+        state.graph.preparationProgress = queryResult.progress || null;
+        renderGraphSidebar();
+        initGraph();
+        while (current()) {
+          await new Promise(function(resolve) { setTimeout(resolve, 0); });
+          if (!current()) return;
+          // A superseded request may still finish its single bounded batch.
+          if (state.graph.preparationInFlight) await state.graph.preparationInFlight;
+          if (!current()) return;
+          var batch = api('graph/query', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ project: project, display: true, prepare: true }), readErrorBody: true });
+          state.graph.preparationInFlight = batch;
+          var response = await batch;
+          if (state.graph.preparationInFlight === batch) state.graph.preparationInFlight = null;
+          if (!current()) return;
+          var preparation = response && response.preparation;
+          if (!preparation || preparation.status === 'error') { fail(preparation && preparation.reason || response && response.reason || 'Graph preparation failed.'); return; }
+          state.graph.preparationProgress = { phase: preparation.phase, processed: preparation.processed };
+          state.graph.queryWarning = preparation.reason || '';
+          renderGraphSidebar();
+          if (preparation.status === 'ready') {
+            state.graph.pageCursors = [null];
+            state.graph.pageIndex = 0;
+            pageCursor = null;
+            break;
           }
-          state.graph.stats = freshResults[1] || {};
+          if (preparation.status !== 'preparing' || preparation.continue !== true) {
+            fail(preparation.reason || 'Graph preparation cannot continue. Retry when prerequisites are available.');
+            return;
+          }
         }
       }
+      if (!current()) return;
+      state.graph.browseStatus = 'ready';
+      state.graph.queryError = null;
+      state.graph.queryPartial = false;
+      state.graph.preparationProgress = null;
+      state.graph.nextCursor = queryResult.hasMore ? queryResult.nextCursor : null;
+      state.graph.edgeScope = queryResult.edgeScope;
+      state.graph.crossPageEdges = queryResult.crossPageEdges;
+      state.graph.crossPageEdgesOmitted = queryResult.crossPageEdges === 'not_loaded';
+      state.graph.edgesTruncated = queryResult.edgesTruncated;
+      state.graph.nodes = queryResult.nodes || [];
+      state.graph.edges = queryResult.edges || [];
+      state.graph.totalNodes = null;
+      state.graph.totalEdges = null;
+      state.graph.stats = {};
 
       state.graph.loaded = true;
       var types = {};
@@ -2009,6 +2233,96 @@
 
       renderGraphSidebar();
       initGraph();
+    }
+
+    async function loadGraphProjects(cursor) {
+      await liveSubscriptionReady;
+      if (state.graph.projectsLoading) return;
+      state.graph.projectsLoading = true;
+      renderGraphProjectPicker();
+      var result = await api('sessions?latest=true&limit=16' + (cursor ? '&cursor=' + encodeURIComponent(cursor) : ''), { readErrorBody: true });
+      var restarted = result && result.error === 'viewer_cursor_stale';
+      if (restarted) {
+        state.graph.sessionNextCursor = null;
+        state.graph.projectNotice = 'Sessions changed. Project browsing restarted; discovered projects and selection are retained. Open a project by name if sessions keep changing.';
+        result = await api('sessions?latest=true&limit=16', { readErrorBody: true });
+      }
+      state.graph.projectsLoading = false;
+      if (!result || result.error || !Array.isArray(result.sessions)) {
+        if (result && (result.error === 'viewer_cursor_stale' || result.error === 'invalid_viewer_cursor')) state.graph.sessionNextCursor = null;
+        state.graph.projectError = restarted
+          ? 'Project browsing could not resume after restarting. Known projects are retained; open a project by name or retry discovery.'
+          : 'Projects could not be loaded. Retry project discovery.';
+        renderGraphProjectPicker();
+        return;
+      }
+      var projects = Object.create(null);
+      (state.graph.projects || []).forEach(function(project) { projects[project] = true; });
+      (result.sessions || []).forEach(function(session) { if (session.project) projects[session.project] = true; });
+      if (state.graph.selectedProject) projects[state.graph.selectedProject] = true;
+      state.graph.projects = Object.keys(projects).sort();
+      state.graph.sessionNextCursor = result.nextCursor;
+      state.graph.projectsLoaded = true;
+      state.graph.projectError = '';
+      if (!state.graph.selectedProject) state.graph.selectedProject = state.graph.projects[0] || '';
+      renderGraphProjectPicker();
+    }
+
+    function renderGraphProjectPicker() {
+      var el = document.getElementById('graph-project-toolbar');
+      if (!el) return;
+      var html = '<label for="graph-project">Project</label><select id="graph-project" style="max-width:100%;min-width:0;">';
+      if (!(state.graph.projects || []).length) html += '<option value="">No projects on this page</option>';
+      (state.graph.projects || []).forEach(function(project) {
+        html += '<option value="' + esc(project) + '"' + (project === state.graph.selectedProject ? ' selected' : '') + '>' + esc(project) + '</option>';
+      });
+      html += '</select>';
+      var disabled = state.graph.projectsLoading ? ' disabled' : '';
+      if (state.graph.sessionNextCursor) html += '<button class="btn" data-action="graph-source-next"' + disabled + '>Browse more projects</button>';
+      if (state.graph.projectError) html += '<button class="btn" data-action="graph-source-retry"' + disabled + '>Retry projects</button>';
+      html += '<label for="graph-project-name">Project name</label><input id="graph-project-name" type="text" maxlength="256" placeholder="Exact project name" style="max-width:100%;min-width:0;" value="' + esc(state.graph.projectInput || '') + '"><button class="btn" data-action="graph-project-open">Open project</button>';
+      html += '<span role="status">' + esc(state.graph.projectsLoading ? 'Loading projects...' : state.graph.projectError || state.graph.projectNotice || 'Projects discovered from session pages; this list may be incomplete. Open a project by its exact name.') + '</span>';
+      el.innerHTML = html;
+      document.getElementById('graph-project').addEventListener('change', function() { selectGraphProject(this.value); });
+      var input = document.getElementById('graph-project-name');
+      input.addEventListener('input', function() { state.graph.projectInput = this.value; });
+      input.addEventListener('keydown', function(event) { if (event.key === 'Enter') { event.preventDefault(); openGraphProject(); } });
+    }
+
+    function openGraphProject() {
+      var input = document.getElementById('graph-project-name');
+      var project = input ? input.value.trim() : '';
+      if (!project || project.length > 256) return;
+      state.graph.projectInput = project;
+      if ((state.graph.projects || []).indexOf(project) < 0) state.graph.projects = (state.graph.projects || []).concat([project]).sort();
+      state.graph.projectsLoaded = true;
+      selectGraphProject(project);
+    }
+
+    async function selectGraphProject(project) {
+      if (!project || (state.graph.projects || []).indexOf(project) < 0) return;
+      state.graph.selectedProject = project;
+      state.graph.pageCursors = [null];
+      state.graph.pageIndex = 0;
+      state.graph.nextCursor = null;
+      state.graph.nodes = [];
+      state.graph.edges = [];
+      state.graph.filters = {};
+      state.graph.selectedNode = null;
+      state.graph.stats = null;
+      state.graph.queryError = null;
+      state.graph.disabledInfo = null;
+      state.graph.rebuildResult = null;
+      state.graph.totalNodes = null;
+      state.graph.totalEdges = null;
+      graphSearchTerm = '';
+      if (graphSim.raf !== null) cancelAnimationFrame(graphSim.raf);
+      graphSim.nodes = [];
+      graphSim.edges = [];
+      graphSim.raf = null;
+      graphSim.dragNode = null;
+      graphSim.running = false;
+      await loadGraph();
     }
 
     var NODE_SHAPES = {
@@ -2020,11 +2334,12 @@
     function renderGraphSidebar() {
       var sb = document.getElementById('graph-sidebar');
       if (!sb) return;
-      var gs = state.graph.stats || {};
-      var nodeCount = gs.totalNodes !== undefined ? gs.totalNodes : (gs.nodes !== undefined ? gs.nodes : (gs.nodeCount || state.graph.nodes.length));
-      var edgeCount = gs.totalEdges !== undefined ? gs.totalEdges : (gs.edges !== undefined ? gs.edges : (gs.edgeCount || state.graph.edges.length));
-
-      var html = '';
+      var html = graphBuildStatusHtml();
+      var ready = state.graph.browseStatus === 'ready';
+      if (ready) html += '<div role="status">Page ' + ((state.graph.pageIndex || 0) + 1) + ': ' + state.graph.nodes.length + ' nodes, ' + state.graph.edges.length + ' connections on this page.</div>';
+      html += '<div style="display:flex;flex-wrap:wrap;gap:8px;margin:8px 0"><button class="btn" data-action="graph-page-previous"' + (ready && state.graph.pageIndex > 0 ? '' : ' disabled') + '>Previous</button><button class="btn" data-action="graph-page-next"' + (ready && state.graph.nextCursor ? '' : ' disabled') + '>Next</button></div>';
+      if (ready && state.graph.edgeScope === 'page') html += '<p>Connections are scoped to this page. Connections to nodes on other pages are not loaded.</p>';
+      if (ready && state.graph.edgesTruncated) html += '<p role="status">Some connections on this page were omitted to keep the response bounded.</p>';
 
       if (state.graph.disabledInfo) {
         html += '<div style="margin:8px 0;padding:10px 12px;border:1px solid var(--border);background:var(--bg-alt);font-size:12px;color:var(--ink);line-height:1.5;">';
@@ -2043,25 +2358,23 @@
         html += '<div style="margin:8px 0;padding:10px 12px;border:1px solid var(--accent);background:var(--bg-alt);font-size:12px;color:var(--ink);line-height:1.4;">';
         html += '<div style="font-weight:600;margin-bottom:4px;">Graph query failed</div>';
         html += '<div style="font-size:11px;color:var(--ink-muted);">' + esc(state.graph.queryError) + '</div>';
-        html += '<button class="btn" data-action="rebuild-graph" style="margin-top:8px;font-size:11px;">Retry</button>';
+        html += '<button class="btn" data-action="reload-graph" style="margin-top:8px;font-size:11px;">Retry query</button>';
         html += '</div>';
-      } else if (state.graph.truncated) {
-        // #753: surface the cap so operators know they're not seeing
-        // the whole graph. Densest-first ranking on the server makes
-        // this the meaningful subset, not an arbitrary head.
-        html += '<div style="margin:8px 0;padding:10px 12px;border:1px solid var(--border);background:var(--bg-alt);font-size:11px;color:var(--ink-muted);line-height:1.4;">';
-        html += 'Showing ' + state.graph.nodes.length + ' of ' + state.graph.totalNodes + ' nodes (most-connected first). The full graph is too large to render at once.';
-        html += '</div>';
+      } else if (state.graph.queryPartial) {
+        var progress = state.graph.preparationProgress;
+        html += '<p role="status" aria-live="polite">Preparing project graph. ' + (progress ? esc(progress.phase) + ': ' + esc(progress.processed) + ' records processed in the latest batch. ' : '') + esc(state.graph.queryWarning || '') + '</p>';
+        html += '<button class="btn" data-action="cancel-graph-browse">Cancel preparation</button>';
       }
-
-      html += '<input type="text" class="graph-search" id="graph-search" placeholder="Search nodes...">';
-
-      html += '<h3 style="margin-top:16px;font-size:10px;text-transform:uppercase;letter-spacing:0.12em;color:var(--ink-muted);font-family:var(--font-ui);font-weight:700;">Graph Stats</h3>';
-      html += '<div style="display:flex;gap:20px;margin:10px 0 16px;padding:12px;background:var(--bg-alt);border:1px solid var(--border-light);border-radius:4px;">';
-      html += '<div style="text-align:center;flex:1;"><span style="font-size:28px;font-weight:900;font-family:var(--font-display);color:var(--ink);line-height:1;">' + nodeCount + '</span><div style="font-size:8px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.12em;font-family:var(--font-ui);font-weight:600;margin-top:4px;">Nodes</div></div>';
-      html += '<div style="width:1px;background:var(--border-light);"></div>';
-      html += '<div style="text-align:center;flex:1;"><span style="font-size:28px;font-weight:900;font-family:var(--font-display);color:var(--ink);line-height:1;">' + edgeCount + '</span><div style="font-size:8px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.12em;font-family:var(--font-ui);font-weight:600;margin-top:4px;">Edges</div></div>';
-      html += '</div>';
+      if (!ready) {
+        html += '<button class="btn" data-action="rebuild-graph"' + (graphRebuilding || !state.graph.selectedProject ? ' disabled' : '') + '>Rebuild project graph</button>';
+        sb.innerHTML = html;
+        return;
+      }
+      if (!state.graph.nodes.length) html += '<p role="status">No graph data in this project. The current graph is empty.</p>';
+      html += '<input type="text" class="graph-search" id="graph-search" aria-label="Search nodes on this page" placeholder="Search nodes...">';
+      html += '<label for="graph-node-select">Inspect node on this page</label><select id="graph-node-select" style="width:100%"><option value="">Choose node</option>';
+      state.graph.nodes.forEach(function(node) { html += '<option value="' + esc(node.id) + '">' + esc(node.type + ': ' + node.name) + '</option>'; });
+      html += '</select>';
 
       html += '<h3 style="margin-top:12px;font-size:10px;text-transform:uppercase;letter-spacing:0.12em;color:var(--ink-muted);font-family:var(--font-ui);font-weight:700;">Filter by Type</h3>';
       Object.keys(state.graph.filters).forEach(function(type) {
@@ -2069,8 +2382,8 @@
         html += '<label class="filter-item"><input type="checkbox" checked data-type="' + esc(type) + '"><span class="filter-dot" style="background:' + color + '"></span>' + esc(type) + '</label>';
       });
 
-      if (state.graph.nodes.length > 0 && state.graph.edges.length === 0) {
-        html += '<div style="margin:10px 0;padding:10px 12px;border:1px solid var(--border-light);background:var(--bg-subtle);font-size:11px;color:var(--ink-muted);line-height:1.5;">Entities extracted, no relations between them yet. Nodes are grouped by kind; edges appear as extraction sees entities acting on each other across more sessions (larger models find them faster).</div>';
+      if (state.graph.nodes.length > 0 && state.graph.edges.length === 0 && !state.graph.crossPageEdgesOmitted) {
+        html += '<div style="margin:10px 0;padding:10px 12px;border:1px solid var(--border-light);background:var(--bg-subtle);font-size:11px;color:var(--ink-muted);line-height:1.5;">No connections are displayed on this page.</div>';
       }
       html += '<div class="graph-legend" style="display:none"><h3>Legend</h3>';
       var shapeLabels = { rect: '&#9645;', circle: '&#9679;', diamond: '&#9670;', hexagon: '&#11042;' };
@@ -2085,7 +2398,7 @@
       });
       html += '</div>';
 
-      html += '<button class="btn" style="margin-top:14px;width:100%;font-size:11px;padding:8px;letter-spacing:0.06em;transition:all 0.15s ease;" data-action="rebuild-graph">↻ Rebuild Graph</button>';
+      html += '<button class="btn" style="margin-top:14px;width:100%;font-size:11px;padding:8px;" data-action="rebuild-graph"' + (graphRebuilding || !state.graph.selectedProject ? ' disabled' : '') + '>↻ Rebuild project graph</button>';
       html += '<div id="selected-node-panel"></div>';
       var __focus = captureSearchFocus(['graph-search']);
       sb.innerHTML = html;
@@ -2098,6 +2411,11 @@
       });
 
       var searchInput = document.getElementById('graph-search');
+      document.getElementById('graph-node-select').addEventListener('change', function() {
+        var id = this.value;
+        var node = graphSim.nodes.find(function(item) { return item.id === id; });
+        if (node) { selectGraphNode(node); wakeGraphSim(); }
+      });
       if (searchInput) {
         bindImeSafeSearch(searchInput, 200, function(v){ graphSearchTerm = v.toLowerCase(); renderGraph(); });
       }
@@ -2119,6 +2437,8 @@
         graphSim.ctx.setTransform(window.devicePixelRatio, 0, 0, window.devicePixelRatio, 0, 0);
       }
       resize();
+      if (graphSim.resizeHandler) window.removeEventListener('resize', graphSim.resizeHandler);
+      graphSim.resizeHandler = resize;
       window.addEventListener('resize', resize);
 
       var cw = canvas.width / window.devicePixelRatio;
@@ -2267,7 +2587,7 @@
         var node = findNode(c.x, c.y);
         if (node) {
           selectGraphNode(node);
-          expandNode(node.id);
+
         }
       });
     }
@@ -2302,44 +2622,10 @@
         });
       }
       var conns = graphSim.edges.filter(function(e) { return e.sourceNodeId === simNode.id || e.targetNodeId === simNode.id; }).length;
-      html += '<div class="prop">Connections: ' + conns + '</div>';
-      html += '<button class="btn btn-primary" style="margin-top:8px;width:100%;" data-action="expand-node" data-node-id="' + esc(simNode.id) + '">Expand neighbors</button>';
+      html += '<div class="prop">Connections on this page: ' + conns + '</div>';
+      html += '<div class="prop">This view contains display fields only. Full properties and provenance remain stored.</div>';
       html += '</div>';
       panel.innerHTML = html;
-    }
-
-    async function expandNode(nodeId) {
-      var result = await apiPost('graph/query', { startNodeId: nodeId, maxDepth: 1 });
-      if (!result) return;
-      var existingIds = {};
-      graphSim.nodes.forEach(function(n) { existingIds[n.id] = true; });
-      var parentNode = graphSim.nodes.find(function(n) { return n.id === nodeId; });
-      var px = parentNode ? parentNode.x : 0;
-      var py = parentNode ? parentNode.y : 0;
-
-      (result.nodes || []).forEach(function(n) {
-        if (!existingIds[n.id]) {
-          state.graph.nodes.push(n);
-          if (!state.graph.filters.hasOwnProperty(n.type)) state.graph.filters[n.type] = true;
-          var angle = Math.random() * Math.PI * 2;
-          graphSim.nodes.push({
-            id: n.id, type: n.type, name: n.name, properties: n.properties,
-            x: px + Math.cos(angle) * 80,
-            y: py + Math.sin(angle) * 80,
-            vx: 0, vy: 0, r: 8
-          });
-        }
-      });
-
-      var existingEdges = {};
-      graphSim.edges.forEach(function(e) { existingEdges[e.id] = true; });
-      (result.edges || []).forEach(function(e) {
-        if (!existingEdges[e.id]) {
-          state.graph.edges.push(e);
-          graphSim.edges.push(e);
-        }
-      });
-      renderGraphSidebar();
     }
 
     function runSimulation() {
@@ -2440,36 +2726,41 @@
 
     var graphRebuilding = false;
 
-    async function rebuildGraph() {
-      if (graphRebuilding) return;
-      var ok = window.confirm(
-        'Rebuild the knowledge graph from every stored observation?\n\n' +
-        'This replays the whole corpus and can take several minutes on a large store. ' +
-        'With an LLM provider configured it also spends provider tokens.'
-      );
-      if (!ok) return;
+    function graphBuildStatusHtml() {
+      if (graphRebuilding) return '<p role="status">Processing one project graph rebuild unit...</p>';
+      var result = state.graph.rebuildResult;
+      if (!result) return '';
+      var labels = { completed: 'Project rebuild completed.', partial: 'This rebuild unit completed; more work remains.',
+        queued: 'Graph extraction queued; completion has not been confirmed.', failed: 'Graph rebuild unit failed.' };
+      var html = '<div role="status" style="margin:8px 0;font-size:12px;overflow-wrap:anywhere;">' + esc(labels[result.status] || 'Graph rebuild status unavailable.');
+      if (result.error) html += ' ' + esc(result.error);
+      if (result.graphJobId) html += '<div>Job: ' + esc(result.graphJobId) + '</div>';
+      var countLabels = { sessionsProcessed: 'Sessions processed', observationsProcessed: 'Observations processed', nodesAdded: 'Nodes added', edgesAdded: 'Edges added' };
+      Object.keys(countLabels).forEach(function(key) {
+        if (typeof result[key] === 'number') html += '<div>' + esc(countLabels[key]) + ': ' + esc(result[key]) + '</div>';
+      });
+      if (result.continuation) html += '<button class="btn" data-action="continue-graph-build"' + (graphRebuilding ? ' disabled' : '') + '>' + (result.status === 'failed' ? 'Retry rebuild unit' : result.status === 'queued' ? 'Resume queued unit' : 'Continue project rebuild') + '</button>';
+      return html + '</div>';
+    }
+
+    async function rebuildGraph(continuation) {
+      var project = state.graph.selectedProject;
+      var requestId = state.graph.requestId;
+      if (graphRebuilding || !project) return;
+      if (!window.confirm('Process one bounded graph rebuild unit for project "' + project + '"?\n\nWith an LLM provider configured this spends provider tokens. Additional units require another click.')) return;
       graphRebuilding = true;
-      var sb = document.getElementById('graph-sidebar');
-      if (sb) sb.innerHTML = '<h3>Graph</h3><p style="font-size:12px;color:var(--ink-faint);font-style:italic;">Rebuilding graph from observations...</p>';
+      renderGraphSidebar();
+      var body = { project: project };
+      if (continuation) body.continuation = continuation;
       try {
-        var result = await apiPost('graph/build', {});
-        state.graph.rebuildResult = result && result.success
-          ? 'Rebuilt from ' + (result.sessions || 0) + ' sessions: ' + (result.nodes || 0) + ' nodes, ' + (result.edges || 0) + ' edges.'
-          : 'Graph rebuild failed or graph extraction is disabled. Check the server log.';
+        var result = await api('graph/build', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), readErrorBody: true });
+        if (requestId !== state.graph.requestId || project !== state.graph.selectedProject) return;
+        state.graph.rebuildResult = result && result.project === project && ['completed', 'partial', 'queued', 'failed'].indexOf(result.status) >= 0
+          ? result : { status: 'failed', error: 'The rebuild request failed or returned an invalid result.', continuation: continuation || null };
+        await loadGraph();
       } finally {
         graphRebuilding = false;
-        state.graph.loaded = false;
-        await loadGraph();
-        if (state.graph.queryError && state.graph.rebuildResult) {
-          state.graph.rebuildResult = 'The rebuild finished, but the graph could not be refreshed. Reload the Graph tab.';
-        }
-        var sidebar = document.getElementById('graph-sidebar');
-        if (sidebar && state.graph.rebuildResult) {
-          var note = document.createElement('p');
-          note.style.cssText = 'font-size:12px;color:var(--ink-muted);margin:8px 0;';
-          note.textContent = state.graph.rebuildResult;
-          sidebar.insertBefore(note, sidebar.firstChild);
-        }
+        renderGraphSidebar();
       }
     }
 
@@ -2760,19 +3051,26 @@
         ctx.fillStyle = '#999999';
         ctx.font = '14px Lora, Georgia, serif';
         ctx.textAlign = 'center';
-        ctx.fillText('No graph data yet.', w / 2, h / 2 - 16);
+        var graphEmptyTitle = state.graph.disabledInfo ? 'Knowledge graph is off.' : state.graph.queryError ? 'Graph query failed.' : state.graph.queryPartial ? ('Preparing project graph.') : 'No graph data in this selection.';
+        ctx.fillText(graphEmptyTitle, w / 2, h / 2 - 16);
         ctx.font = '12px Inter, sans-serif';
-        ctx.fillText('Set GRAPH_EXTRACTION_ENABLED=true to enable knowledge graph extraction.', w / 2, h / 2 + 8);
+        ctx.fillText(state.graph.disabledInfo ? 'Enable knowledge graph extraction in configuration.' : state.graph.queryPartial ? 'Preparation runs in bounded batches. Progress is shown in the sidebar.' : state.graph.queryError ? 'Retry this view after checking the server error.' : 'Select another scope or return after new graph data is available.', w / 2, h / 2 + 8);
       }
     }
 
-    async function loadMemories() {
+    async function loadMemories(cursor) {
+      var request = state.memories.requestId = (state.memories.requestId || 0) + 1;
+      var project = state.memories.project || '';
       var el = document.getElementById('view-memories');
       if (!state.memories.loaded) el.innerHTML = '<div class="loading">Loading memories...</div>';
-      // cap at 2000 so the viewer remains responsive on large
-      // corpora. Older endpoints returned the full unbounded list which
-      // hit the iii invocation timeout and the UI fell through to 0.
-      var result = await apiGet('memories?latest=true&limit=2000');
+      var result = await api('memories?latest=true&limit=16' + (project ? '&project=' + encodeURIComponent(project) : '') + (cursor ? '&cursor=' + encodeURIComponent(cursor) : ''), { readErrorBody: true });
+      if (request !== state.memories.requestId || project !== (state.memories.project || '')) return;
+      if (!result || result.error || !Array.isArray(result.memories)) {
+        state.memories.error = result && result.error || 'Memory request failed. Retained data may be stale.';
+        renderMemories(); return;
+      }
+      state.memories.error = result.reason && result.reason !== 'no_sessions' ? result.reason : '';
+      state.memories.cursor = cursor || null;
       var items = (result && result.memories) || [];
       // Newest first — server returns KV-insertion order.
       items.sort(function(a, b) {
@@ -2781,7 +3079,9 @@
         return bc.localeCompare(ac);
       });
       state.memories.items = items;
-      state.memories.total = (result && typeof result.total === 'number') ? result.total : items.length;
+      state.memories.total = result && result.total;
+      state.memories.partial = !!(result && result.partial);
+      state.memories.nextCursor = result && result.nextCursor;
       state.memories.loaded = true;
       renderMemories();
     }
@@ -2824,18 +3124,26 @@
       var html = '<div class="card" style="margin-bottom:12px;padding:12px;background:var(--bg-subtle);">';
       html += '<div style="font-size:13px;color:var(--ink-muted);line-height:1.5;">';
       html += '<strong>Memories</strong> are durable facts, architecture notes, conventions, and lessons saved via <code>memory_remember</code> MCP tool or the <code>/agentmemory/remember</code> endpoint. They survive across sessions and supersede each other as v1, v2, etc. ';
-      html += '<span style="color:var(--ink-faint);">Shown: ' + items.length + ' total.</span>';
+      html += '<span role="status" style="color:var(--ink-faint);">Shown: ' + items.length + ' on this page.' + (state.memories.partial ? ' Results are partial; the full total is unavailable.' : '') + '</span>';
       html += '</div></div>';
 
       html += '<div class="toolbar">';
-      html += '<input type="text" id="mem-search" placeholder="Search memories..." value="' + esc(state.memories.search) + '">';
-      html += '<select id="mem-type-filter"><option value="">All types</option>';
+      html += '<label>Project <input id="mem-project" placeholder="All projects" value="' + esc(state.memories.project || '') + '"></label><button class="btn" id="mem-project-open">Open scope</button>';
+      html += '<input type="text" id="mem-search" aria-label="Search this memory page" placeholder="Search this page..." value="' + esc(state.memories.search) + '">';
+      html += '<select id="mem-type-filter" aria-label="Memory type on this page"><option value="">All types</option>';
       typeOptions.forEach(function(t) {
         html += '<option value="' + esc(t) + '"' + (typeFilter === t ? ' selected' : '') + '>' + esc(t) + '</option>';
       });
       html += '</select></div>';
-
-      if (filtered.length === 0) {
+      html += '<p role="status">Filters apply to this page. Scope: ' + esc(state.memories.project || 'all projects') + '.</p>';
+      if (state.memories.error) html += '<p role="status">' + esc(state.memories.error) + '</p>';
+      html += '<button class="btn" id="mem-first-page">Refresh first page</button> ';
+      if (state.memories.nextCursor) html += '<button class="btn" id="mem-next-page">Next memory page</button>';
+      if (filtered.length === 0 && state.memories.error) {
+        html += '<p role="status">Memory data is unavailable or preparing. Retry this scope.</p>';
+      } else if (filtered.length === 0 && (state.memories.partial || search || typeFilter)) {
+        html += '<p role="status">No matching memories on this page. Continue to the next page to browse more.</p>';
+      } else if (filtered.length === 0) {
         html += '<div class="empty-state">' +
           '<div class="empty-icon">&#128218;</div>' +
           '<div class="empty-title">No memories yet</div>' +
@@ -2895,10 +3203,20 @@
         html += '</table>';
       }
 
-      var __focus = captureSearchFocus(['mem-search']);
+      var __focus = captureSearchFocus(['mem-search', 'mem-project']);
       setViewHtml(el, html);
 
       var searchInput = document.getElementById('mem-search');
+      document.getElementById('mem-first-page').addEventListener('click', function() { this.disabled = true; loadMemories(); });
+      var openScope = function() {
+        state.memories.project = document.getElementById('mem-project').value.trim();
+        state.memories.items = []; state.memories.nextCursor = null; state.memories.loaded = false;
+        loadMemories();
+      };
+      document.getElementById('mem-project-open').addEventListener('click', openScope);
+      document.getElementById('mem-project').addEventListener('keydown', function(event) { if (event.key === 'Enter') { event.preventDefault(); openScope(); } });
+      var memoryNext = document.getElementById('mem-next-page');
+      if (memoryNext) memoryNext.addEventListener('click', function() { this.disabled = true; loadMemories(state.memories.nextCursor); });
       if (searchInput) {
         bindImeSafeSearch(searchInput, 200, function(v){ state.memories.search = v; renderMemories(); });
       }
@@ -2929,68 +3247,85 @@
       document.getElementById('modal-overlay').classList.remove('open');
     }
 
-    async function loadTimeline() {
+    var timelineRequest = 0;
+    var observationRequest = 0;
+    var activityRequest = 0;
+    var sessionsRequest = 0;
+
+    async function loadTimeline(cursor) {
+      var request = ++timelineRequest;
       var el = document.getElementById('view-timeline');
       if (!state.timeline.loaded) el.innerHTML = '<div class="loading">Loading timeline...</div>';
-      var sessResult = await apiGet('sessions');
-      var sessions = (sessResult && sessResult.sessions) || [];
+      var sessResult = await recentViewerPage('sessions', cursor);
+      if (request !== timelineRequest) return;
+      if (!sessResult) { showRecentError(el, 'sessions'); return; }
+      var sessions = sessResult.sessions;
+      state.timeline.sessionNextCursor = sessResult.nextCursor;
       state.timeline.loaded = true;
-
-      if (sessions.length > 0 && !state.timeline.sessionId) {
-        // Default to the session with the most observations — the newest
-        // one is often a sparse just-started session, which made the tab
-        // look empty on first open.
-        var sorted = sessions.slice().sort(function(a, b) {
-          return (b.observationCount || 0) - (a.observationCount || 0) ||
-            (b.startedAt || '').localeCompare(a.startedAt || '');
-        });
-        var firstSelectable = sorted.find(function(s) { return sessionId(s); });
+      if (sessions.length && !state.timeline.sessionId) {
+        var firstSelectable = sessions.find(function(session) { return sessionId(session); });
         state.timeline.sessionId = firstSelectable ? sessionId(firstSelectable) : '';
+        state.timeline.observationCursor = null;
       }
-
       renderTimelineToolbar(sessions);
-      if (state.timeline.sessionId) await loadObservations();
+      if (state.timeline.sessionId) await loadObservations(state.timeline.observationCursor);
+      else renderObservations();
     }
 
     function renderTimelineToolbar(sessions) {
       var el = document.getElementById('view-timeline');
       var html = '<div class="toolbar">';
-      html += '<select id="tl-session"><option value="">Select session</option>';
+      html += '<select id="tl-session" aria-label="Timeline session"><option value="">Select session</option>';
+      if (state.timeline.sessionId && !sessions.some(function(session) { return sessionId(session) === state.timeline.sessionId; })) {
+        html += '<option selected value="' + esc(state.timeline.sessionId) + '">' + esc(state.timeline.sessionId) + ' (selected session)</option>';
+      }
       sessions.sort(function(a, b) { return (b.startedAt || '').localeCompare(a.startedAt || ''); }).forEach(function(s) {
         var id = sessionId(s);
         var disabled = id ? '' : ' disabled';
         html += '<option value="' + esc(id) + '"' + (id && state.timeline.sessionId === id ? ' selected' : '') + disabled + '>' + esc(sessionLabel(s)) + '</option>';
       });
       html += '</select>';
-      html += '<select id="tl-importance"><option value="0">All importance</option>';
+      html += '<select id="tl-importance" aria-label="Minimum importance"><option value="0">All importance</option>';
       for (var i = 1; i <= 9; i++) {
         html += '<option value="' + i + '"' + (state.timeline.minImportance === i ? ' selected' : '') + '>&ge; ' + i + '</option>';
       }
-      html += '</select></div>';
-      html += '<div id="tl-content"></div>';
+      html += '</select>';
+      if (state.timeline.sessionNextCursor) html += '<button class="btn" id="tl-sessions-next">Next sessions</button>';
+      html += '</div><div id="tl-content"></div>';
       el.innerHTML = html;
 
       document.getElementById('tl-session').addEventListener('change', function() {
         state.timeline.sessionId = this.value;
+        state.timeline.observationCursor = null;
+        tlTypeFilter = '';
         state.timeline.page = 0;
+        state.timeline.observations = [];
+        renderObservations();
         loadObservations();
       });
       document.getElementById('tl-importance').addEventListener('change', function() {
         state.timeline.minImportance = parseInt(this.value);
+        state.timeline.page = 0;
         renderObservations();
       });
+      var sessionNext = document.getElementById('tl-sessions-next');
+      if (sessionNext) sessionNext.addEventListener('click', function() { this.disabled = true; state.timeline.sessionId = ''; loadTimeline(state.timeline.sessionNextCursor); });
     }
 
-    async function loadObservations() {
+    async function loadObservations(cursor) {
+      var request = ++observationRequest;
+      var selectedSession = state.timeline.sessionId;
       var content = document.getElementById('tl-content');
       if (!content) return;
-      if (!state.timeline.sessionId) {
-        content.innerHTML = '<div class="empty-state"><div class="empty-icon">&#128337;</div><p>Select a session to view observations</p></div>';
-        return;
-      }
-      content.innerHTML = '<div class="loading">Loading observations...</div>';
-      var result = await apiGet('observations?sessionId=' + encodeURIComponent(state.timeline.sessionId));
-      state.timeline.observations = latestTimelineObservations((result && result.observations) || []);
+      if (!selectedSession) { content.innerHTML = '<div class="empty-state"><p>Select a session to view observations</p></div>'; return; }
+      if (!state.timeline.observations.length) content.innerHTML = '<p role="status">Loading observations...</p>';
+      var result = await recentViewerPage('observations', cursor, selectedSession);
+      if (request !== observationRequest || selectedSession !== state.timeline.sessionId) return;
+      if (!result) { showRecentError(content, 'observations'); return; }
+      state.timeline.observationCursor = cursor || null;
+      state.timeline.partial = !!result.partial;
+      state.timeline.nextCursor = result.nextCursor;
+      state.timeline.observations = result.observations;
       state.timeline.page = 0;
       renderObservations();
     }
@@ -3000,7 +3335,7 @@
         var aTime = Date.parse(a.timestamp) || 0;
         var bTime = Date.parse(b.timestamp) || 0;
         return bTime - aTime;
-      }).slice(0, 20);
+      }).slice(0, 200);
     }
 
     var tlTypeFilter = '';
@@ -3034,11 +3369,13 @@
       var paged = filtered.slice(start, start + pageSize);
       var totalPages = Math.ceil(filtered.length / pageSize);
 
-      var html = '<div class="type-chips">';
-      html += '<span class="type-chip' + (!tlTypeFilter ? ' active' : '') + '" data-action="timeline-filter" data-type-filter="">All (' + obs.length + ')</span>';
+      var html = state.timeline.partial ? '<p role="status">Showing a bounded page; more observations may exist.</p>' : '';
+      if (state.timeline.nextCursor) html += '<button class="btn" data-action="timeline-source-next">Next observations</button>';
+      html += '<div class="type-chips">';
+      html += '<button class="type-chip' + (!tlTypeFilter ? ' active' : '') + '" data-action="timeline-filter" data-type-filter="" aria-pressed="' + (!tlTypeFilter) + '">All (' + obs.length + ')</button>';
       typeList.forEach(function(t) {
         var color = OBS_TYPE_COLORS[t] || '#666666';
-        html += '<span class="type-chip' + (tlTypeFilter === t ? ' active' : '') + '" data-action="timeline-filter" data-type-filter="' + esc(t) + '" style="' + (tlTypeFilter === t ? 'background:' + color + ';border-color:' + color + ';' : 'border-color:' + color + ';color:' + color + ';') + '">' + esc(t.replace(/_/g, ' ')) + ' (' + typeCounts[t] + ')</span>';
+        html += '<button class="type-chip' + (tlTypeFilter === t ? ' active' : '') + '" data-action="timeline-filter" data-type-filter="' + esc(t) + '" aria-pressed="' + (tlTypeFilter === t) + '" style="' + (tlTypeFilter === t ? 'background:' + color + ';border-color:' + color + ';' : 'border-color:' + color + ';color:' + color + ';') + '">' + esc(t.replace(/_/g, ' ')) + ' (' + typeCounts[t] + ')</button>';
       });
       html += '</div>';
 
@@ -3048,7 +3385,7 @@
         return;
       }
 
-      html += '<div style="font-size:11px;color:var(--ink-faint);margin-bottom:16px;font-family:var(--font-mono);text-transform:uppercase;letter-spacing:0.06em;">' + filtered.length + ' observations shown · Latest 20 operations</div>';
+      html += '<div style="font-size:11px;color:var(--ink-faint);margin-bottom:16px;font-family:var(--font-mono);text-transform:uppercase;letter-spacing:0.06em;">' + filtered.length + ' matching observations in this bounded source window</div>';
 
       html += '<div class="timeline-container">';
 
@@ -3171,29 +3508,15 @@
     }
 
     async function loadActivity() {
+      var request = ++activityRequest;
       var el = document.getElementById('view-activity');
       if (!state.activity.loaded) el.innerHTML = '<div class="loading">Loading activity...</div>';
-      var results = await Promise.all([
-        apiGet('sessions'),
-        apiGet('audit?limit=200')
-      ]);
-      var sessions = (results[0] && results[0].sessions) || [];
-      var auditEntries = (results[1] && results[1].entries) || [];
-
-      var allObs = [];
-      var sorted = sessions.slice().sort(function(a, b) { return (b.startedAt || '').localeCompare(a.startedAt || ''); });
-      var recentSessions = sorted.slice(0, 5);
-
-      var obsResults = await Promise.all(recentSessions.filter(function(s) { return sessionId(s); }).map(function(s) {
-        return apiGet('observations?sessionId=' + encodeURIComponent(sessionId(s)));
-      }));
-      obsResults.forEach(function(r) {
-        if (r && r.observations) allObs = allObs.concat(r.observations);
-      });
-
-      state.activity.sessions = sessions;
-      state.activity.observations = allObs;
-      state.activity.audit = auditEntries;
+      var results = await Promise.all([recentViewerPage('sessions'), recentViewerPage('observations'), apiGet('audit?limit=200')]);
+      if (request !== activityRequest) return;
+      if (!results[0] || !results[1]) { showRecentError(el, !results[0] ? 'sessions' : 'observations'); return; }
+      state.activity.sessions = results[0].sessions;
+      state.activity.observations = results[1].observations;
+      if (results[2] && Array.isArray(results[2].entries)) state.activity.audit = results[2].entries;
       state.activity.loaded = true;
       renderActivity();
     }
@@ -3310,13 +3633,17 @@
     async function loadSessions() {
       var el = document.getElementById('view-sessions');
       if (!state.sessions.loaded) el.innerHTML = '<div class="loading">Loading sessions...</div>';
+      var request = ++sessionsRequest;
       var seqAtStart = liveSessionSeq;
-      var result = await apiGet('sessions');
+      var result = await recentViewerPage('sessions');
+      if (request !== sessionsRequest) return;
+      if (!result) { showRecentError(el, 'sessions'); return; }
       if (result && Array.isArray(result.sessions)) {
         state.sessions.items = replaySessionEvents(result.sessions, seqAtStart);
       } else if (!state.sessions.loaded) {
         state.sessions.items = [];
       }
+      state.sessions.items = state.sessions.items.slice(0, LIVE_BUFFER_MAX);
       state.sessions.detailStale = true;
       state.sessions.loaded = true;
       renderSessions();
@@ -3357,7 +3684,11 @@
       var cached = state.sessions.detailCache;
       if (cached && cached.id === state.sessions.selectedId && !state.sessions.detailStale) {
         var panel = document.getElementById('session-detail');
-        if (panel && panel.innerHTML !== cached.html) panel.innerHTML = cached.html;
+        if (panel && panel.innerHTML !== cached.html) {
+          panel.innerHTML = cached.html;
+          var reflectionButton = panel.querySelector('[data-action="reflect-project"]');
+          if (reflectionButton) mountReflection(reflectionButton);
+        }
         return;
       }
       renderSessionDetail();
@@ -3395,9 +3726,10 @@
         panel.innerHTML = '<div class="detail-panel"><h3>Loading session details…</h3></div>';
       }
 
-      var obsRes = await apiGet('observations?sessionId=' + encodeURIComponent(id));
+      var obsRes = await recentViewerPage('observations', null, id);
       if (request !== sessionDetailRequest || state.sessions.selectedId !== id) return;
-      var obs = (obsRes && obsRes.observations) || [];
+      if (!obsRes) { state.sessions.detailStale = true; showRecentError(panel, 'observations'); return; }
+      var obs = obsRes.observations;
 
       var typeCounts = {};
       var toolCounts = {};
@@ -3487,10 +3819,144 @@
       } else {
         html += '<button class="btn btn-primary" disabled>Summarize unavailable</button>';
       }
-      html += '</div></div>';
+      html += '</div>';
+      html += reflectionPanel(s.project);
+      html += '</div>';
       state.sessions.detailCache = { id: id, html: html };
       panel = document.getElementById('session-detail');
-      if (panel) panel.innerHTML = html;
+      if (panel) {
+        panel.innerHTML = html;
+        var reflectionButton = panel.querySelector('[data-action="reflect-project"]');
+        if (reflectionButton) mountReflection(reflectionButton);
+      }
+    }
+
+    var projectReflections = new Map();
+    function reflectionText(value) {
+      return typeof value === 'string' && value.length > 0 && new TextEncoder().encode(value).length <= 256;
+    }
+    function reflectionPanel(project) {
+      if (!reflectionText(project)) return '<div class="card">Project reflection unavailable: this session has no valid project.</div>';
+      return '<div class="card" style="margin-top:12px;overflow-wrap:anywhere;" data-reflection-panel>' +
+        '<div class="card-title">Project reflection</div><p>Bounded indexed evidence for ' + esc(project) +
+        '. Covers project memories and observations; other families and global coverage are excluded.</p>' +
+        '<button class="btn btn-primary" data-action="reflect-project" data-project="' + esc(project) + '">Reflect project</button>' +
+        '<p data-reflection-status role="status" aria-live="polite">Ready</p>' +
+        '<div class="card-title">Canonical project insights</div><div data-reflection-insights aria-live="polite">Loading insights...</div></div>';
+    }
+    function currentReflection(btn, project) {
+      return btn && btn.isConnected !== false && btn.getAttribute('data-project') === project;
+    }
+    function renderReflection(btn, operation) {
+      if (!currentReflection(btn, operation.payload.project)) return;
+      btn.disabled = operation.busy || operation.stopped;
+      btn.textContent = operation.busy ? 'Reflecting project...' : operation.unknown ? 'Resume reflection' :
+        operation.stopped ? 'Reflection ended' : operation.started ? 'Continue reflection' : 'Reflect project';
+      btn.closest('[data-reflection-panel]').querySelector('[data-reflection-status]').textContent = operation.message;
+    }
+    function mountReflection(btn) {
+      var project = btn.getAttribute('data-project');
+      var operation = projectReflections.get(project);
+      if (operation) { operation.button = btn; renderReflection(btn, operation); }
+      loadReflectionInsights(btn, project);
+    }
+    async function loadReflectionInsights(btn, project) {
+      var list = btn.closest('[data-reflection-panel]').querySelector('[data-reflection-insights]');
+      var request = {};
+      list.reflectionRequest = request;
+      list.textContent = 'Loading insights...';
+      var result;
+      try { result = await apiGet('insights?project=' + encodeURIComponent(project) + '&limit=20'); } catch (_) { result = null; }
+      if (!currentReflection(btn, project) || list.isConnected === false || list.reflectionRequest !== request) return;
+      if (!result || !Array.isArray(result.insights) || result.success === false) {
+        list.textContent = 'Could not load project insights.'; return;
+      }
+      var insights = result.insights.filter(function(item) { return item && item.project === project; }).slice(0, 20);
+      list.innerHTML = insights.length ? insights.map(function(item) {
+        return '<div style="margin-top:8px;"><strong>' + esc(item.title || '') + '</strong><div style="white-space:pre-wrap;">' +
+          esc(item.content || '') + '</div></div>';
+      }).join('') : '<p>No canonical insights for this project yet.</p>';
+    }
+    function reflectionContinuation(token, operation, result) {
+      if (!token || typeof token !== 'object' || Array.isArray(token) || Object.keys(token).length !== 5) return false;
+      if (!['jobId', 'requestId', 'checkpoint'].every(function(key) { return reflectionText(token[key]); }) ||
+          token.project !== operation.payload.project || token.requestId !== operation.payload.requestId || token.jobId !== result.jobId ||
+          !Number.isSafeInteger(token.cut) || token.cut < 1 || token.cut > 256) return false;
+      var previous = operation.payload.continuation;
+      if (previous) return token.jobId === previous.jobId && token.cut === previous.cut + 1;
+      return token.cut === 1;
+    }
+    function reflectionMessage(result) {
+      var labels = { pending: 'Pending', blocked: 'Blocked: outcome unresolved',
+        partial: 'Partial: selection unfinished', failed: 'Failed', completed: 'Completed bounded selection',
+        waiting_index: 'Waiting for index', waiting_graph: 'Waiting for graph', waiting_scope: 'Waiting for scope',
+        waiting_budget: 'Waiting for budget', waiting_batch: 'Waiting for batch' };
+      var message = labels[result.status];
+      ['processedClusters', 'clustersSkipped', 'appliedInsights'].forEach(function(key) {
+        if (Number.isSafeInteger(result[key]) && result[key] >= 0) message += '. ' +
+          ({ processedClusters: 'Clusters processed', clustersSkipped: 'Clusters skipped', appliedInsights: 'Insights applied' })[key] + ': ' + result[key];
+      });
+      var coverage = result.coverage;
+      if (coverage) {
+        var families = ['memory', 'observation', 'fact', 'lesson', 'crystal'];
+        ['requestedFamilies', 'excludedFamilies'].forEach(function(key) {
+          if (Array.isArray(coverage[key])) message += '. ' + (key === 'requestedFamilies' ? 'Selected families: ' : 'Excluded families: ') +
+            coverage[key].filter(function(family) { return families.indexOf(family) >= 0; }).join(', ');
+        });
+        message += coverage.complete === true && result.completed === true ? '. Selection coverage complete' : '. Selection coverage incomplete';
+      }
+      return message + '. Global family coverage is incomplete.';
+    }
+    async function reflectProject(project, btn) {
+      if (!reflectionText(project) || !currentReflection(btn, project)) return;
+      var operation = projectReflections.get(project);
+      if (!operation) {
+        operation = { payload: { project: project, requestId: crypto.randomUUID(), manual: true, maxClusters: 1 },
+          started: false, stopped: false, busy: false, unknown: false, message: 'Ready' };
+        projectReflections.set(project, operation);
+      }
+      if (operation.busy || operation.stopped) return;
+      operation.button = btn;
+      operation.busy = true;
+      operation.started = true;
+      operation.message = 'Pending: reflecting bounded project evidence...';
+      renderReflection(btn, operation);
+      var result;
+      try { result = await apiPost('reflect', operation.payload); } catch (_) { result = null; }
+      operation.busy = false;
+      operation.unknown = true;
+      operation.message = 'Outcome unknown. Resume explicitly with the same request; no automatic retry.';
+      if (!currentReflection(btn, project)) {
+        renderReflection(operation.button, operation);
+        return;
+      }
+      if (result) {
+        var statuses = ['pending', 'blocked', 'partial', 'failed', 'completed',
+          'waiting_index', 'waiting_graph', 'waiting_scope', 'waiting_budget', 'waiting_batch'];
+        var valid = reflectionText(result.jobId) && result.requestId === operation.payload.requestId &&
+          (!operation.jobId || result.jobId === operation.jobId) && statuses.indexOf(result.status) >= 0 &&
+          typeof result.completed === 'boolean' && (result.completed === (result.status === 'completed')) &&
+          (!result.continuation || reflectionContinuation(result.continuation, operation, result));
+        if (valid) {
+          operation.jobId = result.jobId;
+          operation.unknown = false;
+          operation.stopped = result.terminal === true || ['completed', 'partial', 'failed'].indexOf(result.status) >= 0;
+          operation.message = reflectionMessage(result);
+          if (result.continuation && !operation.stopped) {
+            var token = result.continuation;
+            operation.payload = { project: project, requestId: operation.payload.requestId, manual: true, maxClusters: 1,
+              continuation: { jobId: token.jobId, project: token.project, requestId: token.requestId, checkpoint: token.checkpoint, cut: token.cut } };
+          } else if (!operation.stopped) {
+            operation.stopped = true;
+            operation.message += ' Continuation unavailable; operation paused.';
+          }
+          loadReflectionInsights(btn, project);
+        } else {
+          operation.stopped = true;
+          operation.message = 'Reflection response could not be validated. Operation paused; no new request was created.';
+        }
+      }
+      renderReflection(btn, operation);
     }
 
     async function endSession(id) {
@@ -3499,12 +3965,57 @@
     }
 
     async function summarizeSession(id, btn) {
-      if (!btn) return;
+      function validSummaryRecovery(token, id) {
+        if (!token || typeof token !== 'object' || Array.isArray(token)) return false;
+        var strings = ['operationId', 'jobId', 'project', 'sessionId', 'sourceFingerprint', 'unitId', 'deliveryId'];
+        return Object.keys(token).length === 9 && strings.every(function(key) {
+          return typeof token[key] === 'string' && token[key].length > 0 && token[key].length <= 512 &&
+            token[key] === token[key].trim();
+        }) && Number.isSafeInteger(token.step) && token.step >= 0 &&
+          Number.isSafeInteger(token.round) && token.round >= 0 && token.sessionId === id;
+      }
+      if (!btn || btn.disabled || btn.isConnected === false) return;
+      var recovery = btn.summaryRecovery;
+      btn.summaryRecovery = null;
+      var payload = { sessionId: id };
+      if (validSummaryRecovery(recovery, id)) payload.continuation = recovery;
       btn.textContent = 'Summarizing...';
       btn.disabled = true;
-      await apiPost('summarize', { sessionId: id });
-      btn.textContent = 'Done';
-      setTimeout(function() { btn.textContent = 'Summarize'; btn.disabled = false; }, 2000);
+      try {
+        var result = await apiPost('summarize', payload);
+        var cuts = 0;
+        var ceiling = result && result.maxRequests;
+        var operationId = result && result.continuation && result.continuation.operationId;
+        while (result && result.success === true && result.completed === false && result.continuation &&
+            !result.busy && !result.skipped && !result.retryAt &&
+            Number.isSafeInteger(ceiling) && cuts < ceiling &&
+            result.continuation.operationId === operationId && result.continuation.sessionId === id) {
+          cuts++;
+          btn.textContent = 'Summarizing... ' + cuts;
+          result = await apiPost('summarize', { sessionId: id, continuation: result.continuation });
+        }
+        if (result && result.success === false && validSummaryRecovery(result.continuation, id) && btn.isConnected !== false) {
+          btn.summaryRecovery = result.continuation;
+          btn.textContent = 'Retry / Regenerate';
+        } else if (result && result.completed === false && result.continuation && cuts >= ceiling) {
+          btn.textContent = 'Limit reached';
+        } else
+        if (result && result.success === true && (result.queued === true || result.completed === false)) {
+          btn.textContent = result.busy ? 'Busy' : result.retryAt ? 'Retry later' : 'Queued';
+        } else if (result && result.success === true && result.summary) {
+          btn.textContent = 'Done';
+        } else {
+          btn.textContent = 'Failed';
+        }
+      } catch (_) {
+        btn.textContent = 'Failed';
+      } finally {
+        if (btn.summaryRecovery) {
+          btn.disabled = false;
+        } else {
+          setTimeout(function() { btn.textContent = 'Summarize'; btn.disabled = false; }, 2000);
+        }
+      }
     }
 
     async function loadLessons() {
@@ -3665,15 +4176,23 @@
       restoreSearchFocus(__focus);
     }
 
-    async function loadCrystals() {
+    async function loadCrystals(cursor) {
+      var request = state.crystals.requestId = (state.crystals.requestId || 0) + 1;
+      var project = state.crystals.project || '';
       var el = document.getElementById('view-crystals');
       if (!state.crystals.loaded) el.innerHTML = '<div class="loading">Loading crystals...</div>';
-      var results = await Promise.all([apiGet('crystals'), apiGet('lessons')]);
-      state.crystals.items = (results[0] && results[0].crystals) || [];
-      var lessonMap = {};
-      var lessons = (results[1] && results[1].lessons) || [];
-      lessons.forEach(function(l) { if (l && l.id) lessonMap[l.id] = l; });
-      state.crystals.lessonMap = lessonMap;
+      var result = await api('crystals?limit=16' + (project ? '&project=' + encodeURIComponent(project) : '') + (cursor ? '&cursor=' + encodeURIComponent(cursor) : ''), { readErrorBody: true });
+      if (request !== state.crystals.requestId || project !== (state.crystals.project || '')) return;
+      if (!result || result.error || result.success === false || !Array.isArray(result.crystals) || typeof result.partial !== 'boolean' || !(result.nextCursor === null || typeof result.nextCursor === 'string')) {
+        state.crystals.error = 'Crystal page unavailable. Retained data may be stale; retry this scope.';
+        renderCrystals(); return;
+      }
+      state.crystals.error = result.reason || '';
+      state.crystals.cursor = cursor || null;
+      state.crystals.items = result.crystals;
+      state.crystals.partial = result.partial;
+      state.crystals.nextCursor = result.nextCursor;
+      state.crystals.lessonMap = {};
       state.crystals.loaded = true;
       renderCrystals();
     }
@@ -3709,12 +4228,18 @@
       html += '<strong>Crystals</strong> are frozen snapshots of completed work. Each crystal captures one session\'s narrative, the tools invoked (key outcomes), files touched, and lessons surfaced — a replayable summary you keep after raw observations are pruned. Auto-created on JSONL import or via <code>memory_crystallize</code>.';
       html += '</div></div>';
 
-      html += '<div style="display:flex;gap:8px;margin-bottom:12px;">';
-      html += '<input id="crystals-search" class="search-input" type="text" placeholder="Search crystals..." value="' + esc(state.crystals.search) + '" style="flex:1" />';
-      html += '<span style="font-size:12px;color:var(--ink-faint);align-self:center;">' + items.length + ' crystals</span>';
+      html += '<div class="toolbar">';
+      html += '<label>Project <input id="crystals-project" placeholder="All projects" value="' + esc(state.crystals.project || '') + '"></label><button class="btn" id="crystals-project-open">Open scope</button>';
+      html += '<input id="crystals-search" class="search-input" type="text" aria-label="Search this crystal page" placeholder="Search this page..." value="' + esc(state.crystals.search) + '" style="flex:1" />';
+      html += '<span role="status">' + items.length + ' matching crystals on this page. ' + (state.crystals.partial ? 'Full total unavailable.' : '') + '</span>';
       html += '</div>';
+      html += '<button class="btn" id="crystals-refresh">Refresh first page</button> ';
+      if (state.crystals.nextCursor) html += '<button class="btn" id="crystals-next">Next crystal page</button>';
+      if (state.crystals.error) html += '<p role="status">' + esc(state.crystals.error) + '</p>';
 
-      if (items.length === 0) {
+      if (items.length === 0 && (state.crystals.error || state.crystals.partial || search)) {
+        html += '<p role="status">' + (state.crystals.error ? 'Crystal data could not be loaded.' : 'No matching crystals on this page. Clear the filter or continue browsing.') + '</p>';
+      } else if (items.length === 0) {
         html += '<div class="empty-state">' +
           '<div class="empty-icon">&#128142;</div>' +
           '<div class="empty-title">No crystals yet</div>' +
@@ -3771,8 +4296,18 @@
         });
       }
 
-      var __focus = captureSearchFocus(['crystals-search']);
+      var __focus = captureSearchFocus(['crystals-search', 'crystals-project']);
       el.innerHTML = html;
+      document.getElementById('crystals-refresh').addEventListener('click', function() { this.disabled = true; loadCrystals(); });
+      var next = document.getElementById('crystals-next');
+      if (next) next.addEventListener('click', function() { this.disabled = true; loadCrystals(state.crystals.nextCursor); });
+      var openScope = function() {
+        state.crystals.project = document.getElementById('crystals-project').value.trim();
+        state.crystals.items = []; state.crystals.nextCursor = null; state.crystals.loaded = false;
+        loadCrystals();
+      };
+      document.getElementById('crystals-project-open').addEventListener('click', openScope);
+      document.getElementById('crystals-project').addEventListener('keydown', function(event) { if (event.key === 'Enter') { event.preventDefault(); openScope(); } });
       var __cs = document.getElementById('crystals-search');
       if (__cs) bindImeSafeSearch(__cs, 200, function(v){ state.crystals.search = v; renderCrystals(); });
       restoreSearchFocus(__focus);
@@ -4143,11 +4678,11 @@
       }
       html += '</div></div>';
 
-      html += renderRecentActivity(r, state.health.error);
+      html += renderRecentActivity(r, state.health.error, 30);
       html += renderUpdateCard();
 
       var fns = (r.functions || []).slice().sort(function(a, b) { return b.totalCalls - a.totalCalls; });
-      html += '<div class="card" style="margin-top:16px;"><div class="card-title">Functions</div>';
+      html += '<div class="card" style="margin-top:16px;overflow-x:auto"><div class="card-title">Functions</div><p>Recorded functions across projects. Call counters are telemetry, not a complete function catalog or proof of successful output.</p>';
       if (!fns.length) {
         html += '<p style="font-size:13px;color:var(--ink-faint);">No function calls recorded yet.</p>';
       } else {
@@ -4169,13 +4704,25 @@
       el.innerHTML = html;
     }
 
-    async function loadProfile() {
+    async function loadProfile(cursor) {
+      await liveSubscriptionReady;
+      var request = state.profile.discoveryRequest = (state.profile.discoveryRequest || 0) + 1;
       var el = document.getElementById('view-profile');
-      el.innerHTML = '<div class="loading">Loading profile...</div>';
-      var sessResult = await apiGet('sessions');
+      if (!state.profile.loaded) el.innerHTML = '<div class="loading">Loading profile...</div>';
+      var sessResult = await api('sessions?latest=true&limit=16' + (cursor ? '&cursor=' + encodeURIComponent(cursor) : ''), { readErrorBody: true });
+      if (request !== state.profile.discoveryRequest) return;
+      if (sessResult && sessResult.restartRequired && cursor) return loadProfile();
+      if (!sessResult || sessResult.error || sessResult.status && sessResult.status !== 'ready' || !Array.isArray(sessResult.sessions)) {
+        state.profile.discoveryError = sessResult && (sessResult.reason || sessResult.error || sessResult.status) || 'Project discovery failed';
+        renderProfileToolbar(); if (state.profile.selectedProject) await loadProfileData(); return;
+      }
+      state.profile.discoveryError = '';
       var sessions = (sessResult && sessResult.sessions) || [];
+      state.profile.sessionNextCursor = sessResult && sessResult.nextCursor;
 
       var projects = {};
+      state.profile.projects.forEach(function(project) { projects[project] = true; });
+      if (state.profile.selectedProject) projects[state.profile.selectedProject] = true;
       sessions.forEach(function(s) { if (s.project) projects[s.project] = true; });
       state.profile.projects = Object.keys(projects).sort();
       state.profile.loaded = true;
@@ -4191,7 +4738,7 @@
     function renderProfileToolbar() {
       var el = document.getElementById('view-profile');
       var html = '<div class="toolbar">';
-      html += '<select id="profile-project">';
+      html += '<select id="profile-project" aria-label="Profile project">';
       if (state.profile.projects.length === 0) {
         html += '<option value="">No projects</option>';
       } else {
@@ -4199,22 +4746,41 @@
           html += '<option value="' + esc(p) + '"' + (state.profile.selectedProject === p ? ' selected' : '') + '>' + esc(p) + '</option>';
         });
       }
-      html += '</select></div>';
-      html += '<div id="profile-content"></div>';
+      html += '</select><label>Project name <input id="profile-project-name" value="' + esc(state.profile.projectInput || '') + '" placeholder="Exact project"></label><button class="btn" id="profile-project-open">Open project</button><button class="btn" id="profile-refresh">Refresh</button></div>';
+      if (state.profile.sessionNextCursor) html += '<button class="btn" data-action="profile-source-next">Browse more projects</button>';
+      html += '<p role="status">Projects discovered through bounded session pages. ' + esc(state.profile.discoveryError || (state.profile.sessionNextCursor ? 'More projects may exist.' : 'Open an exact name if absent.')) + '</p><div id="profile-content"></div>';
       el.innerHTML = html;
 
       document.getElementById('profile-project').addEventListener('change', function() {
         state.profile.selectedProject = this.value;
         loadProfileData();
       });
+      var input = document.getElementById('profile-project-name');
+      input.addEventListener('input', function() { state.profile.projectInput = this.value; });
+      var openProject = function() {
+        var project = input.value.trim(); if (!project) return;
+        state.profile.selectedProject = project;
+        if (state.profile.projects.indexOf(project) < 0) state.profile.projects.push(project);
+        renderProfileToolbar(); loadProfileData();
+      };
+      input.addEventListener('keydown', function(event) { if (event.key === 'Enter') { event.preventDefault(); openProject(); } });
+      document.getElementById('profile-project-open').addEventListener('click', openProject);
+      document.getElementById('profile-refresh').addEventListener('click', function() { loadProfile(); });
     }
 
     async function loadProfileData() {
+      var request = state.profile.requestId = (state.profile.requestId || 0) + 1;
+      var project = state.profile.selectedProject;
       var content = document.getElementById('profile-content');
       if (!content || !state.profile.selectedProject) return;
       content.innerHTML = '<div class="loading">Loading profile data...</div>';
-      var result = await apiGet('profile?project=' + encodeURIComponent(state.profile.selectedProject));
-      state.profile.data = (result && result.profile) ? result.profile : result;
+      var result = await api('profile?project=' + encodeURIComponent(project), { readErrorBody: true });
+      if (request !== state.profile.requestId || project !== state.profile.selectedProject) return;
+      if (!result || result.error || result.success === false) {
+        content.innerHTML = '<p role="status">Profile request failed. Use Refresh to retry this project.</p>'; return;
+      }
+      state.profile.data = result && Object.prototype.hasOwnProperty.call(result, 'profile') ? result.profile : result;
+      state.profile.reason = result && result.reason;
       renderProfile();
     }
 
@@ -4224,11 +4790,12 @@
       var p = state.profile.data;
 
       if (!p) {
-        content.innerHTML = '<div class="empty-state"><div class="empty-icon">&#128203;</div><p>No profile data for this project</p></div>';
+        content.innerHTML = '<div class="empty-state"><div class="empty-icon">&#128203;</div><p>' + (state.profile.reason && state.profile.reason !== 'no_sessions' ? 'Profile sources are incomplete. Retry after indexing progresses.' : 'No profile data for this project') + '</p></div>';
         return;
       }
 
-      var html = '<div class="two-col">';
+      var html = p.partial ? '<p role="status">Partial profile. Counts cover sampled sources; more history may exist.</p>' : '';
+      html += '<div class="two-col">';
 
       html += '<div class="card"><div class="card-title">Top Concepts</div>';
       var concepts = p.topConcepts || [];
@@ -4279,8 +4846,8 @@
       }
 
       var stats = '<div class="card" style="margin-top:16px;"><div class="card-title">Project Stats</div>';
-      stats += '<div class="detail-row"><div class="dl">Sessions</div><div class="dv" style="font-family:var(--font-mono);">' + (p.sessionCount || 0) + '</div></div>';
-      stats += '<div class="detail-row"><div class="dl">Total Obs</div><div class="dv" style="font-family:var(--font-mono);">' + (p.totalObservations || 0) + '</div></div>';
+      stats += '<div class="detail-row"><div class="dl">' + (p.partial ? 'Sessions sampled' : 'Sessions') + '</div><div class="dv" style="font-family:var(--font-mono);">' + (p.sessionCount || 0) + '</div></div>';
+      stats += '<div class="detail-row"><div class="dl">' + (p.partial ? 'Observations sampled' : 'Total Obs') + '</div><div class="dv" style="font-family:var(--font-mono);">' + (p.totalObservations || 0) + '</div></div>';
       stats += '<div class="detail-row"><div class="dl">Updated</div><div class="dv" style="font-family:var(--font-mono);font-size:12px;">' + esc(formatTime(p.updatedAt)) + '</div></div>';
       stats += '</div>';
 
@@ -4318,6 +4885,8 @@
           loadMemories();
         } else if (state.activeTab === 'sessions') {
           loadSessions();
+        } else if (state.activeTab === 'timeline') {
+          loadTimeline();
         } else if (state.activeTab === 'activity') {
           loadActivity();
         }
@@ -4366,7 +4935,6 @@
           if (state.ws !== ws) return;
           wsRetries = 0;
           stopPolling();
-          if (wsHasConnected) resyncLiveViews();
           wsHasConnected = true;
           if (!ws.__direct) {
             ws.send(JSON.stringify({
@@ -4378,6 +4946,7 @@
               }
             }));
           }
+          if (ws.__direct) finishLiveSubscription();
           setWsStatus('live', 'connected');
         };
         ws.onmessage = function(e) {
@@ -4388,6 +4957,7 @@
           }
           try {
             var msg = JSON.parse(e.data);
+            if (msg.type === 'joined' || msg.type === 'subscribed') finishLiveSubscription();
             if (msg.type === 'stream' && msg.event) {
               handleStreamEvent(msg);
             } else if (msg.event_type && msg.data) {
@@ -4426,7 +4996,99 @@
       }
     }
 
+    var liveSubscriptionResolve;
+    var liveSubscriptionReady = new Promise(function(resolve) { liveSubscriptionResolve = resolve; });
+    var liveSubscriptionFinished = false;
+    setTimeout(function() {
+      if (!liveSubscriptionFinished) { liveSubscriptionFinished = true; liveSubscriptionResolve(); startPolling(); }
+    }, 7000);
+    function finishLiveSubscription() {
+      if (!liveSubscriptionFinished) { liveSubscriptionFinished = true; liveSubscriptionResolve(); }
+      resyncLiveViews();
+    }
+
     var LIVE_BUFFER_MAX = 200;
+
+    var observationLog = [];
+    var observationSeq = 0;
+    var recentHistoryReasons = {};
+    var recentHistoryStates = {};
+
+    function showRecentError(container, entity) {
+      if (!container) return;
+      var notice = container.querySelector('[data-recent-error]');
+      if (!notice) {
+        var loading = container.querySelector('.loading'); if (loading) loading.remove();
+        notice = document.createElement('p'); notice.dataset.recentError = 'true'; notice.setAttribute('role', 'status');
+        container.prepend(notice);
+      }
+      notice.textContent = 'Recent history unavailable or still preparing. Showing retained data; retry shortly.' + (recentHistoryReasons[entity] ? ' ' + recentHistoryReasons[entity] : '');
+      var retry = document.createElement('button');
+      retry.className = 'btn'; retry.dataset.action = 'retry-recent-history'; retry.textContent = 'Retry';
+      notice.appendChild(retry);
+    }
+
+    function mergeObservations(base, updates) {
+      var byId = new Map();
+      base.concat(updates).forEach(function(row) {
+        if (!row || typeof row.id !== 'string') return;
+        var previous = byId.get(row.id);
+        var previousCompressed = previous && (previous.__liveCompressed || previous.compressionMethod === 'llm' || previous.compressionMethod === 'synthetic' || previous.type && previous.narrative);
+        var incomingCompressed = row.__liveCompressed || row.compressionMethod === 'llm' || row.compressionMethod === 'synthetic' || row.type && row.narrative;
+        if (!previous || !previousCompressed || incomingCompressed) byId.set(row.id, Object.assign({}, previous || {}, row));
+      });
+      return Array.from(byId.values()).sort(function(left, right) {
+        return (Date.parse(right.timestamp) || 0) - (Date.parse(left.timestamp) || 0) || left.id.localeCompare(right.id);
+      }).slice(0, LIVE_BUFFER_MAX);
+    }
+
+    var recentRequests = new Map();
+    async function recentViewerPage(entity, initialCursor, selectedSession) {
+      var key = JSON.stringify([entity, initialCursor || null, selectedSession || null]);
+      if (recentRequests.has(key)) return recentRequests.get(key);
+      if (recentRequests.size >= 16) return null;
+      var pending = fetchRecentViewerPage(entity, initialCursor, selectedSession);
+      recentRequests.set(key, pending);
+      try { return await pending; } finally { recentRequests.delete(key); }
+    }
+
+    async function fetchRecentViewerPage(entity, initialCursor, selectedSession) {
+      await liveSubscriptionReady;
+      for (var attempt = 0; attempt < 2; attempt++) {
+        var signal = AbortSignal.timeout(15000);
+        var sinceObservation = observationSeq, sinceSession = liveSessionSeq;
+        var cursor = attempt ? null : initialCursor, rows = [], envelope = null;
+        var restart = false;
+        for (var page = 0; page < 13 && rows.length < LIVE_BUFFER_MAX; page++) {
+          var path = entity + '?latest=true&limit=' + Math.min(16, LIVE_BUFFER_MAX - rows.length) + (selectedSession ? '&sessionId=' + encodeURIComponent(selectedSession) : '') + (cursor ? '&cursor=' + encodeURIComponent(cursor) : '');
+          var result = await api(path, { readErrorBody: true, signal: signal });
+          if (result && result.restartRequired) { restart = true; break; }
+          if (!result || result.error || result.status !== 'ready' || !Array.isArray(result[entity])) {
+            recentHistoryReasons[entity] = result && (result.reason || result.error || result.status) || 'Request failed';
+            recentHistoryStates[entity] = result && (result.status === 'preparing' || result.reason === 'recent_index_not_ready') ? 'preparing' : result ? 'unavailable' : 'transport';
+            return null;
+          }
+          envelope = result;
+          rows = rows.concat(result[entity]).slice(0, LIVE_BUFFER_MAX);
+          cursor = result.nextCursor;
+          if (!cursor) break;
+        }
+        if (restart || entity === 'observations' && observationSeq - sinceObservation > LIVE_BUFFER_MAX || entity === 'sessions' && liveSessionSeq - sinceSession > LIVE_SESSION_LOG_MAX) continue;
+        if (!envelope) return null;
+        if (entity === 'observations') rows = mergeObservations(rows, observationLog.filter(function(entry) {
+          return entry.seq > sinceObservation && (!selectedSession || entry.observation.sessionId === selectedSession);
+        }).map(function(entry) { return entry.observation; }));
+        else rows = replaySessionEvents(rows, sinceSession).slice(0, LIVE_BUFFER_MAX);
+        envelope[entity] = rows;
+        envelope.nextCursor = cursor;
+        envelope.partial = !!cursor || !!initialCursor;
+        envelope.total = envelope.partial ? null : rows.length;
+        delete recentHistoryReasons[entity];
+        delete recentHistoryStates[entity];
+        return envelope;
+      }
+      return null;
+    }
 
     function looksLikeObservation(obj) {
       return !!(obj && typeof obj === 'object' && obj.id && obj.timestamp);
@@ -4482,7 +5144,7 @@
         var request = ++memoryCountRequest;
         var result = await apiGet('memories?latest=true&count=true');
         if (request !== memoryCountRequest) return;
-        if (result && typeof result.total === 'number') {
+        if (result) {
           state.dashboard.memoryTotal = result.total;
           if (state.activeTab === 'dashboard' && state.dashboard.loaded) renderDashboard();
         }
@@ -4503,7 +5165,7 @@
         if (state.activeTab !== 'memories') return;
         memoriesReloading = true;
         try {
-          await loadMemories();
+          await loadMemories(state.memories.cursor);
         } finally {
           memoriesReloading = false;
           if (memoriesReloadPending) {
@@ -4517,8 +5179,13 @@
     function resyncLiveViews() {
       if (state.dashboard.loaded) loadDashboard();
       if (state.sessions.loaded) loadSessions();
+      if (state.timeline.loaded) loadTimeline();
+      if (state.activity.loaded) loadActivity();
       tabFetchedAt.memories = 0;
       if (state.memories.loaded) scheduleMemoriesReload();
+      if (state.activeTab === 'profile') loadProfile();
+      if (state.activeTab === 'crystals') loadCrystals(state.crystals.cursor);
+      if (state.activeTab === 'graph') loadGraph();
       refreshMemoryCount();
     }
 
@@ -4534,6 +5201,10 @@
     }
 
     function handleLiveEvent(type, data) {
+      if (type === 'raw_observation' || type === 'compressed_observation') {
+        routeWsMessage({ observation: data.observation, kind: type === 'compressed_observation' ? 'compressed' : 'raw' });
+        return;
+      }
       if (type === 'memory.updated' || type === 'memory.deleted') {
         refreshMemoryCount();
         tabFetchedAt.memories = 0;
@@ -4549,7 +5220,8 @@
       liveSessionLog.push(entry);
       if (liveSessionLog.length > LIVE_SESSION_LOG_MAX) liveSessionLog.shift();
       state.dashboard.sessions = applySessionEvent(state.dashboard.sessions, entry);
-      state.sessions.items = applySessionEvent(state.sessions.items, entry);
+      state.sessions.items = applySessionEvent(state.sessions.items, entry).slice(0, LIVE_BUFFER_MAX);
+      state.dashboard.sessions = state.dashboard.sessions.slice(0, LIVE_BUFFER_MAX);
       var touched = type === 'session.updated' ? sessionKey(data.session) : data.sessionId;
       if (type !== 'session.activity' && touched === state.sessions.selectedId) {
         state.sessions.detailStale = true;
@@ -4559,63 +5231,35 @@
 
     function handleStreamEvent(msg) {
       var evt = msg.event;
-      var observation;
       if (!evt) return;
+      if (evt.type === 'sync') { finishLiveSubscription(); return; }
       if (evt.type === 'event' && evt.event && evt.event.type) {
-        handleLiveEvent(evt.event.type, evt.event.data || {});
-        return;
+        handleLiveEvent(evt.event.type, evt.event.data || {}); return;
       }
-      if (evt.event_type && evt.event_type !== 'observation' && evt.event_type !== 'create' && evt.event_type !== 'update') {
-        return;
+      var payload = evt.data;
+      if (!payload) return;
+      var type = evt.event_type || payload.type;
+      if (type && (type.indexOf('session.') === 0 || type.indexOf('memory.') === 0)) {
+        handleLiveEvent(type, payload); return;
       }
-      if (evt.type === 'event' && evt.data) {
-        observation = evt.data.observation || evt.data;
-        if (looksLikeObservation(observation)) {
-          routeWsMessage({ observation: observation });
-        }
-        return;
-      }
-      if ((evt.type === 'create' || evt.type === 'update') && evt.data) {
-        var payload = evt.data;
-        observation = payload.observation || payload;
-        if (looksLikeObservation(observation)) {
-          routeWsMessage({ observation: observation });
-        }
-      } else if (evt.type === 'sync') {
-        var items = Array.isArray(evt.data) ? evt.data.slice(-LIVE_BUFFER_MAX) : [];
-        items.forEach(function(item) {
-          var payload = item.data || item;
-          observation = payload.observation || payload;
-          if (looksLikeObservation(observation)) {
-            routeWsMessage({ observation: observation });
-          }
-        });
-      }
+      var observation = payload.observation || payload;
+      if (looksLikeObservation(observation)) routeWsMessage({ observation: observation,
+        kind: type === 'compressed_observation' || payload.type === 'compressed' ? 'compressed' : 'raw' });
     }
 
     function routeWsMessage(msg) {
-      if (msg.observation) scheduleViewerStatusRefresh();
-      if (state.activeTab === 'timeline' && msg.observation) {
-        if (!state.timeline.sessionId || msg.observation.sessionId === state.timeline.sessionId) {
-          var existing = state.timeline.observations.findIndex(function(o) { return o.id === msg.observation.id; });
-          if (existing >= 0) {
-            state.timeline.observations[existing] = msg.observation;
-          } else {
-            state.timeline.observations.unshift(msg.observation);
-            if (state.timeline.observations.length > LIVE_BUFFER_MAX * 4) {
-              state.timeline.observations.length = LIVE_BUFFER_MAX * 4;
-            }
-          }
-          renderObservations();
-        }
+      if (!looksLikeObservation(msg.observation)) return;
+      var observation = Object.assign({}, msg.observation);
+      observation.__liveCompressed = msg.kind === 'compressed';
+      observationLog.push({ seq: ++observationSeq, observation: observation });
+      if (observationLog.length > LIVE_BUFFER_MAX) observationLog.shift();
+      scheduleViewerStatusRefresh();
+      if (observation.sessionId === state.timeline.sessionId) {
+        state.timeline.observations = mergeObservations(state.timeline.observations, [observation]);
+        if (state.activeTab === 'timeline') renderObservations();
       }
-      if (state.activeTab === 'activity' && msg.observation) {
-        state.activity.observations.unshift(msg.observation);
-        if (state.activity.observations.length > LIVE_BUFFER_MAX) {
-          state.activity.observations.length = LIVE_BUFFER_MAX;
-        }
-        renderActivity();
-      }
+      state.activity.observations = mergeObservations(state.activity.observations, [observation]);
+      if (state.activeTab === 'activity') renderActivity();
     }
 
     document.getElementById('tab-bar').addEventListener('click', function(e) {
@@ -4834,9 +5478,24 @@
         rebuildGraph();
         return;
       }
-      if (action === 'expand-node') {
-        var nodeId = target.getAttribute('data-node-id');
-        if (nodeId) expandNode(nodeId);
+      if (action === 'continue-graph-build') {
+        var buildResult = state.graph.rebuildResult;
+        if (buildResult && buildResult.continuation) rebuildGraph(buildResult.continuation);
+        return;
+      }
+      if (action === 'cancel-graph-browse') { cancelGraphBrowse(); state.graph.queryPartial = false; state.graph.browseStatus = 'error'; state.graph.queryError = 'Graph preparation cancelled. Retry to resume.'; renderGraphSidebar(); initGraph(); return; }
+      if (action === 'reload-graph') { state.graph.pageCursors = [null]; state.graph.pageIndex = 0; loadGraph(); return; }
+      if (action === 'retry-recent-history') { target.disabled = true; tabFetchedAt[state.activeTab] = 0; loadTab(state.activeTab); return; }
+      if (action === 'graph-page-next' && state.graph.browseStatus === 'ready' && state.graph.nextCursor) {
+        state.graph.pageCursors = state.graph.pageCursors.slice(0, state.graph.pageIndex + 1);
+        state.graph.pageCursors.push(state.graph.nextCursor);
+        state.graph.pageIndex += 1; loadGraph(); return;
+      }
+      if (action === 'graph-page-previous' && state.graph.browseStatus === 'ready' && state.graph.pageIndex > 0) { state.graph.pageIndex -= 1; loadGraph(); return; }
+      if (action === 'graph-project-open') { openGraphProject(); return; }
+      if (action === 'graph-source-next' || action === 'graph-source-retry') {
+        target.disabled = true;
+        loadGraphProjects(action === 'graph-source-next' ? state.graph.sessionNextCursor : undefined).then(function() { loadGraph(); });
         return;
       }
       if (action === 'delete-memory') {
@@ -4882,6 +5541,8 @@
         if (!Number.isNaN(page)) tlPage(page);
         return;
       }
+      if (action === 'timeline-source-next') { target.disabled = true; loadObservations(state.timeline.nextCursor); }
+      if (action === 'profile-source-next') { target.disabled = true; loadProfile(state.profile.sessionNextCursor); }
       if (action === 'select-session') {
         var sessionId = target.getAttribute('data-session-id');
         if (sessionId) selectSession(sessionId);
@@ -4911,6 +5572,10 @@
       if (action === 'end-session') {
         var endSessionId = target.getAttribute('data-session-id');
         if (endSessionId) endSession(endSessionId);
+        return;
+      }
+      if (action === 'reflect-project') {
+        reflectProject(target.getAttribute('data-project'), target);
         return;
       }
       if (action === 'summarize-session') {

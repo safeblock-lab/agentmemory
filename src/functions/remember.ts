@@ -6,9 +6,12 @@ import { withKeyedLock } from "../state/keyed-mutex.js";
 import { memoryToObservation } from "../state/memory-utils.js";
 import { deleteAccessLog } from "./access-tracker.js";
 import { recordAudit } from "./audit.js";
-import { getSearchIndex, isMemoryIndexReady, scheduleIndexSave, vectorIndexAddGuarded, vectorIndexRemove, flushIndexSave } from "./search.js";
+import { getSearchIndex, scheduleIndexSave, vectorIndexAddGuarded, vectorIndexRemove, flushIndexSave } from "./search.js";
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
+import { createHash } from "node:crypto";
+import { stableObservationJson } from "./observation-identity.js";
+import { decideMemoryAdmission, sameMemoryScope, type AdmissionRequest, type AttributedMemory, type MemorySourceKind } from "./memory-admission.js";
 
 // Slicing by UTF-16 code unit can cut an astral character (emoji, some CJK
 // extensions) mid surrogate pair, leaving a lone high surrogate that renders
@@ -30,6 +33,10 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
       sourceObservationIds?: string[];
       agentId?: string;
       project?: string;
+      action?: "store" | "update" | "merge";
+      targetMemoryId?: string;
+      expectedVersion?: number;
+      sourceKind?: MemorySourceKind;
     }) => {
       if (
         !data.content ||
@@ -38,15 +45,17 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
       ) {
         return { success: false, error: "content is required" };
       }
-      if (data.files && !Array.isArray(data.files)) {
-        return { success: false, error: "files must be an array" };
+      for (const field of ["files", "concepts", "sourceObservationIds"] as const) {
+        if (data[field] !== undefined && (!Array.isArray(data[field]) || data[field].some(value => typeof value !== "string" || !value.trim()))) {
+          return { success: false, error: `${field} must be an array of non-empty strings` };
+        }
       }
-      if (data.concepts && !Array.isArray(data.concepts)) {
-        return { success: false, error: "concepts must be an array" };
-      }
-      if (data.sourceObservationIds && !Array.isArray(data.sourceObservationIds)) {
-        return { success: false, error: "sourceObservationIds must be an array" };
-      }
+      if (data.action !== undefined && !["store", "update", "merge"].includes(data.action)) return { success: false, error: "Invalid admission action" };
+      if (data.sourceKind !== undefined && !["unknown", "human_source", "ai_output", "proposal", "observed_result"].includes(data.sourceKind)) return { success: false, error: "Invalid source kind" };
+      if (data.targetMemoryId !== undefined && (typeof data.targetMemoryId !== "string" || !data.targetMemoryId.trim()
+        || !Number.isSafeInteger(data.expectedVersion) || Number(data.expectedVersion) < 1)) return { success: false, error: "Target requires expectedVersion" };
+      if (data.targetMemoryId !== undefined && data.action !== "update" && data.action !== "merge") return { success: false, error: "Target requires update or merge action" };
+      if (data.expectedVersion !== undefined && data.targetMemoryId === undefined) return { success: false, error: "expectedVersion requires targetMemoryId" };
       const validTypes = new Set([
         "pattern",
         "preference",
@@ -69,105 +78,49 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
           : undefined;
 
       return withKeyedLock("mem:remember", async () => {
-        // Candidate generation: query the BM25 index with the new content
-        // and Jaccard-compare only the top hits, instead of walking the
-        // full memory corpus on every save. The index receives every
-        // memory at save time and is rebuilt at boot, so it covers the
-        // corpus whenever it is non-empty; a cold, never-queried index
-        // falls back to the full scan so supersession never silently
-        // stops working.
-        const idx = getSearchIndex();
-        let candidateMemories: Memory[];
-        try {
-          if (isMemoryIndexReady() && idx.size > 0) {
-            // 50 hits, not 20: the shared index also holds observations,
-            // which occupy slots but never resolve to memories below. A
-            // >0.7-Jaccard duplicate shares most tokens with the query so
-            // it ranks near the top regardless. Only mem_-prefixed ids can
-            // resolve in KV.memories, so skip the guaranteed-miss lookups.
-            const hits = idx
-              .search(data.content, 50)
-              .filter((h) => h.obsId.startsWith("mem_"));
-            const loaded = await Promise.all(
-              hits.map((h) =>
-                kv.get<Memory>(KV.memories, h.obsId).catch(() => null),
-              ),
-            );
-            candidateMemories = loaded.filter((m): m is Memory => m !== null);
-          } else {
-            candidateMemories = await kv.list<Memory>(KV.memories);
-          }
-        } catch (err) {
-          // Candidate generation is an optimization; a failure here must
-          // never block the save itself.
-          logger.warn("supersession candidate lookup failed, using full scan", {
-            error: err instanceof Error ? err.message : JSON.stringify(err),
-          });
-          candidateMemories = await kv.list<Memory>(KV.memories);
+        const callAgentId = typeof data.agentId === "string" && data.agentId.trim()
+          ? data.agentId.trim().slice(0, 128) : getAgentId();
+        const request: AdmissionRequest = {
+          content: data.content, type: memType, project, agentId: callAgentId,
+          action: data.action, targetMemoryId: data.targetMemoryId, expectedVersion: data.expectedVersion,
+          concepts: [...new Set(data.concepts ?? [])], files: [...new Set(data.files ?? [])],
+          sourceObservationIds: [...new Set(data.sourceObservationIds ?? [])],
+          attribution: { sourceKind: data.sourceKind ?? "unknown", evidenceObservationIds: [...new Set(data.sourceObservationIds ?? [])] },
+        };
+        // Exact admission must cover the corpus; a ranked top-k cannot prove absence.
+        const candidates = await kv.list<AttributedMemory>(KV.memories);
+        let decision: ReturnType<typeof decideMemoryAdmission>;
+        try { decision = decideMemoryAdmission(request, candidates); }
+        catch (error) { return { success: false, error: error instanceof Error ? error.message : "memory_admission_failed" }; }
+        if (decision.action === "skip" && decision.current) {
+          return { success: true, memory: decision.current, admission: { action: decision.action, reason: decision.reason }, providerCalls: 0 };
         }
-        let supersededId: string | undefined;
-        let supersededVersion = 1;
-        let supersededMemory: Memory | undefined;
-        // Track the closest sub-threshold match: not similar enough to
-        // supersede, but similar enough that the caller may want to
-        // consolidate. Reported back as a hint; never acted on here.
-        let nearMatch: { id: string; title: string; similarity: number } | undefined;
-        const lowerContent = data.content.toLowerCase();
-        for (const existing of candidateMemories) {
-          if (existing.isLatest === false) continue;
-          // Never supersede a memory that belongs to a different project.
-          // Both sides must have an explicit project for the guard to engage;
-          // an unscoped memory (legacy, no project field) is treated as a
-          // wildcard so pre-existing data is not stranded.
-          if (project && existing.project && existing.project !== project) {
-            continue;
-          }
-          const similarity = jaccardSimilarity(
-            lowerContent,
-            existing.content.toLowerCase(),
-          );
-          if (similarity > 0.7) {
-            supersededId = existing.id;
-            supersededVersion = existing.version ?? 1;
-            supersededMemory = existing;
-            break;
-          }
-          if (
-            similarity > 0.4 &&
-            (!nearMatch || similarity > nearMatch.similarity)
-          ) {
-            nearMatch = { id: existing.id, title: existing.title, similarity };
-          }
-        }
+        const supersededMemory = decision.action === "update" || decision.action === "merge" ? decision.current : undefined;
+        const supersededId = supersededMemory?.id;
+        const nearMatch = candidates.filter(existing => existing.isLatest !== false && sameMemoryScope(existing, request))
+          .map(existing => ({ id: existing.id, title: existing.title, similarity: jaccardSimilarity(data.content.toLowerCase(), existing.content.toLowerCase()) }))
+          .filter(match => match.similarity > 0.4).sort((left, right) => right.similarity - left.similarity || left.id.localeCompare(right.id))[0];
 
-        // stamp the agent role on the memory so future recall can
-        // filter by agent. Request body wins (multi-agent runtimes
-        // explicitly tagging at write time), env AGENT_ID fallback,
-        // none → memory is unscoped (legacy behavior).
-        const callAgentId =
-          typeof data.agentId === "string" && data.agentId.trim().length > 0
-            ? data.agentId.trim().slice(0, 128)
-            : getAgentId();
-
-        const memory: Memory = {
+        const memory: AttributedMemory = {
           id: generateId("mem"),
           createdAt: now,
           updatedAt: now,
           type: memType,
-          title: safeSlice(data.content, 80),
+          title: supersededMemory?.title ?? safeSlice(data.content, 80),
           content: data.content,
-          concepts: data.concepts || [],
-          files: data.files || [],
-          sessionIds: [],
-          strength: 7,
-          version: supersededId ? supersededVersion + 1 : 1,
+          concepts: [...new Set([...(supersededMemory?.concepts ?? []), ...request.concepts])],
+          files: [...new Set([...(supersededMemory?.files ?? []), ...request.files])],
+          sessionIds: supersededMemory?.sessionIds ?? [],
+          strength: supersededMemory?.strength ?? 7,
+          version: (supersededMemory?.version ?? 0) + 1,
           parentId: supersededId,
-          supersedes: supersededId ? [supersededId] : [],
-          sourceObservationIds: (data.sourceObservationIds || []).filter(
-            (id): id is string => typeof id === "string" && id.length > 0,
-          ),
+          supersedes: supersededId ? [supersededId, ...(supersededMemory?.supersedes ?? [])] : [],
+          ...(supersededMemory?.relatedIds ? { relatedIds: supersededMemory.relatedIds } : {}),
+          sourceObservationIds: [...new Set([...(supersededMemory?.sourceObservationIds ?? []), ...request.sourceObservationIds])],
+          attribution: { ...request.attribution, evidenceObservationIds: [...new Set([...(supersededMemory?.attribution?.evidenceObservationIds ?? []), ...request.attribution.evidenceObservationIds])] },
           isLatest: true,
-          origin: { channel: "agent", capturedAt: now },
+          origin: supersededMemory?.origin ?? { channel: "agent", capturedAt: now },
+          ...(supersededMemory?.forgetAfter ? { forgetAfter: supersededMemory.forgetAfter } : {}),
           ...(callAgentId ? { agentId: callAgentId } : {}),
           ...(project !== undefined && { project }),
         };
@@ -177,8 +130,26 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
         }
 
         if (supersededMemory) {
-          supersededMemory.isLatest = false;
-          await kv.set(KV.memories, supersededMemory.id, supersededMemory);
+          if (!project) return { success: false, pending: true, code: "MEMORY_CANONICAL_SCOPE_REQUIRED", error: "Versioned updates and merges require a canonical project target" };
+          const { current, token } = await kv.canonicalMemory.memoryLookup(project, supersededMemory.title.toLowerCase());
+          if (!current || current.id !== supersededMemory.id || current.version !== supersededMemory.version
+            || stableObservationJson(current) !== stableObservationJson(supersededMemory) || !token.rowVersion) {
+            return { success: false, code: "MEMORY_ADMISSION_CONFLICT", error: "Canonical predecessor changed" };
+          }
+          if (decision.action === "merge") memory.embeddingReuse = { sourceMemoryId: current.id, sourceVersion: token.rowVersion };
+          const effectKey = createHash("sha256").update(JSON.stringify(["remember-admission-v1", supersededMemory.id, supersededMemory.version, memory])).digest("hex");
+          await kv.canonicalMemory.evolve(project, supersededMemory.title.toLowerCase(), token, memory, effectKey,
+            { id: supersededMemory.id, version: supersededMemory.version, rowVersion: token.rowVersion });
+        } else if (project) {
+          const { current, token } = await kv.canonicalMemory.memoryLookup(project, memory.title.toLowerCase());
+          if (current) return { success: false, code: "MEMORY_CANONICAL_COLLISION", error: "Canonical title occupied; no fact superseded",
+            retainedInput: { ...request, ttlDays: data.ttlDays }, existingMemoryId: current.id };
+          const effectKey = createHash("sha256").update(JSON.stringify(["remember-create-v1", memory])).digest("hex");
+          await kv.canonicalMemory.evolve(project, memory.title.toLowerCase(), token, memory, effectKey, null);
+        } else {
+          await kv.set(KV.memories, memory.id, memory);
+        }
+        if (supersededMemory) {
           // The superseded version stays in KV (the viewer's version
           // chain reads it there) but leaves both search indexes:
           // recall returning an outdated fact as if current is worse
@@ -188,7 +159,7 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
           } catch {}
           vectorIndexRemove(supersededMemory.id);
         }
-        await kv.set(KV.memories, memory.id, memory);
+        await recordAudit(kv, "remember", "mem::remember", [memory.id], { admission: decision.action, reason: decision.reason, supersededId });
 
         // Without this, mem::remember persists the row but the BM25
         // index never sees it, so memory_smart_search and memory_recall
@@ -204,14 +175,14 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
             error: err instanceof Error ? err.message : String(err),
           });
         }
-        await vectorIndexAddGuarded(
+        if (decision.action !== "merge") await vectorIndexAddGuarded(
           memory.id,
           memory.sessionIds?.[0] ?? "memory",
           memory.title + " " + memory.content,
           { kind: "memory", logId: memory.id },
         );
 
-        if (supersededId) {
+        if (supersededId && decision.action === "update") {
           await sdk.trigger({
             function_id: "mem::cascade-update",
             payload: {
@@ -231,6 +202,7 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
         return {
           success: true,
           memory,
+          admission: { action: decision.action, reason: decision.reason },
           ...(nearMatch && !supersededId
             ? {
                 similarTo: {
@@ -239,6 +211,17 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
                 },
               }
             : {}),
+        };
+      }).catch((error: unknown) => {
+        const code = error instanceof Error ? error.message.match(/STATE_[A-Z0-9_]+/)?.[0]
+          ?? ("code" in error && typeof error.code === "string" ? error.code : undefined) : undefined;
+        if (!code) throw error;
+        logger.warn("Memory admission awaits canonical publication", { code });
+        return { success: false, pending: true, code,
+          error: "Canonical publication outcome requires retry with the same input",
+          retainedInput: { content: data.content, type: data.type, concepts: data.concepts, files: data.files,
+            sourceObservationIds: data.sourceObservationIds, sourceKind: data.sourceKind, project, agentId: data.agentId,
+            action: data.action, targetMemoryId: data.targetMemoryId, expectedVersion: data.expectedVersion, ttlDays: data.ttlDays },
         };
       });
     },
@@ -299,11 +282,12 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
         (!data.observationIds || data.observationIds.length === 0) &&
         !data.memoryId
       ) {
+        const sessionId = data.sessionId;
         const observations = await kv.list<{ id: string; imageData?: string; imageRef?: string }>(
-          KV.observations(data.sessionId),
+          KV.observations(sessionId),
         );
         for (const obs of observations) {
-          await kv.delete(KV.observations(data.sessionId), obs.id);
+          await kv.delete(KV.observations(sessionId), obs.id);
           await deleteAccessLog(kv, obs.id);
           if (obs.imageData) await decrementImageRef(kv, sdk, obs.imageData);
           if (obs.imageRef && obs.imageRef !== obs.imageData) {
@@ -314,8 +298,10 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
           deletedObservationIds.push(obs.id);
           deleted++;
         }
-        await kv.delete(KV.sessions, data.sessionId);
-        await kv.delete(KV.summaries, data.sessionId);
+        await withKeyedLock(`summary-canonical:${sessionId}`, async () => {
+          await kv.delete(KV.sessions, sessionId);
+          await kv.delete(KV.summaries, sessionId);
+        });
         deletedSession = true;
         deleted += 2;
       }

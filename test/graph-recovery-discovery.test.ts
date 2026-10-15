@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { registerGraphJobHandler, registerGraphJobRecovery, runGraphJob, withCompletedGraphRead } from "../src/functions/graph-jobs.js";
+import { registerGraphJobHandler, registerGraphJobRecovery, runGraphJob, withCompletedGraphRead, yieldGraphJob } from "../src/functions/graph-jobs.js";
 import { graphJson, graphRecordDigest } from "../src/functions/graph-job-storage.js";
 import { KV } from "../src/state/schema.js";
 import { prepareStateCommitBatch, StateTransactionError, type StateGraphGuard } from "../src/state/state-transactions.js";
@@ -178,7 +178,8 @@ describe("guarded graph recovery discovery", () => {
     const before = (await f.h.kv.getVersioned<GraphControlState>(KV.graphControl, "current")).value?.recovery;
     const receipts = f.h.receipts.size;
     const rows = [...f.h.rows].filter(([key]) => !key.includes(KV.graphControl));
-    await expect(f.recover()).rejects.toMatchObject({ code });
+    if (scenario === "incomplete applying capture") await expect(f.recover()).resolves.toMatchObject({ success: true, recovered: false, captureUnavailable: true, jobId: f.job.id });
+    else await expect(f.recover()).rejects.toMatchObject({ code });
     expect(handler).not.toHaveBeenCalled();
     expect(f.enumeration).not.toHaveBeenCalled();
     expect(f.h.receipts.size).toBe(receipts);
@@ -191,16 +192,18 @@ describe("guarded graph recovery discovery", () => {
     const handler = vi.fn(async () => undefined);
     registerGraphJobHandler(f.h.kv as never, "extraction", handler);
     await expect(f.recover()).resolves.toMatchObject({ recovered: true });
-    expect(f.enumeration).toHaveBeenCalledWith(KV.graphJobs);
+    expect(f.enumeration).not.toHaveBeenCalled();
     f.h.seed(KV.graphJobs, f.job.id, null, false);
-    await expect(f.recover()).resolves.toEqual({ success: true, recovered: false });
+    await expect(f.recover()).rejects.toMatchObject({ code: "STATE_GRAPH_RECOVERY_REQUIRED" });
+    const empty = graphStateHarness();
+    await expect(empty.sdk.trigger({ function_id: "mem::graph-recover", payload: {} })).resolves.toEqual({ success: true, recovered: false });
   });
 
-  it("invalidates an incomplete initial capture before effects", async () => {
+  it("retains an incomplete initial capture without applying effects", async () => {
     const f = await fixture(false);
     f.h.seed(KV.graphJobs, f.job.id, graphJson({ ...f.job, captureComplete: false }));
-    await expect(f.recover()).resolves.toMatchObject({ success: false, recovered: false, jobId: f.job.id });
-    expect((await f.h.kv.getVersioned<{ state: string }>(KV.graphJobs, f.job.id)).value?.state).toBe("invalidated");
+    await expect(f.recover()).resolves.toMatchObject({ success: true, recovered: false, captureUnavailable: true, jobId: f.job.id });
+    expect((await f.h.kv.getVersioned<{ state: string }>(KV.graphJobs, f.job.id)).value?.state).toBe("staging");
   });
 
   it("returns completed replay without running the body", async () => {
@@ -209,5 +212,52 @@ describe("guarded graph recovery discovery", () => {
     const body = vi.fn();
     await expect(runGraphJob(f.h.kv as never, "extraction", f.input, body, f.job.id)).resolves.toEqual({ exact: true });
     expect(body).not.toHaveBeenCalled();
+  });
+});
+
+
+describe("bounded graph admission discovery", () => {
+  it("admits a fresh store without whole-scope enumeration", async () => {
+    const h = graphStateHarness();
+    const values = vi.spyOn(h.kv, "values");
+    const pages = vi.spyOn(h.kv, "pages");
+    await expect(runGraphJob(h.kv as never, "extraction", { input: "fresh" }, async () => ({ success: true }), "fresh")).resolves.toEqual({ success: true });
+    expect(values).not.toHaveBeenCalled();
+    expect(pages).toHaveBeenCalledWith(KV.graphJobs, expect.objectContaining({ limit: 128, fields: ["id", "state", "generation", "recoveryStopped"] }));
+  });
+
+  it("rediscovers a changed job scope through one bounded page", async () => {
+    const h = graphStateHarness();
+    await runGraphJob(h.kv as never, "extraction", { input: "first" }, async () => ({ success: true }), "first");
+    h.seed(KV.graphJobs, "completed-external", graphJson({ id: "completed-external", generation: "1", state: "completed" }));
+    const values = vi.spyOn(h.kv, "values"), pages = vi.spyOn(h.kv, "pages");
+    await expect(runGraphJob(h.kv as never, "extraction", { input: "next" }, async () => ({ success: true }), "next")).resolves.toEqual({ success: true });
+    expect(values).not.toHaveBeenCalled();
+    expect(pages.mock.calls.filter(([scope]) => scope === KV.graphJobs)).toHaveLength(1);
+  });
+
+  it("continues a discovery page cursor before recovering the pending job", async () => {
+    const h = graphStateHarness();
+    for (let i = 0; i < 128; i++) h.seed(KV.graphJobs, `done-${i}`, graphJson({ id: `done-${i}`, generation: "1", state: "completed" }));
+    const text = JSON.stringify({ observations: [] });
+    h.seed(KV.graphJobs, "pending", graphJson({ id: "pending", generation: "1", state: "staging", kind: "extraction", captureComplete: true, captureParts: 1, captureDigest: graphRecordDigest(text) }));
+    h.seed(KV.graphInputs("pending"), "capture:0", text);
+    const handler = vi.fn(async () => undefined);
+    registerGraphJobHandler(h.kv as never, "extraction", handler);
+    await expect(h.sdk.trigger({ function_id: "mem::graph-recover", payload: {} })).resolves.toMatchObject({ recovered: false, deferred: true });
+    expect(handler).not.toHaveBeenCalled();
+    expect(await h.kv.get(KV.config, "graph-dispatch:discovery")).toMatchObject({ cursor: "128" });
+    await expect(h.sdk.trigger({ function_id: "mem::graph-recover", payload: {} })).resolves.toMatchObject({ recovered: true, jobId: "pending" });
+    expect(handler).toHaveBeenCalledOnce();
+  });
+
+  it("rejects a competitor behind an active continuation without rescanning", async () => {
+    const h = graphStateHarness();
+    await runGraphJob(h.kv as never, "extraction", { input: "pending" }, async () => yieldGraphJob({ success: true }), "active");
+    const pages = vi.spyOn(h.kv, "pages"), other = vi.fn();
+    await expect(runGraphJob(h.kv as never, "extraction", { input: "other" }, other, "other")).rejects.toMatchObject({ code: "STATE_GRAPH_RECOVERY_REQUIRED" });
+    expect(other).not.toHaveBeenCalled();
+    expect(pages.mock.calls.filter(([scope]) => scope === KV.graphJobs)).toHaveLength(0);
+    expect(await h.kv.get(KV.graphJobs, "other")).toBeNull();
   });
 });

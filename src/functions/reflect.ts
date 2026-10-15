@@ -1,77 +1,20 @@
 import type { IIIClient } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
-import { KV, fingerprintId, generateId } from "../state/schema.js";
-import type {
-  Insight,
-  GraphNode,
-  GraphEdge,
-  SemanticMemory,
-  Lesson,
-  Crystal,
-  MemoryProvider,
-} from "../types.js";
+import { KV, fingerprintId } from "../state/schema.js";
+import type { Insight, MemoryProvider, EmbeddingProvider } from "../types.js";
+import { isBackgroundRecoveryPaused } from "../config.js";
 import { recordAudit } from "./audit.js";
-import { logger } from "../logger.js";
-import { applyBatchEffect, runBatchCallback } from "../state/batch-effects.js";
+import { applyBatchEffect, runBatchCallback, batchEffectKey } from "../state/batch-effects.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
-import { REFLECT_SYSTEM, buildReflectPrompt } from "../prompts/reflect.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
-import type { TypeSafeDecisionProvider } from "../providers/typesafe.js";
 import type { FireworksBatchQueue } from "./fireworks-batch.js";
+import { registerReflectQueue, type SelectedReflectControl } from "./reflect-queue.js";
+import { legacyReflectEvidence, currentLegacyReflectEvidence } from "./reflect-retrieval.js";
+import { evaluatePublicationEvidence, type PublicationEvidenceInput } from "./publication-evidence.js";
+import { publicationCallOptions } from "./publication-call-options.js";
 import { stripPrivateData } from "./privacy.js";
-import { TYPESAFE_REFLECTION_GATE_CONFIDENCE_THRESHOLD } from "../config.js";
-import { graphTransactionFailure, withCompletedGraphRead } from "./graph-jobs.js";
-import { collectProjectedRecords } from "./projected-record-reader.js";
-
-const PROTECTED_REFLECT_SIGNAL = /\b(?:error|failed|failure|decision|instruction|prompt|security|secret|token|password|credential|api[-_ ]?key|auth|permission|mutation|write|edit|patch|delete|move|rename|commit|push|reset|deploy|install|shell|terminal|bash|powershell|environment|env|(?:AGENTS|CLAUDE|GEMINI|COPILOT)\.md)\b/i;
-
-function hasProtectedReflectSignal(text: string): boolean {
-  return PROTECTED_REFLECT_SIGNAL.test(text) || stripPrivateData(text) !== text;
-}
-
-interface ConceptCluster {
-  concepts: string[];
-  facts: Array<{ fact: string; confidence: number }>;
-  lessons: Array<{ content: string; confidence: number }>;
-  crystalNarratives: string[];
-  factIds: string[];
-  lessonIds: string[];
-  crystalIds: string[];
-}
-
-function reflectSourceFingerprint(
-  cluster: ConceptCluster,
-  facts: SemanticMemory[],
-  lessons: Lesson[],
-  crystals: Crystal[],
-): string {
-  return fingerprintId("fwbreflect", JSON.stringify({
-    concepts: cluster.concepts,
-    facts: facts.map((fact) => [fact.id, fact.fact, fact.confidence, fact.updatedAt]).sort(),
-    lessons: lessons.map((lesson) => [lesson.id, lesson.content, lesson.confidence, lesson.updatedAt]).sort(),
-    crystals: crystals.map((crystal) => [crystal.id, crystal.narrative, crystal.createdAt]).sort(),
-  }));
-}
-
-async function currentReflectSourceFingerprint(
-  kv: StateKV,
-  cluster: ConceptCluster,
-): Promise<string | undefined> {
-  const [facts, lessons, crystals] = await Promise.all([
-    Promise.all(cluster.factIds.map((id) => kv.get<SemanticMemory>(KV.semantic, id))),
-    Promise.all(cluster.lessonIds.map((id) => kv.get<Lesson>(KV.lessons, id))),
-    Promise.all(cluster.crystalIds.map((id) => kv.get<Crystal>(KV.crystals, id))),
-  ]);
-  if (facts.some((item) => !item) || lessons.some((item) => !item) || crystals.some((item) => !item)) {
-    return undefined;
-  }
-  return reflectSourceFingerprint(
-    cluster,
-    facts as SemanticMemory[],
-    lessons as Lesson[],
-    crystals as Crystal[],
-  );
-}
+import { parseReflectionResult } from "./reflect-result.js";
+import { REFLECT_CONTROL, validReflectText, type ConceptCluster, type ReflectRequest } from "./reflect-queue-types.js";
 
 async function applyInsights(
   kv: StateKV,
@@ -79,68 +22,40 @@ async function applyInsights(
   cluster: ConceptCluster,
   project: string | undefined,
   maxInsights: number,
-  effectKey?: string,
-): Promise<{ newInsights: number; reinforced: number; count: number }> {
-  const insightRegex =
-    /<insight\s+confidence="([^"]+)"\s+title="([^"]+)">([\s\S]*?)<\/insight>/g;
-  let match: RegExpExecArray | null;
+  effectKey: string,
+): Promise<{ newInsights: number; reinforced: number; count: number; insightIds: string[] }> {
   let newInsights = 0;
   let reinforced = 0;
   let count = 0;
+  const insightIds: string[] = [];
 
-  while ((match = insightRegex.exec(response)) !== null && count < maxInsights) {
-    const parsedConfidence = parseFloat(match[1]);
-    const confidence = Number.isNaN(parsedConfidence)
-      ? 0.5
-      : Math.max(0, Math.min(1, parsedConfidence));
-    const title = match[2].trim();
-    const content = match[3].trim();
-    if (!content) continue;
+  for (const { title, content, confidence } of parseReflectionResult(response).slice(0, maxInsights)) {
 
-    const id = fingerprintId("ins", content.toLowerCase());
-    if (effectKey) {
-      await applyBatchEffect<Insight>(kv, KV.insights, id, effectKey, (existing) => {
+    const legacyId = fingerprintId("ins", content.toLowerCase());
+    const legacy = await kv.get<Insight>(KV.insights, legacyId);
+    const id = legacy?.project === project ? legacyId : fingerprintId("ins", `${project ?? ""}:${content.toLowerCase()}`);
+    await applyBatchEffect<Insight & { sourceObservationIds?: string[] }>(kv, KV.insights, id, effectKey, (existing) => {
+        if (existing && existing.project !== project) throw new Error("reflect_insight_project_mismatch");
         if (existing && !existing.deleted) {
           reinforceInsight(existing);
+          existing.sourceMemoryIds = [...new Set([...existing.sourceMemoryIds, ...cluster.factIds, ...(cluster.memoryIds ?? [])])];
+          existing.sourceLessonIds = [...new Set([...existing.sourceLessonIds, ...cluster.lessonIds])];
+          existing.sourceCrystalIds = [...new Set([...existing.sourceCrystalIds, ...cluster.crystalIds])];
+          existing.sourceObservationIds = [...new Set([...(existing.sourceObservationIds ?? []), ...(cluster.observationIds ?? [])])];
           return existing;
         }
         const now = new Date().toISOString();
         return { id, title, content, confidence, reinforcements: 0, sourceConceptCluster: cluster.concepts,
-          sourceMemoryIds: cluster.factIds, sourceLessonIds: cluster.lessonIds, sourceCrystalIds: cluster.crystalIds,
+          sourceMemoryIds: [...cluster.factIds, ...(cluster.memoryIds ?? [])], sourceObservationIds: cluster.observationIds ?? [], sourceLessonIds: cluster.lessonIds, sourceCrystalIds: cluster.crystalIds,
           project, tags: cluster.concepts, createdAt: now, updatedAt: now, decayRate: 0.05 };
       });
-      count++;
-      continue;
-    }
-    const existing = await kv.get<Insight>(KV.insights, id);
-    if (existing && !existing.deleted) {
-      reinforceInsight(existing);
-      await kv.set(KV.insights, existing.id, existing);
-      reinforced++;
-    } else {
-      const now = new Date().toISOString();
-      await kv.set(KV.insights, id, {
-        id,
-        title,
-        content,
-        confidence,
-        reinforcements: 0,
-        sourceConceptCluster: cluster.concepts,
-        sourceMemoryIds: cluster.factIds,
-        sourceLessonIds: cluster.lessonIds,
-        sourceCrystalIds: cluster.crystalIds,
-        project,
-        tags: cluster.concepts,
-        createdAt: now,
-        updatedAt: now,
-        decayRate: 0.05,
-      } satisfies Insight);
-      newInsights++;
-    }
+    if (legacy && !legacy.deleted && legacy.project === project) reinforced++;
+    else newInsights++;
+    if (!insightIds.includes(id)) insightIds.push(id);
     count++;
   }
 
-  return { newInsights, reinforced, count };
+  return { newInsights, reinforced, count, insightIds };
 }
 
 function reinforceInsight(insight: Insight): void {
@@ -154,426 +69,157 @@ function reinforceInsight(insight: Insight): void {
   insight.updatedAt = now;
 }
 
-function buildGraphClusters(
-  nodes: GraphNode[],
-  edges: GraphEdge[],
-  maxClusters: number,
-): string[][] {
-  const conceptNodes = nodes.filter(
-    (n) => n.type === "concept" && !n.stale,
-  );
-  if (conceptNodes.length === 0) return [];
-
-  const edgeMap = new Map<string, Set<string>>();
-  for (const edge of edges) {
-    if (edge.stale) continue;
-    if (!edgeMap.has(edge.sourceNodeId))
-      edgeMap.set(edge.sourceNodeId, new Set());
-    if (!edgeMap.has(edge.targetNodeId))
-      edgeMap.set(edge.targetNodeId, new Set());
-    edgeMap.get(edge.sourceNodeId)!.add(edge.targetNodeId);
-    edgeMap.get(edge.targetNodeId)!.add(edge.sourceNodeId);
-  }
-
-  const degree = new Map<string, number>();
-  for (const node of conceptNodes) {
-    degree.set(node.id, edgeMap.get(node.id)?.size || 0);
-  }
-
-  const sorted = [...conceptNodes].sort(
-    (a, b) => (degree.get(b.id) || 0) - (degree.get(a.id) || 0),
-  );
-
-  const visited = new Set<string>();
-  const clusters: string[][] = [];
-  const conceptNodeIds = new Set(conceptNodes.map((n) => n.id));
-
-  for (const seed of sorted) {
-    if (visited.has(seed.id) || clusters.length >= maxClusters) break;
-
-    const cluster: string[] = [];
-    const queue = [seed.id];
-    const seen = new Set<string>();
-    let depth = 0;
-
-    while (queue.length > 0 && depth <= 2) {
-      const levelCount = queue.length;
-      for (let i = 0; i < levelCount; i++) {
-        const current = queue.shift()!;
-        if (seen.has(current)) continue;
-        seen.add(current);
-
-        if (conceptNodeIds.has(current)) {
-          const node = conceptNodes.find((n) => n.id === current);
-          if (node) cluster.push(node.name);
-          visited.add(current);
-        }
-
-        const neighbors = edgeMap.get(current) || new Set();
-        for (const neighbor of neighbors) {
-          if (!seen.has(neighbor)) queue.push(neighbor);
-        }
-      }
-      depth++;
-    }
-
-    if (cluster.length >= 2) clusters.push(cluster);
-  }
-
-  return clusters;
+function validInsightReadText(value: unknown, maxBytes = 512): value is string {
+  return typeof value === "string" && value.length > 0 && value.trim() === value && Buffer.byteLength(value) <= maxBytes;
 }
 
-function buildJaccardClusters(
-  semanticMemories: SemanticMemory[],
-  lessons: Lesson[],
-  maxClusters: number,
-): string[][] {
-  const allConcepts = new Map<string, Set<string>>();
+function insightReadLimit(value: unknown, fallback: number): number | null {
+  if (value === undefined || value === null) return fallback;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
 
-  for (const sem of semanticMemories) {
-    const terms = sem.fact.toLowerCase().split(/\s+/).filter((t) => t.length > 3);
-    for (const term of terms) {
-      if (!allConcepts.has(term)) allConcepts.set(term, new Set());
-      allConcepts.get(term)!.add(sem.id);
-    }
+async function readSelectedInsights(
+  kv: StateKV,
+  value: unknown,
+): Promise<Insight[] | { success: false; error: string }> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { success: false, error: "selected insight scope is invalid" };
   }
-  for (const lesson of lessons) {
-    for (const tag of lesson.tags) {
-      const key = tag.toLowerCase();
-      if (!allConcepts.has(key)) allConcepts.set(key, new Set());
-      allConcepts.get(key)!.add(lesson.id);
-    }
+  const selected = value as { project?: unknown; insightIds?: unknown };
+  if (!validInsightReadText(selected.project, 4096) || !Array.isArray(selected.insightIds)
+    || selected.insightIds.length < 1 || selected.insightIds.length > 12
+    || selected.insightIds.some((id: unknown) => !validInsightReadText(id))
+    || new Set(selected.insightIds).size !== selected.insightIds.length) {
+    return { success: false, error: "selected insight scope is invalid" };
   }
 
-  const conceptList = [...allConcepts.keys()].filter(
-    (k) => (allConcepts.get(k)?.size || 0) >= 2,
-  );
-
-  const visited = new Set<string>();
-  const clusters: string[][] = [];
-
-  for (const concept of conceptList) {
-    if (visited.has(concept) || clusters.length >= maxClusters) break;
-
-    const cluster = [concept];
-    visited.add(concept);
-
-    const docsA = allConcepts.get(concept) || new Set();
-    for (const other of conceptList) {
-      if (visited.has(other)) continue;
-      const docsB = allConcepts.get(other) || new Set();
-      let intersection = 0;
-      for (const d of docsA) {
-        if (docsB.has(d)) intersection++;
-      }
-      const union = docsA.size + docsB.size - intersection;
-      const similarity = union > 0 ? intersection / union : 0;
-      if (similarity > 0.3) {
-        cluster.push(other);
-        visited.add(other);
-      }
+  const insightIds = selected.insightIds as string[];
+  const records = await Promise.all(insightIds.map(id => kv.get<unknown>(KV.insights, id)));
+  const insights: Insight[] = [];
+  for (let index = 0; index < records.length; index++) {
+    const record = records[index];
+    if (record === null || record === undefined) return { success: false, error: "selected insight not found" };
+    if (!record || typeof record !== "object" || Array.isArray(record)) {
+      return { success: false, error: "selected insight record is invalid" };
     }
-
-    if (cluster.length >= 2) clusters.push(cluster);
+    const insight = record as Partial<Insight>;
+    if (insight.id !== insightIds[index] || !validInsightReadText(insight.title)
+      || !validInsightReadText(insight.content, 64 * 1024) || !Number.isFinite(insight.confidence)
+      || !Array.isArray(insight.tags) || insight.tags.some(tag => !validInsightReadText(tag))) {
+      return { success: false, error: "selected insight record is invalid" };
+    }
+    if (insight.project !== selected.project) return { success: false, error: "selected insight project scope mismatch" };
+    insights.push(insight as Insight);
   }
-
-  return clusters;
+  return insights;
 }
 
 export function registerReflectFunctions(
-  sdk: IIIClient,
-  kv: StateKV,
-  provider: MemoryProvider,
-  llmRouter?: LlmTaskRouter,
-  batchQueue?: FireworksBatchQueue,
-  typeSafe?: TypeSafeDecisionProvider,
+  sdk: IIIClient, kv: StateKV, provider: MemoryProvider, llmRouter?: LlmTaskRouter,
+  batchQueue?: FireworksBatchQueue, _unusedProvider?: unknown, embedding?: EmbeddingProvider,
 ): void {
-  sdk.registerFunction("mem::reflect", 
-    async (data: {
-      maxClusters?: number;
-      project?: string;
-      deferred?: boolean;
-      batchResponse?: string;
-      batchCluster?: string;
-      batchSourceFingerprint?: string;
-      batchEffectKey?: string;
-      force?: boolean;
-    }) => runBatchCallback(kv, "reflect", data?.batchEffectKey, async (resuming, admit) => {
-      const maxClusters = Math.min(data?.maxClusters ?? 10, 20);
-      const maxInsightsPerCluster = 5;
-      const maxTotal = 50;
-
-      const [[graphNodes, graphEdges], semanticMemories, lessons, crystals] =
-        await Promise.all([
-          withCompletedGraphRead(kv, () => Promise.all([
-            collectProjectedRecords<GraphNode>(kv, KV.graphNodes).catch((error) => { if (graphTransactionFailure(error)) throw error; return []; }),
-            kv.list<GraphEdge>(KV.graphEdges).catch((error) => { if (graphTransactionFailure(error)) throw error; return []; }),
-          ])),
-          kv.list<SemanticMemory>(KV.semantic).catch(() => []),
-          kv.list<Lesson>(KV.lessons).catch(() => []),
-          kv.list<Crystal>(KV.crystals).catch(() => []),
-        ]);
-
-      let activeLessons = lessons.filter((l) => !l.deleted);
-      if (data?.project) {
-        activeLessons = activeLessons.filter((l) => l.project === data.project);
+  const queue = registerReflectQueue(sdk, kv, provider,
+    (response, cluster, project, limit, effect) => applyInsights(kv, response, cluster, project, limit, effect),
+    llmRouter, batchQueue, embedding);
+  sdk.registerFunction("mem::reflect", async (data: ReflectRequest & { selected?: SelectedReflectControl }) => {
+    if (data?.batchResponse !== undefined || data?.batchCluster !== undefined) {
+      if (typeof data.batchResponse !== "string" || Buffer.byteLength(data.batchResponse) > 16384 ||
+          typeof data.batchCluster !== "string" || Buffer.byteLength(data.batchCluster) > 16384) {
+        return { success: false, error: "Invalid batch reflection payload" };
       }
-
-      let conceptClusters = buildGraphClusters(
-        graphNodes,
-        graphEdges,
-        maxClusters,
-      );
-
-      const usedFallback = conceptClusters.length === 0;
-      if (usedFallback) {
-        conceptClusters = buildJaccardClusters(
-          semanticMemories,
-          activeLessons,
-          maxClusters,
-        );
-      }
-
-      if (data?.batchResponse && data.batchCluster) {
-        let cluster: ConceptCluster;
-        try {
-          cluster = JSON.parse(data.batchCluster) as ConceptCluster;
-        } catch {
-          return { success: false, error: "Invalid batch reflection cluster" };
-        }
-        const fingerprint = await currentReflectSourceFingerprint(kv, cluster);
-        if (!resuming && (!fingerprint || fingerprint !== data.batchSourceFingerprint)) {
-          return { success: true, stale: true };
-        }
-        await admit();
-        const applied = await applyInsights(
-          kv,
-          data.batchResponse,
-          cluster,
-          data.project,
-          maxInsightsPerCluster,
-          data.batchEffectKey,
-        );
-        await recordAudit(kv, "reflect", "mem::reflect", [], {
-          ...applied,
-          source: "fireworks-batch",
-        }, undefined, undefined, data.batchEffectKey).catch(() => {});
-        return { success: true, ...applied };
-      }
-
-      let newInsights = 0;
-      let reinforced = 0;
-      let clustersSkipped = 0;
-      let totalInsights = 0;
-      let queued = 0;
-
-      for (const conceptNames of conceptClusters) {
-        if (totalInsights >= maxTotal) break;
-
-        const conceptSet = new Set(conceptNames.map((c) => c.toLowerCase()));
-
-        const clusterFacts = semanticMemories.filter((s) => {
-          const factTerms = s.fact.toLowerCase().split(/\s+/);
-          return factTerms.some((t) => conceptSet.has(t));
-        });
-
-        const clusterLessons = activeLessons.filter((l) =>
-          l.tags.some((t) => conceptSet.has(t.toLowerCase())) ||
-          conceptNames.some((c) =>
-            l.content.toLowerCase().includes(c.toLowerCase()),
-          ),
-        );
-
-        const clusterCrystals = crystals.filter((c) =>
-          (c.lessons || []).some((l) =>
-            conceptNames.some((cn) =>
-              l.toLowerCase().includes(cn.toLowerCase()),
-            ),
-          ),
-        );
-
-        const totalItems =
-          clusterFacts.length + clusterLessons.length + clusterCrystals.length;
-        if (totalItems < 3) {
-          clustersSkipped++;
-          continue;
-        }
-
-        const cluster: ConceptCluster = {
-          concepts: conceptNames,
-          facts: clusterFacts.map((f) => ({
-            fact: f.fact,
-            confidence: f.confidence,
-          })),
-          lessons: clusterLessons.map((l) => ({
-            content: l.content,
-            confidence: l.confidence,
-          })),
-          crystalNarratives: clusterCrystals.map((c) => c.narrative),
-          factIds: clusterFacts.map((f) => f.id),
-          lessonIds: clusterLessons.map((l) => l.id),
-          crystalIds: clusterCrystals.map((c) => c.id),
-        };
-
-        const isRecent = (timestamp: string): boolean => {
-          const parsed = Date.parse(timestamp);
-          return !Number.isFinite(parsed) || Date.now() - parsed <= 7 * 24 * 60 * 60 * 1000;
-        };
-        const protectedCluster =
-          hasProtectedReflectSignal(cluster.concepts.join(" ")) ||
-          clusterFacts.some((fact) =>
-            fact.confidence >= 0.85 ||
-            isRecent(fact.updatedAt) ||
-            hasProtectedReflectSignal(fact.fact),
-          ) ||
-          clusterLessons.some((lesson) =>
-            lesson.confidence >= 0.85 ||
-            isRecent(lesson.updatedAt) ||
-            hasProtectedReflectSignal(lesson.content),
-          ) ||
-          clusterCrystals.some((crystal) =>
-            isRecent(crystal.createdAt) ||
-            crystal.filesAffected.length > 0 ||
-            hasProtectedReflectSignal([
-              crystal.narrative,
-              ...crystal.keyOutcomes,
-              ...crystal.filesAffected,
-              ...crystal.lessons,
-            ].join(" ")),
-          );
-        if (
-          typeSafe &&
-          data?.deferred &&
-          !data.force &&
-          !data.batchResponse &&
-          !data.batchEffectKey &&
-          !data.batchCluster &&
-          !data.batchSourceFingerprint &&
-          !protectedCluster
-        ) {
-          try {
-            const decision = await typeSafe.evaluateChoice(
-              "pipelineGates",
-              stripPrivateData(JSON.stringify({
-                workflow: "reflection",
-                concepts: cluster.concepts.slice(0, 5).map((concept) => concept.slice(0, 24)),
-                factCount: cluster.facts.length,
-                lessonCount: cluster.lessons.length,
-                crystalCount: cluster.crystalNarratives.length,
-                samples: [
-                  ...cluster.facts.slice(0, 2).map((fact) => fact.fact.slice(0, 48)),
-                  ...cluster.lessons.slice(0, 2).map((lesson) => lesson.content.slice(0, 48)),
-                  ...cluster.crystalNarratives.slice(0, 1).map((narrative) => narrative.slice(0, 48)),
-                ],
-              })).slice(0, 512),
-              "Should this scheduled reflection cluster be processed?",
-              {
-                run: "Run if combining these persisted facts and lessons may produce a new useful insight.",
-                skip: "Skip only when the cluster is clearly redundant or too weak to support a durable insight.",
-              },
-            );
-            if (decision?.choice === "skip" && decision.confidence >= TYPESAFE_REFLECTION_GATE_CONFIDENCE_THRESHOLD) {
-              clustersSkipped++;
-              continue;
-            }
-          } catch (error) {
-            logger.warn("TypeSafe reflection gate failed open", {
-              errorType: error instanceof Error ? error.name : "unknown",
-            });
-          }
-        }
-
-        try {
-          const prompt = buildReflectPrompt(cluster);
-          if (data?.deferred && batchQueue) {
-            const sourceFingerprint = reflectSourceFingerprint(
-              cluster,
-              clusterFacts,
-              clusterLessons,
-              clusterCrystals,
-            );
-            const enqueueResult = await batchQueue.enqueue({
-              correlationId: data.batchEffectKey ? fingerprintId("fwbreflect", `${data.batchEffectKey}:${sourceFingerprint}`) : generateId("fwbreflect"),
-              task: "reflection",
-              systemPrompt: REFLECT_SYSTEM,
-              userPrompt: prompt,
-              metadata: {
-                cluster: JSON.stringify(cluster),
-                project: data.project || "",
-                sourceFingerprint,
-                ...(data.batchEffectKey ? { batchEffectKey: data.batchEffectKey } : {}),
-              },
-            });
-            if (enqueueResult.queued) {
-              queued++;
-              continue;
-            }
-          }
-          const response = llmRouter
-            ? await llmRouter.run(
-              "reflection",
-              (selectedProvider) => selectedProvider.summarize(REFLECT_SYSTEM, prompt),
-              (candidate) => /<insight\s+confidence="[^"]+"\s+title="[^"]+">[\s\S]*?<\/insight>/.test(candidate),
-            )
-            : await provider.summarize(REFLECT_SYSTEM, prompt);
-
-          const applied = await applyInsights(
-            kv,
-            response,
-            cluster,
-            data?.project,
-            Math.min(maxInsightsPerCluster, maxTotal - totalInsights),
-          );
-          newInsights += applied.newInsights;
-          reinforced += applied.reinforced;
-          totalInsights += applied.count;
-        } catch {
-          continue;
-        }
-      }
-
+      let cluster: ConceptCluster;
       try {
-        await recordAudit(kv, "reflect", "mem::reflect", [], {
-          newInsights,
-          reinforced,
-          clustersProcessed: conceptClusters.length - clustersSkipped,
-          clustersSkipped,
-          usedFallback,
-          queued,
-        });
-      } catch {}
-
-      return {
-        success: true,
-        newInsights,
-        reinforced,
-        clustersProcessed: conceptClusters.length - clustersSkipped,
-        clustersSkipped,
-        usedFallback,
-        queued,
-      };
-    }, () => recordAudit(kv, "reflect", "mem::reflect", [], {}, undefined, undefined, data?.batchEffectKey)),
-  );
+        const value = JSON.parse(data.batchCluster);
+        const names = ["concepts", "factIds", "lessonIds", "crystalIds"];
+        if (!value || names.some(name => !Array.isArray(value[name]) || value[name].length > 12 ||
+          value[name].some((item: unknown) => typeof item !== "string" || Buffer.byteLength(item) > 256)) ||
+          value.factIds.length + value.lessonIds.length + value.crystalIds.length > 12) throw new Error("invalid_cluster");
+        cluster = value;
+      } catch { return { success: false, error: "Invalid batch reflection cluster" }; }
+      if (cluster.jobId !== undefined || cluster.unitId !== undefined) {
+        if (!validReflectText(cluster.jobId) || !validReflectText(cluster.unitId)) return { success: false, error: "Invalid batch reflection identity" };
+        return queue.acceptBatch(data, cluster);
+      }
+      const effect = data.batchEffectKey && /^[a-f0-9]{64}$/.test(data.batchEffectKey) ? data.batchEffectKey :
+        batchEffectKey(JSON.stringify([data.batchSourceFingerprint, data.batchCluster, data.batchResponse]));
+      return withKeyedLock(`reflect-legacy:${effect}`, async () => {
+      const captureId = `callback:${effect}`;
+      const captured = await kv.get<{ response: string; cluster: ConceptCluster; project?: string; fingerprint?: string }>(REFLECT_CONTROL, captureId);
+      if (captured && (captured.response !== data.batchResponse || JSON.stringify(captured.cluster) !== JSON.stringify(cluster)
+        || captured.project !== data.project || captured.fingerprint !== data.batchSourceFingerprint)) {
+        return { success: false, error: "reflect_callback_identity_mismatch" };
+      }
+      const result = captured ?? { response: data.batchResponse, cluster, project: data.project, fingerprint: data.batchSourceFingerprint };
+      if (!captured) await kv.set(REFLECT_CONTROL, captureId, result);
+      const receipt = await kv.get<{ state?: string }>(KV.batchCallbacks, `reflect:${effect}`);
+      let evidence: Awaited<ReturnType<typeof legacyReflectEvidence>>;
+      if (receipt?.state !== "started" && receipt?.state !== "completed" && receipt?.state !== "stale") {
+          if (isBackgroundRecoveryPaused()) return { success: false, reason: "background_recovery_paused" };
+          evidence = await legacyReflectEvidence(kv, result.cluster, result.project);
+          if (!evidence || evidence.fingerprint !== result.fingerprint) return { success: true, stale: true };
+          const input: PublicationEvidenceInput = { workflow: "reflection", operationId: `legacy-reflect:${effect}`,
+            project: result.project!, evidenceComplete: true,
+            candidate: JSON.stringify({ generatedResponse: result.response, cluster: result.cluster,
+              sourceFingerprint: evidence.fingerprint, sourceLineage: evidence.rows.map(row => ({ scope: row.scope,
+                id: row.key, version: row.version, fingerprint: row.fingerprint })) }),
+            sources: evidence.rows.map(row => ({ id: JSON.stringify([row.scope, row.key]), scope: row.scope, key: row.key,
+              version: row.version, project: result.project!, content: stripPrivateData(JSON.stringify(row.value)) })) };
+          const verdict = await evaluatePublicationEvidence(kv, input, async (request, captureRaw) => {
+            const options = publicationCallOptions();
+            const call = async (target: MemoryProvider) => {
+              const raw = await target.summarize(request.systemPrompt, request.userPrompt, options);
+              await captureRaw(raw); return raw;
+            };
+            return llmRouter ? llmRouter.run("reflection", call, () => true, undefined, options) : call(provider);
+          });
+          if (!await currentLegacyReflectEvidence(kv, evidence, result.project!)) return { success: true, stale: true };
+          if (verdict.status === "unsupported") return { success: true, rejected: true, reason: "reflect_publication_unsupported" };
+          if (verdict.status !== "supported") return { success: false, reason: `reflect_publication_${verdict.status}` };
+      }
+      return runBatchCallback(kv, "reflect", effect, async (resuming, admit) => {
+        if (!resuming && isBackgroundRecoveryPaused()) return { success: false, reason: "background_recovery_paused" };
+        if (!resuming && (!evidence || !await currentLegacyReflectEvidence(kv, evidence, result.project!))) return { success: true, stale: true };
+        await admit();
+        const applied = await applyInsights(kv, result.response, result.cluster, result.project, 5, effect);
+        await recordAudit(kv, "reflect", "mem::reflect", [], applied, undefined, undefined, effect);
+        return { success: true, ...applied };
+      });
+      });
+    }
+    return queue.accept(data ?? {});
+  });
 
   sdk.registerFunction("mem::insight-list", 
     async (data: {
-      project?: string;
-      minConfidence?: number;
-      limit?: number;
+      project?: unknown;
+      minConfidence?: unknown;
+      limit?: unknown;
+      selected?: unknown;
     }) => {
-      const limit = data?.limit ?? 50;
+      const limit = insightReadLimit(data?.limit, 50);
       const minConfidence = data?.minConfidence ?? 0;
-      let items = await kv.list<Insight>(KV.insights);
+      if (limit === null) return { success: false, error: "limit must be a non-negative safe integer" };
+      if (typeof minConfidence !== "number" || !Number.isFinite(minConfidence) || minConfidence < 0 || minConfidence > 1) {
+        return { success: false, error: "minConfidence must be between 0 and 1" };
+      }
+      if (data?.selected !== undefined && data.project !== undefined
+        && (!validInsightReadText(data.project, 4096) || data.project !== (data.selected as { project?: unknown } | null)?.project)) {
+        return { success: false, error: "selected insight project does not match project filter" };
+      }
+      let items = data?.selected === undefined
+        ? await kv.list<Insight>(KV.insights)
+        : await readSelectedInsights(kv, data.selected);
+      if (!Array.isArray(items)) return items;
 
       items = items.filter(
         (i) => !i.deleted && i.confidence >= minConfidence,
       );
 
-      if (data?.project) {
+      if (data?.selected === undefined && data?.project) {
         items = items.filter((i) => i.project === data.project);
       }
 
-      items.sort((a, b) => b.confidence - a.confidence);
+      items.sort((a, b) => b.confidence - a.confidence || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 
       return { success: true, insights: items.slice(0, limit) };
     },
@@ -581,25 +227,37 @@ export function registerReflectFunctions(
 
   sdk.registerFunction("mem::insight-search", 
     async (data: {
-      query: string;
-      project?: string;
-      minConfidence?: number;
-      limit?: number;
+      query?: unknown;
+      project?: unknown;
+      minConfidence?: unknown;
+      limit?: unknown;
+      selected?: unknown;
     }) => {
-      if (!data?.query?.trim()) {
+      if (typeof data?.query !== "string" || !data.query.trim()) {
         return { success: false, error: "query is required" };
       }
 
-      const query = data.query.toLowerCase();
+      const query = data.query.trim().toLowerCase();
       const minConfidence = data.minConfidence ?? 0.1;
-      const limit = data.limit ?? 10;
+      const limit = insightReadLimit(data.limit, 10);
+      if (limit === null) return { success: false, error: "limit must be a non-negative safe integer" };
+      if (typeof minConfidence !== "number" || !Number.isFinite(minConfidence) || minConfidence < 0 || minConfidence > 1) {
+        return { success: false, error: "minConfidence must be between 0 and 1" };
+      }
+      if (data.selected !== undefined && data.project !== undefined
+        && (!validInsightReadText(data.project, 4096) || data.project !== (data.selected as { project?: unknown } | null)?.project)) {
+        return { success: false, error: "selected insight project does not match project filter" };
+      }
 
-      let items = await kv.list<Insight>(KV.insights);
+      let items = data.selected === undefined
+        ? await kv.list<Insight>(KV.insights)
+        : await readSelectedInsights(kv, data.selected);
+      if (!Array.isArray(items)) return items;
       items = items.filter(
         (i) => !i.deleted && i.confidence >= minConfidence,
       );
 
-      if (data.project) {
+      if (data.selected === undefined && data.project) {
         items = items.filter((i) => i.project === data.project);
       }
 
@@ -624,7 +282,7 @@ export function registerReflectFunctions(
         })
         .filter(Boolean) as Array<{ insight: Insight; score: number }>;
 
-      scored.sort((a, b) => b.score - a.score);
+      scored.sort((a, b) => b.score - a.score || (a.insight.id < b.insight.id ? -1 : a.insight.id > b.insight.id ? 1 : 0));
 
       try {
         await recordAudit(kv, "insight_search", "mem::insight-search", [], {

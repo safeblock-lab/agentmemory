@@ -161,7 +161,7 @@ export class GeminiAccountPoolProvider implements MemoryProvider {
     userPrompt: string,
     options?: LlmCallOptions,
   ): Promise<string> {
-    return this.enqueue((provider) => provider.compress(systemPrompt, userPrompt, options));
+    return this.enqueue((provider) => provider.compress(systemPrompt, userPrompt, options), options);
   }
 
   summarize(
@@ -169,11 +169,11 @@ export class GeminiAccountPoolProvider implements MemoryProvider {
     userPrompt: string,
     options?: LlmCallOptions,
   ): Promise<string> {
-    return this.enqueue((provider) => provider.summarize(systemPrompt, userPrompt, options));
+    return this.enqueue((provider) => provider.summarize(systemPrompt, userPrompt, options), options);
   }
 
-  private enqueue(operation: (provider: MemoryProvider) => Promise<string>): Promise<string> {
-    const result = this.operationTail.then(() => this.run(operation));
+  private enqueue(operation: (provider: MemoryProvider) => Promise<string>, options?: LlmCallOptions): Promise<string> {
+    const result = this.operationTail.then(() => this.run(operation, options));
     this.operationTail = result.then(
       () => undefined,
       () => undefined,
@@ -181,7 +181,7 @@ export class GeminiAccountPoolProvider implements MemoryProvider {
     return result;
   }
 
-  private async run(operation: (provider: MemoryProvider) => Promise<string>): Promise<string> {
+  private async run(operation: (provider: MemoryProvider) => Promise<string>, options?: LlmCallOptions): Promise<string> {
     const attemptedAccounts = new Set<number>();
     while (attemptedAccounts.size < this.accounts.length) {
       const accountIndex = this.findAvailableAccount(attemptedAccounts);

@@ -5,7 +5,6 @@ import { withSerializedGraphRetrieval } from '../src/functions/graph-retrieval-r
 import { HybridSearch } from '../src/state/hybrid-search.js';
 import { SearchIndex } from '../src/state/search-index.js';
 import { IndexedVector } from '../src/state/indexed-vector.js';
-import { indexedGraphItems, type IndexedSeed } from '../src/state/indexed-retrieval.js';
 import { prepareIndexedCorpus } from '../src/state/indexed-preparation.js';
 import { IndexedLocalEmbedding } from '../src/state/indexed-embedding.js';
 import { setIndexedVector, setEmbeddingProvider, vectorIndexAddGuarded, vectorIndexRemove, flushIndexSave, getSearchIndex } from '../src/functions/search.js';
@@ -14,6 +13,7 @@ import type { StateKV } from '../src/state/kv.js';
 import type { EmbeddingProvider, CompressedObservation, GraphNode, GraphEdge } from '../src/types.js';
 import { KV } from '../src/state/schema.js';
 
+vi.mock('iii-sdk', () => ({ InvocationError: class InvocationError extends Error { code = 'TEST_INVOCATION_ERROR'; } }));
 vi.mock('../src/state/reranker.js', () => ({ rerank: vi.fn(async (_query, results) => results) }));
 const { extraction, pipeline } = vi.hoisted(() => {
   const extraction = vi.fn();
@@ -37,8 +37,9 @@ function fixture() {
     retrieval: vi.fn(async (payload: Record<string, unknown>): Promise<unknown> => {
       if (payload.action === 'index_status') return { version: 1, capabilities: ['state::semantic_lsh_v1', 'state::indexed_graph_v1'], graph: [KV.graphNodes, KV.graphEdges].map(scope => ({ scope, status: 'ready' })), semantic: [{ ...identity, status: 'ready', count: '2', lexical_count: '2', lexical_ready: true, source_kind: 'agentmemory', source_prepared: true, dirty_count: '0', coverage_ready: true }] };
       if (payload.action === 'source_prepare') return { source_prepared: true, dirty_count: '0', coverage_ready: true, items: [] };
-      if (payload.action === 'graph_seeds') return { generation: '1', items: (payload.entity_names as string[]).length ? [{ key: 'n1', id: 'n1', position: '9007199254740993', entity: true, observation: false }] : [] };
-      if (payload.action === 'graph_edges') return { generation: '1', items: [] };
+      if (payload.action === 'graph_read') return payload.project
+        ? { status: 'ready', project: payload.project, items: [], has_more: false }
+        : { status: 'partial', reason: 'project_required', project: '', items: [], has_more: false };
       if (payload.action === 'keyword_search') return { ...identity, items: [{ obsId: 'a', sessionId: 's', score: 1 }] };
       if (payload.action === 'semantic_search') return { ...identity, approximate: true, budget_exhausted: false, candidates: '1', items: [{ obsId: 'b', sessionId: 's', score: 1 }] };
       return {};
@@ -59,6 +60,25 @@ describe('indexed runtime contracts', () => {
     expect(state.retrieval).toHaveBeenCalledWith(expect.objectContaining({
       action: 'semantic_search', probes: 128, max_candidates: 4096, limit: 100,
     }));
+    expect(state.list).not.toHaveBeenCalled();
+    expect(state.pages).not.toHaveBeenCalled();
+  });
+  it('applies project scope before lexical and vector candidate budgets', async () => {
+    const { kv, state } = fixture();
+    const vector = new IndexedVector(kv, provider);
+    await vector.keywordSearch('auth', 240, 'project-a');
+    await vector.search(new Float32Array([1, 0]), 240, 'project-a');
+
+    expect(state.retrieval).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'keyword_search', project: 'project-a', limit: 100,
+    }));
+    expect(state.retrieval).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'semantic_search', project: 'project-a', limit: 100,
+    }));
+    const candidateCalls = state.retrieval.mock.calls
+      .map(([payload]) => payload as Record<string, unknown>)
+      .filter(payload => payload.action === 'keyword_search' || payload.action === 'semantic_search');
+    expect(candidateCalls.every(payload => payload.project === 'project-a' && payload.global !== true)).toBe(true);
     expect(state.list).not.toHaveBeenCalled();
     expect(state.pages).not.toHaveBeenCalled();
   });
@@ -103,36 +123,32 @@ describe('indexed runtime contracts', () => {
     const { kv, state } = fixture();
     const edges = [edge('later', '2026-02-01'), edge('earlier', '2026-01-01')];
     const original = state.retrieval.getMockImplementation()!;
-    state.retrieval.mockImplementation(async payload => payload.action === 'graph_edges' ? { generation: '1', items: edges.map((value, i) => ({ key: value.id, position: String(2 - i), value })) } : original(payload));
+    state.retrieval.mockImplementation(async payload => {
+      if (payload.action !== 'graph_read') return original(payload);
+      if (payload.mode === 'search') return {
+        status: 'ready', project: 'project-a', has_more: false,
+        items: [{ key: 'n1', id: 'n1', position: '1', entity: true, observation: false }],
+      };
+      if (payload.mode === 'neighbors' || payload.mode === 'history') return {
+        status: 'ready', project: 'project-a', has_more: false,
+        items: edges.map((value, i) => ({ key: value.id, id: value.id, position: String(2 - i), value })),
+      };
+      return { status: 'ready', project: 'project-a', has_more: false, items: [] };
+    });
     const retrieval = new GraphRetrieval(kv);
-    expect((await retrieval.searchByEntities(['AgentMemory']))[0].obsId).toBe('a');
-    const temporal = await retrieval.temporalQuery('AgentMemory', '2026-01-15');
+    expect((await retrieval.searchByEntities(['AgentMemory'], 2, 20, 'project-a'))[0].obsId).toBe('a');
+    const temporal = await retrieval.temporalQuery('AgentMemory', '2026-01-15', undefined, 'project-a');
     expect(temporal.entity?.id).toBe('n1');
     expect(temporal.currentState.map(item => item.id)).toEqual(['earlier']);
     expect(state.pages).not.toHaveBeenCalled();
     expect(state.list).not.toHaveBeenCalled();
-  });
-  it('merges chunked seed flags and orders positions larger than safe integers', async () => {
-    const { kv, state } = fixture();
-    state.retrieval.mockResolvedValueOnce({ generation: '1', items: [{ key: 'z', id: 'z', position: '9007199254740993', entity: true, observation: false }] })
-      .mockResolvedValueOnce({ generation: '1', items: [{ key: 'a', id: 'a', position: '9007199254740992', entity: false, observation: true }, { key: 'z', id: 'z', position: '9007199254740993', entity: false, observation: true }] });
-    const result = await indexedGraphItems<IndexedSeed>(kv, [{ action: 'graph_seeds' }, { action: 'graph_seeds' }]);
-    expect(result.map(item => item.id)).toEqual(['a', 'z']);
-    expect(result[1]).toMatchObject({ entity: true, observation: true });
-  });
-  it('rejects generation changes and native resource errors instead of truncating', async () => {
-    const { kv, state } = fixture();
-    state.retrieval.mockResolvedValueOnce({ generation: '1', items: [] }).mockResolvedValueOnce({ generation: '2', items: [] });
-    await expect(indexedGraphItems(kv, [{}, {}])).rejects.toMatchObject({ code: 'STATE_GRAPH_RECOVERY_REQUIRED' });
-    state.retrieval.mockResolvedValueOnce({ error: 'STATE_RETRIEVAL_RESOURCE_LIMIT' });
-    await expect(indexedGraphItems(kv, [{}])).rejects.toMatchObject({ code: 'STATE_RETRIEVAL_RESOURCE_LIMIT' });
   });
   it('fuses lexical and semantic expanded candidates before one final local rerank', async () => {
     const { kv, state } = fixture();
     const bm25 = new SearchIndex();
     const residentSearch = vi.spyOn(bm25, 'search');
     const hybrid = new HybridSearch(bm25, null, provider, kv);
-    const results = await hybrid.searchWithExpansion('auth', 20, { reformulations: ['jwt', 'tokens'], temporalConcretizations: [], entityExtractions: [] });
+    const results = await hybrid.searchWithExpansion('auth', 20, { reformulations: ['jwt', 'tokens'], temporalConcretizations: [], entityExtractions: [] }, 'project-a');
     expect(new Set(results.map(item => item.observation.id))).toEqual(new Set(['a', 'b']));
     expect(rerank).toHaveBeenCalledTimes(1);
     expect(residentSearch).not.toHaveBeenCalled();

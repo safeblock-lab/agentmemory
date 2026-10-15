@@ -137,7 +137,8 @@ describe("graph extraction without persistent audit history", () => {
     await expect(harness.sdk.trigger({
       function_id: "mem::graph-extract",
       payload: { observations: [observation("typed-failure-source")], graphJobId: "typed-failure-job" },
-    })).rejects.toMatchObject({ code: "STATE_TX_FAILED" });
+    })).resolves.toMatchObject({ success: true, queued: true, deferred: true });
+    expect(await harness.kv.get(KV.graphDispatchIntents, "graphintent_cf93e0210cc5bef5ffea7a159cde499e08989ece84a227157a54c70bab29a5a6")).toMatchObject({ state: "pending", failureCode: "STATE_TX_FAILED" });
     expect(await harness.kv.list(KV.audit)).toHaveLength(0);
   });
 });

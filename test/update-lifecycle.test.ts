@@ -195,11 +195,24 @@ describe("GitHub release update", () => {
   });
 
   it("rejects release metadata pointing to any other asset URL", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
       tag_name: nextTag, draft: false, prerelease: false,
-      assets: [{ name: assetName, browser_download_url: "https://evil.example/package.tgz" }],
-    }))));
-    await expect(checkForUpdate()).rejects.toThrow("missing verified asset");
+      assets: [
+        { name: assetName, browser_download_url: "https://evil.example/package.tgz" },
+        { name: "SHA256SUMS.txt", browser_download_url: base + "SHA256SUMS.txt" },
+      ],
+    })));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(checkForUpdate()).rejects.toThrow(`GitHub release contains an invalid URL for asset ${assetName}.`);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects release metadata missing its verified checksum asset", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({
+      tag_name: nextTag, draft: false, prerelease: false,
+      assets: [{ name: assetName, browser_download_url: base + assetName }],
+    })));
+    await expect(checkForUpdate()).rejects.toThrow("missing verified asset SHA256SUMS.txt");
   });
 
   it("rejects a mismatched package checksum before installation", async () => {

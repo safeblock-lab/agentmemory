@@ -1,0 +1,386 @@
+{
+  "nodes": [
+    {
+      "id": "gn_mv309chj_18148e2bb068",
+      "type": "project",
+      "name": "agentmemory-realproof-20261010",
+      "properties": {
+        "audience": "project",
+        "timestamp": "2026-10-10"
+      },
+      "sourceObservationIds": [
+        "obs_mv2ndcdv_a341dbce4881",
+        "obs_mv2ndsfr_0db1ba9ee8c6"
+      ],
+      "createdAt": "2026-10-10T23:08:17.133Z"
+    },
+    {
+      "id": "gn_mv309chj_116ca66ab1dc",
+      "type": "function",
+      "name": "dual-llm-routing",
+      "properties": {
+        "description": "Dynamically routes 13 LLM functions between primary and auxiliary models",
+        "valid_from": "2026-08-22",
+        "valid_to": "current"
+      },
+      "sourceObservationIds": [
+        "obs_mv2ndcdv_a341dbce4881",
+        "obs_mv2ndsfr_0db1ba9ee8c6"
+      ],
+      "createdAt": "2026-10-10T23:08:17.133Z"
+    },
+    {
+      "id": "gn_mv309chj_5c6ec26f4c82",
+      "type": "function",
+      "name": "primary-fireworks-model",
+      "properties": {
+        "role": "Primary LLM provider",
+        "valid_from": "unknown",
+        "valid_to": "2026-08-23"
+      },
+      "sourceObservationIds": [
+        "obs_mv2ndcdv_a341dbce4881",
+        "obs_mv2ndsfr_0db1ba9ee8c6"
+      ],
+      "createdAt": "2026-10-10T23:08:17.133Z"
+    },
+    {
+      "id": "gn_mv309chj_068cfd8a419e",
+      "type": "function",
+      "name": "auxiliary-model-provider",
+      "properties": {
+        "role": "Auxiliary LLM provider",
+        "valid_from": "2026-08-22",
+        "valid_to": "current"
+      },
+      "sourceObservationIds": [
+        "obs_mv2ndcdv_a341dbce4881",
+        "obs_mv2ndsfr_0db1ba9ee8c6"
+      ],
+      "createdAt": "2026-10-10T23:08:17.133Z"
+    },
+    {
+      "id": "gn_mv309chj_23c6747f8e36",
+      "type": "function",
+      "name": "AGENTMEMORY_SUMMARY_LLM",
+      "properties": {
+        "type": "LLM task",
+        "valid_from": "2026-08-23",
+        "valid_to": "current"
+      },
+      "sourceObservationIds": [
+        "obs_mv2ndcdv_a341dbce4881",
+        "obs_mv2ndsfr_0db1ba9ee8c6"
+      ],
+      "createdAt": "2026-10-10T23:08:17.133Z"
+    },
+    {
+      "id": "gn_mv309chj_012a9da14979",
+      "type": "function",
+      "name": "AGENTMEMORY_FLOW_COMPRESSION_LLM",
+      "properties": {
+        "type": "LLM task",
+        "valid_from": "2026-08-23",
+        "valid_to": "current"
+      },
+      "sourceObservationIds": [
+        "obs_mv2ndcdv_a341dbce4881",
+        "obs_mv2ndsfr_0db1ba9ee8c6"
+      ],
+      "createdAt": "2026-10-10T23:08:17.133Z"
+    },
+    {
+      "id": "gn_mv309chj_20a27ff77f80",
+      "type": "project",
+      "name": "dual-llm-routing",
+      "properties": {
+        "type": "Git branch",
+        "valid_from": "2026-08-22",
+        "valid_to": "current"
+      },
+      "sourceObservationIds": [
+        "obs_mv2ndcdv_a341dbce4881",
+        "obs_mv2ndsfr_0db1ba9ee8c6"
+      ],
+      "createdAt": "2026-10-10T23:08:17.133Z"
+    },
+    {
+      "id": "gn_mv309chj_b7f84c8374f7",
+      "type": "file",
+      "name": "C:/Users/harus/.agentmemory/.env",
+      "properties": {
+        "type": "Environment configuration",
+        "valid_from": "2026-08-23",
+        "valid_to": "current"
+      },
+      "sourceObservationIds": [
+        "obs_mv2ndcdv_a341dbce4881",
+        "obs_mv2ndsfr_0db1ba9ee8c6"
+      ],
+      "createdAt": "2026-10-10T23:08:17.133Z"
+    },
+    {
+      "id": "gn_mv309chj_59c1259b8a99",
+      "type": "file",
+      "name": "C:/Users/harus/.agentmemory/Start-AgentMemory.ps1",
+      "properties": {
+        "type": "Startup script",
+        "valid_from": "2026-08-23",
+        "valid_to": "current"
+      },
+      "sourceObservationIds": [
+        "obs_mv2ndcdv_a341dbce4881",
+        "obs_mv2ndsfr_0db1ba9ee8c6"
+      ],
+      "createdAt": "2026-10-10T23:08:17.133Z"
+    },
+    {
+      "id": "gn_mv309chj_bef781012b9b",
+      "type": "concept",
+      "name": "environment-configuration",
+      "properties": {
+        "valid_from": "2026-08-23",
+        "valid_to": "current"
+      },
+      "sourceObservationIds": [
+        "obs_mv2ndcdv_a341dbce4881",
+        "obs_mv2ndsfr_0db1ba9ee8c6"
+      ],
+      "createdAt": "2026-10-10T23:08:17.133Z"
+    },
+    {
+      "id": "gn_mv309chj_ce397b88372b",
+      "type": "concept",
+      "name": "Ollama-API-security",
+      "properties": {
+        "description": "Restricted to localhost:11434",
+        "valid_from": "2026-08-22",
+        "valid_to": "current"
+      },
+      "sourceObservationIds": [
+        "obs_mv2ndcdv_a341dbce4881",
+        "obs_mv2ndsfr_0db1ba9ee8c6"
+      ],
+      "createdAt": "2026-10-10T23:08:17.133Z"
+    }
+  ],
+  "edges": [
+    {
+      "id": "ge_mv309chj_c6f555ce622f",
+      "type": "implements",
+      "sourceNodeId": "gn_mv309chj_18148e2bb068",
+      "targetNodeId": "gn_mv309chj_116ca66ab1dc",
+      "weight": 1,
+      "sourceObservationIds": [
+        "obs_mv2ndcdv_a341dbce4881",
+        "obs_mv2ndsfr_0db1ba9ee8c6"
+      ],
+      "createdAt": "2026-10-10T23:08:17.133Z",
+      "tcommit": "2026-10-10T23:08:17.133Z",
+      "tvalid": "2026-08-22",
+      "context": {
+        "reasoning": "Dual-LLM routing architecture was implemented in the AgentMemory project fork (agentmemory-realproof-20261010) as per the August 22 observation.",
+        "sentiment": "positive",
+        "alternatives": [
+          "Alternative routing could have been monolithic (single-model)"
+        ],
+        "confidence": 1
+      },
+      "version": 1,
+      "isLatest": true
+    },
+    {
+      "id": "ge_mv309chj_900888fb1d43",
+      "type": "modifies",
+      "sourceNodeId": "gn_mv309chj_116ca66ab1dc",
+      "targetNodeId": "gn_mv309chj_5c6ec26f4c82",
+      "weight": 0.7,
+      "sourceObservationIds": [
+        "obs_mv2ndcdv_a341dbce4881",
+        "obs_mv2ndsfr_0db1ba9ee8c6"
+      ],
+      "createdAt": "2026-10-10T23:08:17.133Z",
+      "tcommit": "2026-10-10T23:08:17.133Z",
+      "tvalid": "2026-08-22",
+      "tvalidEnd": "2026-08-23",
+      "context": {
+        "reasoning": "Primary Fireworks model was the default provider before August 23 configuration changes.",
+        "sentiment": "neutral",
+        "alternatives": [
+          "Primary model could have remained unchanged"
+        ],
+        "confidence": 0.7
+      },
+      "version": 1,
+      "isLatest": true
+    },
+    {
+      "id": "ge_mv309chj_9cb9304ebd0a",
+      "type": "uses",
+      "sourceNodeId": "gn_mv309chj_116ca66ab1dc",
+      "targetNodeId": "gn_mv309chj_068cfd8a419e",
+      "weight": 1,
+      "sourceObservationIds": [
+        "obs_mv2ndcdv_a341dbce4881",
+        "obs_mv2ndsfr_0db1ba9ee8c6"
+      ],
+      "createdAt": "2026-10-10T23:08:17.133Z",
+      "tcommit": "2026-10-10T23:08:17.133Z",
+      "tvalid": "2026-08-22",
+      "context": {
+        "reasoning": "Implemented to handle dynamic routing of LLM functions alongside primary model.",
+        "sentiment": "positive",
+        "alternatives": [
+          "Could have used a single model for all tasks"
+        ],
+        "confidence": 1
+      },
+      "version": 1,
+      "isLatest": true
+    },
+    {
+      "id": "ge_mv309chj_c28c4b4cc433",
+      "type": "routes",
+      "sourceNodeId": "gn_mv309chj_116ca66ab1dc",
+      "targetNodeId": "gn_mv309chj_23c6747f8e36",
+      "weight": 1,
+      "sourceObservationIds": [
+        "obs_mv2ndcdv_a341dbce4881",
+        "obs_mv2ndsfr_0db1ba9ee8c6"
+      ],
+      "createdAt": "2026-10-10T23:08:17.133Z",
+      "tcommit": "2026-10-10T23:08:17.133Z",
+      "tvalid": "2026-08-23",
+      "context": {
+        "reasoning": "Explicitly configured to use auxiliary provider instead of primary Fireworks model.",
+        "sentiment": "positive",
+        "alternatives": [
+          "Could have remained on primary model"
+        ],
+        "confidence": 1
+      },
+      "version": 1,
+      "isLatest": true
+    },
+    {
+      "id": "ge_mv309chj_a37390f713cf",
+      "type": "routes",
+      "sourceNodeId": "gn_mv309chj_116ca66ab1dc",
+      "targetNodeId": "gn_mv309chj_012a9da14979",
+      "weight": 1,
+      "sourceObservationIds": [
+        "obs_mv2ndcdv_a341dbce4881",
+        "obs_mv2ndsfr_0db1ba9ee8c6"
+      ],
+      "createdAt": "2026-10-10T23:08:17.133Z",
+      "tcommit": "2026-10-10T23:08:17.133Z",
+      "tvalid": "2026-08-23",
+      "context": {
+        "reasoning": "Explicitly configured to use auxiliary provider instead of primary Fireworks model.",
+        "sentiment": "positive",
+        "alternatives": [
+          "Could have remained on primary model"
+        ],
+        "confidence": 1
+      },
+      "version": 1,
+      "isLatest": true
+    },
+    {
+      "id": "ge_mv309chj_9e294fa06e3f",
+      "type": "modifies",
+      "sourceNodeId": "gn_mv309chj_116ca66ab1dc",
+      "targetNodeId": "gn_mv309chj_b7f84c8374f7",
+      "weight": 1,
+      "sourceObservationIds": [
+        "obs_mv2ndcdv_a341dbce4881",
+        "obs_mv2ndsfr_0db1ba9ee8c6"
+      ],
+      "createdAt": "2026-10-10T23:08:17.133Z",
+      "tcommit": "2026-10-10T23:08:17.133Z",
+      "tvalid": "2026-08-23",
+      "context": {
+        "reasoning": "Environment variables (including AGENTMEMORY_VERBOSE=1) were configured to enable verbose logging and routing criteria.",
+        "sentiment": "positive",
+        "alternatives": [
+          "Could have used default logging levels"
+        ],
+        "confidence": 1
+      },
+      "version": 1,
+      "isLatest": true
+    },
+    {
+      "id": "ge_mv309chj_960f1ffcd438",
+      "type": "executes",
+      "sourceNodeId": "gn_mv309chj_59c1259b8a99",
+      "targetNodeId": "gn_mv309chj_116ca66ab1dc",
+      "weight": 1,
+      "sourceObservationIds": [
+        "obs_mv2ndcdv_a341dbce4881",
+        "obs_mv2ndsfr_0db1ba9ee8c6"
+      ],
+      "createdAt": "2026-10-10T23:08:17.133Z",
+      "tcommit": "2026-10-10T23:08:17.133Z",
+      "tvalid": "2026-08-23",
+      "context": {
+        "reasoning": "Startup script propagates environment variables and initializes the routing architecture.",
+        "sentiment": "positive",
+        "alternatives": [
+          "Could have been a separate CLI command"
+        ],
+        "confidence": 1
+      },
+      "version": 1,
+      "isLatest": true
+    },
+    {
+      "id": "ge_mv309chj_89d66ccd32f2",
+      "type": "restricts",
+      "sourceNodeId": "gn_mv309chj_116ca66ab1dc",
+      "targetNodeId": "gn_mv309chj_ce397b88372b",
+      "weight": 1,
+      "sourceObservationIds": [
+        "obs_mv2ndcdv_a341dbce4881",
+        "obs_mv2ndsfr_0db1ba9ee8c6"
+      ],
+      "createdAt": "2026-10-10T23:08:17.133Z",
+      "tcommit": "2026-10-10T23:08:17.133Z",
+      "tvalid": "2026-08-22",
+      "context": {
+        "reasoning": "Security checks implemented to limit API calls to localhost:11434.",
+        "sentiment": "positive",
+        "alternatives": [
+          "Could have allowed external API calls"
+        ],
+        "confidence": 1
+      },
+      "version": 1,
+      "isLatest": true
+    },
+    {
+      "id": "ge_mv309chj_7bba55209325",
+      "type": "optimizes_for",
+      "sourceNodeId": "gn_mv309chj_116ca66ab1dc",
+      "targetNodeId": "gn_mv309chj_bef781012b9b",
+      "weight": 0.9,
+      "sourceObservationIds": [
+        "obs_mv2ndcdv_a341dbce4881",
+        "obs_mv2ndsfr_0db1ba9ee8c6"
+      ],
+      "createdAt": "2026-10-10T23:08:17.133Z",
+      "tcommit": "2026-10-10T23:08:17.133Z",
+      "tvalid": "2026-08-23",
+      "context": {
+        "reasoning": "Provider selection criteria routed routine operations to auxiliary model to reduce costs.",
+        "sentiment": "positive",
+        "alternatives": [
+          "Could have used primary model for all tasks"
+        ],
+        "confidence": 0.9
+      },
+      "version": 1,
+      "isLatest": true
+    }
+  ]
+}

@@ -33,6 +33,10 @@ async function withAdmission<T>(family: string, run: () => Promise<T>): Promise<
   }
 }
 
+export function withConsolidationAdmission<T>(run: () => Promise<T>): Promise<T> {
+  return withAdmission("consolidation", run);
+}
+
 export function withGraphLeaseAdmission<T>(run: () => Promise<T>): Promise<T> {
   // The exclusive maintenance owner may import graph state under its own lock.
   if (maintenanceContext.getStore()?.active) return run();

@@ -111,7 +111,7 @@ describe("bundled iii-engine artifacts", () => {
     });
   });
 
-  it("rejects the wrong engine version, capability, and source pin", () => {
+  it("rejects the wrong engine version, a missing required capability, and source pin", () => {
     const wrongVersion = createBundle();
     const versionManifest = JSON.parse(
       readFileSync(join(wrongVersion.root, "manifest.json"), "utf8"),
@@ -127,7 +127,9 @@ describe("bundled iii-engine artifacts", () => {
     const capabilityManifest = JSON.parse(
       readFileSync(join(missingCapability.root, "manifest.json"), "utf8"),
     ) as { capabilities: string[] };
-    capabilityManifest.capabilities = [];
+    capabilityManifest.capabilities = REQUIRED_ENGINE_CAPABILITIES.filter(
+      (capability) => capability !== "state::storage_retention_v1",
+    );
     writeFileSync(
       join(missingCapability.root, "manifest.json"),
       JSON.stringify(capabilityManifest),
@@ -159,7 +161,9 @@ describe("bundled iii-engine artifacts", () => {
     const capabilityManifest = JSON.parse(
       readFileSync(join(badCapability.root, "manifest.json"), "utf8"),
     ) as { capabilities: string[] };
-    capabilityManifest.capabilities = [];
+    capabilityManifest.capabilities = REQUIRED_ENGINE_CAPABILITIES.filter(
+      (capability) => capability !== "state::storage_retention_v1",
+    );
     writeFileSync(
       join(badCapability.root, "manifest.json"),
       JSON.stringify(capabilityManifest),

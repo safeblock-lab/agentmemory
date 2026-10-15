@@ -8,6 +8,60 @@ import { recordAudit } from "./audit.js";
 import { applyBatchEffect } from "../state/batch-effects.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 
+export interface ContextLessonSelection {
+  lessons: Lesson[];
+  partial: boolean;
+}
+
+export async function selectContextLessons(
+  kv: StateKV,
+  project: string,
+): Promise<ContextLessonSelection> {
+  const eligible: Lesson[] = [];
+  let bytesRead = 0;
+  let pagesRead = 0;
+  let partial = false;
+  let byteLimitReached = false;
+
+  for await (const page of kv.pages<Lesson>(KV.lessons, { limit: 12, maxBytes: 16_384 })) {
+    pagesRead++;
+    for (const lesson of page.items) {
+      if (!lesson || typeof lesson !== "object" || typeof lesson.id !== "string" || !lesson.id) {
+        partial = true;
+        continue;
+      }
+      if (typeof lesson.content !== "string" || typeof lesson.context !== "string"
+        || !Number.isFinite(lesson.confidence)) {
+        partial = true;
+        continue;
+      }
+      const bytes = Buffer.byteLength(JSON.stringify(lesson));
+      if (bytesRead + bytes > 262_144) {
+        partial = true;
+        byteLimitReached = true;
+        break;
+      }
+      bytesRead += bytes;
+      if (!lesson.deleted && (!lesson.project || lesson.project === project)) {
+        eligible.push(lesson);
+        eligible.sort((a, b) => {
+          const scoreA = (a.project === project ? 1.5 : 1) * a.confidence;
+          const scoreB = (b.project === project ? 1.5 : 1) * b.confidence;
+          return scoreB - scoreA;
+        });
+        if (eligible.length > 10) eligible.pop();
+      }
+    }
+    if (byteLimitReached) break;
+    if (pagesRead >= 16) {
+      if (page.next_cursor !== null) partial = true;
+      break;
+    }
+  }
+
+  return { lessons: eligible, partial };
+}
+
 // Dedicated BM25 index for lessons, with the full records cached
 // alongside it. Recall previously listed every lesson from KV and
 // substring-matched per query — O(corpus) per call with no term

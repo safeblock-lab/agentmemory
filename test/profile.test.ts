@@ -29,6 +29,19 @@ function mockKV() {
       const entries = store.get(scope);
       return entries ? (Array.from(entries.values()) as T[]) : [];
     },
+    pages: async function* <T>(scope: string) {
+      yield { items: Array.from(store.get(scope)?.values() ?? []) as T[], next_cursor: null };
+    },
+    retrieval: async (request: { action: string; project: string }) => {
+      if (request.action !== "project_sessions_page") throw new Error("Unexpected retrieval action");
+      const sessions = Array.from(store.get("mem:sessions")?.values() ?? []) as Session[];
+      return {
+        items: sessions.filter(session => session.project === request.project).map(session => ({
+          session_id: session.id, source_key: session.id, row_version: "1", session,
+        })),
+        status: "ready", partial: false, next_cursor: null, revision: 1, epoch: 1,
+      };
+    },
   };
 }
 

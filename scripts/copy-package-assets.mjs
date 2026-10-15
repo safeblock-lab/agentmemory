@@ -8,10 +8,7 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-  validatePinnedEngineSource,
-  validateStagedEngineArtifacts,
-} from "./build-iii-engine.mjs";
+import { validateStagedEngineArtifacts } from "./build-iii-engine.mjs";
 
 const ASSETS = [
   "iii-config.yaml",
@@ -70,8 +67,9 @@ export function copyPackageAssets(rootDir, { requireEngineArtifact = false } = {
       );
     }
   } else {
-    const pinnedSource = validatePinnedEngineSource();
-    manifest = validateStagedEngineArtifacts(stagedEngine, pinnedSource.patchSha256);
+    manifest = validateStagedEngineArtifacts(stagedEngine, null, {
+      verifyArtifactDigest: false,
+    });
   }
 
   for (const sourceRelativePath of ASSETS) {

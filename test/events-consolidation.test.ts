@@ -60,6 +60,7 @@ function mockSdk(opts?: { rejectFor?: string; enqueueResult?: unknown }) {
       if (input.function_id === "mem::summary-enqueue") {
         return opts?.enqueueResult ?? { success: true, queued: true, jobId: "job_1" };
       }
+      if (input.function_id === "mem::skill-lifecycle-session-stopped") return { success: true, captured: true };
       return { ok: true };
     },
   );

@@ -84,17 +84,23 @@ export class HybridSearch {
   async search(
     query: string,
     limit = 20,
+    projectOrSignal?: string | AbortSignal,
     signal?: AbortSignal,
   ): Promise<HybridSearchResult[]> {
-    return this.finalRerank(query, await this.tripleStreamSearch(query, limit, undefined, signal), limit, signal);
+    const project = typeof projectOrSignal === "string" ? projectOrSignal.trim() || undefined : undefined;
+    const activeSignal = typeof projectOrSignal === "string" ? signal : projectOrSignal;
+    return this.finalRerank(query, await this.tripleStreamSearch(query, limit, undefined, activeSignal, project), limit, activeSignal);
   }
 
   async searchWithExpansion(
     query: string,
     limit: number,
     expansion: QueryExpansion,
+    projectOrSignal?: string | AbortSignal,
     signal?: AbortSignal,
   ): Promise<HybridSearchResult[]> {
+    const project = typeof projectOrSignal === "string" ? projectOrSignal.trim() || undefined : undefined;
+    const activeSignal = typeof projectOrSignal === "string" ? signal : projectOrSignal;
     const allQueries = [
       query,
       ...expansion.reformulations,
@@ -108,7 +114,7 @@ export class HybridSearch {
 
     if (allQueries.length > 16) throw new IndexedRetrievalError('STATE_RETRIEVAL_RESOURCE_LIMIT', 'Query expansion exceeds 16 variants.');
     const resultSets: HybridSearchResult[][] = [];
-    for (const q of new Set(allQueries)) resultSets.push(await this.tripleStreamSearch(q, limit, allEntities, signal));
+    for (const q of new Set(allQueries)) resultSets.push(await this.tripleStreamSearch(q, limit, allEntities, activeSignal, project));
 
     const merged = new Map<string, HybridSearchResult>();
     for (const results of resultSets) {
@@ -127,7 +133,7 @@ export class HybridSearch {
           (a.observation.id < b.observation.id ? -1 : a.observation.id > b.observation.id ? 1 : 0),
       )
       .slice(0, Math.max(limit, 50));
-    return this.finalRerank(query, fused, limit, signal);
+    return this.finalRerank(query, fused, limit, activeSignal);
   }
 
   private async tripleStreamSearch(
@@ -135,11 +141,12 @@ export class HybridSearch {
     limit: number,
     entityHints?: string[],
     signal?: AbortSignal,
+    project?: string,
   ): Promise<HybridSearchResult[]> {
     const candidateLimit = Math.min(100, Math.max(50, limit * 2));
     if (this.kv.indexedRetrieval && !this.indexedVector) throw new IndexedRetrievalError('STATE_INDEX_NOT_READY', 'Local embedding provider is required.');
     const bm25Results = this.indexedVector
-      ? await this.indexedVector.keywordSearch(query, candidateLimit)
+      ? await this.indexedVector.keywordSearch(query, candidateLimit, project)
       : this.bm25.search(query, limit * 2);
 
     let vectorResults: Array<{
@@ -151,7 +158,7 @@ export class HybridSearch {
 
     if (this.indexedVector && this.embeddingProvider) {
       queryEmbedding = await this.embeddingProvider.embed(query);
-      vectorResults = await this.indexedVector.search(queryEmbedding, candidateLimit);
+      vectorResults = await this.indexedVector.search(queryEmbedding, candidateLimit, project);
     } else if (this.vector && this.embeddingProvider && this.vector.size > 0) {
       try {
         queryEmbedding = await this.embeddingProvider.embed(query);
@@ -177,8 +184,12 @@ export class HybridSearch {
           limit,
           5,
           signal,
+          project,
         );
         graphResults = [...graph.entities, ...graph.chunks];
+        if (graph.partial) {
+          console.warn("Graph enrichment is partial.", graph.reason ?? "Project membership or graph-index coverage is incomplete.");
+        }
       } catch (error) {
         if (signal?.aborted) {
           throw signal.reason instanceof Error

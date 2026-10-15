@@ -23,9 +23,10 @@ export function nativeCount(value: unknown): number | null {
 }
 
 export async function readNativeIndexStatus(kv: StateKV, provider: EmbeddingProvider | null) {
-  const [status, marker] = await Promise.all([
+  const [status, marker, projectIndexes] = await Promise.all([
     retrievalRequest<IndexedStatus>(kv, { action: 'index_status' }),
     kv.get<{ status: string; model: string; dimensions: number; generation: string }>(KV.config, 'indexed-corpus'),
+    kv.get<ProjectIndexProgress>(KV.config, 'project-index-maintenance'),
   ]);
   const selected = provider && status.version === 1 && Array.isArray(status.semantic)
     ? status.semantic.find(item => item.index_id === 'observations' && item.model === provider.name &&
@@ -48,17 +49,23 @@ export async function readNativeIndexStatus(kv: StateKV, provider: EmbeddingProv
     graphReady;
   return {
     lexicalCount, vectorCount, dirtyCount, ready, graphReady, graph,
+    projectIndexes: projectIndexes ?? null,
     lexicalReady: selected.lexical_ready === true,
     sourcePrepared: selected.source_prepared === true,
     coverageReady: selected.coverage_ready === true,
     identity: { indexId: selected.index_id, model: selected.model, dimensions: selected.dimensions, generation: selected.generation },
   };
 }
-export async function retrievalRequest<T>(kv: StateKV, payload: Record<string, unknown>): Promise<T> {
+export async function retrievalRequest<T>(kv: StateKV, payload: Record<string, unknown>, options?: { timeoutMs?: number }): Promise<T> {
   let result: unknown;
   try {
-    result = await kv.retrieval<unknown>(payload);
+    result = await (options === undefined
+      ? kv.retrieval<unknown>(payload)
+      : kv.retrieval<unknown>(payload, options));
   } catch (error) {
+    if (error instanceof InvocationError && ['STATE_RECENT_CURSOR_STALE', 'STATE_TX_INVALID_REQUEST'].includes(error.code)) {
+      throw new IndexedRetrievalError(error.code, 'Native retrieval cursor or request is no longer valid.');
+    }
     if (error instanceof InvocationError && error.code === 'STATE_RETRIEVAL_RESOURCE_LIMIT') {
       throw new IndexedRetrievalError('STATE_RETRIEVAL_RESOURCE_LIMIT', 'Native indexed retrieval exceeded its response resource limit.');
     }
@@ -75,41 +82,56 @@ export function comparePositions(a: { position: string }, b: { position: string 
   const left = BigInt(a.position), right = BigInt(b.position);
   return left < right ? -1 : left > right ? 1 : 0;
 }
-export async function indexedGraphItems<T extends { key: string; position: string }>(
-  kv: StateKV, requests: Record<string, unknown>[], signal?: AbortSignal, retain?: (bytes: number) => void,
-): Promise<T[]> {
-  const merged = new Map<string, T>();
-  let generation: string | undefined;
-  let bytes = 0;
-  for (const payload of requests) {
-    signal?.throwIfAborted();
-    const result = await retrievalRequest<{ items: T[]; generation: string }>(kv, {
-      ...payload, max_items: 16_384, max_bytes: 8 * 1024 * 1024,
-    });
-    if (!Array.isArray(result.items) || typeof result.generation !== 'string') throw new IndexedRetrievalError('STATE_TX_INVALID_REQUEST', 'Invalid indexed graph response.');
-    if (generation !== undefined && generation !== result.generation) throw new IndexedRetrievalError('STATE_GRAPH_RECOVERY_REQUIRED', 'Graph generation changed between indexed requests.');
-    generation = result.generation;
-    for (const item of result.items) {
-      if (typeof item.key !== 'string' || !/^\d+$/.test(item.position)) throw new IndexedRetrievalError('STATE_TX_INVALID_REQUEST', 'Invalid indexed insertion position.');
-      const previous = merged.get(item.key);
-      if (previous) {
-        for (const field of ['entity', 'observation'] as const) {
-          if (field in previous && field in item) (previous as unknown as Record<string, unknown>)[field] ||= (item as unknown as Record<string, unknown>)[field];
-        }
-        continue;
-      }
-      const itemBytes = Buffer.byteLength(JSON.stringify(item));
-      bytes += itemBytes;
-      if (bytes > 64 * 1024 * 1024) throw new IndexedRetrievalError('STATE_RETRIEVAL_RESOURCE_LIMIT', 'Indexed graph response exceeds 64 MiB.');
-      retain?.(itemBytes);
-      merged.set(item.key, item);
-    }
-  }
-  signal?.throwIfAborted();
-  return [...merged.values()].sort(comparePositions);
-}
 export function chunks<T>(items: T[], size = 512): T[][] {
   const result: T[][] = [];
   for (let offset = 0; offset < items.length; offset += size) result.push(items.slice(offset, offset + size));
   return result;
+}
+
+interface ProjectIndexProgress {
+  next: number;
+  nextAttemptAt: number;
+  sources: Record<string, { status: string; processed: number; cursor: string; revision: string; incompleteRows?: string }>;
+  errorCode?: string;
+}
+
+export function createProjectIndexMaintenance(
+  kv: StateKV, paused: () => boolean, foregroundBusy: () => boolean,
+  log: (message: string) => void,
+): () => Promise<void> {
+  let running = false;
+  return async () => {
+    if (paused() || foregroundBusy() || running || !kv.indexedRetrieval) return;
+    running = true;
+    try {
+      const saved = await kv.get<ProjectIndexProgress>(KV.config, 'project-index-maintenance');
+      const progress: ProjectIndexProgress = saved ?? { next: 0, nextAttemptAt: 0, sources: {} };
+      if (progress.nextAttemptAt > Date.now() || paused() || foregroundBusy()) return;
+      const ordinal = Number.isInteger(progress.next) ? Math.abs(progress.next % 3) : 0;
+      const source = ['sessions', 'summaries', 'vectors'][ordinal]!;
+      try {
+        const payload = source === 'vectors'
+          ? { action: 'project_vectors_prepare', index_id: 'observations', max_rows: 16, max_bytes: 65_536 }
+          : { action: 'project_catalog_prepare', source, max_rows: 16, max_bytes: 65_536 };
+        const result = await retrievalRequest<Record<string, unknown>>(kv, payload);
+        if (!['pending', 'partial', 'ready'].includes(String(result.status)) ||
+            !Number.isSafeInteger(result.processed) || Number(result.processed) < 0 || Number(result.processed) > 16 ||
+            typeof result.cursor !== 'string' || typeof result.revision !== 'string') {
+          throw new IndexedRetrievalError('STATE_TX_INVALID_RESPONSE', 'Invalid project index maintenance response.');
+        }
+        progress.sources[source] = { status: String(result.status), processed: Number(result.processed),
+          cursor: result.cursor, revision: result.revision,
+          ...(typeof result.incomplete_rows === 'string' ? { incompleteRows: result.incomplete_rows } : {}) };
+        delete progress.errorCode;
+        progress.nextAttemptAt = Date.now() + 60_000;
+      } catch (error) {
+        progress.errorCode = error instanceof IndexedRetrievalError ? error.code : 'STATE_INDEX_NOT_READY';
+        progress.nextAttemptAt = Date.now() + 15 * 60_000;
+        log(`Project index maintenance deferred (${progress.errorCode}).`);
+      }
+      // Native cursors commit with each bounded cut; this record is progress, not authority.
+      progress.next = (ordinal + 1) % 3;
+      await kv.set(KV.config, 'project-index-maintenance', progress);
+    } finally { running = false; }
+  };
 }

@@ -1,8 +1,9 @@
-import type { LlmCallOptions, MemoryProvider, OpenAIReasoningEffort } from "../types.js";
+import type { LlmCallOptions, LlmResponseFormat, MemoryProvider, OpenAIReasoningEffort } from "../types.js";
 import { getEnvVar, isDeepSeekThinkingEnabled } from "../config.js";
 import { fetchWithTimeout } from "./_fetch.js";
 import { extractLlmTokenUsage, startLlmCallTelemetry } from "./_llm-logging.js";
 import { taskOutputTokens } from "./task-output-limits.js";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   DEFAULT_AZURE_API_VERSION,
   buildAuthHeaders,
@@ -13,6 +14,20 @@ import {
 } from "./_openai-shared.js";
 
 const DEFAULT_TIMEOUT_MS = 60_000;
+interface StrictGraphResponseBinding {
+  endpoint: string; model: string; timeoutMs: number; maxRequestBytes: number; maxResponseBytes: number; maxOutputTokens: number;
+}
+const strictGraphResponse = new AsyncLocalStorage<{ binding: Readonly<StrictGraphResponseBinding>; admit: () => Promise<void>; used: boolean }>();
+export function withStrictGraphResponse<T>(binding: StrictGraphResponseBinding, admit: () => Promise<void>, run: () => Promise<T>): Promise<T> {
+  return strictGraphResponse.run({ binding: Object.freeze({ ...binding }), admit, used: false }, run);
+}
+
+export class OpenAIHttpError extends Error {
+  constructor(readonly status: number) {
+    super(`OpenAI API error (${status})`);
+    this.name = "OpenAIHttpError";
+  }
+}
 
 export interface OpenAIProviderOptions {
   timeoutMs?: number;
@@ -95,12 +110,9 @@ export class OpenAIProvider implements MemoryProvider {
     return this.call(systemPrompt, userPrompt, "summarize", options);
   }
 
-  private async call(
-    systemPrompt: string,
-    userPrompt: string,
-    operation: "compress" | "summarize",
-    options?: LlmCallOptions,
-  ): Promise<string> {
+  private serializeRequest(
+    operation: "compress" | "summarize", systemPrompt: string, userPrompt: string, options?: LlmCallOptions,
+  ): { endpoint: string; body: string; thinkingRequest?: "enabled" | "disabled" } {
     const url = buildChatUrl(this.baseUrl, this.isAzure, this.azureApiVersion);
     const isDeepSeek = isDeepSeekUrl(this.baseUrl);
     const thinkingOverride = options?.thinking;
@@ -110,12 +122,6 @@ export class OpenAIProvider implements MemoryProvider {
         ? (this.noThink || !isDeepSeekThinkingEnabled() ? "disabled" : "enabled")
         : (thinkingOverride ? "enabled" : "disabled"))
       : undefined;
-    const telemetry = startLlmCallTelemetry({
-      provider: isDeepSeek ? "deepseek" : "openai",
-      model: this.model,
-      operation,
-      thinkingRequest,
-    });
     const body: Record<string, unknown> = {
       model: this.model,
       max_tokens: taskOutputTokens(options?.task, this.maxTokens, options?.outputTokens),
@@ -153,7 +159,65 @@ export class OpenAIProvider implements MemoryProvider {
       body.thinking = { type: thinkingRequest };
     }
     if (this.keepAlive) body.keep_alive = this.keepAlive;
+    if (options?.responseFormat !== undefined) {
+      validateResponseFormat(options.responseFormat);
+      body.response_format = options.responseFormat;
+    }
 
+    return { endpoint: url, body: JSON.stringify(body), thinkingRequest };
+  }
+
+  private async call(
+    systemPrompt: string,
+    userPrompt: string,
+    operation: "compress" | "summarize",
+    options?: LlmCallOptions,
+  ): Promise<string> {
+    const prepared = this.serializeRequest(operation, systemPrompt, userPrompt, options);
+    const url = prepared.endpoint;
+    const strict = strictGraphResponse.getStore();
+    if (strict) {
+      const binding = strict.binding;
+      const body = JSON.parse(prepared.body) as { model?: unknown; max_tokens?: unknown };
+      if (strict.used || !this.apiKey || operation !== "compress" || options?.task !== "graph_extraction"
+        || url !== binding.endpoint || this.model !== binding.model || body.model !== binding.model
+        || !Number.isSafeInteger(body.max_tokens) || Number(body.max_tokens) < 1 || Number(body.max_tokens) > binding.maxOutputTokens
+        || Buffer.byteLength(prepared.body) > binding.maxRequestBytes) throw new Error("strict_graph_response_preflight_rejected");
+      strict.used = true;
+      const deadline = Date.now() + binding.timeoutMs;
+      await strict.admit();
+      if (Date.now() >= deadline) throw new Error("strict_graph_response_deadline");
+      const response = await fetch(url, {
+        method: "POST", headers: buildAuthHeaders(this.apiKey, this.isAzure), body: prepared.body,
+        redirect: "error", signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
+      });
+      if (!response.ok) { await response.body?.cancel(); throw new OpenAIHttpError(response.status); }
+      if (!response.body) throw new Error("strict_graph_response_body_missing");
+      const reader = response.body.getReader(), chunks: Uint8Array[] = [];
+      let bytes = 0;
+      try {
+        while (true) {
+          const part = await reader.read();
+          if (part.done) break;
+          bytes += part.value.byteLength;
+          if (bytes > binding.maxResponseBytes) { await reader.cancel(); throw new Error("strict_graph_response_limit"); }
+          chunks.push(part.value);
+        }
+      } finally { reader.releaseLock(); }
+      const result = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { choices?: Array<{ message?: { content?: unknown } }>; usage?: unknown };
+      const content = result.choices?.[0]?.message?.content;
+      if (typeof content !== "string" || !content.trim()) throw new Error("strict_graph_response_content_missing");
+      options.onUsage?.({ ...extractLlmTokenUsage(result.usage), responseChars: content.length });
+      return content;
+    }
+    const isDeepSeek = isDeepSeekUrl(this.baseUrl);
+    const thinkingRequest = prepared.thinkingRequest;
+    const telemetry = startLlmCallTelemetry({
+      provider: isDeepSeek ? "deepseek" : "openai",
+      model: this.model,
+      operation,
+      thinkingRequest,
+    });
     // Bound the request via the shared fetchWithTimeout helper, which
     // owns the AbortController + clearTimeout cleanup for every raw-fetch
     // provider (minimax, openrouter, gemini, openrouter-embed, etc.).
@@ -167,7 +231,7 @@ export class OpenAIProvider implements MemoryProvider {
         {
           method: "POST",
           headers: buildAuthHeaders(this.apiKey, this.isAzure),
-          body: JSON.stringify(body),
+          body: prepared.body,
         },
         this.timeoutMs,
       );
@@ -184,8 +248,8 @@ export class OpenAIProvider implements MemoryProvider {
 
     if (!response.ok) {
       telemetry.failure({ httpStatus: response.status, errorKind: "provider_response" });
-      const text = await response.text();
-      throw new Error(`OpenAI API error (${response.status}): ${text}`);
+      await response.body?.cancel().catch(() => undefined);
+      throw new OpenAIHttpError(response.status);
     }
 
     let data: {
@@ -245,6 +309,84 @@ function isDeepSeekUrl(baseUrl: string): boolean {
     return hostname === "deepseek.com" || hostname.endsWith(".deepseek.com");
   } catch {
     return false;
+  }
+}
+
+function validateResponseFormat(value: unknown): asserts value is LlmResponseFormat {
+  if (!isPlainRecord(value)) throw new TypeError("Invalid OpenAI response format.");
+  if (value.type === "json_object") {
+    if (!hasOnlyOwnKeys(value, ["type"])) throw new TypeError("Invalid OpenAI response format.");
+    return;
+  }
+  if (value.type !== "json_schema" || !hasOnlyOwnKeys(value, ["type", "json_schema"])) {
+    throw new TypeError("Invalid OpenAI response format.");
+  }
+
+  const jsonSchema = value.json_schema;
+  if (!isPlainRecord(jsonSchema) || !hasOnlyOwnKeys(jsonSchema, ["name", "strict", "schema"]) ||
+    typeof jsonSchema.name !== "string" || jsonSchema.name.trim().length === 0 ||
+    typeof jsonSchema.strict !== "boolean" || !isJsonSchema(jsonSchema.schema)) {
+    throw new TypeError("Invalid OpenAI JSON schema response format.");
+  }
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function hasOnlyOwnKeys(value: object, keys: string[]): boolean {
+  const ownKeys = Reflect.ownKeys(value);
+  return ownKeys.length === keys.length && keys.every(key => Object.hasOwn(value, key));
+}
+
+function isJsonSchema(value: unknown, ancestors = new Set<object>()): value is Record<string, unknown> {
+  if (!isPlainRecord(value) || ancestors.has(value)) return false;
+  ancestors.add(value);
+  try {
+    for (const key of Reflect.ownKeys(value)) {
+      if (typeof key !== "string") return false;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor?.enumerable || !("value" in descriptor) || !isJsonValue(descriptor.value, ancestors)) {
+        return false;
+      }
+    }
+    return true;
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
+function isJsonValue(value: unknown, ancestors: Set<object>): boolean {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value !== "object" || ancestors.has(value)) return false;
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      if (Object.getPrototypeOf(value) !== Array.prototype || Reflect.ownKeys(value).length !== value.length + 1) {
+        return false;
+      }
+      for (let index = 0; index < value.length; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+        if (!descriptor?.enumerable || !("value" in descriptor) || !isJsonValue(descriptor.value, ancestors)) {
+          return false;
+        }
+      }
+      return true;
+    }
+    if (!isPlainRecord(value)) return false;
+    for (const key of Reflect.ownKeys(value)) {
+      if (typeof key !== "string") return false;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor?.enumerable || !("value" in descriptor) || !isJsonValue(descriptor.value, ancestors)) {
+        return false;
+      }
+    }
+    return true;
+  } finally {
+    ancestors.delete(value);
   }
 }
 

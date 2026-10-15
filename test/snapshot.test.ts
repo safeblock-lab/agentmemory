@@ -1,323 +1,218 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
-import { readFileSync, writeFileSync } from "node:fs";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { Writable } from "node:stream";
 import { join } from "node:path";
-import { installGraphStateWire } from "./helpers/graph-state-harness.js";
+import type { SnapshotReadRequest, SnapshotTransport } from "../src/state/snapshot-read-view.js";
 
-vi.mock("../src/logger.js", () => ({
-  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+const controls = vi.hoisted(() => ({ disk: true, stream: false, closeFailure: false, closeEvents: [] as string[], priorBytes: null as number | null, git: [] as string[][] }));
+vi.mock("../src/logger.js", () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
+vi.mock("../src/state/schema.js", () => ({
+  KV: { sessions: "mem:sessions", memories: "mem:memories", graphNodes: "mem:graph:nodes", accessLog: "mem:access", observations: (id: string) => `mem:obs:${id}` },
+  generateId: (prefix: string) => `${prefix}_${randomUUID()}`,
 }));
-
-vi.mock("node:child_process", () => ({
-  execFile: vi.fn(
-    (_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
-      cb(null, { stdout: "abc1234\n", stderr: "" });
-    },
-  ),
+vi.mock("../src/functions/audit.js", () => ({ recordAudit: vi.fn() }));
+vi.mock("../src/functions/graph-jobs.js", () => ({
+  graphKV: (value: unknown) => value, registerGraphJobHandler: vi.fn(),
+  runGraphJob: async (_kv: unknown, _kind: unknown, input: unknown, run: (value: unknown) => unknown) => run(input),
+  withGraphDelta: async (_kv: unknown, run: () => unknown) => run(),
 }));
-
-vi.mock("node:util", async () => {
-  const actual = (await vi.importActual("node:util")) as Record<
-    string,
-    unknown
-  >;
-  return {
-    ...actual,
-    promisify: () => async () => ({ stdout: "abc1234\n", stderr: "" }),
-  };
-});
-
+vi.mock("../src/state/batch-effects.js", () => ({
+  BatchMaintenanceBusyError: class extends Error {}, withBatchMutationLocks: async (_kv: unknown, run: () => unknown) => run(),
+  preserveBatchProvenance: (_old: unknown, value: unknown) => value,
+}));
+vi.mock("node:child_process", () => ({ execFile: vi.fn() }));
+vi.mock("node:util", async () => ({ ...await vi.importActual("node:util"),
+  promisify: () => async (_cmd: string, args: string[]) => { controls.git.push(args); return { stdout: "abc1234\n" }; },
+}));
+vi.mock("node:fs/promises", async () => ({ ...await vi.importActual("node:fs/promises"),
+  stat: async (path: string) => controls.priorBytes === null
+    ? (await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises")).stat(path) : { size: controls.priorBytes },
+  statfs: async () => ({ bavail: controls.disk ? 64n * 1024n ** 3n : 1n, bsize: 1n }),
+}));
 vi.mock("node:fs", async () => {
   const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
-  return {
-    ...actual,
-    existsSync: vi.fn(actual.existsSync),
-    mkdirSync: vi.fn(actual.mkdirSync),
-    writeFileSync: vi.fn(),
-    readFileSync: vi.fn().mockReturnValue('{"version":"0.4.0","sessions":[],"memories":[]}'),
-  };
+  return { ...actual, createWriteStream: (...args: Parameters<typeof actual.createWriteStream>) => {
+    if (controls.closeFailure) {
+      const options = typeof args[1] === "object" ? args[1] : {};
+      const stream = actual.createWriteStream(args[0], { ...options, fs: { ...actual,
+        close: (fd, callback) => actual.close(fd, error => callback(error ?? Object.assign(new Error("CLOSE_FAILED"), { code: "EIO" }))),
+      } });
+      stream.on("error", () => controls.closeEvents.push("error"));
+      stream.once("close", () => controls.closeEvents.push("close"));
+      return stream;
+    }
+    if (!controls.stream) return actual.createWriteStream(...args);
+    const stream = new Writable({ write(_chunk, _encoding, callback) { callback(new Error("STREAM_FAILED")); } });
+    queueMicrotask(() => stream.emit("open",0));
+    return stream;
+  } };
 });
-
 import { registerSnapshotFunction } from "../src/functions/snapshot.js";
-import { runBatchCallback } from "../src/state/batch-effects.js";
+import { withSnapshotReadView, SnapshotReadView, SNAPSHOT_ROW_BYTES } from "../src/state/snapshot-read-view.js";
+import { triggerSnapshotStorage } from "../src/state/storage.js";
 import { logger } from "../src/logger.js";
-import type { Session, Memory, SnapshotMeta } from "../src/types.js";
-
-function mockKV() {
-  const store = new Map<string, Map<string, unknown>>();
-  return {
-    get: async <T>(scope: string, key: string): Promise<T | null> => {
-      return (store.get(scope)?.get(key) as T) ?? null;
-    },
-    set: async <T>(scope: string, key: string, data: T): Promise<T> => {
-      if (!store.has(scope)) store.set(scope, new Map());
-      store.get(scope)!.set(key, data);
-      return data;
-    },
-    delete: async (scope: string, key: string): Promise<void> => {
-      store.get(scope)?.delete(key);
-    },
-    list: async <T>(scope: string): Promise<T[]> => {
-      const entries = store.get(scope);
-      return entries ? (Array.from(entries.values()) as T[]) : [];
-    },
+type Corpus = Map<string, Map<string, Record<string, unknown>>>;
+const root = "D:/agentmemory/.codex-task/full-closure/snapshot-readview-source/candidate/.test-files";
+let folder: string;
+function fixture() {
+  const live: Corpus = new Map(); const generation = randomUUID(); const handle = randomUUID();
+  let cut: Corpus | undefined; let owner = "", request = "", closed = false, calls = 0;
+  const cursors = new Map<string, { scope: string; offset: number }>(); const requests: SnapshotReadRequest[] = [];
+  const hooks: { beforeCut?: () => void; read?: (call: number) => void; fail?: string; cleanupFail?: boolean; lostAck?: boolean; expired?: boolean } = {};
+  const set = (scope: string, key: string, value: Record<string, unknown>) => { if (!live.has(scope)) live.set(scope, new Map()); live.get(scope)!.set(key, value); };
+  const transport: SnapshotTransport = async data => {
+    requests.push(data);
+    if (data.action === "snapshot_open") {
+      hooks.beforeCut?.(); owner = data.owner_id; request = data.request_id; cut = structuredClone(live); closed = false;
+      if (hooks.lostAck) throw new Error("OPEN_ACK_LOST");
+      const now = Date.now() - (hooks.expired ? 700_000 : 0);
+      return { handle, generation, cut_at: new Date(now).toISOString(), expires_at: new Date(now + 600_000).toISOString() };
+    }
+    if (data.action === "snapshot_cancel") {
+      if (hooks.cleanupFail) throw new Error("CLEANUP_FAILED");
+      if (data.owner_id === owner && data.request_id === request) { closed = true; cut = undefined; }
+      return { closed: true };
+    }
+    if (data.generation !== generation) throw new Error("STATE_SNAPSHOT_STALE");
+    if (closed || !cut) throw new Error("STATE_SNAPSHOT_EXPIRED");
+    if (data.owner_id !== owner || data.request_id !== request || data.handle !== handle) throw new Error("STATE_SNAPSHOT_FOREIGN");
+    hooks.read?.(++calls); if (hooks.fail) throw new Error(hooks.fail);
+    if (data.action === "snapshot_get") {
+      const value = cut.get(data.scope)?.get(data.key); if (!value) throw new Error("STATE_SNAPSHOT_RECORD_MISSING");
+      if (Buffer.byteLength(JSON.stringify(value)) > SNAPSHOT_ROW_BYTES) throw new Error("STATE_RECORD_TOO_LARGE"); return { value };
+    }
+    const prior = data.cursor ? cursors.get(data.cursor) : { scope: data.scope, offset: 0 };
+    if (!prior || prior.scope !== data.scope) throw new Error("STATE_SNAPSHOT_CURSOR_INVALID");
+    const keys = [...cut.get(data.scope)?.keys() ?? []].sort().slice(prior.offset, prior.offset + 2);
+    if (keys.some(key => Buffer.byteLength(key) > 4096)) throw new Error("STATE_RECORD_TOO_LARGE");
+    const more = (cut.get(data.scope)?.size ?? 0) > prior.offset + keys.length;
+    if (data.cursor) cursors.delete(data.cursor); const next = more ? randomUUID() : null;
+    if (next) cursors.set(next, { scope: data.scope, offset: prior.offset + keys.length }); return { keys, next_cursor: next };
   };
+  const functions = new Map<string, (data?: unknown) => Promise<unknown>>();
+  const sdk = { registerFunction: (name: string, run: (data?: unknown) => Promise<unknown>) => functions.set(name, run) };
+  const kv = { snapshotTransport: transport, get: vi.fn(), set: vi.fn() };
+  registerSnapshotFunction(sdk as never, kv as never, folder);
+  return { live, set, hooks, requests, transport, generation, handle, kv, isClosed: () => closed,
+    create: () => functions.get("mem::snapshot-create")!({ message: "fixture" }), run: (name: string, data?: unknown) => functions.get(name)!(data) };
 }
-
-function mockSdk() {
-  const functions = new Map<string, Function>();
-  return {
-    registerFunction: (idOrOpts: string | { id: string }, handler: Function) => {
-      const id = typeof idOrOpts === "string" ? idOrOpts : idOrOpts.id;
-      functions.set(id, handler);
-    },
-    registerTrigger: () => {},
-    trigger: async (idOrInput: string | { function_id: string; payload: unknown }, data?: unknown) => {
-      const id = typeof idOrInput === "string" ? idOrInput : idOrInput.function_id;
-      const payload = typeof idOrInput === "string" ? data : idOrInput.payload;
-      const fn = functions.get(id);
-      if (!fn) throw new Error(`No function: ${id}`);
-      return fn(payload);
-    },
-  };
-}
-
-describe("Snapshot Functions", () => {
-  let sdk: ReturnType<typeof mockSdk>;
-  let kv: ReturnType<typeof mockKV>;
-  const snapshotDir = join(tmpdir(), `agentmemory-snapshots-${Date.now()}`);
-
-  beforeEach(async () => {
-    await rm(snapshotDir, { recursive: true, force: true });
-    await mkdir(snapshotDir, { recursive: true });
-    sdk = mockSdk();
-    kv = mockKV();
-    installGraphStateWire(sdk as never, kv as never);
-    vi.clearAllMocks();
-    registerSnapshotFunction(sdk as never, kv as never, snapshotDir);
-
-    const session: Session = {
-      id: "ses_1",
-      project: "test",
-      cwd: "/tmp",
-      startedAt: "2026-02-01T00:00:00Z",
-      status: "completed",
-      observationCount: 1,
-    };
-    await kv.set("mem:sessions", "ses_1", session);
-
-    const mem: Memory = {
-      id: "mem_1",
-      createdAt: "2026-02-01T00:00:00Z",
-      updatedAt: "2026-02-01T00:00:00Z",
-      type: "pattern",
-      title: "Test pattern",
-      content: "Always test",
-      concepts: [],
-      files: [],
-      sessionIds: ["ses_1"],
-      strength: 5,
-      version: 1,
-      isLatest: true,
-    };
-    await kv.set("mem:memories", "mem_1", mem);
-  });
-
-  it("snapshot-create serializes state and returns meta", async () => {
-    const result = (await sdk.trigger("mem::snapshot-create", {
-      message: "Test snapshot",
-    })) as { success: boolean; snapshot: SnapshotMeta };
-
-    expect(result.success).toBe(true);
-    expect(result.snapshot).toBeDefined();
-    expect(result.snapshot.commitHash).toBe("abc1234");
-    expect(result.snapshot.message).toBe("Test snapshot");
-    expect(result.snapshot.stats.sessions).toBe(1);
-    expect(result.snapshot.stats.memories).toBe(1);
-    const persisted = JSON.parse(await readFile(join(snapshotDir, "state.json"), "utf8"));
-    expect(persisted.sessions).toHaveLength(1);
-    expect(persisted.memories).toHaveLength(1);
-    expect(persisted.observations).toEqual({});
-  });
-
-  it("streams an oversized graph node and publishes the complete JSON", async () => {
-    const largeNode = { id: "large-node", type: "concept", name: "large", properties: { text: "x".repeat(1_320_550) } };
-    await kv.set("mem:graph:nodes", largeNode.id, largeNode);
-
-    const result = await sdk.trigger("mem::snapshot-create", {});
-    expect(result).toMatchObject({ success: true, snapshot: { stats: { graphNodes: 1 } } });
-    const persisted = JSON.parse(await readFile(join(snapshotDir, "state.json"), "utf8"));
-    expect(persisted.graphNodes).toEqual([largeNode]);
-  });
-
-  it("keeps the prior snapshot if a projected node read fails", async () => {
-    const oldState = '{"version":"previous"}';
-    await writeFile(join(snapshotDir, "state.json"), oldState, "utf8");
-    await kv.set("mem:graph:nodes", "broken-node", { id: "broken-node", type: "concept", name: "broken" });
-    const originalGet = kv.get;
-    vi.spyOn(kv, "get").mockImplementation(async (scope, key) => {
-      if (scope === "mem:graph:nodes") throw new Error("projected node read failed");
-      return originalGet(scope, key);
-    });
-
-    expect(await sdk.trigger("mem::snapshot-create", {})).toMatchObject({ success: false, error: "projected node read failed" });
-    expect(await readFile(join(snapshotDir, "state.json"), "utf8")).toBe(oldState);
-  });
-
-  it("snapshot-list returns snapshots from git log", async () => {
-    const result = (await sdk.trigger("mem::snapshot-list", {})) as {
-      snapshots: Array<{
-        commitHash: string;
-        createdAt: string;
-        message: string;
-      }>;
-    };
-
-    expect(result.snapshots).toBeDefined();
-    expect(Array.isArray(result.snapshots)).toBe(true);
-  });
-
-  it("snapshot-restore requires commitHash", async () => {
-    const result = (await sdk.trigger("mem::snapshot-restore", {})) as {
-      success: boolean;
-      error: string;
-    };
-
-    expect(result.success).toBe(false);
-    expect(result.error).toContain("commitHash");
-  });
-
-  it("snapshot-restore loads state from commit", async () => {
-    const result = (await sdk.trigger("mem::snapshot-restore", {
-      commitHash: "abc1234",
-    })) as { success: boolean; commitHash: string };
-
-    expect(result.success).toBe(true);
-    expect(result.commitHash).toBe("abc1234");
-  });
-
-  it("snapshot-create succeeds without persisting diagnostic audit history", async () => {
-    const result = await sdk.trigger("mem::snapshot-create", { message: "Snapshot test" });
-
-    expect(result).toMatchObject({ success: true });
-    expect(await kv.list("mem:audit")).toHaveLength(0);
-  });
-
-  it("refuses restore before touching the snapshot when a callback needs recovery", async () => {
-    await kv.set("mem:batch-callbacks", "active:graph", { state: "started", activeKey: "a".repeat(64) });
-    const result = await sdk.trigger("mem::snapshot-restore", { commitHash: "abc1234" });
-    expect(result).toMatchObject({ success: false, error: expect.stringContaining("recovered") });
-    expect(readFileSync).not.toHaveBeenCalled();
-  });
-
-  it("does not snapshot a partially applied callback", async () => {
-    await kv.set("mem:batch-callbacks", "active:graph", { state: "started", activeKey: "a".repeat(64) });
-    expect(await sdk.trigger("mem::snapshot-create", {})).toMatchObject({ success: false, error: expect.stringContaining("recovered") });
-    expect(writeFileSync).not.toHaveBeenCalled();
-  });
-
-  it("defers long provider work without a partial snapshot and retries after it completes", async () => {
-    vi.useFakeTimers();
-    let entered!: () => void, finish!: () => void;
-    const started = new Promise<void>((resolve) => { entered = resolve; });
-    const providerResult = new Promise<void>((resolve) => { finish = resolve; });
-    const provider = vi.fn(async () => { entered(); await providerResult; });
-    const callback = runBatchCallback(kv as never, "reflect", undefined, async () => {
-      await kv.set("mem:memories", "provider", { id: "provider", title: "partial" });
-      await provider();
-      await kv.set("mem:memories", "provider", { id: "provider", title: "complete" });
-      return { success: true };
-    });
-    try {
-      await started;
-      const snapshot = sdk.trigger("mem::snapshot-create", {});
-      await vi.advanceTimersByTimeAsync(30001);
-      expect(await snapshot).toMatchObject({
-        success: false, deferred: true, retryable: true, code: "BATCH_MAINTENANCE_BUSY",
-        error: expect.stringContaining("quiescence timed out"),
-        details: { activeAdmissions: 1, families: [{ family: "reflect", count: 1, oldestMs: 30000 }] },
-      });
-      expect(writeFileSync).not.toHaveBeenCalled();
-      expect(logger.error).not.toHaveBeenCalled();
-      expect(logger.warn).toHaveBeenCalledWith("Snapshot deferred", expect.objectContaining({ code: "BATCH_MAINTENANCE_BUSY" }));
-      finish(); await callback;
-      expect(await sdk.trigger("mem::snapshot-create", {})).toMatchObject({ success: true, snapshot: expect.any(Object) });
-      const state = JSON.parse(await readFile(join(snapshotDir, "state.json"), "utf8"));
-      expect(state.memories).toContainEqual({ id: "provider", title: "complete" });
-      expect(provider).toHaveBeenCalledOnce();
-    } finally { finish(); await callback; vi.useRealTimers(); }
-  });
-
-  it("preserves graph provenance when restoring a legacy snapshot", async () => {
-    const key = "b".repeat(64);
-    await kv.set("mem:graph:nodes", "node", { id: "node", sourceObservationIds: ["current"], appliedBatchEffects: [key] });
-    vi.mocked(readFileSync).mockReturnValueOnce(JSON.stringify({ graphNodes: [{ id: "node", sourceObservationIds: ["snapshot"] }] }));
-    expect(await sdk.trigger("mem::snapshot-restore", { commitHash: "abc1234" })).toMatchObject({ success: true });
-    expect(await kv.get("mem:graph:nodes", "node")).toMatchObject({ sourceObservationIds: ["current", "snapshot"], appliedBatchEffects: [key] });
-  });
+beforeEach(async () => {
+  controls.disk = true; controls.stream = false; controls.closeFailure = false; controls.closeEvents = []; controls.priorBytes = null; controls.git = [];
+  vi.mocked(logger.warn).mockClear();
+  folder = join(root, randomUUID()); await mkdir(join(folder, ".git"), { recursive: true });
+  await writeFile(join(folder, ".git", "HEAD"), "OLD_HEAD"); await writeFile(join(folder, "state.json"), "OLD_STATE");
 });
-
-describe("snapshot-create reentrancy guard", () => {
-  // Regression (P2): mem::snapshot-create is triggered by the periodic timer,
-  // REST (api::snapshot-create), and MCP. Two runs writing state.json and
-  // committing in the same git repo at once race on the index lock. An
-  // overlapping call must be a no-op success while the first run finishes.
-  it("skips an overlapping call and releases the guard on completion", async () => {
-    let releaseFirst!: () => void;
-    const firstListGate = new Promise<void>((resolve) => {
-      releaseFirst = resolve;
-    });
-    let listCalls = 0;
-    const store = new Map<string, Map<string, unknown>>();
-    const gatedKv = {
-      get: async () => null,
-      set: async <T>(scope: string, key: string, data: T): Promise<T> => {
-        if (!store.has(scope)) store.set(scope, new Map());
-        store.get(scope)!.set(key, data);
-        return data;
-      },
-      delete: async () => {},
-      list: async <T>(scope: string): Promise<T[]> => {
-        listCalls++;
-        // Park the first snapshot inside its initial list() so a second
-        // snapshot-create observes the in-flight guard.
-        if (listCalls === 1) await firstListGate;
-        return (Array.from(store.get(scope)?.values() ?? []) as T[]) ?? [];
-      },
+async function unchanged() {
+  expect(await readFile(join(folder, "state.json"), "utf8")).toBe("OLD_STATE");
+  expect(await readFile(join(folder, ".git", "HEAD"), "utf8")).toBe("OLD_HEAD");
+  expect((await readdir(folder)).filter(name => name.endsWith(".tmp"))).toEqual([]); expect(controls.git).toEqual([]);
+}
+describe("coherent snapshot candidate using mocked future State transport", () => {
+  it("preserves one completion cut across pages/collections while create/update/delete continue", async () => {
+    const f = fixture();
+    for (let i = 0; i < 7; i++) {
+      f.set("mem:sessions", `s${i}`, { id: `s${i}`, original: i }); f.set("mem:memories", `m${i}`, { id: `m${i}`, original: i, provenance: ["original"] });
+      f.set(`mem:obs:s${i}`, `o${i}`, { id: `o${i}`, raw: `original-${i}` }); f.set("mem:graph:nodes", `g${i}`, { id: `g${i}`, sourceObservationIds: [`o${i}`] });
+    }
+    f.set("mem:access", "m1", { memoryId: "m1", count: 7, recent: ["a"] });
+    f.hooks.beforeCut = () => f.set("mem:memories", "at-completion", { id: "at-completion", content: "completed cut" });
+    f.hooks.read = () => {
+      f.set("mem:sessions", "late", { id: "late" }); f.live.get("mem:sessions")!.delete("s3");
+      f.set("mem:memories", "m0", { id: "m0", original: "updated" }); f.live.get("mem:memories")!.delete("m4");
+      f.set("mem:graph:nodes", "g0", { id: "g0", sourceObservationIds: ["late"] });
+      f.live.get("mem:obs:s2")!.delete("o2"); f.set("mem:access", "m1", { memoryId: "m1", count: 99 });
     };
-    const localSdk = mockSdk();
-    installGraphStateWire(localSdk as never, gatedKv as never);
-    const reentrantDir = join(tmpdir(), `agentmemory-reentrant-${Date.now()}`);
-    await mkdir(reentrantDir, { recursive: true });
-    registerSnapshotFunction(localSdk as never, gatedKv as never, reentrantDir);
-
-    // Start the first snapshot; it parks inside kv.list with the guard held.
-    const p1 = localSdk.trigger("mem::snapshot-create", { message: "first" });
-    await Promise.resolve();
-    await Promise.resolve();
-
-    // Overlapping call: must be rejected as already-in-progress, NOT run git.
-    const r2 = (await localSdk.trigger("mem::snapshot-create", {
-      message: "second",
-    })) as { success: boolean; message?: string; snapshot?: unknown };
-    expect(r2).toEqual({
-      success: true,
-      message: "Snapshot already in progress",
-    });
-    expect(r2.snapshot).toBeUndefined();
-
-    // Release the first run; it completes normally.
-    releaseFirst();
-    const r1 = (await p1) as { success: boolean; snapshot?: unknown };
-    expect(r1.success).toBe(true);
-    expect(r1.snapshot).toBeDefined();
-
-    // Guard is released: a fresh call runs the full body again.
-    const r3 = (await localSdk.trigger("mem::snapshot-create", {
-      message: "third",
-    })) as { success: boolean; snapshot?: unknown };
-    expect(r3.success).toBe(true);
-    expect(r3.snapshot).toBeDefined();
+    expect(await f.create()).toMatchObject({ success: true, snapshot: { stats: { sessions: 7, memories: 8, observations: 7, graphNodes: 7 } } });
+    const state = JSON.parse(await readFile(join(folder, "state.json"), "utf8"));
+    expect(state.sessions).toHaveLength(7); expect(state.sessions).toContainEqual({ id: "s3", original: 3 });
+    expect(state.memories).toContainEqual({ id: "m0", original: 0, provenance: ["original"] }); expect(state.memories).toContainEqual({ id: "at-completion", content: "completed cut" });
+    expect(state.observations.s2).toEqual([{ id: "o2", raw: "original-2" }]); expect(state.graphNodes[0].sourceObservationIds).toEqual(["o0"]); expect(state.accessLogs[0].count).toBe(7);
+    expect(f.kv.get).not.toHaveBeenCalled(); expect(f.isClosed()).toBe(true);
+    expect(new Set(f.requests.filter(r => "handle" in r).map(r => "handle" in r && r.handle)).size).toBe(1);
+  });
+  it("preserves complete fifteen MiB original/provenance/JSON/counters", async () => {
+    const f = fixture(); const row = { id: "o", raw: "x".repeat(15 * 1024 * 1024), provenance: [{ source: "full", revisions: [1,2,3] }], metadata: { original: true } };
+    f.set("mem:sessions", "s", { id: "s", extra: { full: true } }); f.set("mem:obs:s", "o", row);
+    expect(await f.create()).toMatchObject({ success: true, snapshot: { stats: { observations: 1, sessions: 1 } } });
+    expect(JSON.parse(await readFile(join(folder, "state.json"), "utf8")).observations.s).toEqual([row]);
+  });
+  it.each(["STATE_RECORD_TOO_LARGE", "STATE_SNAPSHOT_DISK_LIMIT", "STATE_SNAPSHOT_EXPIRED", "STATE_SNAPSHOT_STALE", "STATE_SNAPSHOT_FOREIGN", "STATE_GRAPH_RECOVERY_REQUIRED", "STATE_SNAPSHOT_RECORD_MISSING", "READ_FAILED"])("preserves old file/Git on %s", async failure => {
+    const f = fixture(); f.hooks.fail = failure; expect(await f.create()).toMatchObject({ success: false, error: failure }); await unchanged(); expect(f.isClosed()).toBe(true);
+  });
+  it("refuses oversized full rows", async () => {
+    const f = fixture(); f.set("mem:memories", "m", { id: "m", raw: "x".repeat(SNAPSHOT_ROW_BYTES) });
+    expect(await f.create()).toMatchObject({ success: false, error: "STATE_RECORD_TOO_LARGE" }); await unchanged();
+  });
+  it("refuses oversized identities", async () => {
+    const f = fixture(); const key = "k".repeat(4097); f.set("mem:memories", key, { id: key });
+    expect(await f.create()).toMatchObject({ success: false, error: "STATE_RECORD_TOO_LARGE" }); await unchanged();
+  });
+  it("refuses mismatched row identities", async () => {
+    const f = fixture(); f.set("mem:memories", "key", { id: "other" }); expect(await f.create()).toMatchObject({ success: false, error: "SNAPSHOT_RECORD_KEY_MISMATCH" }); await unchanged();
+  });
+  it("preflights publication capacity before view open", async () => {
+    controls.disk = false; const f = fixture(); expect(await f.create()).toMatchObject({ success: false, error: "STATE_SNAPSHOT_DISK_LIMIT" }); expect(f.requests).toEqual([]); await unchanged();
+  });
+  it("enforces the combined old/new/Git publication ceiling while streaming", async () => {
+    controls.priorBytes = 4 * 1024 ** 3 - 16 * 1024 ** 2 - 2048;
+    const f = fixture(); f.set("mem:memories", "m", { id: "m", content: "x".repeat(4096) });
+    expect(await f.create()).toMatchObject({ success: false, error: "STATE_SNAPSHOT_DISK_LIMIT" }); await unchanged(); expect(f.isClosed()).toBe(true);
+  });
+  it("refuses pre-existing crash artifacts without deleting another publisher's file", async () => {
+    await writeFile(join(folder,".state-snapshot.tmp"),"ORPHAN_OR_ACTIVE"); const f = fixture();
+    expect(await f.create()).toMatchObject({ success: false, error: "STATE_SNAPSHOT_PUBLICATION_RECOVERY_REQUIRED" });
+    expect(await readFile(join(folder,".state-snapshot.tmp"),"utf8")).toBe("ORPHAN_OR_ACTIVE");
+    expect(await readFile(join(folder,"state.json"),"utf8")).toBe("OLD_STATE"); expect(controls.git).toEqual([]); expect(f.requests).toEqual([]);
+  });
+  it("cleans the view/output after stream failure", async () => {
+    controls.stream = true; const f = fixture(); expect(await f.create()).toMatchObject({ success: false, error: "STREAM_FAILED" }); await unchanged(); expect(f.isClosed()).toBe(true);
+  });
+  it("cancels the exact open request after lost ACK", async () => {
+    const f = fixture(); f.hooks.lostAck = true; expect(await f.create()).toMatchObject({ success: false, error: "OPEN_ACK_LOST" }); await unchanged(); expect(f.isClosed()).toBe(true);
+    const [open,cancel] = f.requests; expect(cancel).toMatchObject({ owner_id: open.owner_id, request_id: open.request_id, action: "snapshot_cancel" });
+  });
+  it("attempts owned unlink after a real WriteStream emits a close error and preserves the primary failure", async () => {
+    controls.closeFailure = true;
+    const f = fixture(); f.hooks.lostAck = true;
+    expect(await f.create()).toMatchObject({ success: false, error: "OPEN_ACK_LOST" });
+    expect(controls.closeEvents).toEqual(["error", "close"]);
+    expect(logger.warn).toHaveBeenCalledWith("Snapshot temporary file cleanup failed", { stage: "stream_close", error: "CLOSE_FAILED" });
+    expect(f.isClosed()).toBe(true);
+    await unchanged();
+  });
+  it("requires cleanup ACK before rename/Git", async () => {
+    const f = fixture(); f.hooks.cleanupFail = true; expect(await f.create()).toMatchObject({ success: false, error: "CLEANUP_FAILED" }); await unchanged();
+  });
+  it("rejects expired completed views before reads", async () => {
+    const f = fixture(); f.hooks.expired = true; expect(await f.create()).toMatchObject({ success: false, error: "STATE_SNAPSHOT_EXPIRED" }); await unchanged(); expect(f.isClosed()).toBe(true);
+  });
+  it("closes on cancellation", async () => {
+    const f = fixture(); const abort = new AbortController();
+    await expect(withSnapshotReadView(f.transport, async view => { abort.abort(); await view.get("mem:memories", "x"); },abort.signal)).rejects.toThrow("STATE_SNAPSHOT_CANCELLED");
+    expect(f.isClosed()).toBe(true); await unchanged();
+  });
+  it("rejects stale/foreign/expired mock-native handles", async () => {
+    const f = fixture(); const owner_id = randomUUID(), request_id = randomUUID();
+    const cut = await f.transport({ action: "snapshot_open", owner_id, request_id },1000) as { handle: string; generation: string; cut_at: string; expires_at: string };
+    await expect(new SnapshotReadView(f.transport,owner_id,request_id,{...cut,generation:randomUUID()}).get("mem:memories","x")).rejects.toThrow("STALE");
+    await expect(new SnapshotReadView(f.transport,randomUUID(),request_id,cut).get("mem:memories","x")).rejects.toThrow("FOREIGN");
+    await f.transport({ action: "snapshot_cancel",owner_id,request_id },1000);
+    await expect(new SnapshotReadView(f.transport,owner_id,request_id,cut).get("mem:memories","x")).rejects.toThrow("EXPIRED");
+  });
+  it("preserves reentrancy and releases the guard", async () => {
+    const f = fixture(); const original = f.kv.snapshotTransport; let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
+    f.kv.snapshotTransport = async (request, timeout) => { if (request.action === "snapshot_open") await gate; return original(request, timeout); };
+    const first = f.create(); expect(await f.create()).toEqual({ success: true, message: "Snapshot already in progress" }); release();
+    expect(await first).toMatchObject({ success: true }); expect(await f.create()).toMatchObject({ success: true });
+  });
+  it("preserves restore validation", async () => {
+    const f = fixture(); expect(await f.run("mem::snapshot-restore",{})).toMatchObject({ success: false, error: "commitHash is required" });
+    expect(await f.run("mem::snapshot-restore",{ commitHash: "../invalid" })).toMatchObject({ success: false, error: "Invalid commitHash format" });
+  });
+  it("uses State transport with explicit deadlines", async () => {
+    const trigger = vi.fn().mockResolvedValue({ closed: true }); const request: SnapshotReadRequest = { action: "snapshot_cancel", owner_id: randomUUID(), request_id: randomUUID() };
+    await triggerSnapshotStorage({ trigger } as never,request,10_000); expect(trigger).toHaveBeenCalledWith({ function_id: "state::storage",payload:request,timeoutMs:10_000 });
+    await expect(triggerSnapshotStorage({ trigger } as never,request,0)).rejects.toThrow("INVALID_REQUEST");
   });
 });

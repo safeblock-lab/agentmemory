@@ -1,3 +1,5 @@
+export const SUMMARY_SOURCE_EVIDENCE_RULES = `Embedded originals keep their source provenance and event time; the enclosing session ID and capture time describe collection, not authorship. Do not recast historical work as current. Merge same-session chunks and preserve distinct origins among full originals. Qualify missing or conflicting provenance; invent no dates or identities. Paths and file lists may be historical; include only files supported as changed in the session being summarized, or none. An IDE-tab path does not prove a file changed; neither do open, read, attached, or mentioned paths. Treat configuration, script propagation, provider selection, and outcomes as distinct; claim causal links only when sources connect the specific setting to behavior. Evaluate evidence semantically; word overlap is not support.`
+
 export const SUMMARY_SYSTEM = `You are a session summarizer for an AI coding agent's memory system. Given all compressed observations from a coding session, produce a concise session summary.
 
 Output EXACTLY this XML format with no additional text:
@@ -19,7 +21,9 @@ Output EXACTLY this XML format with no additional text:
 Rules:
 - Focus on outcomes, not individual tool calls
 - Highlight decisions and their rationale
-- List all files that were created or modified
+- List only files whose path is explicitly present in the source observations or cited source paths
+- Do not infer directory prefixes or invent paths from concepts or feature names
+${SUMMARY_SOURCE_EVIDENCE_RULES}
 - Concepts should be searchable terms for future context retrieval`
 
 export function buildSummaryPrompt(observations: Array<{
@@ -42,6 +46,8 @@ export interface SummaryPromptItem {
   obsRangeStart: number
   obsRangeEnd: number
   fragment?: boolean
+  sourcePaths?: string[]
+  modifiedPaths?: string[]
 }
 
 export function formatSummaryObservation(observation: {
@@ -55,12 +61,20 @@ export function buildSummaryItemsPrompt(items: SummaryPromptItem[]): string {
   const sections = items.map(item => item.fragment
     ? `[Observation ${item.obsRangeStart} fragment, in source order]\n${item.text}`
     : item.text)
-  return `Session observations (${count} total):\n\n${sections.join('\n\n---\n\n')}`
+  const modifiedPaths = [...new Set(items.flatMap(item => item.modifiedPaths ?? []))]
+  const pathContext = modifiedPaths.length
+    ? `\n\nPath candidates for grounding only (not evidence of current edits):\n${modifiedPaths.join('\n')}`
+    : ""
+  return `Session observations (${count} total):\n\n${sections.join('\n\n---\n\n')}${pathContext}`
 }
 
 export function buildReduceItemsPrompt(items: SummaryPromptItem[]): string {
   const sections = items.map((item, index) => `[Chunk ${index + 1} of ${items.length} — obs ${item.obsRangeStart}-${item.obsRangeEnd}${item.fragment ? ', fragment in source order' : ''}]\n${item.text}`)
-  return `Partial summaries (${items.length} chunks of one session, chronological):\n\n${sections.join('\n\n---\n\n')}`
+  const modifiedPaths = [...new Set(items.flatMap(item => item.modifiedPaths ?? []))]
+  const pathContext = modifiedPaths.length
+    ? `\n\nPath candidates for grounding only (not evidence of current edits):\n${modifiedPaths.join('\n')}`
+    : ""
+  return `Partial summaries (${items.length} chunks of one session, chronological):\n\n${sections.join('\n\n---\n\n')}${pathContext}`
 }
 
 export function formatSummaryPartial(partial: {
@@ -90,7 +104,9 @@ Output EXACTLY this XML format with no additional text:
 Rules:
 - Synthesize a single narrative that reflects the whole arc, not a chunk-by-chunk recap
 - Preserve every distinct decision across chunks
-- Union (deduplicate) all files and concepts
+- Union (deduplicate) concepts and files supported as changed in the session being summarized
+- Do not infer directory prefixes or invent paths from concepts or feature names
+${SUMMARY_SOURCE_EVIDENCE_RULES}
 - Title should capture the session's overall outcome`
 
 export function buildReducePrompt(partials: Array<{

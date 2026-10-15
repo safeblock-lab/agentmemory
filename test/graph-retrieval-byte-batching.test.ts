@@ -278,3 +278,74 @@ describe('graph edge adaptive byte batching', () => {
     await expect(reader.readSubgraph(request)).rejects.toBe(failure);
   });
 });
+
+
+describe('project-scoped graph compatibility', () => {
+  function scopedFixture() {
+    const h = fixture(2);
+    h.nodes[0].name = h.nodes[1].name = 'same-name';
+    for (const node of h.nodes) h.harness.seed('mem:graph:nodes', node.id, node as never);
+    h.retrieval.mockImplementation(async payload => {
+      if (payload.action !== 'graph_read') throw new Error('Scoped request attempted global fallback');
+      const selected = payload.project === 'project-a' ? 0 : 1;
+      return { status: 'ready', project: payload.project, revision: '1', has_more: false,
+        items: payload.mode === 'search' ? [{ id: h.nodes[selected].id, entity: true }]
+          : payload.mode === 'neighbors' ? [h.edges[selected]] : [] } as never;
+    });
+    return h;
+  }
+
+  it('isolates homonymous project candidates and uses the native scoped budgets', async () => {
+    const h = scopedFixture();
+    for (const [project, selected] of [['project-a', 'n0'], ['project-b', 'n1']] as const) {
+      const result = await h.reader.readSubgraph({ ...request, project });
+      expect([...result.nodes.keys()]).toEqual([selected]);
+      expect(result.edges.map(edge => edge.sourceNodeId)).toEqual([selected]);
+      expect(result.partial).toBe(false);
+    }
+    expect(h.retrieval.mock.calls.every(([p]) => p.action === 'graph_read' && p.max_bytes === 65536 && p.limit === 16)).toBe(true);
+    expect(h.retrieval.mock.calls.filter(([p]) => p.mode === 'neighbors').every(([p]) => (p.node_ids as string[]).length <= 12)).toBe(true);
+  });
+
+  it('keeps an explicitly blank project scoped without global fallback', async () => {
+    const h = scopedFixture();
+    expect(await h.reader.readSubgraph({ ...request, project: '' })).toMatchObject({ partial: true, reason: 'project_required' });
+    expect(h.retrieval).not.toHaveBeenCalled();
+  });
+
+  it('rejects a native page belonging to another project', async () => {
+    const h = scopedFixture();
+    h.retrieval.mockResolvedValue({ status: 'ready', project: 'foreign', has_more: false, items: [] } as never);
+    await expect(h.reader.readSubgraph({ ...request, project: 'project-a' })).rejects.toMatchObject({ code: 'STATE_TX_INVALID_RESPONSE' });
+    expect(h.retrieval).toHaveBeenCalledOnce();
+  });
+
+  it('rejects a scoped byte overflow without retrying globally', async () => {
+    const h = scopedFixture();
+    h.retrieval.mockResolvedValue({ status: 'ready', project: 'project-a', has_more: false, items: [{ id: 'n0', extra: 'x'.repeat(65536) }] } as never);
+    await expect(h.reader.readSubgraph({ ...request, project: 'project-a' })).rejects.toMatchObject({ code: 'STATE_RETRIEVAL_RESOURCE_LIMIT' });
+    expect(h.retrieval).toHaveBeenCalledOnce();
+  });
+
+  it('preserves scoped failures and cancellation without global fallback', async () => {
+    const h = scopedFixture();
+    const failure = new Error('native transport failure');
+    h.retrieval.mockRejectedValueOnce(failure);
+    await expect(h.reader.readSubgraph({ ...request, project: 'project-a' })).rejects.toBe(failure);
+    const controller = new AbortController();
+    controller.abort(failure);
+    await expect(h.reader.readSubgraph({ ...request, project: 'project-a' }, controller.signal)).rejects.toBe(failure);
+    expect(h.retrieval).toHaveBeenCalledOnce();
+  });
+
+  it('rejects graph fencing changes during a scoped read', async () => {
+    const h = scopedFixture();
+    const original = h.retrieval.getMockImplementation()!;
+    h.retrieval.mockImplementation(async payload => {
+      const result = await original(payload);
+      h.harness.seed('mem:graph:control', 'current', { version: 1, generation: '1', fence: '2', lease: null, recovery: null });
+      return result;
+    });
+    await expect(h.reader.readSubgraph({ ...request, project: 'project-a' })).rejects.toMatchObject({ code: 'STATE_GRAPH_RECOVERY_REQUIRED' });
+  });
+});

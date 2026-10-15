@@ -1,4 +1,4 @@
-import { TriggerAction, type IIIClient } from "iii-sdk";
+import type { IIIClient } from "iii-sdk";
 import { readFileSync } from "node:fs";
 import { isManagedImagePath } from "../utils/image-store.js";
 import type {
@@ -7,7 +7,7 @@ import type {
   ObservationType,
   MemoryProvider,
 } from "../types.js";
-import { KV, STREAM } from "../state/schema.js";
+import { publishLiveObservation } from "./live-observation.js";
 import { StateKV } from "../state/kv.js";
 import {
   COMPRESSION_SYSTEM,
@@ -20,10 +20,12 @@ import { CompressOutputSchema } from "../eval/schemas.js";
 import { validateOutput } from "../eval/validator.js";
 import { scoreCompression } from "../eval/quality.js";
 import { compressWithRetry } from "../eval/self-correct.js";
+import { KV } from "../state/schema.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import { logger } from "../logger.js";
 import { recordOperation } from "./dashboard-activity.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
+import { replaceObservation } from "./observation-identity.js";
 
 const VALID_TYPES = new Set<string>([
   "file_read",
@@ -79,8 +81,32 @@ export function registerCompressFunction(
       sessionId: string;
       raw: RawObservation;
       importanceOverride?: number;
+      selected?: { project: string; sessionId: string; sourceFingerprint: string };
     }) => {
       const startMs = Date.now();
+      const current = await sdk.trigger<unknown, { version: string; value: RawObservation | CompressedObservation | null }>({
+        function_id: "state::get_versioned",
+        payload: { scope: `mem:obs:${data.sessionId}`, key: data.observationId },
+      });
+      if (!current?.value || current.value.id !== data.observationId || current.value.sessionId !== data.sessionId) {
+        return { success: false, error: "STATE_OBSERVATION_MISSING" };
+      }
+      if (!("hookType" in current.value) || typeof current.value.hookType !== "string" || !("raw" in current.value)) {
+        return { success: true, compressed: current.value, deduplicated: true };
+      }
+      // Read the durable original, never a caller-supplied excerpt or stale event.
+      data = { ...data, raw: { ...current.value, hookType: current.value.hookType, raw: current.value.raw } };
+      if (data.selected) {
+        const session = await kv.get<{ project: string }>(KV.sessions, data.sessionId);
+        if (!session || session.project !== data.selected.project || data.selected.sessionId !== data.sessionId ||
+            data.selected.sourceFingerprint !== current.value.identityDigest) {
+          return { success: false, error: "selection_source_mismatch" };
+        }
+      }
+      const completeSource = JSON.stringify(data.raw.raw) ?? "null";
+      if (!data.raw.identityDigest || completeSource.length > 65536 || "storageBounds" in data.raw) {
+        return { success: false, pending: true, error: "source_requires_complete_compression" };
+      }
 
       let imageDescription: string | undefined;
       const hasImage = data.raw.modality === "image" || data.raw.modality === "mixed";
@@ -112,6 +138,10 @@ export function registerCompressFunction(
         }
       }
 
+      if (hasImage && !imageDescription) {
+        return { success: false, pending: true, error: "image_preservation_pending" };
+      }
+
       const prompt = buildCompressionPrompt({
         hookType: data.raw.hookType,
         toolName: data.raw.toolName,
@@ -121,7 +151,10 @@ export function registerCompressFunction(
           : data.raw.toolOutput,
         userPrompt: data.raw.userPrompt,
         timestamp: data.raw.timestamp,
-      });
+      }) + `\n\nComplete sanitized source (preserve all useful information, including details omitted from previews above):\n${completeSource}`;
+      if (prompt.length > 65536) {
+        return { success: false, pending: true, error: "source_requires_complete_compression" };
+      }
 
       try {
         const validator = (response: string) => {
@@ -137,6 +170,7 @@ export function registerCompressFunction(
             : { valid: false, errors: result.result.errors };
         };
 
+        const execute = async () => {
         const routedResponse = llmRouter?.hasAuxiliaryProvider
           ? await llmRouter.run(
             llmRouter.hasExplicitRoute("classification") ? "classification" : "compression",
@@ -153,6 +187,9 @@ export function registerCompressFunction(
             1,
           )
           : { response: routedResponse, retried: false };
+        return { response, retried };
+        };
+        const { response, retried } = await execute();
 
         const parsed = parseCompressionXml(response);
         if (!parsed) {
@@ -164,11 +201,14 @@ export function registerCompressFunction(
             obsId: data.observationId,
             retried,
           });
-          await recordOperation(kv, "mem::compress", "failed", { observationsProcessed: 1, observationsCompressed: 0 }, data.raw.agentId);
+          await recordOperation(kv, "mem::compress", "failed", { observationsProcessed: 1, observationsCompressed: 0 }, data.raw.agentId, { durationMs: latencyMs, errorCode: "parse_failed" });
           return { success: false, error: "parse_failed" };
         }
 
         const qualityScore = scoreCompression(parsed);
+        if (!parsed.narrative.trim() || !parsed.title.trim()) {
+          return { success: false, pending: true, error: "useful_compression_pending" };
+        }
         const importanceOverride =
           typeof data.importanceOverride === "number" &&
           Number.isFinite(data.importanceOverride) &&
@@ -177,7 +217,7 @@ export function registerCompressFunction(
             ? Math.round(data.importanceOverride)
             : undefined;
 
-        const compressed: CompressedObservation = {
+        let compressed: CompressedObservation = {
           id: data.observationId,
           sessionId: data.sessionId,
           timestamp: data.raw.timestamp,
@@ -186,6 +226,8 @@ export function registerCompressFunction(
             ? { importance: importanceOverride }
             : {}),
           confidence: qualityScore / 100,
+          compressionMethod: "llm",
+          ...(data.raw.identityDigest ? { sourceIdentityDigests: [data.raw.identityDigest] } : {}),
           ...(hasImage ? { modality: data.raw.modality } : {}),
           ...(imageDescription ? { imageDescription } : {}),
           ...(data.raw.imageData ? { imageRef: data.raw.imageData } : {}),
@@ -193,11 +235,7 @@ export function registerCompressFunction(
           ...(data.raw.origin ? { origin: data.raw.origin } : {}),
         };
 
-        await kv.set(
-          KV.observations(data.sessionId),
-          data.observationId,
-          compressed,
-        );
+        compressed = await replaceObservation(sdk, compressed, current.version);
 
         try {
           getSearchIndex().add(compressed);
@@ -218,44 +256,7 @@ export function registerCompressFunction(
           { kind: "observation", logId: compressed.id },
         );
 
-        const streamResults = await Promise.allSettled([
-          sdk.trigger({
-            function_id: "stream::set",
-            payload: {
-              stream_name: STREAM.name,
-              group_id: STREAM.group(data.sessionId),
-              item_id: data.observationId,
-              data: { type: "compressed", observation: compressed },
-            },
-          }),
-          sdk.trigger({
-            function_id: "stream::send",
-            payload: {
-              stream_name: STREAM.name,
-              group_id: STREAM.viewerGroup,
-              id: `compressed-${data.observationId}`,
-              type: "compressed_observation",
-              data: {
-                type: "compressed",
-                observation: compressed,
-                sessionId: data.sessionId,
-              },
-            },
-            action: TriggerAction.Void(),
-          }),
-        ]);
-        for (const result of streamResults) {
-          if (result.status === "rejected") {
-            logger.warn("Non-fatal stream publish failure after compress", {
-              sessionId: data.sessionId,
-              observationId: data.observationId,
-              error:
-                result.reason instanceof Error
-                  ? result.reason.message
-                  : String(result.reason),
-            });
-          }
-        }
+        await publishLiveObservation(sdk, "compressed", compressed);
 
         const latencyMs = Date.now() - startMs;
         if (metricsStore) {
@@ -275,7 +276,7 @@ export function registerCompressFunction(
           retried,
         });
 
-        await recordOperation(kv, "mem::compress", "completed", { observationsProcessed: 1, observationsCompressed: 1 }, data.raw.agentId);
+        await recordOperation(kv, "mem::compress", "completed", { observationsProcessed: 1, observationsCompressed: 1 }, data.raw.agentId, { durationMs: latencyMs });
         return { success: true, compressed, qualityScore };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -287,7 +288,7 @@ export function registerCompressFunction(
           obsId: data.observationId,
           error: msg,
         });
-        await recordOperation(kv, "mem::compress", "failed", { observationsProcessed: 1 }, data.raw.agentId);
+        await recordOperation(kv, "mem::compress", "failed", { observationsProcessed: 1 }, data.raw.agentId, { durationMs: latencyMs, errorCode: "compression_failed" });
         return { success: false, error: "compression_failed" };
       }
     },

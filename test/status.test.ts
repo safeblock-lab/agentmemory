@@ -54,6 +54,21 @@ describe("evaluateStatus", () => {
     expect(report.service.engineVersion).toBe("0.22.1");
   });
 
+  it("includes operational dashboard metrics in the existing status report", () => {
+    const metrics = {
+      asOf: "2026-09-24T12:00:00.000Z",
+      failures24h: {
+        count: 2, intervalStart: "2026-09-23T12:00:00.000Z", intervalEnd: "2026-09-24T12:00:00.000Z",
+        complete: true, coverageSince: "2026-09-22T00:00:00.000Z",
+      },
+      graphStorage: { storedBytes: 1024, rows: 4, sampleAt: "2026-09-24T11:00:00.000Z", coverage: "state_rows only", complete: true },
+      engineMemory: { residentBytes: 4096, sampledAt: "2026-09-24T12:00:00.000Z", source: "iii.exe" as const },
+      lastSuccessfulCompactionAt: "2026-09-24T10:00:00.000Z",
+      automaticCompaction: { enabled: false, state: "paused" as const, autoVacuumMode: null },
+    };
+    expect(evaluateStatus(inputs({ operationalMetrics: metrics })).operationalMetrics).toEqual(metrics);
+  });
+
   it("flags a function failing at least 20% of 5+ calls with a provider-specific fix", () => {
     const report = evaluateStatus(
       inputs({
@@ -241,9 +256,14 @@ describe("status wiring", () => {
 
   it("time-boxes every status probe so a slow store cannot hang the page", () => {
     const handler = api.slice(api.indexOf('registerFunction("api::status"'), api.indexOf('function_id: "api::status"'));
-    expect(handler.match(/valueWithin\(/g)?.length).toBe(4);
+    expect(handler.match(/valueWithin\(/g)?.length).toBe(8);
     expect(handler).toMatch(/valueWithin\(sharedUnindexedScan\(\), STATUS_CHECK_TIMEOUT_MS\)/);
     expect(api).toMatch(/const sharedUnindexedScan = singleFlight\(\(\) => findUnindexedObservations\(kv\), UNINDEXED_SCAN_REUSE_MS\);/);
+  });
+
+  it("reads dashboard failure counters from the same configured agent scope as activity writes", () => {
+    const handler = api.slice(api.indexOf('registerFunction("api::status"'), api.indexOf('function_id: "api::status"'));
+    expect(handler).toMatch(/operationalMetrics\.read\(\s*checkedAt, automaticMaintenancePaused, getAgentId\(\),/);
   });
 
   it("config flags and status share one flag list", () => {

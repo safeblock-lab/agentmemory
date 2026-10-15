@@ -1,4 +1,5 @@
 import { getEnvVar } from "../config.js";
+import { consumeProviderAttempt } from "./provider-attempt-budget.js";
 
 // Bounded retry for transient rate-limit / unavailable responses. Attempts is
 // total tries (initial + retries). Retries are bounded by a TOTAL elapsed
@@ -45,8 +46,17 @@ function parseRetryAfter(header: string | null): number | undefined {
 async function fetchOnce(
   url: string,
   init: RequestInit,
-  ms: number,
+  deadline: number,
 ): Promise<Response> {
+  if (init.signal?.aborted) {
+    throw new DOMException("The operation was aborted", "AbortError");
+  }
+  const budgeted = await consumeProviderAttempt(url, init.method ?? "GET", deadline, init.signal);
+  if (init.signal?.aborted) {
+    throw new DOMException("The operation was aborted", "AbortError");
+  }
+  const ms = deadline - Date.now();
+  if (ms <= 0) throw new DOMException("The operation timed out", "TimeoutError");
   const ctl = new AbortController();
   const signal = init.signal
     ? AbortSignal.any([init.signal, ctl.signal])
@@ -54,7 +64,8 @@ async function fetchOnce(
   const timer = setTimeout(() => ctl.abort(), ms);
   timer.unref();
   try {
-    const response = await fetch(url, { ...init, signal });
+    const redirect = budgeted && init.redirect !== "error" ? "manual" : init.redirect;
+    const response = await fetch(url, { ...init, redirect, signal });
     // The body is consumed by the caller after fetch resolves; keep its deadline active.
     if (!response.body) clearTimeout(timer);
     return response;
@@ -78,11 +89,12 @@ export async function fetchWithTimeout(
   // capped so we never approach the iii invocation timeout.
   const budgetMs = Math.min(ms, HARD_BUDGET_CAP_MS);
   const start = Date.now();
+  const deadline = start + budgetMs;
 
   // The first attempt must honor the capped budget too — passing raw `ms`
   // here would let a large caller timeout hang past HARD_BUDGET_CAP_MS (and
   // the iii 180s invocation timeout) before any retry logic runs.
-  let response: Response = await fetchOnce(url, init, budgetMs);
+  let response: Response = await fetchOnce(url, init, deadline);
   for (let attempt = 1; attempt < MAX_ATTEMPTS; attempt++) {
     if (!RETRY_STATUS.has(response.status)) return response;
 
@@ -105,11 +117,7 @@ export async function fetchWithTimeout(
 
     // Cap the per-attempt timeout to whatever budget is left so a late attempt
     // can't push total elapsed past the deadline.
-    const attemptMs = Math.max(
-      MIN_ATTEMPT_FLOOR_MS,
-      Math.min(ms, budgetMs - (Date.now() - start)),
-    );
-    response = await fetchOnce(url, init, attemptMs);
+    response = await fetchOnce(url, init, deadline);
   }
   return response;
 }

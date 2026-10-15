@@ -1,6 +1,9 @@
 import type { IndexLegStatus, IndexPersistenceStatus } from "../state/index-persistence.js";
 import type { DashboardActivity } from "./dashboard-activity.js";
+import type { SavingsReport } from "./savings.js";
+import type { DashboardOperationalMetrics } from "./dashboard-operational-metrics.js";
 import type { readNativeIndexStatus } from "../state/indexed-retrieval.js";
+import type { GraphSampleStatistics } from "./graph-statistics.js";
 
 export type StatusLevel = "ok" | "info" | "warn" | "error";
 
@@ -27,10 +30,10 @@ export interface StatusFlag {
   enableHow: string;
 }
 
-export interface GraphStatsInput {
+export interface GraphStatsInput extends Partial<GraphSampleStatistics> {
   totalNodes?: number | null;
   totalEdges?: number | null;
-  provenance?: "snapshot" | "unavailable";
+  provenance?: "snapshot" | "historical_snapshot" | "unavailable";
   countsAreCurrent?: boolean;
   fromSnapshot?: boolean;
   updatedAt?: string;
@@ -67,6 +70,8 @@ export interface StatusInputs {
     native?: Awaited<ReturnType<typeof readNativeIndexStatus>>;
   };
   activity?: DashboardActivity | null;
+  operationalMetrics?: DashboardOperationalMetrics | null;
+  savings?: SavingsReport | null;
   graph: GraphStatsInput | null;
   graphExtractionEnabled: boolean;
   indexPersistence?: IndexPersistenceStatus | null;
@@ -85,6 +90,8 @@ export interface StatusReport {
   provider: { llm: string; embeddings: string; circuitBreaker: StatusInputs["circuitBreaker"] };
   index: StatusInputs["index"];
   activity: DashboardActivity | null;
+  operationalMetrics: DashboardOperationalMetrics | null;
+  savings: SavingsReport | null;
   indexPersistence: IndexPersistenceStatus | null;
   graph: (GraphStatsInput & { ageSeconds: number | null; extractionEnabled: boolean }) | null;
   functions: Array<FunctionMetricInput & { failureRate: number }>;
@@ -285,6 +292,8 @@ export function evaluateStatus(input: StatusInputs): StatusReport {
     },
     index: input.index,
     activity: input.activity ?? null,
+    operationalMetrics: input.operationalMetrics ?? null,
+    savings: input.savings ?? null,
     indexPersistence: persistence,
     graph,
     functions,

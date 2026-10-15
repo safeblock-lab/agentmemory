@@ -1,3 +1,4 @@
+import { validManualReflectContinuation } from "../functions/reflect-queue-types.js";
 import type { IIIClient } from "iii-sdk";
 import type { HttpRequest } from "@iii-dev/helpers/http";
 import type { StateKV } from "../state/kv.js";
@@ -14,6 +15,8 @@ import { iterateProjectedRecords } from "../functions/projected-record-reader.js
 import { getVisibleTools } from "./tools-registry.js";
 import { timingSafeCompare } from "../auth.js";
 import { getAgentId, isAgentScopeIsolated } from "../config.js";
+import { randomUUID } from "node:crypto";
+import { recordContextUsage, warnContextUsageFailure } from "../functions/context-usage.js";
 
 type McpResponse = {
   status_code: number;
@@ -23,6 +26,24 @@ type McpResponse = {
 
 function asNonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+const MAX_CONSOLIDATION_ID_BYTES = 256;
+const MAX_CONSOLIDATION_BATCH_SOURCES = 12;
+
+function isBoundedConsolidationIdentity(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0
+    && Buffer.byteLength(value) <= MAX_CONSOLIDATION_ID_BYTES;
+}
+
+function invalidConsolidationArguments(): McpResponse {
+  return {
+    status_code: 200,
+    body: {
+      content: [{ type: "text", text: "Invalid memory_consolidate arguments" }],
+      isError: true,
+    },
+  };
 }
 
 function asNumber(value: unknown, fallback?: number): number | undefined {
@@ -78,6 +99,7 @@ export function registerMcpEndpoints(
     async (
       req: HttpRequest<{ name: string; arguments: Record<string, unknown> }>,
     ): Promise<McpResponse> => {
+      const execute = async (): Promise<McpResponse> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
 
@@ -194,6 +216,10 @@ export function registerMcpEndpoints(
                 ? (args.agentId as string).trim()
                 : undefined;
 
+            if (args.sourceObservationIds !== undefined && typeof args.sourceObservationIds !== "string") {
+              return { status_code: 400, body: { error: "sourceObservationIds must be comma-separated IDs" } };
+            }
+
             const result = await sdk.trigger({ function_id: "mem::remember", payload: {
               content: args.content,
               type,
@@ -201,6 +227,11 @@ export function registerMcpEndpoints(
               files,
               ...(project !== undefined && { project }),
               ...(saveAgentId !== undefined && { agentId: saveAgentId }),
+              ...(args.action !== undefined && { action: args.action }),
+              ...(args.targetMemoryId !== undefined && { targetMemoryId: args.targetMemoryId }),
+              ...(args.expectedVersion !== undefined && { expectedVersion: args.expectedVersion }),
+              ...(args.sourceKind !== undefined && { sourceKind: args.sourceKind }),
+              ...(typeof args.sourceObservationIds === "string" && { sourceObservationIds: parseCsvList(args.sourceObservationIds) }),
             } });
             return {
               status_code: 200,
@@ -473,11 +504,16 @@ export function registerMcpEndpoints(
           case "memory_graph_query": {
             try {
               const payload: {
+                project?: string;
                 startNodeId?: string;
                 nodeType?: string;
                 maxDepth?: number;
                 query?: string;
               } = {};
+              if (args.project !== undefined && (typeof args.project !== "string" || !args.project.trim() || Buffer.byteLength(args.project) > 256)) {
+                return { status_code: 200, body: { content: [{ type: "text", text: "Invalid project" }], isError: true } };
+              }
+              if (typeof args.project === "string") payload.project = args.project.trim();
               const startNodeId = asNonEmptyString(args.startNodeId);
               const nodeType = asNonEmptyString(args.nodeType);
               const query = asNonEmptyString(args.query);
@@ -514,10 +550,51 @@ export function registerMcpEndpoints(
           }
 
           case "memory_consolidate": {
+            if (!args || typeof args !== "object" || Array.isArray(args)) {
+              return invalidConsolidationArguments();
+            }
+            if (args.tier !== undefined && (typeof args.tier !== "string"
+              || !args.tier.trim() || Buffer.byteLength(args.tier) > 32)) {
+              return invalidConsolidationArguments();
+            }
+            const payload: Record<string, unknown> = { tier: args.tier as string };
+            if (args.project !== undefined) {
+              if (!isBoundedConsolidationIdentity(args.project)) return invalidConsolidationArguments();
+              payload.project = args.project;
+            }
+            for (const key of ["force", "deferred", "consolidationCatalogProject"] as const) {
+              const value = args[key];
+              if (value !== undefined) {
+                if (typeof value !== "boolean") return invalidConsolidationArguments();
+                payload[key] = value;
+              }
+            }
+            const continuationIds = [
+              "consolidationSelectionId",
+              "consolidationManifestId",
+              "decayManifestId",
+            ] as const;
+            let continuationIdCount = 0;
+            for (const key of continuationIds) {
+              const value = args[key];
+              if (value !== undefined) {
+                if (!isBoundedConsolidationIdentity(value)) return invalidConsolidationArguments();
+                payload[key] = value;
+                continuationIdCount += 1;
+              }
+            }
+            if (continuationIdCount > 1) return invalidConsolidationArguments();
+            if (args.batchSourceIds !== undefined) {
+              const sourceIds = args.batchSourceIds;
+              if (!Array.isArray(sourceIds) || sourceIds.length === 0
+                || sourceIds.length > MAX_CONSOLIDATION_BATCH_SOURCES
+                || sourceIds.some((id) => !isBoundedConsolidationIdentity(id))) {
+                return invalidConsolidationArguments();
+              }
+              payload.batchSourceIds = sourceIds;
+            }
             try {
-              const result = await sdk.trigger({ function_id: "mem::consolidate-pipeline", payload: {
-                tier: args.tier as string,
-              } });
+              const result = await sdk.trigger({ function_id: "mem::consolidate-pipeline", payload });
               return {
                 status_code: 200,
                 body: {
@@ -1170,9 +1247,16 @@ export function registerMcpEndpoints(
           }
 
           case "memory_reflect": {
-            const reflectResult = await sdk.trigger({ function_id: "mem::reflect", payload: {
-              project: args.project,
-              maxClusters: args.maxClusters,
+            if (args.requestId !== undefined && typeof args.requestId !== "string" || args.continuation !== undefined && !validManualReflectContinuation(args.continuation)) {
+              return { status_code: 200, body: { isError: true, content: [{ type: "text", text: "invalid_manual_reflect_request" }] } };
+            }
+            const reflectResult = await sdk.trigger({ function_id: "mem::reflect", timeoutMs: 180_000, payload: {
+              project: typeof args.project === "string" ? args.project : undefined,
+              maxClusters: typeof args.maxClusters === "number" ? args.maxClusters : undefined,
+              manual: true, requestId: args.requestId ?? randomUUID(),
+              ...(args.continuation !== undefined && { continuation: { jobId: args.continuation.jobId,
+                requestId: args.continuation.requestId, project: args.continuation.project,
+                checkpoint: args.continuation.checkpoint, cut: args.continuation.cut } }),
             } });
             return { status_code: 200, body: { content: [{ type: "text", text: JSON.stringify(reflectResult, null, 2) }] } };
           }
@@ -1318,6 +1402,24 @@ export function registerMcpEndpoints(
           },
         };
       }
+      };
+      const response = await execute();
+      if (response.status_code === 200 && response.body && typeof response.body === "object") {
+        const content = (response.body as { content?: unknown }).content;
+        if (Array.isArray(content)) {
+          const text = content.map((item: unknown) => {
+            if (!item || typeof item !== "object") return "";
+            const block = item as { type?: unknown; text?: unknown };
+            return block.type === "text" && typeof block.text === "string" ? block.text : "";
+          }).join("\n");
+          try {
+            await recordContextUsage(kv, "unattributed-mcp-response", {
+              eventId: randomUUID(), source: "mcp-response", text,
+            });
+          } catch { warnContextUsageFailure(); }
+        }
+      }
+      return response;
     },
   );
   sdk.registerTrigger({

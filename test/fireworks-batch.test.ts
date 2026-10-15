@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+vi.mock("iii-sdk", () => ({ InvocationError: class InvocationError extends Error { code = "TEST_INVOCATION_ERROR"; } }));
 import { FireworksBatchCoordinator } from "../src/functions/fireworks-batch.js";
 import { StateKV } from "../src/state/kv.js";
 import type { StatePageRequest } from "../src/state/state-pages.js";
@@ -10,6 +11,7 @@ import { FireworksBatchClient, FireworksBatchError, type FireworksBatchTransport
 function createKv(options: {
   rejectHistoricalLists?: boolean;
   onSet?: (scope: string, key: string | undefined, value: unknown, store: Map<string, unknown>) => void;
+  onNativeRequest?: (request: Record<string, unknown>) => void;
 } = {}): StateKV {
   const store = new Map<string, unknown>();
   const sdk = {
@@ -18,6 +20,34 @@ function createKv(options: {
       payload: { scope: string; key?: string; value?: unknown; cursor?: string; limit?: number; max_bytes?: number };
     }) {
       const { scope, key, value } = input.payload;
+      if (input.function_id === "state::retrieval") {
+        const request = input.payload as unknown as Record<string, unknown>;
+        options.onNativeRequest?.(request);
+        if (request.action === "batch_work_payload") {
+          const items: unknown[] = []; const deferred: unknown[] = []; let bytes = 0;
+          for (const id of request.keys as string[]) {
+            const work = store.get(`${KV.fireworksBatchWorkItems}:${id}`);
+            const encoded = JSON.stringify(work ?? null);
+            if (!work) deferred.push({ key: id, reason: "missing" });
+            else if (bytes + Buffer.byteLength(encoded) > Number(request.max_bytes)) deferred.push({ key: id, reason: "oversized" });
+            else { bytes += Buffer.byteLength(encoded); items.push({ key: id, version: "1", fingerprint: encoded, value: structuredClone(work) }); }
+          }
+          return { items, deferred };
+        }
+        if (request.action === "batch_work_submission_patch") {
+          const refs = request.items as Array<{ key: string; expected_fingerprint: string }>;
+          const selected = refs.map(ref => store.get(`${KV.fireworksBatchWorkItems}:${ref.key}`) as FireworksBatchWorkItem);
+          if (selected.some((work, index) => !work || work.state !== "queued" || JSON.stringify(work) !== refs[index].expected_fingerprint ||
+            store.has(`mem:reflect:control:legacy-bridge:${work.id}`))) return { applied: false, reason: "stale" };
+          for (const work of selected) store.set(`${KV.fireworksBatchWorkItems}:${work.id}`, { ...work, state: "submitted", batchJobId: request.batch_job_id, updatedAt: request.updated_at });
+          return { applied: true };
+        }
+        if (request.action === "batch_work_bridge_ack") {
+          store.set(`mem:reflect:control:legacy-ack:${request.key}`, { acknowledged: true, receiptKey: request.receipt_key });
+          return { acknowledged: true };
+        }
+        throw new Error(`unexpected retrieval ${request.action}`);
+      }
       const rejectHistoricalList = () => {
         if (options.rejectHistoricalLists && (
           scope === KV.fireworksBatchWorkItems

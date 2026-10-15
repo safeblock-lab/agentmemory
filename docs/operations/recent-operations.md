@@ -1,11 +1,31 @@
 # Recent operation feed
 
-Dashboard and Health render the same `api::status` activity result. It reads only
+Dashboard renders the latest 10 entries and Health the latest 30 from the same
+`api::status` activity result. It reads only
 `mem:recent-operations/current` through native iii-engine StateKV, with no corpus
 enumeration or historical audit scan. The record holds the latest 30 outcomes in
 native append order; the UI displays newest first. Service restarts retain it.
 
-Only `mem::compress`, `mem::summarize` and `mem::graph-extract` publish outcomes.
+Compression, direct summaries and graph extraction publish their existing outcomes.
+The durable summary queue also records new enqueues, successfully saved map/reduce
+units, failed unit attempts, and final persisted summaries or failed jobs.
+Duplicate deliveries and dispatcher/recovery polls do not create entries.
+Final summaries identify deterministic fallback separately from LLM synthesis.
+An enqueue is recorded only for a newly created job, not a deduplicated request.
+
+An explicit processing catalog in `dashboard-activity.ts`, wrapped by
+`operation-tracking.ts`, records profile generation,
+skill extraction, consolidation and its pipeline, pattern/rule generation, reflection,
+crystallization, workflow/file compression, window/session enrichment, temporal graph
+extraction, retention scoring/eviction, automatic forgetting, eviction, cascade updates,
+healing, slot reflection, image embedding, migration and graph import. Cached profiles,
+skips, queued work, partial failures and thrown/returned errors have distinct outcomes.
+The instrumentation preserves original results and thrown errors. It does not invoke
+providers or schedule work. Registration names outside this catalog are excluded,
+including API/status calls, searches, matching/listing/getters, dispatcher/recovery
+polls, routine coordination and ordinary writes. New processing functions must be
+added explicitly rather than inheriting telemetry from a `mem::` prefix.
+
 Routine session and observation writes do not displace these operations. Existing
 legacy audit history remains read-only; `recordAudit` stays disabled.
 

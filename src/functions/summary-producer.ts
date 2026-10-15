@@ -12,6 +12,9 @@ import {
   isExplicitSummarySizeError, smallerSummaryLimit,
 } from "./summary-budget.js";
 import { parseSummaryXml } from "./summary-xml.js";
+import {
+  groundSummarySourcePaths, summarySourceModifiedPathLiterals, summarySourcePathLiterals,
+} from "./summary-source-grounding.js";
 
 interface ProducedSummary {
   response: string;
@@ -71,10 +74,12 @@ function summaryProviderErrorDetails(error: unknown): SummaryProviderErrorDetail
 export function createSummaryProducer(
   provider: MemoryProvider, llmRouter: LlmTaskRouter | undefined,
   config: SummaryBudgetConfig, sessionId: string, project: string,
+  selected?: { sourceFingerprint: string },
 ): (observations: CompressedObservation[]) => Promise<ProducedSummary> {
   const inputLimit = summaryCallInputLimit(config);
   const chunkInputLimit = summaryChunkInputLimit(config);
-  const concurrency = Math.max(1, config.concurrency);
+  const selectedExecution = Boolean(selected);
+  const concurrency = selectedExecution ? 1 : Math.max(1, config.concurrency);
   let calls = 0;
   let firstProviderFailureLogged = false;
   const call = async (system: string, prompt: string): Promise<string> => {
@@ -89,9 +94,10 @@ export function createSummaryProducer(
       return selected.summarize(system, prompt, { task: "summary", outputTokens });
     };
     try {
-      return await (llmRouter
+      const execute = () => llmRouter
         ? llmRouter.run("summary", operation, candidate => parseSummaryXml(candidate, sessionId, project, 0) !== null)
-        : operation(provider));
+        : operation(provider);
+      return await execute();
     } catch (error) {
       if (!(error instanceof SummaryBudgetError) && !firstProviderFailureLogged) {
         firstProviderFailureLogged = true;
@@ -103,14 +109,21 @@ export function createSummaryProducer(
       throw error;
     }
   };
-  const partial = (summary: SessionSummary, items: SummaryPromptItem[]): SummaryPromptItem => ({
-    text: formatSummaryPartial(summary),
-    obsRangeStart: items[0].obsRangeStart,
-    obsRangeEnd: items[items.length - 1].obsRangeEnd,
-  });
+  const partial = (summary: SessionSummary, items: SummaryPromptItem[]): SummaryPromptItem => {
+    const sourcePaths = [...new Set(items.flatMap(item => item.sourcePaths ?? []))];
+    const modifiedPaths = [...new Set(items.flatMap(item => item.modifiedPaths ?? []))];
+    const grounded = groundSummarySourcePaths(summary, sourcePaths, modifiedPaths);
+    return {
+      text: formatSummaryPartial(grounded),
+      obsRangeStart: items[0].obsRangeStart,
+      obsRangeEnd: items[items.length - 1].obsRangeEnd,
+      sourcePaths,
+      modifiedPaths,
+    };
+  };
   const map = async (items: SummaryPromptItem[], limit: number, depth: number): Promise<SummaryPromptItem[] | null> => {
     if (depth > MAX_SUMMARY_DEPTH) throw new SummaryBudgetError("summary_depth_limit_exceeded");
-    for (let attempt = 1; attempt <= 2; attempt++) {
+    for (let attempt = 1; attempt <= (selectedExecution ? 1 : 2); attempt++) {
       try {
         const response = await call(SUMMARY_SYSTEM, buildSummaryItemsPrompt(items));
         const summary = parseSummaryXml(response, sessionId, project, 0);
@@ -118,6 +131,7 @@ export function createSummaryProducer(
         logger.warn("Summarize chunk parse failed", { sessionId, attempt, items: items.length });
       } catch (error) {
         if (error instanceof SummaryBudgetError) throw error;
+        if (selectedExecution) throw error;
         if (isExplicitSummarySizeError(error)) {
           const nextLimit = smallerSummaryLimit(SUMMARY_SYSTEM, buildSummaryItemsPrompt, limit);
           const groups = packSummaryItems(items, SUMMARY_SYSTEM, buildSummaryItemsPrompt, nextLimit, config.chunkSize);
@@ -146,14 +160,14 @@ export function createSummaryProducer(
         try {
           return await call(REDUCE_SYSTEM, buildReduceItemsPrompt(groups[0]));
         } catch (error) {
-          if (error instanceof SummaryBudgetError || !isExplicitSummarySizeError(error)) throw error;
+          if (selectedExecution || error instanceof SummaryBudgetError || !isExplicitSummarySizeError(error)) throw error;
           limit = smallerSummaryLimit(REDUCE_SYSTEM, buildReduceItemsPrompt, limit);
           logger.warn("Summarize reduce context limit; subdividing", { sessionId, depth, groups: groups.length });
           continue;
         }
       }
       const summarizeGroup = async (group: SummaryPromptItem[]): Promise<SummaryPromptItem> => {
-        for (let attempt = 1; attempt <= 2; attempt++) {
+        for (let attempt = 1; attempt <= (selectedExecution ? 1 : 2); attempt++) {
           const response = await call(REDUCE_SYSTEM, buildReduceItemsPrompt(group));
           const summary = parseSummaryXml(response, sessionId, project, 0);
           if (summary) return partial(summary, group);
@@ -165,7 +179,7 @@ export function createSummaryProducer(
         for (const result of settled) {
           if (result.status === "rejected") {
             const error: unknown = result.reason;
-            if (error instanceof SummaryBudgetError || !isExplicitSummarySizeError(error)) throw error;
+            if (selectedExecution || error instanceof SummaryBudgetError || !isExplicitSummarySizeError(error)) throw error;
             limit = smallerSummaryLimit(REDUCE_SYSTEM, buildReduceItemsPrompt, limit);
             logger.warn("Summarize reduce context limit; subdividing", { sessionId, depth, groups: groups.length });
             resized = true;
@@ -187,6 +201,8 @@ export function createSummaryProducer(
   return async observations => {
     const items = observations.map((observation, index) => ({
       text: formatSummaryObservation(observation, index + 1), obsRangeStart: index + 1, obsRangeEnd: index + 1,
+      sourcePaths: summarySourcePathLiterals([observation]),
+      modifiedPaths: summarySourceModifiedPathLiterals([observation]),
     }));
     let mapLimit = chunkInputLimit;
     let chunks = packSummaryItems(items, SUMMARY_SYSTEM, buildSummaryItemsPrompt, mapLimit, config.chunkSize);
@@ -194,7 +210,7 @@ export function createSummaryProducer(
       try {
         return { response: await call(SUMMARY_SYSTEM, buildSummaryItemsPrompt(chunks[0])), mode: "single", chunks: 1 };
       } catch (error) {
-        if (!isExplicitSummarySizeError(error)) throw error;
+        if (selectedExecution || !isExplicitSummarySizeError(error)) throw error;
         mapLimit = smallerSummaryLimit(SUMMARY_SYSTEM, buildSummaryItemsPrompt, mapLimit);
         chunks = packSummaryItems(items, SUMMARY_SYSTEM, buildSummaryItemsPrompt, mapLimit, config.chunkSize);
       }
@@ -202,6 +218,7 @@ export function createSummaryProducer(
     logger.info("Summarize chunking session", {
       sessionId, chunks: chunks.length, concurrency: config.concurrency, totalObservations: observations.length,
     });
+    if (selectedExecution && chunks.length > 1) throw new SummaryBudgetError("selected_summary_requires_unit_workflow");
     const results: Array<SummaryPromptItem[] | null> = [];
     for (let start = 0; start < chunks.length; start += concurrency) {
       const settled = await Promise.allSettled(chunks.slice(start, start + concurrency)

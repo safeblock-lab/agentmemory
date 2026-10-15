@@ -11,6 +11,7 @@ import type { EmbeddingProvider } from '../types.js'
 import { memoryToObservation } from '../state/memory-utils.js'
 import { recordAccessBatch } from './access-tracker.js'
 import { logger } from "../logger.js";
+import { countContextTokens } from "../utils/context-tokens.js";
 import {
   getAgentId,
   getVectorBackfillMax,
@@ -40,6 +41,7 @@ let currentEmbeddingProvider: EmbeddingProvider | null = null
 type HybridRanker = (
   query: string,
   limit: number,
+  project?: string,
 ) => Promise<Array<{ observation: CompressedObservation; sessionId: string; combinedScore: number }>>
 let hybridRanker: HybridRanker | null = null
 
@@ -704,7 +706,7 @@ export function registerSearchFunction(sdk: IIIClient, kv: StateKV): void {
       }>
       if (hybridRanker && (kv.indexedRetrieval || (vectorIndex && vectorIndex.size > 0))) {
         try {
-          const hybrid = await hybridRanker(query, fetchLimit)
+          const hybrid = await hybridRanker(query, fetchLimit, projectFilter)
           results = hybrid.map((r) => ({
             obsId: r.observation.id,
             sessionId: r.sessionId,
@@ -828,24 +830,21 @@ export function registerSearchFunction(sdk: IIIClient, kv: StateKV): void {
         enriched.map((r) => r.observation.id),
       )
 
-      const estimateTokens = (value: unknown): number =>
-        Math.max(1, Math.ceil(JSON.stringify(value).length / 3))
-
-      const applyTokenBudget = <T>(items: T[]): {
+      const applyTokenBudget = <T>(items: T[], render: (items: T[]) => string = (values) => JSON.stringify(values, null, 2)): {
         items: T[]
         used: number
         truncated: boolean
       } => {
-        if (!tokenBudget) return { items, used: items.reduce((sum, item) => sum + estimateTokens(item), 0), truncated: false }
+        if (!tokenBudget) return { items, used: countContextTokens(render(items)), truncated: false }
         const selected: T[] = []
         let used = 0
         for (const item of items) {
-          const itemTokens = estimateTokens(item)
-          if (used + itemTokens > tokenBudget) {
+          const nextTokens = countContextTokens(render([...selected, item]))
+          if (nextTokens > tokenBudget) {
             return { items: selected, used, truncated: selected.length < items.length }
           }
           selected.push(item)
-          used += itemTokens
+          used = nextTokens
         }
         return { items: selected, used, truncated: false }
       }
@@ -864,6 +863,7 @@ export function registerSearchFunction(sdk: IIIClient, kv: StateKV): void {
           format,
           results: packed.items,
           tokens_used: packed.used,
+          tokenizer: 'o200k_base',
           tokens_budget: tokenBudget,
           truncated: packed.truncated,
         }
@@ -878,7 +878,10 @@ export function registerSearchFunction(sdk: IIIClient, kv: StateKV): void {
           score: r.score,
           timestamp: r.observation.timestamp,
         }))
-        const packed = applyTokenBudget(narrativeResults)
+        const renderNarrative = (items: typeof narrativeResults) => items
+          .map((r, index) => `${index + 1}. ${r.title}\n${r.narrative}`)
+          .join('\n\n')
+        const packed = applyTokenBudget(narrativeResults, renderNarrative)
         const text = packed.items
           .map((r, index) => `${index + 1}. ${r.title}\n${r.narrative}`)
           .join('\n\n')
@@ -887,6 +890,7 @@ export function registerSearchFunction(sdk: IIIClient, kv: StateKV): void {
           results: packed.items,
           text,
           tokens_used: packed.used,
+          tokenizer: 'o200k_base',
           tokens_budget: tokenBudget,
           truncated: packed.truncated,
         }
@@ -905,6 +909,7 @@ export function registerSearchFunction(sdk: IIIClient, kv: StateKV): void {
         format,
         results: packed.items,
         tokens_used: packed.used,
+        tokenizer: 'o200k_base',
         tokens_budget: tokenBudget,
         truncated: packed.truncated,
       }

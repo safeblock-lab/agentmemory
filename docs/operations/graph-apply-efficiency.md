@@ -1,0 +1,13 @@
+# Native graph apply efficiency
+
+Graph apply commits rewrite state rows and derived retrieval rows in one native SQLite transaction. Before this change, every node write deleted and rebuilt all of that node's name grams and `sourceObservationIds` memberships, even when only an unrelated property changed. Edge writes also deleted and reinserted their derived row when its indexed endpoints were unchanged.
+
+The live writer now keeps passing the previous row into retrieval maintenance. It uses the incremental path only when the graph index is `ready` and its saved revision is exactly the predecessor of the state revision being written. The graph metadata epoch/revision update still runs for every write, and row versions, scope revisions, source-index maintenance, receipts, and transaction fencing retain their existing flow. If the index is pending, stale, or the expected derived row is absent, maintenance uses the existing full replacement path; in that state this optimization does not speed up the apply.
+
+For ready node rows, the incremental path skips derived work when the indexed projection is unchanged. It updates only changed name grams and membership pairs when those fields change, preserving shared observation identifiers and deleting identifiers only after both membership directions become empty. Small deltas use point updates; changes affecting more than 128 derived rows keep the existing bulk replacement path. Edge rows update only when their source, target, or position changes. Preparation and recovery continue to use full replacement so they can repair a pending or incomplete epoch.
+
+The existing SQLite access paths already cover the orphan checks: `retrieval_membership` has primary key `(epoch, observation, key)` and a secondary index on `(epoch, key)`; name-gram cleanup is covered by `(epoch, key)`. No extra index is justified by the inspected predicates.
+
+The measured incident included a 732,485-byte commit taking 92,694 ms. That confirms severe native apply latency, but the available timing does not prove which individual SQL statement caused it or how much this optimization will reduce it. Compare subsequent per-commit timings after installing the compiled source before claiming a speedup.
+
+`STATE_TX_LIMIT_EXCEEDED` is also used for distinct adapter conditions. A 780,956-byte serialized commit is under the 4 MiB default commit limit and the 16 MiB envelope limit. The SQLite actor has a bounded 32-item queue and a 64 MiB admission budget, and both queue saturation and admission exhaustion map to that public error. The current record does not distinguish those cases; changing queue or admission behavior requires separate evidence and review.

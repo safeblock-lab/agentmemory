@@ -91,9 +91,12 @@ export class IndexedVector {
             typeof ref.source_scope !== 'string' || (ref.source_scope !== KV.memories && !ref.source_scope.startsWith('mem:obs:'))) {
             throw new IndexedRetrievalError('STATE_INDEX_NOT_READY', 'Invalid incremental semantic source reference.');
           }
-          const source = await this.kv.getVersioned<{ title: string; narrative?: string; content?: string; sessionId?: string; sessionIds?: string[] }>(ref.source_scope, ref.id);
+          const source = await this.kv.getVersioned<{ title: string; narrative?: string; content?: string; sessionId?: string; sessionIds?: string[]; embeddingReuse?: unknown }>(ref.source_scope, ref.id);
           if (!source.exists || !source.value || source.version !== ref.source_version || typeof source.value.title !== 'string') {
             throw new IndexedRetrievalError('STATE_INDEX_NOT_READY', 'Semantic source changed during incremental recovery.');
+          }
+          if (source.value.embeddingReuse !== undefined) {
+            throw new IndexedRetrievalError('STATE_INDEX_NOT_READY', 'Metadata embedding reuse remains pending; automatic embedding is forbidden.');
           }
           const memory = ref.source_scope === KV.memories;
           const content = memory ? source.value.content : source.value.narrative;
@@ -135,8 +138,9 @@ export class IndexedVector {
     const selected = status.semantic?.find(item => item.index_id === this.identity.index_id);
     if (status.version !== 1 || !status.capabilities?.includes('state::semantic_lsh_v1') || !status.capabilities.includes('state::indexed_graph_v1') ||
       ![KV.graphNodes, KV.graphEdges].every(scope => status.graph?.some(item => item.scope === scope && item.status === 'ready')) ||
-      !selected || selected.status !== 'ready' || selected.lexical_ready !== true || !/^\d+$/.test(selected.count) || selected.lexical_count !== selected.count ||
-      selected.source_kind !== 'agentmemory' || !/^\d+$/.test(selected.dirty_count) ||
+      !selected || selected.status !== 'ready' || selected.lexical_ready !== true || !Number.isSafeInteger(Number(selected.count)) ||
+      !Number.isSafeInteger(Number(selected.lexical_count)) || Number(selected.lexical_count) !== Number(selected.count) ||
+      selected.source_kind !== 'agentmemory' || !/^\d+$/.test(String(selected.dirty_count)) ||
       selected.model !== this.identity.model || selected.dimensions !== this.identity.dimensions || selected.generation !== this.identity.generation ||
       (marker?.status !== 'ready' && !(allowPendingMarker && marker?.status === 'pending')) || marker.model !== this.identity.model || marker.dimensions !== this.identity.dimensions || marker.generation !== this.identity.generation) {
       throw new IndexedRetrievalError('STATE_INDEX_NOT_READY', 'Prepare the complete semantic corpus with the selected embedding identity before searching.');
@@ -176,9 +180,10 @@ export class IndexedVector {
     for (let i = 0; i < embedding.length; i++) bytes.writeFloatLE(embedding[i], i * 4);
     await this.mutate({ action: 'semantic_upsert', ...this.identity, items: [{ id, session_id: sessionId, embedding: bytes.toString('base64'), text, source_scope: sourceScope, source_version: source.version }] });
   }
-  async keywordSearch(query: string, limit: number): Promise<Array<{ obsId: string; sessionId: string; score: number }>> {
+  async keywordSearch(query: string, limit: number, project?: string): Promise<Array<{ obsId: string; sessionId: string; score: number }>> {
     return this.queryWithReadinessRetry(async () => {
-      const response = await retrievalRequest<{ items: Array<{ obsId: string; sessionId: string; score: number }>; model: string; dimensions: number; generation: string }>(this.kv, { action: 'keyword_search', ...this.identity, query, limit: Math.min(limit, 100) });
+      const scope = project?.trim() ? { project: project.trim() } : { global: true };
+      const response = await retrievalRequest<{ items: Array<{ obsId: string; sessionId: string; score: number }>; model: string; dimensions: number; generation: string }>(this.kv, { action: 'keyword_search', ...this.identity, ...scope, query, limit: Math.min(limit, 100) });
       this.validateIdentity(response);
       if (!Array.isArray(response.items)) throw new IndexedRetrievalError('STATE_TX_INVALID_REQUEST', 'Invalid lexical candidate response.');
       return response.items;
@@ -198,12 +203,13 @@ export class IndexedVector {
     await this.pending;
     if (this.failure) throw this.failure;
   }
-  async search(embedding: Float32Array, limit: number): Promise<Array<{ obsId: string; sessionId: string; score: number }>> {
+  async search(embedding: Float32Array, limit: number, project?: string): Promise<Array<{ obsId: string; sessionId: string; score: number }>> {
     const bytes = Buffer.alloc(embedding.length * 4);
     for (let i = 0; i < embedding.length; i++) bytes.writeFloatLE(embedding[i], i * 4);
     return this.queryWithReadinessRetry(async () => {
+      const scope = project?.trim() ? { project: project.trim() } : { global: true };
       const result = await retrievalRequest<{ items: Array<{ obsId: string; sessionId: string; score: number }>; approximate: boolean; budget_exhausted: boolean; candidates: string; model: string; dimensions: number; generation: string }>(this.kv, {
-        action: 'semantic_search', ...this.identity, embedding: bytes.toString('base64'), limit: Math.min(limit, 100), max_candidates: 4096, probes: semanticProbes,
+        action: 'semantic_search', ...this.identity, ...scope, embedding: bytes.toString('base64'), limit: Math.min(limit, 100), max_candidates: 4096, probes: semanticProbes,
       });
       this.validateIdentity(result);
       if (!Array.isArray(result.items) || result.approximate !== true || typeof result.budget_exhausted !== 'boolean') throw new IndexedRetrievalError('STATE_TX_INVALID_REQUEST', 'Invalid semantic candidate response.');

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { execSync } from "node:child_process";
 import { basename } from "node:path";
+import { randomUUID } from "node:crypto";
 //#region src/hooks/_project.ts
 function resolveProject(cwd) {
 	const explicit = process.env["AGENTMEMORY_PROJECT_NAME"];
@@ -29,6 +30,30 @@ function hookCwd(data) {
 	}
 	const projectDir = process.env["DEVIN_PROJECT_DIR"] || process.env["CLAUDE_PROJECT_DIR"];
 	if (projectDir && projectDir.trim()) return projectDir;
+}
+//#endregion
+//#region src/hooks/_context-usage.ts
+function recordContextEmission(url, headers, sessionId, source, text, candidateTokens) {
+	fetch(`${url}/agentmemory/observe`, {
+		method: "POST",
+		headers,
+		body: JSON.stringify({
+			sessionId,
+			project: "context-telemetry",
+			cwd: process.cwd(),
+			hookType: "notification",
+			timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+			data: {
+				event: "context_emitted_v1",
+				eventId: randomUUID(),
+				source,
+				text,
+				candidateTokens
+			}
+		}),
+		signal: AbortSignal.timeout(1e3)
+	}).catch(() => {});
+	setTimeout(() => process.exit(0), 500).unref();
 }
 //#endregion
 //#region src/hooks/pre-compact.ts
@@ -78,7 +103,10 @@ async function main() {
 		});
 		if (res.ok) {
 			const result = await res.json();
-			if (result.context) process.stdout.write(result.context);
+			if (result.context) {
+				const text = result.context;
+				process.stdout.write(text, () => recordContextEmission(REST_URL, authHeaders(), sessionId, "pre-compact", text, result.candidateTokens));
+			}
 		}
 	} catch {}
 }

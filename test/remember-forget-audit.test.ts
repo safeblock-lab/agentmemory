@@ -4,11 +4,8 @@ vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-vi.mock("../src/state/keyed-mutex.js", () => ({
-  withKeyedLock: <T>(_key: string, fn: () => Promise<T>) => fn(),
-}));
-
 import { registerRememberFunction } from "../src/functions/remember.js";
+import { withKeyedLock } from "../src/state/keyed-mutex.js";
 import {
   getSearchIndex,
   setIndexPersistence,
@@ -102,6 +99,45 @@ describe("mem::forget without persistent audit history", () => {
     expect(await kv.get("mem:access", "obs_a")).toBeNull();
     expect(await kv.get("mem:access", "obs_b")).toBeNull();
     expect(auditRows).toHaveLength(0);
+  });
+
+  it("keeps the session and canonical summary until the summary lock is acquired", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerRememberFunction(sdk as never, kv as never);
+    const sessionId = "sess_locked_forget";
+    await kv.set("mem:sessions", sessionId, { id: sessionId });
+    await kv.set("mem:summaries", sessionId, { sessionId, title: "Existing summary" });
+    await kv.set(`mem:obs:${sessionId}`, "obs_a", { id: "obs_a" });
+
+    let signalLockHeld!: () => void;
+    let releaseLock!: () => void;
+    const lockHeld = new Promise<void>(resolve => { signalLockHeld = resolve; });
+    const lockRelease = new Promise<void>(resolve => { releaseLock = resolve; });
+    const heldLock = withKeyedLock(`summary-canonical:${sessionId}`, async () => {
+      signalLockHeld();
+      await lockRelease;
+    });
+    await lockHeld;
+
+    let settled = false;
+    const forgetting = sdk.trigger({ function_id: "mem::forget", payload: { sessionId } })
+      .finally(() => { settled = true; });
+    try {
+      await vi.waitFor(async () => {
+        expect(await kv.get(`mem:obs:${sessionId}`, "obs_a")).toBeNull();
+      });
+      expect(await kv.get("mem:sessions", sessionId)).not.toBeNull();
+      expect(await kv.get("mem:summaries", sessionId)).not.toBeNull();
+      expect(settled).toBe(false);
+    } finally {
+      releaseLock();
+    }
+
+    await heldLock;
+    expect(await forgetting).toMatchObject({ success: true, deleted: 3 });
+    expect(await kv.get("mem:sessions", sessionId)).toBeNull();
+    expect(await kv.get("mem:summaries", sessionId)).toBeNull();
   });
 
   it("removes only the forgotten observations' access logs", async () => {

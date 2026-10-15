@@ -1,5 +1,63 @@
 # Graph job retention
 
+## Storage source candidate, 13 October 2026
+
+The candidate in `.codex-task/full-closure/storage-source/delta-manifest.json`
+requires serial native/shared integration. Its TypeScript changes have isolated
+mocked receipts; native changes have not been compiled or run, and this candidate
+has not been installed or used for live cleanup. No physical reduction is claimed.
+The historical behavior below describes the earlier candidate and is superseded
+by the following safety changes when these deltas are integrated.
+
+Terminal maintenance retains captured inputs, provider results and delta
+manifests used by completed replay readers. It removes generated shadows,
+prepared payloads, remaps, working snapshots and older receipts only after native
+terminal state, checkpoint, final receipt, recovery barrier and current lease
+validation. Failed, unknown and merely stopped jobs remain. The final receipt,
+job and checkpoint remain. Automatic closing transactions defer cleanup to the
+explicit maintenance endpoint, keeping publication independent of cleanup guards.
+
+Each native page scans at most 256 rows with the existing byte target and
+three-second native work deadline. Dependency/reference reads are bounded to
+128 KiB of both logical and stored payload. Oversized, undecodable or protected
+referencing rows refuse the page with `STATE_GRAPH_RECOVERY_REQUIRED`; the native
+transaction must roll back the page. Protected graph families, reflection
+`reflectjob_e7a9c192888162d1` and the identified unknown summary family remain.
+Large unclassified rows require a separate dependency proof; their age does not
+authorize deletion.
+
+The application stores an unfinished job ID, pinned checkpoint version and
+native continuation alongside the scan cursor. Later ticks drain that job before
+enumerating another page. A changed checkpoint drops only this maintenance
+continuation; a native refusal reports pending and keeps source rows. A lost
+acknowledgement retries through the native idempotent page contract. Stale engine
+pagination resets only the scan cursor.
+
+Five-day technical retention keeps event receipts and observation identity maps:
+they distinguish old unseen occurrences from replay. It also keeps lifetime
+metrics, current health, failed routine runs and failed/unknown summary work.
+Summary-unit cleanup requires bounded completed publication dependencies.
+Semantic retention scoring/manual eviction remains a separate explicit API;
+technical maintenance does not invoke it or evict semantic knowledge by age.
+
+Observation identity includes the complete sanitized payload, so changed tool
+output creates another original. Exact repeats retain first/last timestamps,
+count and provenance. Native admission counts distinct old events instead of
+treating every old event as replay; provenance overflow refuses the operation
+without truncation. Native replacement preserves original source fields and
+provenance. Removing a redundant raw copy requires a separate indexed canonical
+copy, exact original equivalence, pinned version and retained provenance/time/
+count proof; it records `rawSource` and preserves metadata on the duplicate.
+
+Integration must merge the maintenance delta from its immutable baseline and
+the `src/types.ts` additions with the current owners' changes. Require exact
+baseline text before whole-file replacement; otherwise merge the small affected
+sections. Run the authored native observation, technical retention and terminal
+retention cases serially, then perform installed interface/replay acceptance
+before selecting any current physical deletion batch.
+
+## Historical candidate and receipts
+
 The source candidate's native final `complete` transaction closes a job when its persisted state is
 `completed`, `invalidated`, or `recoveryStopped: true`. It removes the five job
 staging scopes (inputs, provider results, deltas, prepared payloads and remaps),
@@ -60,8 +118,9 @@ eligible only when it has a complete checkpoint; this includes a failed job
 that was explicitly stopped. The native operation then verifies the final
 receipt and recovery barrier before deleting any staging data. The job row,
 checkpoint, final receipt and `recoveryStopped` marker remain unchanged, so the
-two protected stopped campaigns keep their metadata and cannot be resumed;
-their completed staging data can be reclaimed when the native proof passes.
+two protected stopped campaigns keep all their data and cannot be resumed.
+Their staging scopes and records referencing either protected family are
+excluded from retention, even when the ordinary terminal proof passes.
 Incomplete checkpoints and missing receipts remain intact. Maintenance persists one scan cursor in
 `mem:config / graph-terminal-retention-page`; a page with remaining work is
 revisited on the next tick. Engine restart or stale pagination resets only
@@ -111,8 +170,7 @@ checkpoint and final-receipt checks. The receipt counts nonterminal jobs,
 incomplete checkpoints and native refusals separately; those records remain
 intact and require another run only if their state later becomes safely
 eligible. The two protected stopped jobs' rows and `recoveryStopped` markers
-are compared before and after each run; their staging is reclaimed only when
-the native replay guard passes. A bounded batch that has not reached the end
+are preserved together with their staging and referencing records. A bounded batch that has not reached the end
 can be resumed from its receipt. If the scan reached the end but reports an
 incomplete checkpoint or native refusal, it exits unsuccessfully and retains
 that job's data; after its state is repaired, start a fresh `graph-work` run.
@@ -127,7 +185,7 @@ runner does not fall back to the older Program Files package.
 The native candidate advertises `state::terminal_retention_v1`; package and
 installer bindings must require it. A missing maintenance endpoint is a failure,
 not a successful cleanup. Deployment requires passing the native tests,
-rebuilding the native candidate and updating bound manifests/checksums.
+rebuilding the native candidate and updating bound capability manifests.
 These source edits do not install a candidate or clean the live database.
 
 The retained debug tree passed all seven selected terminal-retention tests and

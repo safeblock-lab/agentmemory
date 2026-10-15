@@ -3,6 +3,7 @@ import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
 import { effectMetadata } from "../state/batch-effects.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
+import { recordProcessingUsage } from "../functions/processing-usage.js";
 
 export class MetricsStore {
   private cache = new Map<string, FunctionMetrics>();
@@ -113,6 +114,7 @@ export class MetricsStore {
     Object.assign(metrics, effectMetadata(existing, effectKey));
     await this.kv.set(KV.metrics, functionId, metrics);
     this.cache.set(functionId, structuredClone(metrics));
+    await recordProcessingUsage(this.kv, usage, effectKey);
     });
   }
 }

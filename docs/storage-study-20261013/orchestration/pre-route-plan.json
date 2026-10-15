@@ -1,0 +1,41 @@
+{
+  "schemaVersion": "1.3.0",
+  "planId": "database-tenfold-study",
+  "objective": "Full read-only physical and logical database investigation, quantified >=10x reduction alternatives and reversible migration proposal preserving fidelity and behavior.",
+  "constraints": ["No product source, database, service, active configuration, provider or build effects", "Only investigation artifacts in owned docs/storage-study-20261013 subdirectories", "One bounded scanner; no long WAL-pinned transaction or full database in RAM", "iii-engine StateModule remains persistence authority; migration needs later explicit approval"],
+  "leaves": [
+    {
+      "id": "measurement",
+      "objective": "Locate authoritative storage and own bounded complete physical/logical measurement and exact/structural redundancy accounting; distinguish temporal coverage from coherent snapshots.",
+      "phase": "diagnosis",
+      "facts": {"mutation": true, "externalEffect": false, "sharedState": true, "unresolvedDecision": true},
+      "readPaths": ["D:/agentmemory/src/state", "D:/agentmemory/.codex-task/full-closure", "D:/agentmemory/data", "D:/agentmemory/config.yaml", "D:/agentmemory/iii-config.yaml"],
+      "exclusiveWrites": ["docs/storage-study-20261013/measurement"],
+      "dependsOn": [],
+      "validation": ["Actual database identity and file footprint established from local source/configuration evidence before scans", "Every table and namespace attributed; rows and logical bytes reconciled with physical pages/indexes/free space/WAL and auxiliary copies", "Full bounded batches with coverage/cursors/cut drift and exact duplicate comparison; structural equivalence stated; sampled estimates labelled", "No source/database/runtime effects; no long read pin or full-RAM aggregation"],
+      "resourceKeys": ["agentmemory-db-scan-exclusive"]
+    },
+    {
+      "id": "source-mapping",
+      "objective": "Map current StateModule storage contracts and established lossless encoding/shared-reference/normalization opportunities with fidelity constraints, using source only.",
+      "phase": "diagnosis",
+      "facts": {"mutation": true, "externalEffect": false, "unresolvedDecision": true},
+      "readPaths": ["D:/agentmemory/src", "D:/agentmemory/test", "D:/agentmemory/docs/operations", "D:/agentmemory/docs/graph", "D:/agentmemory/.codex-task/full-closure"],
+      "exclusiveWrites": ["docs/storage-study-20261013/source-mapping"],
+      "dependsOn": [],
+      "validation": ["Writers/readers/exports/native boundaries mapped to exact source evidence and scope coverage", "Payload/vector/graph/history/index duplication opportunities distinguish lossless versus semantic/lossy transformations", "IDs/provenance/relations/order/export and supported lookup contracts preserved; unknowns explicit", "No DB scans, tests, builds, source edits, live calls or service/config effects"],
+      "resourceKeys": []
+    },
+    {
+      "id": "reduction-proposal",
+      "objective": "Produce measured nonoverlapping storage reduction alternatives and concrete reversible migration design, assessing whether at least 10x is supportable within StateModule.",
+      "phase": "planning",
+      "facts": {"mutation": true, "externalEffect": false, "unresolvedDecision": true},
+      "readPaths": ["D:/agentmemory/docs/storage-study-20261013/measurement", "D:/agentmemory/docs/storage-study-20261013/source-mapping"],
+      "exclusiveWrites": ["docs/storage-study-20261013/proposal"],
+      "dependsOn": ["measurement", "source-mapping"],
+      "validation": ["Alternatives have baseline boundaries, measured inputs, conservative byte estimates, overlap removal and explicit unknowns", "All retained originals/relations/indexes/sidecars included; fidelity and behavior acceptance plus reversible coexistence/migration/rollback specified", "Clearly state whether >=10x target is supported, architectural change required or evidence insufficient; do not promise unsupported savings", "No migration/deletion/VACUUM/runtime effects; final concrete proposal ready for human review"],
+      "resourceKeys": []
+    }
+  ]
+}

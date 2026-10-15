@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
-import type { MemoryProvider } from '../types.js'
+import type { LlmCallOptions, MemoryProvider } from '../types.js'
 import { startLlmCallTelemetry } from './_llm-logging.js'
 
 // #781: the recursion guard used to live on `process.env.AGENTMEMORY_SDK_CHILD`
@@ -50,11 +50,11 @@ export class AgentSDKProvider implements MemoryProvider {
     return this.sdkPromise
   }
 
-  async compress(systemPrompt: string, userPrompt: string): Promise<string> {
+  async compress(systemPrompt: string, userPrompt: string, options?: LlmCallOptions): Promise<string> {
     return this.query(systemPrompt, userPrompt, 'compress')
   }
 
-  async summarize(systemPrompt: string, userPrompt: string): Promise<string> {
+  async summarize(systemPrompt: string, userPrompt: string, options?: LlmCallOptions): Promise<string> {
     return this.query(systemPrompt, userPrompt, 'summarize')
   }
 

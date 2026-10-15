@@ -13,6 +13,7 @@ import type {
   SessionSummary,
   ExportData,
 } from "../src/types.js";
+import { withKeyedLock } from "../src/state/keyed-mutex.js";
 import { installGraphStateWire } from "./helpers/graph-state-harness.js";
 
 function mockKV() {
@@ -52,6 +53,21 @@ function mockSdk() {
       return fn(payload);
     },
   };
+}
+
+function holdKeyedLock(key: string) {
+  let release!: () => void;
+  let markEntered!: () => void;
+  const entered = new Promise<void>((resolve) => { markEntered = resolve; });
+  const held = withKeyedLock(key, async () => {
+    markEntered();
+    await new Promise<void>((resolve) => { release = resolve; });
+  });
+  return { entered, held, release: () => release() };
+}
+
+function nextTurn(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 const testSession: Session = {
@@ -126,7 +142,7 @@ describe("Export/Import Functions", () => {
   it("export produces valid ExportData structure", async () => {
     const result = (await sdk.trigger("mem::export", {})) as ExportData;
 
-    expect(result.version).toBe("0.9.88");
+    expect(result.version).toBe("0.9.89");
     expect(result.exportedAt).toBeDefined();
     expect(result.sessions.length).toBe(1);
     expect(result.sessions[0].id).toBe("ses_1");
@@ -231,6 +247,100 @@ describe("Export/Import Functions", () => {
     expect(result.sessions).toBe(0);
   });
 
+  it("serializes the import skip check and write with canonical summary publication", async () => {
+    const sessionId = "ses_imported";
+    const importedSummary = { ...testSummary, sessionId, title: "Imported summary" };
+    const publishedSummary = { ...testSummary, sessionId, title: "Published while import waited" };
+    const exportData: ExportData = {
+      version: "0.9.89",
+      exportedAt: new Date().toISOString(),
+      sessions: [{ ...testSession, id: sessionId }],
+      observations: {},
+      memories: [],
+      summaries: [importedSummary],
+    };
+    const sessionWritten = new Promise<void>((resolve) => {
+      const originalSet = kv.set;
+      kv.set = async <T>(scope: string, key: string, value: T): Promise<T> => {
+        const result = await originalSet(scope, key, value);
+        if (scope === "mem:sessions" && key === sessionId) resolve();
+        return result;
+      };
+    });
+    const canonical = holdKeyedLock(`summary-canonical:${sessionId}`);
+    await canonical.entered;
+    let importSettled = false;
+    const importPromise = (sdk.trigger("mem::import", {
+      exportData,
+      strategy: "skip",
+    }) as Promise<{ success: boolean; summaries: number; skipped: number }>).finally(() => {
+      importSettled = true;
+    });
+
+    try {
+      await sessionWritten;
+      await nextTurn();
+      expect(importSettled).toBe(false);
+      expect(await kv.get("mem:summaries", sessionId)).toBeNull();
+
+      await kv.set("mem:summaries", sessionId, publishedSummary);
+    } finally {
+      canonical.release();
+    }
+
+    await canonical.held;
+    const result = await importPromise;
+    expect(result.success).toBe(true);
+    expect(result.summaries).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(await kv.get("mem:summaries", sessionId)).toEqual(publishedSummary);
+  });
+
+  it("waits for the canonical lock before merge replaces a summary", async () => {
+    const sessionId = "ses_imported";
+    const importedSummary = { ...testSummary, sessionId, title: "Imported summary" };
+    const exportData: ExportData = {
+      version: "0.9.89",
+      exportedAt: new Date().toISOString(),
+      sessions: [{ ...testSession, id: sessionId }],
+      observations: {},
+      memories: [],
+      summaries: [importedSummary],
+    };
+    const sessionWritten = new Promise<void>((resolve) => {
+      const originalSet = kv.set;
+      kv.set = async <T>(scope: string, key: string, value: T): Promise<T> => {
+        const result = await originalSet(scope, key, value);
+        if (scope === "mem:sessions" && key === sessionId) resolve();
+        return result;
+      };
+    });
+    const canonical = holdKeyedLock(`summary-canonical:${sessionId}`);
+    await canonical.entered;
+    let importSettled = false;
+    const importPromise = (sdk.trigger("mem::import", {
+      exportData,
+      strategy: "merge",
+    }) as Promise<{ success: boolean; summaries: number }>).finally(() => {
+      importSettled = true;
+    });
+
+    try {
+      await sessionWritten;
+      await nextTurn();
+      expect(importSettled).toBe(false);
+      expect(await kv.get("mem:summaries", sessionId)).toBeNull();
+    } finally {
+      canonical.release();
+    }
+
+    await canonical.held;
+    const result = await importPromise;
+    expect(result.success).toBe(true);
+    expect(result.summaries).toBe(1);
+    expect(await kv.get("mem:summaries", sessionId)).toEqual(importedSummary);
+  });
+
   it("import with replace strategy clears existing data first", async () => {
     const newSession: Session = {
       id: "ses_new",
@@ -259,6 +369,54 @@ describe("Export/Import Functions", () => {
 
     const oldSession = await kv.get("mem:sessions", "ses_1");
     expect(oldSession).toBeNull();
+  });
+
+  it("waits for the canonical lock before replace removes summaries", async () => {
+    const newSession: Session = {
+      id: "ses_new",
+      project: "new-project",
+      cwd: "/tmp/new",
+      startedAt: "2026-03-01T00:00:00Z",
+      status: "active",
+      observationCount: 0,
+    };
+    const memoryDeleted = new Promise<void>((resolve) => {
+      const originalDelete = kv.delete;
+      kv.delete = async (scope: string, key: string): Promise<void> => {
+        await originalDelete(scope, key);
+        if (scope === "mem:memories" && key === "mem_1") resolve();
+      };
+    });
+    const canonical = holdKeyedLock("summary-canonical:ses_1");
+    await canonical.entered;
+    let importSettled = false;
+    const importPromise = (sdk.trigger("mem::import", {
+      exportData: {
+        version: "0.9.89",
+        exportedAt: new Date().toISOString(),
+        sessions: [newSession],
+        observations: {},
+        memories: [],
+        summaries: [],
+      },
+      strategy: "replace",
+    }) as Promise<{ success: boolean }>).finally(() => {
+      importSettled = true;
+    });
+
+    try {
+      await memoryDeleted;
+      await nextTurn();
+      expect(importSettled).toBe(false);
+      expect(await kv.get("mem:summaries", "ses_1")).toEqual(testSummary);
+    } finally {
+      canonical.release();
+    }
+
+    await canonical.held;
+    const result = await importPromise;
+    expect(result.success).toBe(true);
+    expect(await kv.get("mem:summaries", "ses_1")).toBeNull();
   });
 
   it("export then import round-trip preserves data", async () => {

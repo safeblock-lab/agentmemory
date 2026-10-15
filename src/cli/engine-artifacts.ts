@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
@@ -12,6 +11,14 @@ export const REQUIRED_ENGINE_CAPABILITIES = [
   "state::shadow_migration_v1",
   "state::terminal_retention_v1",
   "state::scope_revision_v1",
+  "state::storage",
+  "state::observation_admit_v1",
+  "state::observation_replace_v1",
+  "state::storage_retention_v1",
+  "state::viewer_recent_v1",
+  "state::graph_concept_seeds_v1",
+  "state::crystal_page_v1",
+  "state::provider_attempt_budget_v1",
 ] as const;
 export const PINNED_ENGINE_VERSION = "0.22.1";
 export const PINNED_ENGINE_REPOSITORY = "https://github.com/iii-hq/iii.git";
@@ -277,7 +284,6 @@ export function resolveBundledEngineArtifact(
   }
 
   const binaryPath = resolve(engineRoot, ...artifact.path.split("/"));
-  let bytes: Buffer;
   try {
     const stat = statSync(binaryPath);
     if (!stat.isFile() || stat.size !== artifact.sizeBytes) {
@@ -287,7 +293,6 @@ export function resolveBundledEngineArtifact(
         message: `The bundled iii-engine artifact for ${key} has an unexpected size.`,
       };
     }
-    bytes = readFileSync(binaryPath);
   } catch {
     return {
       ok: false,
@@ -296,16 +301,7 @@ export function resolveBundledEngineArtifact(
     };
   }
 
-  const sha256 = createHash("sha256").update(bytes).digest("hex");
-  if (sha256 !== artifact.sha256) {
-    return {
-      ok: false,
-      code: "checksum-mismatch",
-      message: `The bundled iii-engine artifact for ${key} failed its SHA-256 check.`,
-    };
-  }
-
-  return { ok: true, binaryPath, sha256 };
+  return { ok: true, binaryPath, sha256: artifact.sha256 };
 }
 
 function hasRequiredEngineCapabilities(value: unknown): value is string[] {

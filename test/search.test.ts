@@ -1,10 +1,10 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { registerSearchFunction, getSearchIndex, rebuildIndex, setVectorIndex, setEmbeddingProvider, getVectorIndex } from "../src/functions/search.js";
+import { registerSearchFunction, getSearchIndex, rebuildIndex, setVectorIndex, setEmbeddingProvider, getVectorIndex, setHybridRanker } from "../src/functions/search.js";
 import { VectorIndex } from "../src/state/vector-index.js";
 import { KV } from "../src/state/schema.js";
 import type { CompressedObservation, Session } from "../src/types.js";
@@ -56,6 +56,7 @@ describe("mem::search", () => {
   let kv: ReturnType<typeof mockKV>;
 
   beforeEach(async () => {
+    setHybridRanker(null);
     sdk = mockSdk();
     kv = mockKV();
     registerSearchFunction(sdk as never, kv as never);
@@ -107,6 +108,8 @@ describe("mem::search", () => {
     await rebuildIndex(kv as never);
   });
 
+  afterEach(() => setHybridRanker(null));
+
   it("returns full format by default", async () => {
     const result = (await sdk.trigger("mem::search", {
       query: "auth middleware",
@@ -115,6 +118,27 @@ describe("mem::search", () => {
     expect(result.format).toBe("full");
     expect(result.results).toHaveLength(1);
     expect(result.results[0]?.observation.id).toBe("obs_a");
+  });
+
+  it("forwards the known project to hybrid ranking before candidate truncation", async () => {
+    const observation = await kv.get<CompressedObservation>(KV.observations("ses_1"), "obs_a");
+    expect(observation).not.toBeNull();
+    Object.assign(kv, { indexedRetrieval: true });
+    const ranker = vi.fn().mockResolvedValue([{
+      observation,
+      sessionId: "ses_1",
+      combinedScore: 0.95,
+    }]);
+    setHybridRanker(ranker);
+
+    const result = (await sdk.trigger("mem::search", {
+      query: "auth",
+      limit: 2,
+      project: " demo ",
+    })) as { results: Array<{ observation: CompressedObservation }> };
+
+    expect(ranker).toHaveBeenCalledWith("auth", 100, "demo");
+    expect(result.results.map((entry) => entry.observation.id)).toEqual(["obs_a"]);
   });
 
   it("returns compact format when requested", async () => {

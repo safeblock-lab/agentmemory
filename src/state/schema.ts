@@ -4,6 +4,8 @@ import { hasCjk, segmentCjk } from "./cjk-segmenter.js";
 export const KV = {
   sessions: "mem:sessions",
   observations: (sessionId: string) => `mem:obs:${sessionId}`,
+  observationIdentities: (sessionId: string) => `mem:obs-identity:${sessionId}`,
+  observationEvents: (sessionId: string) => `mem:obs-events:${sessionId}`,
   memories: "mem:memories",
   summaries: "mem:summaries",
   summaryQueueJobs: "mem:summary-queue:jobs",
@@ -14,6 +16,15 @@ export const KV = {
   config: "mem:config",
   metrics: "mem:metrics",
   recentOperations: "mem:recent-operations",
+  dashboardFailureMinutes: "mem:dashboard:failure-minutes",
+  contextUsage: "mem:context-usage",
+  processingUsage: "mem:processing-usage",
+  storageMaintenance: "mem:storage-maintenance",
+  reflectJobs: "mem:reflect:jobs",
+  reflectPending: "mem:reflect:pending",
+  reflectControl: "mem:reflect:control",
+  skillLifecycleIntents: "mem:skill-lifecycle:intents",
+  skillLifecycleRecovery: "mem:skill-lifecycle:recovery",
   health: "mem:health",
   embeddings: (obsId: string) => `mem:emb:${obsId}`,
   bm25Index: "mem:index:bm25",
@@ -22,6 +33,8 @@ export const KV = {
   claudeBridge: "mem:claude-bridge",
   graphNodes: "mem:graph:nodes",
   graphEdges: "mem:graph:edges",
+  temporalGraphWork: "mem:temporal-graph-work",
+  temporalGraphPending: "mem:temporal-graph-pending",
   // #814: precomputed snapshot of the top-degree subgraph and aggregate
   // type counts. Saves /graph/query and /graph/stats from a full
   // kv.list enumeration over 75K+ node corpora, which exceeds the iii
@@ -46,6 +59,8 @@ export const KV = {
   graphNodeDegree: "mem:graph:node-degree",
   graphControl: "mem:graph:control",
   graphJobs: "mem:graph:jobs",
+  graphDispatchIntents: "mem:graph-dispatch:intents",
+  graphDispatchInputs: (intentId: string) => `mem:graph-dispatch:inputs:${intentId}`,
   graphCheckpoints: "mem:graph:checkpoints",
   graphReceipts: "mem:graph:receipts",
   graphWorkingSnapshots: "mem:graph:working-snapshots",

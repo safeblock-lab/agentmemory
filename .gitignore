@@ -2,6 +2,11 @@ node_modules/
 dist/
 .iii-engine-build/
 .native-pagination-build/
+artifacts/private/
+artifacts/activation-rollback/
+artifacts/agentmemory-v*/
+.tmp/
+test/.update-readiness-*/
 *.tsbuildinfo
 
 .env
@@ -33,3 +38,4 @@ eval/data/longmemeval/
 .fireworks*
 .release*
 .batch*
+.codex-task/

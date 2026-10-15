@@ -19,6 +19,13 @@ export interface GraphRetrievalResult {
   pathLength: number;
 }
 
+export interface GraphRetrievalBatch {
+  entities: GraphRetrievalResult[];
+  chunks: GraphRetrievalResult[];
+  partial: boolean;
+  reason?: string;
+}
+
 function buildGraphContext(
   path: Array<{ node: RetrievalNode; edge?: RetrievalEdge }>,
 ): string {
@@ -55,6 +62,7 @@ export class GraphRetrieval {
     entityNames: string[],
     maxDepth = 2,
     maxResults = 20,
+    project?: string,
   ): Promise<GraphRetrievalResult[]> {
     const result = await this.searchByEntitiesAndChunks(
       entityNames,
@@ -63,6 +71,8 @@ export class GraphRetrieval {
       0,
       maxResults,
       0,
+      undefined,
+      project,
     );
     return result.entities;
   }
@@ -71,6 +81,7 @@ export class GraphRetrieval {
     obsIds: string[],
     maxDepth = 1,
     maxResults = 10,
+    project?: string,
   ): Promise<GraphRetrievalResult[]> {
     const result = await this.searchByEntitiesAndChunks(
       [],
@@ -79,6 +90,8 @@ export class GraphRetrieval {
       maxDepth,
       0,
       maxResults,
+      undefined,
+      project,
     );
     return result.chunks;
   }
@@ -91,18 +104,21 @@ export class GraphRetrieval {
     entityMaxResults = 20,
     observationMaxResults = 10,
     signal?: AbortSignal,
-  ): Promise<{ entities: GraphRetrievalResult[]; chunks: GraphRetrievalResult[] }> {
+    project?: string,
+  ): Promise<GraphRetrievalBatch> {
     if (entityNames.length === 0 && observationIds.length === 0) {
-      return { entities: [], chunks: [] };
+      return { entities: [], chunks: [], partial: false };
     }
     return withSerializedGraphRetrieval(this.kv, async () => {
       const graph = await this.reader.readSubgraph(
-        { entityNames, observationIds, entityDepth, observationDepth },
+        { entityNames, observationIds, entityDepth, observationDepth, project },
         signal,
       );
       return {
         entities: this.searchEntities(graph, entityDepth, entityMaxResults),
         chunks: this.expandChunks(graph, observationIds, observationDepth, observationMaxResults),
+        partial: graph.partial,
+        ...(graph.reason ? { reason: graph.reason } : {}),
       };
     });
   }
@@ -190,24 +206,28 @@ export class GraphRetrieval {
     entityName: string,
     asOf?: string,
     signal?: AbortSignal,
+    project?: string,
   ): Promise<{
     entity: GraphNode | null;
     currentState: GraphEdge[];
     history: GraphEdge[];
+    partial: boolean;
+    reason?: string;
   }> {
     return withSerializedGraphRetrieval(this.kv, async () => {
-      const { entity, edges: relatedEdges } = await this.reader.readTemporalEntity(
+      const { entity, edges: relatedEdges, partial, reason } = await this.reader.readTemporalEntity(
         entityName,
+        project,
         signal,
       );
-      if (!entity) return { entity: null, currentState: [], history: [] };
+      if (!entity) return { entity: null, currentState: [], history: [], partial: true, reason: reason ?? "entity_not_found" };
 
       if (!asOf) {
         const latestEdges = this.getLatestEdges(relatedEdges);
         const historicalEdges = relatedEdges.filter(
           (e) => !latestEdges.some((le) => le.id === e.id),
         );
-        return { entity, currentState: latestEdges, history: historicalEdges };
+        return { entity, currentState: latestEdges, history: historicalEdges, partial, ...(reason ? { reason } : {}) };
       }
 
       const asOfDate = new Date(asOf).getTime();
@@ -229,6 +249,8 @@ export class GraphRetrieval {
         entity,
         currentState: this.getLatestEdges(validEdges),
         history: validEdges,
+        partial: true,
+        reason: reason ?? "bounded_temporal_candidates",
       };
     });
   }

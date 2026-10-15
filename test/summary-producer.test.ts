@@ -7,7 +7,7 @@ import {
   estimateSummaryTokens, summaryOutputTokenBudget, summaryInputLimit, summaryChunkInputLimit,
   summaryReduceInputLimit, MAX_SUMMARY_CALLS, MAX_SUMMARY_DEPTH,
 } from "../src/functions/summary-budget.js";
-import { SUMMARY_SYSTEM, buildSummaryItemsPrompt, formatSummaryObservation } from "../src/prompts/summary.js";
+import { SUMMARY_SYSTEM, REDUCE_SYSTEM, buildReduceItemsPrompt, buildSummaryItemsPrompt, formatSummaryObservation } from "../src/prompts/summary.js";
 
 vi.mock("../src/logger.js", () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
 const xml = (narrative = "Done.") => `<summary><title>Summary</title><narrative>${narrative}</narrative><decisions><decision>decision</decision></decisions><files><file>a.ts</file></files><concepts><concept>code</concept></concepts></summary>`;
@@ -30,6 +30,17 @@ const small: SummaryBudgetConfig = { contextTokens: 4096, outputTokens: 512, saf
 const produce = (selected: MemoryProvider, config = small) => createSummaryProducer(selected, undefined, config, "session", "project");
 
 describe("bounded summary producer", () => {
+  it("labels collected paths as grounding candidates rather than evidence of current edits", () => {
+    const prompt = buildSummaryItemsPrompt([{
+      text: "Imported source summary", obsRangeStart: 1, obsRangeEnd: 1,
+      sourcePaths: [".env.local"], modifiedPaths: [".env.local"],
+    }]);
+
+    expect(prompt).toContain("Path candidates for grounding only (not evidence of current edits):");
+    expect(prompt).toContain(".env.local");
+    expect(prompt).not.toContain("supported as modified files");
+  });
+
   it("logs only a stable category and HTTP status for the first provider failure", async () => {
     const mock = provider(() => {
       throw new Error("OpenAI API error (503): Authorization: Bearer sk-test-private upstream body");
@@ -94,8 +105,8 @@ describe("bounded summary producer", () => {
     const cap = 3000;
     const config = parseSummaryBudgetConfig({ AGENTMEMORY_SUMMARY_MAX_CALL_INPUT_BYTES: String(cap) });
     const mock = provider((system, prompt) => system.includes("merging")
-      ? xml("merged")
-      : xml(`partial-${prompt.match(/\[(\d+)\] conversation/)?.[1] ?? "fragment"} ${"x".repeat(900)}`));
+      ? xml("merged-round")
+      : xml(`source-indices:${[...prompt.matchAll(/^\[(\d+)\] conversation/gm)].map(match => match[1]).join(",") || "fragment"} ${"x".repeat(900)}`));
     await produce(mock.selected, config)([observation(1)]);
     expect(mock.calls).toHaveLength(1);
     expect(estimateSummaryTokens(mock.calls[0].system, mock.calls[0].prompt)).toBeLessThanOrEqual(cap);
@@ -105,11 +116,11 @@ describe("bounded summary producer", () => {
     expect(result.mode).toBe("chunked");
     expect(mock.calls.filter(call => !call.system.includes("merging")).length).toBeGreaterThan(1);
     const reduction = mock.calls.filter(call => call.system.includes("merging"));
-    const firstRound = reduction.filter(call => call.prompt.includes("partial-"));
+    const firstRound = reduction.filter(call => call.prompt.includes("source-indices:") && !call.prompt.includes("merged-round"));
     expect(firstRound.length).toBeGreaterThan(1);
     expect(reduction.some(call => !call.prompt.includes("partial-") && call.prompt.includes("merged"))).toBe(true);
-    const sourceIndices = [...firstRound.map(call => call.prompt).join("\n").matchAll(/partial-(\d+)/g)]
-      .map(match => Number(match[1]));
+    const sourceIndices = [...firstRound.map(call => call.prompt).join("\n").matchAll(/source-indices:([\d,]+)/g)]
+      .flatMap(match => match[1].split(",").map(Number));
     expect(sourceIndices.length).toBeGreaterThan(1);
     expect(sourceIndices).toEqual([...sourceIndices].sort((left, right) => left - right));
     for (const call of mock.calls) {
@@ -254,11 +265,22 @@ describe("bounded summary producer", () => {
     await expect(produce(mock.selected, { ...small, chunkSize: 1 })(Array.from({ length: 4 }, (_, i) => observation(i)))).rejects.toThrow("summary_reduce_no_progress");
   });
   it("bounds reducer depth even when each round makes tiny progress", async () => {
+    const narrative = "x".repeat(1400);
+    const partial = (obsRangeStart: number) => ({
+      text: `Title: Summary\nNarrative: ${narrative}\nDecisions:\n  - decision\nFiles:\n  - a.ts\nConcepts: code`,
+      obsRangeStart, obsRangeEnd: obsRangeStart,
+    });
+    const singleItemLimit = estimateSummaryTokens(REDUCE_SYSTEM, buildReduceItemsPrompt([partial(1)]));
+    const twoItemLimit = estimateSummaryTokens(REDUCE_SYSTEM, buildReduceItemsPrompt([partial(1), partial(2)]));
+    const maxCallInputBytes = Math.floor((singleItemLimit + twoItemLimit - 1) / 2);
+    const config: SummaryBudgetConfig = {
+      ...small, contextTokens: maxCallInputBytes * 2 + 1024, maxCallInputBytes, chunkSize: 1,
+    };
     const mock = provider((system, prompt) => {
       const narrative = system.includes("merging") ? (prompt.match(/Narrative: (x+)/)?.[1].slice(1) ?? "x".repeat(1400)) : "x".repeat(1400);
       return xml(narrative);
     });
-    await expect(produce(mock.selected, { ...small, chunkSize: 1 })(Array.from({ length: 4 }, (_, i) => observation(i)))).rejects.toThrow("summary_depth_limit_exceeded");
+    await expect(produce(mock.selected, config)(Array.from({ length: 4 }, (_, i) => observation(i)))).rejects.toThrow("summary_depth_limit_exceeded");
     expect(mock.calls.length).toBeLessThanOrEqual(4 + 4 * MAX_SUMMARY_DEPTH);
   });
   it("caps total selected-provider calls across the invocation", async () => {

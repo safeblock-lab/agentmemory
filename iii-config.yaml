@@ -35,8 +35,7 @@ workers:
       adapter:
         name: kv
         config:
-          store_method: file_based
-          file_path: ./data/stream_store
+          store_method: in_memory
   - name: iii-observability
     config:
       enabled: true

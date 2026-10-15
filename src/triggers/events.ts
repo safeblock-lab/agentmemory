@@ -4,7 +4,6 @@ import { KV, STREAM } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { isReflectEnabled } from "../functions/slots.js";
 import {
-  detectLlmProviderKind,
   getAgentId,
   getConsolidationCooldownMs,
   isAgentScopeIsolated,
@@ -98,6 +97,11 @@ export function registerEventTriggers(sdk: IIIClient, kv: StateKV): void {
   sdk.registerFunction(
     "event::session::stopped",
     async (data: { sessionId: string; skipConsolidation?: boolean }) => {
+      const lifecycle = await sdk.trigger({
+        function_id: "mem::skill-lifecycle-session-stopped",
+        payload: { sessionId: data.sessionId, skipConsolidation: data.skipConsolidation === true },
+      });
+      if (!isSuccessResult(lifecycle)) throw new Error("Skill lifecycle intent was not persisted");
       let summary: unknown;
       try {
         summary = await sdk.trigger({
@@ -160,9 +164,6 @@ export function registerEventTriggers(sdk: IIIClient, kv: StateKV): void {
       if (await consolidationDue(kv)) {
         fireVoid("mem::consolidate-pipeline", { tier: "all", deferred: true });
         fireVoid("mem::auto-crystallize", { olderThanDays: 0, deferred: true });
-        if (detectLlmProviderKind() === "llm") {
-          fireVoid("mem::skill-extract", { sessionId: data.sessionId });
-        }
       }
     }
       return summary;
@@ -181,6 +182,11 @@ export function registerEventTriggers(sdk: IIIClient, kv: StateKV): void {
         { type: "set", path: "endedAt", value: new Date().toISOString() },
         { type: "set", path: "status", value: "completed" },
       ]);
+      const lifecycle = await sdk.trigger({
+        function_id: "mem::skill-lifecycle-session-ended",
+        payload: { sessionId: data.sessionId },
+      });
+      if (!isSuccessResult(lifecycle)) throw new Error("Skill lifecycle completion was not recorded");
       return { success: true };
     },
   );

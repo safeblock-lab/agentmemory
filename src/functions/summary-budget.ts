@@ -8,6 +8,7 @@ import {
 export const MAX_SUMMARY_ITEMS = 4096;
 export const MAX_SUMMARY_CALLS = 4096;
 export const MAX_SUMMARY_DEPTH = 12;
+export const MAX_SUMMARY_RECOVERY_INPUT_BYTES = 32_768;
 export const MIN_SUMMARY_CHUNK_CONTENT_TOKENS = 500;
 // Covers role framing and the supported Ollama JSON output instruction/schema.
 export const SUMMARY_ENVELOPE_TOKENS = 512;

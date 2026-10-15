@@ -1,0 +1,13 @@
+# Manual reflection
+
+`POST /agentmemory/reflect` and `memory_reflect` run a bounded foreground cut through the application's configured provider. Each cut processes at most one exact source unit. Project discovery and pagination can require a cut without provider calls. Captured generation and publication evidence are replayed from durable state so a continuation does not repeat completed work.
+
+Supply a stable `requestId`, optional `project`, and optional `maxClusters` (default 4, maximum 20). An omitted first-request ID is generated and returned. Continue by repeating the original filters and returned `requestId`, with the exact `continuation` object. Replaying an already answered request returns its saved response without repeating work. Changing the job, request, original project, checkpoint or cut is rejected. A new request ID starts a distinct operation.
+
+Read `processedClusters`, `clustersSkipped`, `appliedInsights`, `status`, `deferredFamilies` and `reason`. `partial` preserves deferred evidence families and unsupported candidates; it does not assert complete corpus coverage. `terminal` ends the operation; `completed` is false for failed work or an operation ceiling. Stop when continuation is absent. Operations permit 256 cuts within 30 minutes. Each REST/MCP reflection trigger has a local 180-second timeout; generation has a 45-second deadline and the durable judge has a 60-second deadline. A transport timeout does not mean completed work: repeat the same request to recover its saved result. Unknown provider outcomes are retained without automatic paid retries; a late generation capture remains bound to its original unit and can be continued explicitly.
+
+The global form preserves project catalog pagination between cuts. `force` on an ordinary internal queued request does not bypass the background pause. Existing selected execution retains its separate provider binding and budget contracts. Manual origin is recorded in both admission intent and job; captured content alone grants no execution authority.
+
+Legacy batch callbacks without job/unit identity require bounded complete original sources, the original source fingerprint, exact project/version lineage, durable evidence judgment and source revalidation before new effects. While background work is paused, they admit no new judgment/effect. Exact started/completed callbacks recover before mutable source checks and without another judge or duplicate reinforcement.
+
+These guarantees use the existing single-worker keyed locks and durable iii-engine state; they do not introduce cross-process compare-and-swap. Offline behavior tests establish source contracts; installed/provider proof remains a separate operation.

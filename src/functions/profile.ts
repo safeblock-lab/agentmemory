@@ -1,13 +1,14 @@
 import type { IIIClient } from "iii-sdk";
 import type {
-  CompressedObservation,
-  Session,
   ProjectProfile,
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
+import { viewerProjectSessions, viewerPage, VIEWER_OBSERVATION_FIELDS } from "./viewer-memory-page.js";
+
+type BoundedProfile = ProjectProfile & { partial: boolean; nextCursor: string | null; boundedVersion: 1; sourceRevision: number; sourceEpoch: number; countScope: "bounded_sources" };
 
 export function registerProfileFunction(sdk: IIIClient, kv: StateKV): void {
   sdk.registerFunction("mem::profile", 
@@ -17,25 +18,23 @@ export function registerProfileFunction(sdk: IIIClient, kv: StateKV): void {
       }
       const project = data.project.trim();
 
+      const sourcePage = await viewerProjectSessions(kv, project);
+      if (sourcePage.status === "not_ready") return { profile: null, partial: true, reason: "project_sessions_not_ready" };
       if (!data.refresh) {
         const cached = await kv
-          .get<ProjectProfile>(KV.profiles, project)
-          .catch(() => null);
-        if (cached) {
+          .get<BoundedProfile>(KV.profiles, project);
+        if (cached?.project === project && cached.boundedVersion === 1 && cached.sourceRevision === sourcePage.revision && cached.sourceEpoch === sourcePage.epoch) {
           const age = Date.now() - new Date(cached.updatedAt).getTime();
           if (age < 3600_000) {
-            return { profile: cached, cached: true };
+            return { profile: cached, cached: true, partial: cached.partial };
           }
         }
       }
 
-      const sessions = await kv.list<Session>(KV.sessions);
-      const projectSessions = sessions.filter(
-        (s) => s.project === project,
-      );
+      const projectSessions = sourcePage.items.map(item => item.session);
 
       if (projectSessions.length === 0) {
-        return { profile: null, reason: "no_sessions" };
+        return { profile: null, partial: sourcePage.partial, reason: sourcePage.partial ? "project_sessions_incomplete" : "no_sessions" };
       }
 
       const conceptFreq = new Map<string, number>();
@@ -46,17 +45,26 @@ export function registerProfileFunction(sdk: IIIClient, kv: StateKV): void {
 
       const sortedSessions = projectSessions.sort(
         (a, b) =>
-          new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime(),
+          new Date(b.startedAt ?? "").getTime() - new Date(a.startedAt ?? "").getTime(),
       );
 
       const top20Sessions = sortedSessions.slice(0, 20);
-      const obsPerSession = await Promise.all(
-        top20Sessions.map((s) =>
-          kv
-            .list<CompressedObservation>(KV.observations(s.id))
-            .catch(() => [] as CompressedObservation[]),
-        ),
-      );
+      const obsPerSession: Array<Array<{ title: string; type: string; importance: number; concepts: string[]; files: string[] }>> = [];
+      let partial = sourcePage.partial || sourcePage.next_cursor !== null;
+      for (const session of top20Sessions) {
+        const page = await viewerPage(kv, KV.observations(session.id), {}, VIEWER_OBSERVATION_FIELDS);
+        if (page.items.some(obs => obs.sessionId !== session.id)) throw new Error("profile_observation_session_mismatch");
+        obsPerSession.push(page.items.map(obs => {
+          const concepts = obs.concepts ?? [], files = obs.files ?? [];
+          if (!Array.isArray(concepts) || concepts.some(value => typeof value !== "string")
+            || !Array.isArray(files) || files.some(value => typeof value !== "string")) throw new Error("profile_observation_invalid");
+          return { title: typeof obs.title === "string" ? obs.title : "", type: typeof obs.type === "string" ? obs.type : "",
+            importance: typeof obs.importance === "number" ? obs.importance : 0,
+            concepts: concepts.filter((value): value is string => typeof value === "string"),
+            files: files.filter((value): value is string => typeof value === "string") };
+        }));
+        partial ||= page.partial;
+      }
 
       for (let i = 0; i < top20Sessions.length; i++) {
         const session = top20Sessions[i];
@@ -80,7 +88,7 @@ export function registerProfileFunction(sdk: IIIClient, kv: StateKV): void {
           .sort((a, b) => b.importance - a.importance);
         if (important.length > 0) {
           recentActivity.push(
-            `[${session.startedAt.slice(0, 10)}] ${important[0].title}`,
+            `[${(session.startedAt ?? "").slice(0, 10)}] ${important[0].title}`,
           );
         }
       }
@@ -97,7 +105,7 @@ export function registerProfileFunction(sdk: IIIClient, kv: StateKV): void {
 
       const uniqueErrors = [...new Set(errors)].slice(0, 10);
 
-      const profile: ProjectProfile = {
+      const profile: BoundedProfile = {
         project,
         updatedAt: new Date().toISOString(),
         topConcepts,
@@ -107,6 +115,8 @@ export function registerProfileFunction(sdk: IIIClient, kv: StateKV): void {
         recentActivity: recentActivity.slice(0, 10),
         sessionCount: projectSessions.length,
         totalObservations: totalObs,
+        partial, nextCursor: sourcePage.next_cursor, boundedVersion: 1,
+        sourceRevision: sourcePage.revision, sourceEpoch: sourcePage.epoch, countScope: "bounded_sources",
       };
 
       await kv.set(KV.profiles, project, profile);
@@ -120,7 +130,7 @@ export function registerProfileFunction(sdk: IIIClient, kv: StateKV): void {
         sessions: projectSessions.length,
         observations: totalObs,
       });
-      return { profile, cached: false };
+      return { profile, cached: false, partial };
     },
   );
 }

@@ -2,12 +2,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { registerObserveFunction } from "../src/functions/observe.js";
 import { registerGraphFunction } from "../src/functions/graph.js";
 import { registerConsolidationPipelineFunction } from "../src/functions/consolidation-pipeline.js";
+import { pageKey } from "../src/functions/consolidation-manifest.js";
 import { registerReflectFunctions } from "../src/functions/reflect.js";
 import { registerSkillExtractFunctions } from "../src/functions/skill-extract.js";
 import { KV } from "../src/state/schema.js";
+import { applyBatchEffect, batchEffectKey } from "../src/state/batch-effects.js";
+import type { ConsolidationCanonicalLookup, ConsolidationCanonicalWriter } from "../src/functions/consolidation-selection.js";
 import type { CompressedObservation, SessionSummary } from "../src/types.js";
 import { installGraphStateWire } from "./helpers/graph-state-harness.js";
 import { mockKV } from "./helpers/mocks.js";
+import { effectHarness } from "./batch-effects-harness.js";
 
 type FunctionHandler = (data: unknown) => Promise<unknown>;
 
@@ -25,7 +29,81 @@ function harness() {
     },
   };
   const kv = mockKV();
-  return installGraphStateWire(sdk as never, kv as never);
+  void kv.set("mem:obs-identity:session-test", "__ready__", { version: 1, ready: true });
+  const wired = installGraphStateWire(sdk as never, kv as never);
+  const revisions = new Map<string, number>();
+  const set = wired.kv.set.bind(wired.kv);
+  const remove = wired.kv.delete.bind(wired.kv);
+  wired.kv.set = async (scope: string, key: string, value: unknown) => {
+    const result = await set(scope, key, value);
+    revisions.set(scope, (revisions.get(scope) ?? 0) + 1);
+    return result;
+  };
+  wired.kv.delete = async (scope: string, key: string) => {
+    await remove(scope, key);
+    revisions.set(scope, (revisions.get(scope) ?? 0) + 1);
+  };
+  Object.assign(wired.kv, {
+    retrieval: async (request: Record<string, unknown>) => {
+      if (request.action === "canonical_apply" && request.receipt_only === true) return { status: "not_applied" };
+      throw new Error(`Unexpected retrieval fixture operation: ${request.action}`);
+    },
+    scopeRevision: async (scope: string) => ({
+      generation: "00000000-0000-0000-0000-000000000001",
+      revision: String(revisions.get(scope) ?? 0),
+    }),
+  });
+  const graphTrigger = wired.sdk.trigger.bind(wired.sdk);
+  wired.sdk.trigger = async (call: string | { function_id: string; payload: unknown }, data?: unknown) => {
+    const functionId = typeof call === "string" ? call : call.function_id;
+    const payload = typeof call === "string" ? data : call.payload;
+    if (functionId === "state::observation_admit_v1") {
+      const request = payload as { session_id: string; observation: CompressedObservation };
+      const observation = request.observation;
+      await wired.kv.set(KV.observations(request.session_id), observation.id, observation);
+      return {
+        created: true,
+        duplicate_event: false,
+        observation_id: observation.id,
+        version: "1",
+        occurrence_count: 1,
+        observation,
+      };
+    }
+    return graphTrigger(call as never, data as never);
+  };
+  return wired;
+}
+
+function selectSummaries(kv: ReturnType<typeof mockKV>) {
+  return async (project: string) => (await kv.list<SessionSummary>(KV.summaries))
+    .filter((summary) => summary.project === project)
+    .map((summary) => ({ id: summary.sessionId, sessionId: summary.sessionId, rowVersion: "1" }));
+}
+
+function canonicalAccess(kv: ReturnType<typeof mockKV>) {
+  const lookup: ConsolidationCanonicalLookup = async () => ({ status: "ready", version: "1", canonicalId: null });
+  const write: ConsolidationCanonicalWriter = async (scope, key, match, proposedId, effect, update) => {
+    const id = match.canonicalId ?? proposedId;
+    const old = await kv.get<Record<string, unknown>>(KV[scope], id);
+    const applied = await applyBatchEffect(kv as never, KV[scope], id, effect, update as never);
+    return {
+      applied: !(old?.appliedBatchEffects as string[] | undefined)?.includes(effect),
+      created: !old,
+      id,
+      rowVersion: "1",
+      receipt: {
+        operationKind: "upsert",
+        effectKey: effect,
+        operationFingerprint: batchEffectKey(key),
+        id,
+        rowVersion: "1",
+        created: !old,
+        resultFingerprint: batchEffectKey(JSON.stringify(applied)),
+      },
+    };
+  };
+  return { lookup, write };
 }
 
 function choice(choice: string, confidence = 0.99) {
@@ -45,6 +123,19 @@ function decisionProvider(overrides: {
     evaluate: vi.fn(overrides.evaluate ?? (async () => undefined)),
     evaluateChoice: vi.fn(overrides.evaluateChoice ?? (async () => choice("run"))),
   };
+}
+
+function semanticFixtureResponse(prompt: string): string {
+  const candidatesMarker = "Candidate facts with source evidence:\n\n";
+  if (prompt.includes(candidatesMarker)) {
+    const candidates = JSON.parse(prompt.slice(prompt.indexOf(candidatesMarker) + candidatesMarker.length)) as Array<{ candidateIds: string[] }>;
+    const candidateIds = [...new Set(candidates.flatMap((candidate) => candidate.candidateIds))];
+    return `<facts><fact confidence="0.9" candidateIds="${candidateIds.join(",")}">A durable decision.</fact></facts>`;
+  }
+  const fragmentsMarker = "Analyze these original source fragments with their provenance:\n\n";
+  const fragments = JSON.parse(prompt.slice(prompt.indexOf(fragmentsMarker) + fragmentsMarker.length)) as Array<{ sourceId: string }>;
+  const sourceIds = [...new Set(fragments.map((fragment) => fragment.sourceId))];
+  return `<facts><fact confidence="0.9" sourceIds="${sourceIds.join(",")}">A durable decision.</fact></facts>`;
 }
 
 function compressedObservation(
@@ -117,7 +208,7 @@ describe("TypeSafe pipeline decisions", () => {
       data: {
         tool_name: "Read",
         tool_input: { file_path: "src/example.ts" },
-        tool_output: "x".repeat(2_000),
+        tool_output: "x".repeat(200),
       },
     }) as { observationId: string };
 
@@ -186,8 +277,15 @@ describe("TypeSafe pipeline decisions", () => {
       `obs-${index}`,
       index === 6 ? { title: "compacted-out-observation", timestamp: "2020-01-01T00:00:00.000Z" } : {},
     ));
+    await kv.set(KV.sessions, "session-test", {
+      id: "session-test", project: "test-project", cwd: "D:/test", startedAt: new Date().toISOString(),
+      status: "active", observationCount: observations.length,
+    });
+    for (const observation of observations) {
+      await kv.set(KV.observations(observation.sessionId), observation.id, observation);
+    }
 
-    const result = await sdk.trigger("mem::graph-extract", { observations });
+    const result = await sdk.trigger("mem::graph-extract", { sessionId: "session-test" });
 
     expect(result).toMatchObject({ success: true, nodesAdded: 1 });
     expect(typeSafe.evaluate).toHaveBeenCalledWith(
@@ -195,7 +293,7 @@ describe("TypeSafe pipeline decisions", () => {
       expect.objectContaining({ candidates: expect.any(Array) }),
       expect.any(Object),
     );
-    expect(await kv.list(KV.observations("session-test"))).toHaveLength(0);
+    expect(await kv.list(KV.observations("session-test"))).toHaveLength(7);
   });
 
   it("gates scheduled graph extraction with bounded state and retains its input", async () => {
@@ -221,8 +319,9 @@ describe("TypeSafe pipeline decisions", () => {
     expect(provider.compress).not.toHaveBeenCalled();
   });
 
-  it("gates automatic semantic consolidation but still runs with compacted input when allowed", async () => {
-    const { sdk, kv } = harness();
+  it("keeps complete automatic consolidation evidence and uses a distinct semantic judge without TypeSafe", async () => {
+    const h = harness();
+    const { sdk, kv } = h;
     const typeSafe = decisionProvider({
       evaluate: async (feature) => feature === "compaction"
         ? { candidate_0: choice("drop") }
@@ -231,61 +330,107 @@ describe("TypeSafe pipeline decisions", () => {
     });
     const provider = {
       summarize: vi.fn(async (_system: string, prompt: string) => {
-        expect(prompt).not.toContain("compacted-out-summary");
-        return '<fact confidence="0.8">Selected summary fact</fact>';
+        if (_system.startsWith("You evaluate publication evidence.")) {
+          const evidence = JSON.parse(prompt); expect(evidence.sources).toHaveLength(7);
+          expect(prompt).toContain("compacted-out-summary");
+          return JSON.stringify({ requestId: /requestId must be ([^.]+)\./.exec(_system)![1], verdict: "supported", reason: "The fixture candidate preserves all seven original records." });
+        }
+        return semanticFixtureResponse(prompt);
       }),
     };
     for (let index = 0; index < 7; index += 1) {
       const summary = sessionSummary(`session-${index}`, index);
       if (index === 6) summary.title = "compacted-out-summary";
       await kv.set(KV.summaries, summary.sessionId, summary);
+      await kv.set(KV.sessions, summary.sessionId, {
+        id: summary.sessionId, project: "test-project", cwd: "D:/test", startedAt: summary.createdAt,
+        status: "completed", observationCount: summary.observationCount,
+      });
     }
-    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never, undefined, undefined, undefined, typeSafe as never);
+    Object.assign(kv, { indexedRetrieval: true });
+    const canonical = canonicalAccess(kv);
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never, undefined, undefined, undefined,
+      typeSafe as never, selectSummaries(kv), canonical.lookup, undefined, canonical.write);
 
-    const result = await sdk.trigger("mem::consolidate-pipeline", { tier: "semantic", deferred: true }) as {
-      results: { semantic: { newFacts: number; compactedSummaries: number } };
-    };
+    let result = await sdk.trigger("mem::consolidate-pipeline", { tier: "semantic", project: "test-project", deferred: true });
+    let manifestId = (result as { results?: { semantic?: { continuation?: { consolidationManifestId?: string } } } })
+      .results?.semantic?.continuation?.consolidationManifestId;
+    const progress: string[] = [];
+    for (let step = 0; manifestId && step < 40; step += 1) {
+      result = await sdk.trigger("mem::consolidate-pipeline", { consolidationManifestId: manifestId });
+      const root = await kv.get<Record<string, unknown>>(KV.state, pageKey(manifestId, "root", 0));
+      const response = result as { error?: unknown; phase?: unknown; completed?: unknown; queued?: unknown };
+      progress.push(`${root?.phase ?? "missing"}:capture=${(root?.capture as { source?: number } | undefined)?.source ?? "?"}/${Array.isArray(root?.refs) ? root.refs.length : "?"},quality=${(root?.quality as { source?: number } | undefined)?.source ?? "?"},extract=${(root?.extract as { page?: number; offset?: number } | undefined)?.page ?? "?"}/${root?.fragmentPages ?? "?"}:${(root?.extract as { page?: number; offset?: number } | undefined)?.offset ?? "?"},eligible=${Array.isArray(root?.eligibleSources) ? root.eligibleSources.length : "?"},response=${String(response.error ?? response.phase ?? (response.completed ? "completed" : response.queued ? "queued" : "no-status"))}`);
+      manifestId = (result as { continuation?: { consolidationManifestId?: string } }).continuation?.consolidationManifestId;
+    }
+    expect(manifestId, progress.join(" -> ")).toBeUndefined();
 
-    expect(typeSafe.evaluate).toHaveBeenCalledTimes(1);
-    expect(typeSafe.evaluateChoice).toHaveBeenCalledWith(
-      "pipelineGates",
-      expect.stringContaining('"workflow":"semantic-consolidation"'),
-      expect.any(String),
-      expect.any(Object),
-    );
-    expect(result.results.semantic.compactedSummaries).toBe(1);
-    expect(result.results.semantic.newFacts).toBe(1);
+    expect(result).toMatchObject({ success: true });
+    expect(typeSafe.evaluate).not.toHaveBeenCalled();
+    expect(typeSafe.evaluateChoice).not.toHaveBeenCalled();
+    expect(provider.summarize).toHaveBeenCalledTimes(9);
+    expect(provider.summarize.mock.calls.filter(([system]) => system.startsWith("You evaluate publication evidence."))).toHaveLength(1);
+    expect(await kv.list(KV.semantic)).toHaveLength(1);
   });
 
   it("preserves forced consolidation input without invoking TypeSafe", async () => {
-    const { sdk, kv } = harness();
+    const h = harness();
+    const { sdk, kv } = h;
     const typeSafe = decisionProvider();
     const provider = {
       summarize: vi.fn(async (_system: string, prompt: string) => {
-        expect(prompt).toContain("forced-summary");
-        return '<fact confidence="0.8">Forced fact retained</fact>';
+        if (_system.startsWith("You evaluate publication evidence.")) {
+          const evidence = JSON.parse(prompt); expect(evidence.sources).toHaveLength(7);
+          expect(prompt).toContain("forced-summary");
+          return JSON.stringify({ requestId: /requestId must be ([^.]+)\./.exec(_system)![1], verdict: "supported", reason: "The forced fixture candidate preserves all seven original records." });
+        }
+        return semanticFixtureResponse(prompt);
       }),
     };
     for (let index = 0; index < 7; index += 1) {
       const summary = sessionSummary(`forced-session-${index}`, index);
       if (index === 6) summary.title = "forced-summary";
       await kv.set(KV.summaries, summary.sessionId, summary);
+      await kv.set(KV.sessions, summary.sessionId, {
+        id: summary.sessionId, project: "test-project", cwd: "D:/test", startedAt: summary.createdAt,
+        status: "completed", observationCount: summary.observationCount,
+      });
     }
-    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never, undefined, undefined, undefined, typeSafe as never);
+    Object.assign(kv, { indexedRetrieval: true });
+    const canonical = canonicalAccess(kv);
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never, undefined, undefined, undefined,
+      typeSafe as never, selectSummaries(kv), canonical.lookup, undefined, canonical.write);
 
-    await sdk.trigger("mem::consolidate-pipeline", { tier: "semantic", force: true });
+    let result = await sdk.trigger("mem::consolidate-pipeline", { tier: "semantic", project: "test-project", force: true });
+    let manifestId = (result as { results?: { semantic?: { continuation?: { consolidationManifestId?: string } } } })
+      .results?.semantic?.continuation?.consolidationManifestId;
+    const progress: string[] = [];
+    for (let step = 0; manifestId && step < 40; step += 1) {
+      result = await sdk.trigger("mem::consolidate-pipeline", { consolidationManifestId: manifestId });
+      const root = await kv.get<Record<string, unknown>>(KV.state, pageKey(manifestId, "root", 0));
+      const response = result as { error?: unknown; phase?: unknown; completed?: unknown; queued?: unknown };
+      progress.push(`${root?.phase ?? "missing"}:capture=${(root?.capture as { source?: number } | undefined)?.source ?? "?"}/${Array.isArray(root?.refs) ? root.refs.length : "?"},quality=${(root?.quality as { source?: number } | undefined)?.source ?? "?"},extract=${(root?.extract as { page?: number; offset?: number } | undefined)?.page ?? "?"}/${root?.fragmentPages ?? "?"}:${(root?.extract as { page?: number; offset?: number } | undefined)?.offset ?? "?"},eligible=${Array.isArray(root?.eligibleSources) ? root.eligibleSources.length : "?"},response=${String(response.error ?? response.phase ?? (response.completed ? "completed" : response.queued ? "queued" : "no-status"))}`);
+      manifestId = (result as { continuation?: { consolidationManifestId?: string } }).continuation?.consolidationManifestId;
+    }
+    expect(manifestId, progress.join(" -> ")).toBeUndefined();
 
+    expect(result).toMatchObject({ success: true });
     expect(typeSafe.evaluate).not.toHaveBeenCalled();
     expect(typeSafe.evaluateChoice).not.toHaveBeenCalled();
-    expect(provider.summarize).toHaveBeenCalledTimes(1);
+    expect(provider.summarize).toHaveBeenCalledTimes(9);
+    expect(provider.summarize.mock.calls.filter(([system]) => system.startsWith("You evaluate publication evidence."))).toHaveLength(1);
+    expect(provider.summarize.mock.calls.some(([, prompt]) => prompt.includes("forced-summary"))).toBe(true);
+    expect(await kv.list(KV.semantic)).toHaveLength(1);
   });
 
   it("gates only low-value scheduled reflection clusters", async () => {
-    const { sdk, kv } = harness();
+    const h = effectHarness();
+    const { sdk, kv } = h;
     const typeSafe = decisionProvider({ evaluateChoice: async () => choice("skip") });
     for (let index = 0; index < 3; index += 1) {
       await kv.set(KV.semantic, `semantic-${index}`, {
         id: `semantic-${index}`,
+        project: "test-project",
         fact: "database caching improves query performance",
         confidence: 0.5,
         updatedAt: "2020-01-01T00:00:00.000Z",
@@ -294,11 +439,34 @@ describe("TypeSafe pipeline decisions", () => {
     const provider = {
       summarize: vi.fn(async () => "<no-skill/>"),
     };
-    registerReflectFunctions(sdk as never, kv as never, provider as never, undefined, undefined, typeSafe as never);
-
-    const result = await sdk.trigger("mem::reflect", { deferred: true, maxClusters: 1 }) as {
-      clustersSkipped: number;
+    const indexStatus = {
+      version: 1,
+      capabilities: ["state::semantic_lsh_v1", "state::indexed_graph_v1"],
+      graph: [KV.graphNodes, KV.graphEdges].map((scope) => ({ scope, status: "ready", revision: "1" })),
+      semantic: [{ index_id: "observations", model: "fixture-embedding", dimensions: 2, generation: "local-v1",
+        status: "ready", count: 0, lexical_count: 0, lexical_ready: true, source_kind: "agentmemory",
+        source_prepared: true, dirty_count: 0, coverage_ready: true }],
     };
+    const retrieval = kv.retrieval.bind(kv);
+    kv.retrieval = async (request) => {
+      if (request.action === "index_status") return indexStatus as never;
+      if (request.action === "keyword_search" || request.action === "semantic_search") {
+        return { items: [], model: "fixture-embedding", dimensions: 2, generation: "local-v1" } as never;
+      }
+      return retrieval(request);
+    };
+    await kv.set(KV.config, "indexed-corpus", { status: "ready", model: "fixture-embedding", dimensions: 2, generation: "local-v1" });
+    const embedding = { name: "fixture-embedding", dimensions: 2,
+      embed: async () => new Float32Array([1, 0]), embedBatch: async (texts: string[]) => texts.map(() => new Float32Array([1, 0])) };
+    registerReflectFunctions(sdk as never, kv as never, provider as never, undefined, undefined, typeSafe as never, embedding as never);
+
+    const accepted = await h.call<{ jobId: string; queued: boolean }>("mem::reflect", {
+      project: "test-project", query: "database caching improves query performance", factIds: ["semantic-0", "semantic-1", "semantic-2"],
+      deferred: true, maxClusters: 1,
+    });
+    expect(accepted).toMatchObject({ success: true, queued: true });
+    await h.drainDeliveries();
+    const result = await h.call<{ clustersSkipped: number }>("mem::reflect-status", { jobId: accepted.jobId });
 
     expect(result.clustersSkipped).toBe(1);
     expect(typeSafe.evaluateChoice).toHaveBeenCalledWith(
@@ -310,10 +478,13 @@ describe("TypeSafe pipeline decisions", () => {
     expect(provider.summarize).not.toHaveBeenCalled();
   });
 
-  it("gates low-signal skill extraction and accepts force to bypass the gate", async () => {
+  it("lets the LLM decline low-signal skill extraction without TypeSafe gating, including force", async () => {
     const { sdk, kv } = harness();
     const typeSafe = decisionProvider({ evaluateChoice: async () => choice("skip") });
-    await kv.set(KV.sessions, "session-test", { id: "session-test", status: "completed" });
+    await kv.set(KV.sessions, "session-test", {
+      id: "session-test", project: "test-project", cwd: "D:/test", startedAt: new Date().toISOString(),
+      status: "completed", observationCount: 3,
+    });
     await kv.set(KV.summaries, "session-test", {
       ...sessionSummary("session-test", 0),
       filesModified: [],
@@ -322,18 +493,16 @@ describe("TypeSafe pipeline decisions", () => {
       await kv.set(KV.observations("session-test"), `observation-${index}`, compressedObservation(`observation-${index}`));
     }
     const provider = { summarize: vi.fn(async () => "<no-skill/>") };
-    registerSkillExtractFunctions(sdk as never, kv as never, provider as never, undefined, typeSafe as never);
+    registerSkillExtractFunctions(sdk as never, kv as never, provider as never, undefined, typeSafe as never,
+      async (_project, sessionId) => (await kv.list<CompressedObservation>(KV.observations(sessionId)))
+        .map((observation) => ({ id: observation.id, sessionId, rowVersion: "1", scope: KV.observations(sessionId) })) as never);
 
     const result = await sdk.trigger("mem::skill-extract", { sessionId: "session-test" });
 
-    expect(result).toMatchObject({ success: true, extracted: false, skipped: true });
-    expect(typeSafe.evaluateChoice).toHaveBeenCalledWith(
-      "pipelineGates",
-      expect.stringContaining('"workflow":"skill-extraction"'),
-      expect.any(String),
-      expect.any(Object),
-    );
-    expect(provider.summarize).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ success: true, extracted: false });
+    expect(typeSafe.evaluateChoice).not.toHaveBeenCalled();
+    expect(typeSafe.evaluate).not.toHaveBeenCalled();
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
 
     typeSafe.evaluateChoice.mockClear();
     await sdk.trigger("mem::skill-extract", { sessionId: "session-test", force: true });

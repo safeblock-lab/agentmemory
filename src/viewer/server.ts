@@ -514,6 +514,22 @@ export function startViewerServer(
   return server;
 }
 
+const DEFAULT_PROXY_TIMEOUT_MS = 10_000;
+const LONG_GENERATION_POST_TIMEOUTS_MS = new Map([
+  ["/agentmemory/summarize", 360_000],
+  ["/agentmemory/reflect", 180_000],
+  ["/agentmemory/consolidate", 180_000],
+  ["/agentmemory/graph/extract", 180_000],
+  ["/agentmemory/graph/build", 180_000],
+  ["/agentmemory/consolidate-pipeline", 180_000],
+  ["/agentmemory/slot/reflect", 180_000],
+]);
+
+function proxyTimeoutMs(method: string, upstreamPath: string): number {
+  if (method.toUpperCase() !== "POST") return DEFAULT_PROXY_TIMEOUT_MS;
+  return LONG_GENERATION_POST_TIMEOUTS_MS.get(upstreamPath) ?? DEFAULT_PROXY_TIMEOUT_MS;
+}
+
 async function proxyToRestApi(
   restPort: number,
   pathname: string,
@@ -544,7 +560,10 @@ async function proxyToRestApi(
   }
 
   const controller = new AbortController();
-  const fetchTimeout = setTimeout(() => controller.abort(), 10000);
+  const fetchTimeout = setTimeout(
+    () => controller.abort(),
+    proxyTimeoutMs(method, upstreamPath),
+  );
   let upstream: Response;
   try {
     upstream = await fetch(upstreamUrl, {

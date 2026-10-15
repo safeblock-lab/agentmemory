@@ -1,4 +1,29 @@
 #!/usr/bin/env node
+import { randomUUID } from "node:crypto";
+//#region src/hooks/_context-usage.ts
+function recordContextEmission(url, headers, sessionId, source, text, candidateTokens) {
+	fetch(`${url}/agentmemory/observe`, {
+		method: "POST",
+		headers,
+		body: JSON.stringify({
+			sessionId,
+			project: "context-telemetry",
+			cwd: process.cwd(),
+			hookType: "notification",
+			timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+			data: {
+				event: "context_emitted_v1",
+				eventId: randomUUID(),
+				source,
+				text,
+				candidateTokens
+			}
+		}),
+		signal: AbortSignal.timeout(1e3)
+	}).catch(() => {});
+	setTimeout(() => process.exit(0), 500).unref();
+}
+//#endregion
 //#region src/hooks/pre-tool-use.ts
 function isSdkChildContext(payload) {
 	if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -74,7 +99,10 @@ async function main() {
 		});
 		if (res.ok) {
 			const result = await res.json();
-			if (result.context) process.stdout.write(result.context);
+			if (result.context) {
+				const text = result.context;
+				process.stdout.write(text, () => recordContextEmission(REST_URL, authHeaders(), sessionId, "pre-tool-use", text, result.candidateTokens));
+			}
 		}
 	} catch {}
 }

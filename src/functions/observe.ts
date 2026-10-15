@@ -1,8 +1,9 @@
 import { TriggerAction, type IIIClient } from "iii-sdk";
+import { publishLiveObservation } from "./live-observation.js";
 import type { RawObservation, HookPayload, Origin } from "../types.js";
 
 const TOOL_HOOKS = new Set(["pre_tool_use", "post_tool_use", "post_tool_failure"]);
-import { KV, STREAM, generateId } from "../state/schema.js";
+import { KV, generateId } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { stripPrivateData } from "./privacy.js";
 import { DedupMap } from "./dedup.js";
@@ -14,11 +15,12 @@ import {
   TYPESAFE_ADMISSION_CONFIDENCE_THRESHOLD,
   TYPESAFE_SCORING_CONFIDENCE_THRESHOLD,
 } from "../config.js";
-import { buildSyntheticCompression } from "./compress-synthetic.js";
 import { getSearchIndex, scheduleIndexSave, vectorIndexAddGuarded } from "./search.js";
 import { logger } from "../logger.js";
+import { recordContextUsage, warnContextUsageFailure } from "./context-usage.js";
 import { saveImageToDisk } from "../utils/image-store.js";
 import type { TypeSafeDecisionProvider, TypeSafeQuestion } from "../providers/typesafe.js";
+import { admitObservation, buildStoredSynthetic, observationIdentity, ObservationAdmissionError, captureTranscriptSnapshot } from "./observation-identity.js";
 
 const READ_ONLY_TOOL_TOKENS = new Set([
   "read",
@@ -105,7 +107,8 @@ function shouldProtectObservation(raw: RawObservation, imageData?: string): bool
     return true;
   }
   if (!isTypeSafeObservationTool(raw.toolName)) return true;
-  const preview = `${compactObservationText(raw.toolInput, 256)} ${compactObservationText(raw.toolOutput, 256)}`;
+  if ((JSON.stringify(raw.raw)?.length ?? 0) > 448) return true;
+  const preview = compactObservationText(raw.raw, 448);
   return PROTECTED_OBSERVATION_SIGNAL.test(preview) || stripPrivateData(preview) !== preview;
 }
 
@@ -135,7 +138,7 @@ export function extractImage(d: unknown): string | undefined {
 export function registerObserveFunction(
   sdk: IIIClient,
   kv: StateKV,
-  dedupMap?: DedupMap,
+  _dedupMap?: DedupMap,
   maxObservationsPerSession?: number,
   typeSafe?: TypeSafeDecisionProvider,
 ): void {
@@ -148,7 +151,8 @@ export function registerObserveFunction(
         !payload.hookType ||
         typeof payload.hookType !== "string" ||
         !payload.timestamp ||
-        typeof payload.timestamp !== "string"
+        typeof payload.timestamp !== "string" ||
+        !Number.isFinite(Date.parse(payload.timestamp))
       ) {
         return {
           success: false,
@@ -157,43 +161,38 @@ export function registerObserveFunction(
         };
       }
 
-      const obsId = generateId("obs");
-      let typeSafeImportance: number | undefined;
-
-      let dedupHash: string | undefined;
-      if (dedupMap) {
-        const dataIsObject =
-          typeof payload.data === "object" && payload.data !== null;
-        const d = dataIsObject
-          ? (payload.data as Record<string, unknown>)
-          : {};
-        const toolName = (d["tool_name"] as string) || payload.hookType;
-        // Hash the full payload when tool_input is absent so distinct
-        // events never collapse onto one key.
-        const dedupInput =
-          d["tool_input"] !== undefined
-            ? d["tool_input"]
-            : dataIsObject
-              ? d
-              : payload.data;
-        dedupHash = dedupMap.computeHash(
-          payload.sessionId,
-          toolName,
-          dedupInput,
-        );
-        if (dedupMap.isDuplicate(dedupHash)) {
-          return { deduplicated: true, sessionId: payload.sessionId };
+      const telemetryData = payload.data && typeof payload.data === "object" && !Array.isArray(payload.data)
+        ? payload.data as Record<string, unknown> : null;
+      if (payload.hookType === "prompt_submit" && telemetryData?.event === "transcript_capture_v1") {
+        return captureTranscriptSnapshot(sdk, kv, payload);
+      }
+      if (payload.hookType === "notification" && telemetryData?.event === "context_emitted_v1") {
+        try {
+          await recordContextUsage(kv, payload.sessionId, telemetryData);
+          return { success: true, telemetry: true };
+        } catch {
+          warnContextUsageFailure();
+          return { success: false, error: "Context emission telemetry rejected" };
         }
       }
 
-      let sanitizedRaw: unknown = payload.data;
+      const obsId = generateId("obs");
+      let typeSafeImportance: number | undefined;
+
+      let serializedData: string;
       try {
-        const jsonStr = JSON.stringify(payload.data);
-        const sanitized = stripPrivateData(jsonStr);
+        serializedData = JSON.stringify(payload.data) ?? JSON.stringify(String(payload.data));
+      } catch {
+        return { success: false, error: "Invalid payload: data must be JSON serializable" };
+      }
+      const sanitized = stripPrivateData(serializedData);
+      let sanitizedRaw: unknown;
+      try {
         sanitizedRaw = JSON.parse(sanitized);
       } catch {
-        sanitizedRaw = stripPrivateData(String(payload.data));
+        sanitizedRaw = sanitized;
       }
+      const identity = observationIdentity(payload, sanitizedRaw, { toolInputIdentity: true });
 
       let originChannel: Origin["channel"] = "agent";
       if (payload.hookType === "prompt_submit") originChannel = "user";
@@ -204,6 +203,7 @@ export function registerObserveFunction(
         timestamp: payload.timestamp,
         hookType: payload.hookType,
         raw: sanitizedRaw,
+        identityDigest: identity.identityDigest,
         origin: {
           channel: originChannel,
           capturedAt: payload.timestamp,
@@ -220,7 +220,7 @@ export function registerObserveFunction(
         ) {
           raw.toolName = d["tool_name"] as string | undefined;
           raw.toolInput = d["tool_input"];
-          raw.toolOutput = d["tool_output"] || d["error"];
+          raw.toolOutput = d["tool_output"] ?? d["error"];
           if (raw.origin && raw.toolName) raw.origin.detail = raw.toolName;
         }
         if (payload.hookType === "prompt_submit") {
@@ -241,33 +241,26 @@ export function registerObserveFunction(
       const pendingImageData = extractedImage;
 
       return withKeyedLock(`obs:${payload.sessionId}`, async () => {
-        if (maxObservationsPerSession && maxObservationsPerSession > 0) {
-          const existing = await kv.list(KV.observations(payload.sessionId));
-          if (existing.length >= maxObservationsPerSession) {
-            logger.warn("Session observation limit reached", {
-              sessionId: payload.sessionId,
-              limit: maxObservationsPerSession,
-            });
-            return {
-              success: false,
-              code: "SESSION_OBSERVATION_LIMIT",
-              error: `Session observation limit reached (${maxObservationsPerSession})`,
-            };
+        const readiness = await kv.get<{ version?: number; ready?: boolean }>(`mem:obs-identity:${payload.sessionId}`, "__ready__");
+        if (readiness?.version !== 1 || readiness.ready !== true) {
+          for await (const page of kv.pages<{ id: string }>(`mem:obs:${payload.sessionId}`, { limit: 1, maxBytes: 4096, fields: ["id"] })) {
+            if (page.items.length) {
+              return { success: false, pending: true, code: "STATE_OBSERVATION_INDEX_PENDING", sessionId: payload.sessionId };
+            }
+            break;
           }
         }
-
         const admissionEnabled = isTypeSafeFeatureEnabled("admission");
         const scoringEnabled = isTypeSafeFeatureEnabled("scoring");
+        const retainedIdentity = typeSafe && (admissionEnabled || scoringEnabled)
+          ? await kv.get(`mem:obs-identity:${payload.sessionId}`, identity.identityDigest) : null;
         if (
           typeSafe &&
+          !retainedIdentity &&
           !shouldProtectObservation(raw, pendingImageData) &&
           (admissionEnabled || scoringEnabled)
         ) {
-          const inputPreview = compactObservationText(raw.toolInput, 192);
-          const outputPreview = compactObservationText(raw.toolOutput, 320);
-          const preview = stripPrivateData(
-            `${inputPreview}${inputPreview && outputPreview ? " | " : ""}${outputPreview}`,
-          ).slice(0, 448);
+          const preview = stripPrivateData(compactObservationText(raw.raw, 448));
           const state = { preview };
           const questions: Record<string, TypeSafeQuestion> = {};
           if (admissionEnabled) {
@@ -300,7 +293,6 @@ export function registerObserveFunction(
               admission.choice === "discard" &&
               admission.confidence >= TYPESAFE_ADMISSION_CONFIDENCE_THRESHOLD
             ) {
-              if (dedupMap && dedupHash) dedupMap.record(dedupHash);
               return {
                 success: true,
                 skipped: true,
@@ -330,8 +322,6 @@ export function registerObserveFunction(
         // retroactively scoped by a later AGENT_ID export.
         const existingSession = await kv.get<{
           agentId?: string;
-          observationCount?: number;
-          firstPrompt?: string;
         }>(KV.sessions, payload.sessionId);
         const inheritedAgentId = existingSession
           ? existingSession.agentId
@@ -350,25 +340,25 @@ export function registerObserveFunction(
             payload: { deltaBytes: bytesWritten },
             action: TriggerAction.Void(),
           });
-          if (process.env["AGENTMEMORY_IMAGE_EMBEDDINGS"] === "true") {
-            sdk.trigger({
-              function_id: "mem::vision-embed",
-              payload: {
-                imageRef: filePath,
-                sessionId: payload.sessionId,
-                observationId: obsId,
-              },
-              action: TriggerAction.Void(),
-            });
-          }
         }
 
+        const autoCompress = isAutoCompressEnabled();
+        const synthetic = buildStoredSynthetic(raw);
+        if (typeSafeImportance !== undefined) synthetic.importance = typeSafeImportance;
+        const trimmedPrompt = raw.userPrompt?.replace(/\s+/g, " ").trim().slice(0, 200);
+        const sessionCandidate = typeof payload.project === "string" && payload.project.trim()
+          && typeof payload.cwd === "string" && payload.cwd.trim() ? {
+            id: payload.sessionId, project: payload.project, cwd: payload.cwd,
+            startedAt: payload.timestamp, updatedAt: payload.timestamp,
+            status: "active", observationCount: 0,
+            ...(inheritedAgentId ? { agentId: inheritedAgentId } : {}),
+            ...(trimmedPrompt ? { firstPrompt: trimmedPrompt } : {}),
+          } : undefined;
+        let admission;
         try {
-
-          await kv.set(KV.observations(payload.sessionId), obsId, raw);
-
+          admission = await admitObservation(sdk, identity, autoCompress ? raw : { ...synthetic, ...raw }, raw, sessionCandidate, maxObservationsPerSession);
         } catch (error) {
-          if (raw.imageData) {
+          if (raw.imageData && error instanceof ObservationAdmissionError && error.releaseImage) {
             // Roll back the ref taken above. decrementImageRef deletes the file
             // only when no other observation still references it (deduped images
             // survive) and emits the disk-size delta itself — deleting the file
@@ -385,95 +375,38 @@ export function registerObserveFunction(
               });
             }
           }
+          if (error instanceof Error && error.message.includes("STATE_OBSERVATION_LIMIT")) {
+            return { success: false, code: "SESSION_OBSERVATION_LIMIT", error: `Session observation limit reached (${maxObservationsPerSession})` };
+          }
+          if (error instanceof Error && error.message.includes("STATE_OBSERVATION_INDEX_PENDING")) {
+            return { success: false, pending: true, code: "STATE_OBSERVATION_INDEX_PENDING", sessionId: payload.sessionId };
+          }
           throw error;
         }
 
-        if (dedupMap && dedupHash) {
-          dedupMap.record(dedupHash);
-        }
-
-        await sdk.trigger({
-          function_id: "stream::set",
-          payload: {
-          stream_name: STREAM.name,
-          group_id: STREAM.group(payload.sessionId),
-          item_id: obsId,
-          data: { type: "raw", observation: raw },
-          },
-        });
-
-        await sdk.trigger({
-          function_id: "stream::send",
-          payload: {
-            stream_name: STREAM.name,
-            group_id: STREAM.viewerGroup,
-            id: `raw-${obsId}`,
-            type: "raw_observation",
-            data: { type: "raw", observation: raw, sessionId: payload.sessionId },
-          },
-          action: TriggerAction.Void(),
-        });
-
-        const session = existingSession;
-        if (session) {
-          const updates: Array<{ type: "set"; path: string; value: unknown }> = [
-            { type: "set", path: "updatedAt", value: new Date().toISOString() },
-            {
-              type: "set",
-              path: "observationCount",
-              value: (session.observationCount || 0) + 1,
-            },
-          ];
-          if (!session.firstPrompt && typeof raw.userPrompt === "string") {
-            const trimmed = raw.userPrompt.replace(/\s+/g, " ").trim();
-            if (trimmed.length > 0) {
-              updates.push({
-                type: "set",
-                path: "firstPrompt",
-                value: trimmed.slice(0, 200),
-              });
-            }
+        if (!admission.created && admission.observation_id !== obsId) {
+          if (raw.imageData) {
+            const { decrementImageRef } = await import("./image-refs.js");
+            await decrementImageRef(kv, sdk, raw.imageData);
           }
-          await kv.update(KV.sessions, payload.sessionId, updates);
-        } else if (
-          typeof payload.project === "string" &&
-          payload.project.trim().length > 0 &&
-          typeof payload.cwd === "string" &&
-          payload.cwd.trim().length > 0
-        ) {
-          // OpenCode (and any plugin that skips POST /session/start)
-          // can fire observations before the session record exists. Without
-          // an implicit create, those observations stack up but
-          // `memory_sessions` never lists them, and summarize bails with
-          // "Session not found for summarize". Create the session now from
-          // the observation payload — but only when project + cwd are
-          // present (HookPayload contract). Older test payloads without
-          // those fields keep their original no-op behaviour.
-          const trimmedPrompt =
-            typeof raw.userPrompt === "string"
-              ? raw.userPrompt.replace(/\s+/g, " ").trim().slice(0, 200)
-              : undefined;
-          const ts = new Date().toISOString();
-          await kv.set(KV.sessions, payload.sessionId, {
-            id: payload.sessionId,
-            project: payload.project,
-            cwd: payload.cwd,
-            startedAt: payload.timestamp ?? ts,
-            updatedAt: ts,
-            status: "active",
-            observationCount: 1,
-            ...(inheritedAgentId ? { agentId: inheritedAgentId } : {}),
-            ...(trimmedPrompt && trimmedPrompt.length > 0
-              ? { firstPrompt: trimmedPrompt }
-              : {}),
+          return {
+            observationId: admission.observation_id, deduplicated: true,
+            duplicateEvent: admission.duplicate_event, sessionId: payload.sessionId,
+            occurrenceCount: admission.occurrence_count,
+          };
+        }
+        if (raw.imageData && process.env["AGENTMEMORY_IMAGE_EMBEDDINGS"] === "true") {
+          await sdk.trigger({
+            function_id: "mem::vision-embed",
+            payload: { imageRef: raw.imageData, sessionId: payload.sessionId, observationId: obsId },
+            action: TriggerAction.Void(),
           });
         }
 
-        // Per-observation LLM compression is opt-in as of 0.8.8.
-        // Default path: build a zero-LLM synthetic compression so recall
-        // and BM25 search still work without burning the user's Claude
-        // token allocation on every tool invocation.
-        if (isAutoCompressEnabled()) {
+        await publishLiveObservation(sdk, "raw", admission.observation);
+
+        // Synthetic search/display projections never replace the complete source.
+        if (autoCompress) {
           await sdk.trigger({
             function_id: "mem::compress",
             payload: {
@@ -487,45 +420,16 @@ export function registerObserveFunction(
             action: TriggerAction.Void(),
           });
         } else {
-          const synthetic = buildSyntheticCompression(raw);
-          if (typeSafeImportance !== undefined) {
-            synthetic.importance = typeSafeImportance;
-          }
-          await kv.set(
-            KV.observations(payload.sessionId),
-            obsId,
-            synthetic,
-          );
-          getSearchIndex().add(synthetic);
+          const stored = { ...admission.observation, ...synthetic };
+          getSearchIndex().add(stored);
           scheduleIndexSave();
           await vectorIndexAddGuarded(
-            synthetic.id,
-            synthetic.sessionId,
-            synthetic.title + " " + (synthetic.narrative || ""),
-            { kind: "synthetic", logId: synthetic.id },
+            stored.id,
+            stored.sessionId,
+            stored.title + " " + (stored.narrative || ""),
+            { kind: "synthetic", logId: stored.id },
           );
-          await sdk.trigger({
-            function_id: "stream::set",
-            payload: {
-              stream_name: STREAM.name,
-              group_id: STREAM.group(payload.sessionId),
-              item_id: obsId,
-              data: { type: "compressed", observation: synthetic },
-            },
-          });
-          await sdk.trigger({
-            function_id: "stream::set",
-            payload: {
-              stream_name: STREAM.name,
-              group_id: STREAM.viewerGroup,
-              item_id: obsId,
-              data: {
-                type: "compressed",
-                observation: synthetic,
-                sessionId: payload.sessionId,
-              },
-            },
-          });
+          await publishLiveObservation(sdk, "compressed", stored);
         }
 
         logger.info("Observation captured", {

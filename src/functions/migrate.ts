@@ -2,6 +2,7 @@ import type { IIIClient } from "iii-sdk";
 import { resolve } from "node:path";
 import { homedir } from "node:os";
 import { KV, generateId } from "../state/schema.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 import { StateKV } from "../state/kv.js";
 import type {
   Memory,
@@ -211,7 +212,8 @@ export function registerMigrateFunction(sdk: IIIClient, kv: StateKV): void {
             concepts: safeJsonParse(row.concepts, []),
             observationCount: row.observation_count || 0,
           };
-          await kv.set(KV.summaries, row.session_id, summary);
+          await withKeyedLock(`summary-canonical:${row.session_id}`, () =>
+            kv.set(KV.summaries, row.session_id, summary));
           summaryCount++;
         }
 

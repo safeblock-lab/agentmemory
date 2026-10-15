@@ -21,7 +21,40 @@ function harness() {
       return handlers.get(id)?.(payload) ?? null;
     },
   };
-  return { sdk, kv: mockKV(), triggered };
+  const kv = mockKV();
+  (kv as any).pages = async function* (scope: string, options: { limit: number; fields?: string[] }) {
+    const rows = Array.from(kv.store.get(scope)?.entries() ?? [], ([id, value]) => options.fields?.length ? { id } : value);
+    for (let offset = 0; offset < rows.length; offset += options.limit) yield { items: rows.slice(offset, offset + options.limit) };
+  };
+  sdk.registerFunction("state::observation_admit_v1", async (input: unknown) => {
+    const request = input as Record<string, any>;
+    const sessionId = request.session_id as string;
+    const identityScope = `mem:obs-identity:${sessionId}`;
+    const eventScope = `mem:obs-events:${sessionId}`;
+    const observationScope = `mem:obs:${sessionId}`;
+    const identity = await kv.get<{ observationId: string }>(identityScope, request.identity_digest);
+    const observationId = identity?.observationId ?? request.observation.id;
+    const current = await kv.get<Record<string, any>>(observationScope, observationId);
+    const event = await kv.get(eventScope, request.event_id);
+    if (event && current) return { created: false, duplicate_event: true, observation_id: observationId, observation: current, version: "1", occurrence_count: current.occurrenceCount ?? 1 };
+    if (identity && current) {
+      const count = (current.occurrenceCount ?? 1) + 1;
+      const updated = { ...current, occurrenceCount: count, lastSeenAt: request.occurred_at };
+      await kv.set(observationScope, observationId, updated);
+      await kv.set(eventScope, request.event_id, { observationId, identityDigest: request.identity_digest, occurredAt: request.occurred_at });
+      return { created: false, duplicate_event: false, observation_id: observationId, observation: updated, version: String(count), occurrence_count: count };
+    }
+    const session = await kv.get<Record<string, any>>("mem:sessions", sessionId) ?? request.session;
+    if (request.max_observations && session && (session.observationCount ?? 0) >= request.max_observations) throw new Error("STATE_OBSERVATION_LIMIT");
+    const observation = { ...request.observation, identityDigest: request.identity_digest, occurrenceCount: 1, firstSeenAt: request.occurred_at, lastSeenAt: request.occurred_at, provenance: [{ ...request.provenance, count: 1, firstSeenAt: request.occurred_at, lastSeenAt: request.occurred_at }] };
+    await kv.set(observationScope, observationId, observation);
+    await kv.set(identityScope, request.identity_digest, { observationId, identityDigest: request.identity_digest });
+    await kv.set(identityScope, "__ready__", { version: 1, ready: true });
+    await kv.set(eventScope, request.event_id, { observationId, identityDigest: request.identity_digest, occurredAt: request.occurred_at });
+    if (session) await kv.set("mem:sessions", sessionId, { ...session, observationCount: (session.observationCount ?? 0) + 1, updatedAt: request.occurred_at });
+    return { created: true, duplicate_event: false, observation_id: observationId, observation, version: "1", occurrence_count: 1 };
+  });
+  return { sdk, kv, triggered };
 }
 
 function observationPayload() {

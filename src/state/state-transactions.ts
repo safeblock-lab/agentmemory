@@ -47,7 +47,11 @@ export interface StateGraphPruneRequest extends StatePruneBudget {
 export interface StateAuditPruneRequest extends StatePruneBudget {
   guard: StateGraphGuard; through_key: string; cursor?: StatePruneCursor
 }
-export interface StatePruneResult { deleted_count: number; deleted_bytes: number; cursor: StatePruneCursor | null; done: boolean }
+export interface StatePruneResult {
+  deleted_count: number; deleted_bytes: number; cursor: StatePruneCursor | null; done: boolean
+  deleted_logical_bytes?: number; deleted_stored_bytes?: number
+  skipped_oversized_count?: number; rows_scanned?: number
+}
 export type StateTransactionFunction = 'state::get_versioned' | 'state::lease' | 'state::commit_batch' | 'state::graph_prune_terminal' | 'state::audit_prune_history'
 export type StateTransactionTrigger = (functionId: StateTransactionFunction, payload: unknown) => Promise<unknown>
 
@@ -250,9 +254,13 @@ export async function pruneStateWork(trigger: StateTransactionTrigger, request: 
   requireValid(request.cursor === undefined || validCursor(request.cursor))
   const result = await invoke(trigger, graph ? 'state::graph_prune_terminal' : 'state::audit_prune_history', request)
   responseJson(result)
-  requireValid(keys(result, ['deleted_count', 'deleted_bytes', 'cursor', 'done'])
+  requireValid(keys(result, ['deleted_count', 'deleted_bytes', 'cursor', 'done'], [
+    'deleted_logical_bytes', 'deleted_stored_bytes', 'skipped_oversized_count', 'rows_scanned',
+  ])
     && Number.isInteger(result.deleted_count) && Number(result.deleted_count) >= 0 && Number(result.deleted_count) <= request.limit
     && Number.isSafeInteger(result.deleted_bytes) && Number(result.deleted_bytes) >= 0
+    && ['deleted_logical_bytes', 'deleted_stored_bytes', 'skipped_oversized_count', 'rows_scanned'].every((key) =>
+      !Object.hasOwn(result, key) || (Number.isSafeInteger(result[key]) && Number(result[key]) >= 0))
     && typeof result.done === 'boolean' && (result.done ? result.cursor === null : validCursor(result.cursor)), 'STATE_TX_INVALID_RESPONSE')
   return result as unknown as StatePruneResult
 }

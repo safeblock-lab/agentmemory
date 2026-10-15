@@ -1,5 +1,15 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
+import { registerApiTriggers } from "../src/triggers/api.js";
+import { registerConsolidationPipelineFunction } from "../src/functions/consolidation-pipeline.js";
+import { pageKey } from "../src/functions/consolidation-manifest.js";
+import { registerSkillLifecycleFunctions, type SkillLifecycleSession } from "../src/functions/skill-lifecycle.js";
+import { CONSOLIDATION_LAST_RUN_KEY } from "../src/functions/consolidation-status.js";
+import { KV } from "../src/state/schema.js";
+import { applyBatchEffect, batchEffectKey } from "../src/state/batch-effects.js";
+import type { ConsolidationCanonicalLookup, ConsolidationCanonicalWriter } from "../src/functions/consolidation-selection.js";
+import type { SessionSummary } from "../src/types.js";
+import { effectHarness } from "./batch-effects-harness.js";
 import {
   describeConsolidation,
   type ConsolidationStatusInput,
@@ -24,6 +34,19 @@ function tier(status: ReturnType<typeof describeConsolidation>, id: string) {
   const found = status.tiers.find((t) => t.id === id);
   if (!found) throw new Error(`tier ${id} missing`);
   return found;
+}
+
+function semanticFixtureResponse(prompt: string): string {
+  const candidatesMarker = "Candidate facts with source evidence:\n\n";
+  if (prompt.includes(candidatesMarker)) {
+    const candidates = JSON.parse(prompt.slice(prompt.indexOf(candidatesMarker) + candidatesMarker.length)) as Array<{ candidateIds: string[] }>;
+    const candidateIds = [...new Set(candidates.flatMap((candidate) => candidate.candidateIds))];
+    return `<facts><fact confidence="0.9" candidateIds="${candidateIds.join(",")}">A durable decision.</fact></facts>`;
+  }
+  const fragmentsMarker = "Analyze these original source fragments with their provenance:\n\n";
+  const fragments = JSON.parse(prompt.slice(prompt.indexOf(fragmentsMarker) + fragmentsMarker.length)) as Array<{ sourceId: string }>;
+  const sourceIds = [...new Set(fragments.map((fragment) => fragment.sourceId))];
+  return `<facts><fact confidence="0.9" sourceIds="${sourceIds.join(",")}">A durable decision.</fact></facts>`;
 }
 
 describe("describeConsolidation", () => {
@@ -131,46 +154,125 @@ describe("skill extraction runs inside the consolidation cooldown", () => {
     const sdk = {
       registerFunction: (id: string, fn: (p: unknown) => Promise<unknown>) => handlers.set(id, fn),
       registerTrigger: () => undefined,
-      trigger: vi.fn(async (req: { function_id: string }) => {
+      trigger: vi.fn(async (req: { function_id: string; payload: unknown }) => {
         fired.push(req.function_id);
-        return {};
+        const handler = handlers.get(req.function_id);
+        return handler ? handler(req.payload) : { success: true };
       }),
     };
+    const store = new Map<string, Map<string, unknown>>();
     const kv = {
-      get: vi.fn(async () => null),
-      set: vi.fn(async () => undefined),
-      list: vi.fn(async () => []),
+      get: async <T>(scope: string, key: string): Promise<T | null> => (store.get(scope)?.get(key) as T) ?? null,
+      set: async <T>(scope: string, key: string, value: T): Promise<T> => {
+        if (!store.has(scope)) store.set(scope, new Map());
+        store.get(scope)!.set(key, value);
+        return value;
+      },
+      list: async <T>(scope: string): Promise<T[]> => Array.from(store.get(scope)?.values() ?? []) as T[],
     };
+    registerSkillLifecycleFunctions(sdk as never, kv as never);
     registerEventTriggers(sdk as never, kv as never);
     await handlers.get("event::session::stopped")!({ sessionId: "s1" });
-    return fired;
+    return {
+      fired,
+      intent: await kv.get<SkillLifecycleSession>(KV.skillLifecycleIntents, "session:s1"),
+    };
   }
 
-  it("extracts a procedure from the session when consolidation is due and an LLM key is set", async () => {
-    const fired = await stop({ ANTHROPIC_API_KEY: "sk-test", CONSOLIDATION_ENABLED: "true" });
+  it("persists provider-eligible lifecycle intent before due consolidation", async () => {
+    const { fired, intent } = await stop({ ANTHROPIC_API_KEY: "sk-test", CONSOLIDATION_ENABLED: "true" });
     expect(fired).toContain("mem::consolidate-pipeline");
-    expect(fired).toContain("mem::skill-extract");
-  });
-
-  it("never calls skill extraction without an LLM key, even with consolidation forced on", async () => {
-    const fired = await stop({ CONSOLIDATION_ENABLED: "true" });
     expect(fired).not.toContain("mem::skill-extract");
+    expect(intent).toMatchObject({ kind: "session", sessionId: "s1", consolidationEnabled: true, providerEligible: true });
   });
 
-  it("never calls skill extraction when consolidation is off", async () => {
-    const fired = await stop({ ANTHROPIC_API_KEY: "sk-test", CONSOLIDATION_ENABLED: "false" });
+  it("persists provider ineligibility without directly dispatching skill extraction", async () => {
+    const { fired, intent } = await stop({ CONSOLIDATION_ENABLED: "true" });
+    expect(fired).not.toContain("mem::skill-extract");
+    expect(intent).toMatchObject({ kind: "session", consolidationEnabled: true, providerEligible: false });
+  });
+
+  it("persists disabled lifecycle state and suppresses consolidation scheduling", async () => {
+    const { fired, intent } = await stop({ ANTHROPIC_API_KEY: "sk-test", CONSOLIDATION_ENABLED: "false" });
     expect(fired).not.toContain("mem::skill-extract");
     expect(fired).not.toContain("mem::consolidate-pipeline");
+    expect(intent).toMatchObject({ kind: "session", consolidationEnabled: false, providerEligible: true });
   });
 });
 
 describe("consolidation status wiring", () => {
   const api = readFileSync("src/triggers/api.ts", "utf-8");
-  const pipeline = readFileSync("src/functions/consolidation-pipeline.ts", "utf-8");
   const viewer = readFileSync("src/viewer/index.html", "utf-8");
 
-  it("the pipeline stores each run's per-tier results", () => {
-    expect(pipeline).toMatch(/\.set\(KV\.config, CONSOLIDATION_LAST_RUN_KEY, \{ at: new Date\(\)\.toISOString\(\), tier, results \}\)/);
+  it("persists actual per-tier results from a consolidation run", async () => {
+    const h = effectHarness();
+    Object.assign(h.kv, { indexedRetrieval: true });
+    const summaries = Array.from({ length: 5 }, (_, index): SessionSummary => ({
+      sessionId: `status-session-${index}`, project: "test-project",
+      createdAt: new Date(Date.UTC(2026, 0, index + 1)).toISOString(),
+      title: `Status source ${index}`, narrative: "A durable project decision.", keyDecisions: [],
+      filesModified: [], concepts: [], observationCount: 1,
+    }));
+    summaries.forEach((summary) => {
+      h.seed(KV.summaries, summary.sessionId, summary);
+      h.seed(KV.sessions, summary.sessionId, {
+        id: summary.sessionId, project: "test-project", cwd: "D:/test", startedAt: summary.createdAt,
+        status: "completed", observationCount: summary.observationCount,
+      });
+    });
+    const selectSources = async (project: string) => (await h.kv.list<SessionSummary>(KV.summaries))
+      .filter((summary) => summary.project === project)
+      .map((summary) => ({ id: summary.sessionId, sessionId: summary.sessionId, rowVersion: "1" }));
+    const provider = { summarize: vi.fn(async (system: string, prompt: string) => {
+      if (system.startsWith("You evaluate publication evidence.")) {
+        const evidence = JSON.parse(prompt);
+        expect(evidence.sources.map((source: { key: string }) => source.key).sort()).toEqual(summaries.map(source => source.sessionId).sort());
+        return JSON.stringify({ requestId: /requestId must be ([^.]+)\./.exec(system)![1], verdict: "supported", reason: "All original fixture decisions support the candidate." });
+      }
+      return semanticFixtureResponse(prompt);
+    }) };
+    const lookup: ConsolidationCanonicalLookup = async () => ({ status: "ready", version: "1", canonicalId: null });
+    const write: ConsolidationCanonicalWriter = async (scope, key, match, proposedId, effect, update) => {
+      const id = match.canonicalId ?? proposedId;
+      const old = await h.kv.get<Record<string, unknown>>(KV[scope], id);
+      const applied = await applyBatchEffect(h.kv, KV[scope], id, effect, update as never);
+      return {
+        applied: !(old?.appliedBatchEffects as string[] | undefined)?.includes(effect),
+        created: !old,
+        id,
+        rowVersion: "1",
+        receipt: {
+          operationKind: "upsert",
+          effectKey: effect,
+          operationFingerprint: batchEffectKey(key),
+          id,
+          rowVersion: "1",
+          created: !old,
+          resultFingerprint: batchEffectKey(JSON.stringify(applied)),
+        },
+      };
+    };
+    registerConsolidationPipelineFunction(h.sdk as never, h.kv, provider as never, undefined, undefined, undefined,
+      undefined, selectSources, lookup, undefined, write);
+
+    let result = await h.call<Record<string, unknown>>("mem::consolidate-pipeline", { tier: "semantic", project: "test-project", force: true });
+    let manifestId = (result as { results?: { semantic?: { continuation?: { consolidationManifestId?: string } } } })
+      .results?.semantic?.continuation?.consolidationManifestId;
+    const progress: string[] = [];
+    for (let step = 0; manifestId && step < 32; step += 1) {
+      result = await h.call("mem::consolidate-pipeline", { consolidationManifestId: manifestId });
+      const root = await h.kv.get<Record<string, unknown>>(KV.state, pageKey(manifestId, "root", 0));
+      const response = result as { error?: unknown; phase?: unknown; completed?: unknown; queued?: unknown };
+      progress.push(`${root?.phase ?? "missing"}:capture=${(root?.capture as { source?: number } | undefined)?.source ?? "?"}/${Array.isArray(root?.refs) ? root.refs.length : "?"},quality=${(root?.quality as { source?: number } | undefined)?.source ?? "?"},extract=${(root?.extract as { page?: number; offset?: number } | undefined)?.page ?? "?"}/${root?.fragmentPages ?? "?"}:${(root?.extract as { page?: number; offset?: number } | undefined)?.offset ?? "?"},eligible=${Array.isArray(root?.eligibleSources) ? root.eligibleSources.length : "?"},response=${String(response.error ?? response.phase ?? (response.completed ? "completed" : response.queued ? "queued" : "no-status"))}`);
+      manifestId = (result as { continuation?: { consolidationManifestId?: string } }).continuation?.consolidationManifestId;
+    }
+    expect(manifestId, progress.join(" -> ")).toBeUndefined();
+    expect(result).toMatchObject({ success: true, completed: true });
+    expect(provider.summarize).toHaveBeenCalled();
+    expect(await h.kv.list(KV.semantic), JSON.stringify(result)).toHaveLength(1);
+    expect(await h.kv.get(KV.config, CONSOLIDATION_LAST_RUN_KEY)).toMatchObject({
+      tier: "semantic", results: { semantic: expect.any(Object) },
+    });
   });
 
   it("GET /agentmemory/consolidation/status is registered behind auth", () => {
@@ -178,15 +280,17 @@ describe("consolidation status wiring", () => {
     expect(api).toMatch(/api_path: "\/agentmemory\/consolidation\/status", http_method: "GET"/);
   });
 
-  it("status requests share one set of store scans instead of listing every scope per request", () => {
-    expect(api).toMatch(/const sharedConsolidationCounts = singleFlight\(async \(\) => \{/);
-    expect(api).toMatch(/\}, CONSOLIDATION_COUNTS_REUSE_MS\);/);
-    const handler = api.slice(
-      api.indexOf('registerFunction("api::consolidation-status"'),
-      api.indexOf('function_id: "api::consolidation-status"'),
-    );
-    expect(handler).toMatch(/sharedConsolidationCounts\(\)/);
-    expect(handler).not.toMatch(/kv\.list\(/);
+  it("reuses one bounded set of store scans across status requests", async () => {
+    const h = effectHarness();
+    const apiSdk = { ...h.sdk, registerTrigger: () => undefined };
+    registerApiTriggers(apiSdk as never, h.kv, "test-secret");
+    const pageScans = vi.spyOn(h.kv, "pages");
+    const request = { headers: { authorization: "Bearer test-secret" } };
+    expect((await h.call<{ status_code: number }>("api::consolidation-status", request)).status_code).toBe(200);
+    const firstScanCount = pageScans.mock.calls.length;
+    expect(firstScanCount).toBeGreaterThan(0);
+    expect((await h.call<{ status_code: number }>("api::consolidation-status", request)).status_code).toBe(200);
+    expect(pageScans).toHaveBeenCalledTimes(firstScanCount);
   });
 
   it("the dashboard shows one Memory layers panel instead of the three separate cards", () => {

@@ -2,11 +2,34 @@ import { describe, expect, it, vi } from "vitest";
 import { registerApiTriggers } from "../src/triggers/api.js";
 import { registerSnapshotFunction } from "../src/functions/snapshot.js";
 import { registerConsolidationPipelineFunction } from "../src/functions/consolidation-pipeline.js";
+import { semanticProjectCheckpointKey } from "../src/functions/consolidation-manifest.js";
 import { effectHarness } from "./batch-effects-harness.js";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
+import { KV } from "../src/state/schema.js";
+import { applyBatchEffect, batchEffectKey } from "../src/state/batch-effects.js";
+import type { ConsolidationCanonicalLookup, ConsolidationCanonicalWriter } from "../src/functions/consolidation-selection.js";
+import type { SessionSummary } from "../src/types.js";
 
 type Response = { status_code: number; body: unknown };
+
+function semanticFixtureResponse(prompt: string): string {
+  const candidatesMarker = "Candidate facts with source evidence:\n\n";
+  if (prompt.includes(candidatesMarker)) {
+    const candidates = JSON.parse(prompt.slice(prompt.indexOf(candidatesMarker) + candidatesMarker.length)) as Array<{ candidateIds: string[] }>;
+    const candidateIds = [...new Set(candidates.flatMap((candidate) => candidate.candidateIds))];
+    return `<facts><fact confidence="0.9" candidateIds="${candidateIds.join(",")}">Preserve source evidence</fact></facts>`;
+  }
+  const episodesMarker = "Extract factual candidates from these episodes and identify their supporting session IDs:\n\n";
+  if (prompt.includes(episodesMarker)) {
+    const sourceIds = [...new Set([...prompt.matchAll(/^Session ID: ([^\r\n]+)$/gm)].map((match) => match[1]))];
+    return `<facts><fact confidence="0.9" sourceIds="${sourceIds.join(",")}">Preserve source evidence</fact></facts>`;
+  }
+  const fragmentsMarker = "Analyze these original source fragments with their provenance:\n\n";
+  const fragments = JSON.parse(prompt.slice(prompt.indexOf(fragmentsMarker) + fragmentsMarker.length)) as Array<{ sourceId: string }>;
+  const sourceIds = [...new Set(fragments.map((fragment) => fragment.sourceId))];
+  return `<facts><fact confidence="0.9" sourceIds="${sourceIds.join(",")}">Preserve source evidence</fact></facts>`;
+}
 
 function registerSnapshot(result: unknown, secret = "") {
   const handlers = new Map<string, (request: unknown) => Promise<Response>>();
@@ -58,29 +81,80 @@ describe("api::snapshot-create status", () => {
     vi.useFakeTimers();
     const h = effectHarness();
     const sdk = { ...h.sdk, registerTrigger: () => {} };
-    const snapshotDir = resolve(".native-pagination-build/background-health-20261004/verification/snapshot-busy-test");
+    const snapshotDir = resolve(".native-pagination-build/background-health-20261004/verification",
+      `snapshot-busy-test-${process.pid}-${Date.now()}`);
     let entered!: () => void, finish!: () => void;
     const started = new Promise<void>((resolve) => { entered = resolve; });
     const providerResult = new Promise<void>((resolve) => { finish = resolve; });
     const provider = {
       compress: vi.fn(),
-      summarize: vi.fn(async () => {
+      summarize: vi.fn(async (system: string, prompt: string) => {
+        if (system.startsWith("You evaluate publication evidence.")) {
+          const evidence = JSON.parse(prompt);
+          expect(evidence.sources).toHaveLength(5);
+          return JSON.stringify({ requestId: /requestId must be ([^.]+)\./.exec(system)![1], verdict: "supported", reason: "The fixture candidate preserves the five source records." });
+        }
         entered(); await providerResult;
-        return '<facts><fact confidence="0.9" sourceIds="ses_0,ses_1">Preserve source evidence</fact></facts>';
+        return semanticFixtureResponse(prompt);
       }),
     };
     registerApiTriggers(sdk as never, h.kv, "");
     registerSnapshotFunction(sdk as never, h.kv, snapshotDir);
-    registerConsolidationPipelineFunction(sdk as never, h.kv, provider as never);
+    Object.assign(h.kv, { indexedRetrieval: true });
     for (let index = 0; index < 5; index++) {
-      h.seed("mem:summaries", `ses_${index}`, {
-        sessionId: `ses_${index}`, title: "Source evidence", narrative: "Retain original records",
+      const summary = {
+        sessionId: `ses_${index}`, project: "test-project", title: "Source evidence", narrative: "Retain original records",
         concepts: ["evidence"], createdAt: new Date(2026, 0, index + 1).toISOString(),
+      };
+      h.seed(KV.summaries, `ses_${index}`, summary);
+      h.seed(KV.sessions, `ses_${index}`, {
+        id: `ses_${index}`, project: "test-project", cwd: "D:/test", startedAt: summary.createdAt,
+        status: "completed", observationCount: 1,
       });
     }
-    const consolidation = h.call("api::consolidate-pipeline", { headers: {}, body: { tier: "semantic", force: true } });
+    const selectSources = async (project: string) => (await h.kv.list<SessionSummary>(KV.summaries))
+      .filter((summary) => summary.project === project)
+      .map((summary) => ({ id: summary.sessionId, sessionId: summary.sessionId, rowVersion: "1" }));
+    const lookup: ConsolidationCanonicalLookup = async () => ({ status: "ready", version: "1", canonicalId: null });
+    const write: ConsolidationCanonicalWriter = async (scope, key, match, proposedId, effect, update) => {
+      const id = match.canonicalId ?? proposedId;
+      const old = await h.kv.get<Record<string, unknown>>(KV[scope], id);
+      const applied = await applyBatchEffect(h.kv, KV[scope], id, effect, update as never);
+      return {
+        applied: !(old?.appliedBatchEffects as string[] | undefined)?.includes(effect),
+        created: !old,
+        id,
+        rowVersion: "1",
+        receipt: {
+          operationKind: "upsert",
+          effectKey: effect,
+          operationFingerprint: batchEffectKey(key),
+          id,
+          rowVersion: "1",
+          created: !old,
+          resultFingerprint: batchEffectKey(JSON.stringify(applied)),
+        },
+      };
+    };
+    registerConsolidationPipelineFunction(sdk as never, h.kv, provider as never, undefined, undefined, undefined,
+      undefined, selectSources, lookup, undefined, write);
+    const consolidation = (async () => {
+      let response = await h.call<Response>("api::consolidate-pipeline", {
+        headers: {}, body: { tier: "semantic", force: true, project: "test-project" },
+      });
+      let manifestId = (response.body as { results?: { semantic?: { continuation?: { consolidationManifestId?: string } } } })
+        .results?.semantic?.continuation?.consolidationManifestId;
+      for (let step = 0; manifestId && step < 40; step += 1) {
+        response = await h.call("api::consolidate-pipeline", { headers: {}, body: { consolidationManifestId: manifestId } });
+        manifestId = (response.body as { continuation?: { consolidationManifestId?: string } }).continuation?.consolidationManifestId;
+      }
+      if (manifestId) throw new Error("Consolidation continuation limit exceeded before completion");
+      return response;
+    })();
+    const delivery = consolidation.then(() => h.drainDeliveries());
     try {
-      await started;
+      await Promise.race([started, consolidation.then(() => { throw new Error("Consolidation completed before provider invocation"); })]);
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
       const snapshot = h.call<Response>("api::snapshot-create", { headers: {}, body: {} });
       await vi.advanceTimersByTimeAsync(30001);
       expect(await snapshot).toMatchObject({ status_code: 503, body: {
@@ -89,10 +163,13 @@ describe("api::snapshot-create status", () => {
       } });
       expect(existsSync(snapshotDir)).toBe(false);
       finish();
-      expect(await consolidation).toMatchObject({ status_code: 200, body: { results: { semantic: { newFacts: 1 } } } });
-      expect(await h.kv.list("mem:semantic")).toMatchObject([{ sourceSessionIds: ["ses_0", "ses_1"] }]);
-      expect(await h.kv.get("mem:state", "semantic-consolidation")).toBeTruthy();
-      expect(provider.summarize).toHaveBeenCalledOnce();
-    } finally { finish(); await consolidation; vi.useRealTimers(); }
+      expect(await consolidation).toMatchObject({ status_code: 200, body: { success: true } });
+      await delivery;
+      expect(await h.kv.list<Record<string, unknown>>(KV.semantic)).toMatchObject([{
+        sourceSessionIds: expect.arrayContaining(["ses_0", "ses_1", "ses_2", "ses_3", "ses_4"]),
+      }]);
+      expect(await h.kv.get(KV.state, semanticProjectCheckpointKey("test-project"))).toBeTruthy();
+      expect(provider.summarize).toHaveBeenCalled();
+    } finally { finish(); await consolidation; await delivery; vi.useRealTimers(); }
   });
 });

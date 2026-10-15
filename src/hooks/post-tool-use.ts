@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { resolveProject, hookCwd } from "./_project.js";
+import { boundCapture, TOOL_INPUT_BYTES, TOOL_OUTPUT_BYTES } from "./_capture-bounds.js";
 
 function isSdkChildContext(payload: unknown): boolean {
   if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -50,8 +51,8 @@ async function main() {
       timestamp: new Date().toISOString(),
       data: {
         tool_name: toolName,
-        tool_input: toolInput,
-        tool_output: truncate(cleanOutput, 8000),
+        tool_input: boundCapture(toolInput, TOOL_INPUT_BYTES),
+        tool_output: boundCapture(cleanOutput, TOOL_OUTPUT_BYTES),
         ...(imageData ? { image_data: imageData } : {}),
       },
     }),
@@ -102,18 +103,6 @@ function extractImageData(output: unknown): { imageData: string | undefined; cle
   }
 
   return { imageData: undefined, cleanOutput: output };
-}
-
-function truncate(value: unknown, max: number): unknown {
-  if (typeof value === "string" && value.length > max) {
-    return value.slice(0, max) + "\n[...truncated]";
-  }
-  if (typeof value === "object" && value !== null) {
-    const str = JSON.stringify(value);
-    if (str.length > max) return str.slice(0, max) + "...[truncated]";
-    return value;
-  }
-  return value;
 }
 
 main().catch(() => process.exit(0));

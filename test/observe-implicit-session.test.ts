@@ -29,6 +29,14 @@ function mockKV() {
       const m = store.get(scope);
       return m ? (Array.from(m.values()) as T[]) : [];
     },
+    async *pages<T>(scope: string, options: { limit: number; fields?: string[] }) {
+      const rows = Array.from(store.get(scope)?.entries() ?? [], ([id, value]) =>
+        options.fields?.length ? { id, ...Object.fromEntries(options.fields.filter((field) => field !== "id").map((field) => [field, (value as Record<string, unknown>)[field]])) } : value,
+      );
+      for (let offset = 0; offset < rows.length; offset += options.limit) {
+        yield { items: rows.slice(offset, offset + options.limit) as T[] };
+      }
+    },
   };
 }
 
@@ -56,6 +64,37 @@ function mockSdk() {
   };
 }
 
+function registerObservationAdmission(sdk: ReturnType<typeof mockSdk>, kv: ReturnType<typeof mockKV>) {
+  sdk.registerFunction("state::observation_admit_v1", async (input: unknown) => {
+    const request = input as Record<string, any>;
+    const sessionId = request.session_id as string;
+    const identityScope = `mem:obs-identity:${sessionId}`;
+    const eventScope = `mem:obs-events:${sessionId}`;
+    const observationScope = `mem:obs:${sessionId}`;
+    const identity = await kv.get<{ observationId: string }>(identityScope, request.identity_digest);
+    const observationId = identity?.observationId ?? request.observation.id;
+    const current = await kv.get<Record<string, any>>(observationScope, observationId);
+    const event = await kv.get(eventScope, request.event_id);
+    if (event && current) return { created: false, duplicate_event: true, observation_id: observationId, observation: current, version: "1", occurrence_count: current.occurrenceCount ?? 1 };
+    if (identity && current) {
+      const count = (current.occurrenceCount ?? 1) + 1;
+      const updated = { ...current, occurrenceCount: count, lastSeenAt: request.occurred_at };
+      await kv.set(observationScope, observationId, updated);
+      await kv.set(eventScope, request.event_id, { observationId, identityDigest: request.identity_digest, occurredAt: request.occurred_at });
+      return { created: false, duplicate_event: false, observation_id: observationId, observation: updated, version: String(count), occurrence_count: count };
+    }
+    const session = await kv.get<Record<string, any>>("mem:sessions", sessionId) ?? request.session;
+    if (request.max_observations && session && (session.observationCount ?? 0) >= request.max_observations) throw new Error("STATE_OBSERVATION_LIMIT");
+    const observation = { ...request.observation, identityDigest: request.identity_digest, occurrenceCount: 1, firstSeenAt: request.occurred_at, lastSeenAt: request.occurred_at, provenance: [{ ...request.provenance, count: 1, firstSeenAt: request.occurred_at, lastSeenAt: request.occurred_at }] };
+    await kv.set(observationScope, observationId, observation);
+    await kv.set(identityScope, request.identity_digest, { observationId, identityDigest: request.identity_digest });
+    await kv.set(identityScope, "__ready__", { version: 1, ready: true });
+    await kv.set(eventScope, request.event_id, { observationId, identityDigest: request.identity_digest, occurredAt: request.occurred_at });
+    if (session) await kv.set("mem:sessions", sessionId, { ...session, observationCount: (session.observationCount ?? 0) + 1, updatedAt: request.occurred_at });
+    return { created: true, duplicate_event: false, observation_id: observationId, observation, version: "1", occurrence_count: 1 };
+  });
+}
+
 describe("observe implicit session create (#638)", () => {
   beforeEach(() => {
     vi.resetModules();
@@ -66,6 +105,7 @@ describe("observe implicit session create (#638)", () => {
     const sdk = mockSdk();
     const kv = mockKV();
     registerObserveFunction(sdk as never, kv as never);
+    registerObservationAdmission(sdk, kv);
 
     const result = (await sdk.trigger("mem::observe", {
       sessionId: "ses_opencode_abc",
@@ -95,6 +135,7 @@ describe("observe implicit session create (#638)", () => {
     const sdk = mockSdk();
     const kv = mockKV();
     registerObserveFunction(sdk as never, kv as never);
+    registerObservationAdmission(sdk, kv);
 
     await sdk.trigger("mem::observe", {
       sessionId: "ses_no_project",
@@ -113,6 +154,7 @@ describe("observe implicit session create (#638)", () => {
     const sdk = mockSdk();
     const kv = mockKV();
     registerObserveFunction(sdk as never, kv as never);
+    registerObservationAdmission(sdk, kv);
 
     await kv.set("mem:sessions", "ses_existing", {
       id: "ses_existing",

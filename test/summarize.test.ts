@@ -1,558 +1,236 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-
-vi.mock("../src/logger.js", () => ({
-  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
-}));
-
-vi.mock("../src/state/schema.js", () => ({
-  KV: {
-    sessions: "sessions",
-    summaries: "summaries",
-    observations: (sessionId: string) => `obs:${sessionId}`,
-    audit: "audit",
-  },
-}));
-
-vi.mock("../src/eval/schemas.js", () => ({
-  SummaryOutputSchema: {},
-}));
-
-vi.mock("../src/eval/validator.js", () => ({
-  validateOutput: () => ({ valid: true, result: { errors: [] } }),
-}));
-
-vi.mock("../src/eval/quality.js", () => ({
-  scoreSummary: () => 100,
-}));
-
-vi.mock("../src/functions/audit.js", () => ({
-  safeAudit: vi.fn(),
-}));
-
+﻿import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { registerSummarizeFunction } from "../src/functions/summarize.js";
-import { estimateSummaryTokens } from "../src/functions/summary-budget.js";
-import type {
-  CompressedObservation,
-  Session,
-  MemoryProvider,
-} from "../src/types.js";
+import { registerApiTriggers } from "../src/triggers/api.js";
+import { KV, fingerprintId } from "../src/state/schema.js";
+import { withKeyedLock } from "../src/state/keyed-mutex.js";
+import type { CompressedObservation, Session } from "../src/types.js";
+import { WorkflowAttemptAccounting, type WorkflowAttemptIdentity } from "../src/functions/workflow-attempt-accounting.js";
+const attempts = vi.hoisted(() => ({ enter: vi.fn() }));
+vi.mock("../src/providers/provider-attempt-budget.js", () => ({
+  withProviderAttemptBudget: async (binding: unknown, run: () => Promise<unknown>) => { attempts.enter(binding); return run(); },
+}));
 
-function mockKV() {
-  const store = new Map<string, Map<string, unknown>>();
-  return {
-    store,
-    get: async <T>(scope: string, key: string): Promise<T | null> =>
-      (store.get(scope)?.get(key) as T) ?? null,
-    set: async <T>(scope: string, key: string, data: T): Promise<T> => {
-      if (!store.has(scope)) store.set(scope, new Map());
-      store.get(scope)!.set(key, data);
-      return data;
-    },
-    delete: async (scope: string, key: string): Promise<void> => {
-      store.get(scope)?.delete(key);
-    },
-    list: async <T>(scope: string): Promise<T[]> => {
-      const entries = store.get(scope);
-      return entries ? (Array.from(entries.values()) as T[]) : [];
-    },
-  };
-}
+vi.mock("../src/logger.js", () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
+vi.mock("../src/functions/audit.js", () => ({ recordAudit: vi.fn() }));
+vi.mock("../src/functions/dashboard-activity.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../src/functions/dashboard-activity.js")>(), recordOperation: vi.fn(),
+}));
 
-function mockSdk() {
-  const functions = new Map<string, Function>();
-  return {
-    functions,
-    registerFunction: (id: string, handler: Function) => {
-      functions.set(id, handler);
-    },
-    registerTrigger: () => {},
-    trigger: async () => ({}),
-  };
-}
-
-function makeObs(i: number, sessionId: string): CompressedObservation {
-  return {
-    id: `obs_${i}`,
-    sessionId,
-    timestamp: new Date().toISOString(),
-    type: "conversation",
-    title: `obs ${i}`,
-    facts: [`fact ${i}`],
-    narrative: `narrative for obs ${i}`,
-    concepts: [],
-    files: [`src/file_${i}.ts`],
-    importance: 5,
-  };
-}
-
-function makeProvider(responses: string[]): MemoryProvider & {
-  calls: Array<{ system: string; user: string }>;
-} {
-  const calls: Array<{ system: string; user: string }> = [];
-  let i = 0;
-  return {
-    name: "test",
-    calls,
-    compress: async () => "",
-    summarize: async (system: string, user: string) => {
-      calls.push({ system, user });
-      const r = responses[i] ?? responses[responses.length - 1];
-      i += 1;
-      return r;
+export async function harness(count = 1, accounting?: WorkflowAttemptAccounting) {
+  const rows = new Map<string, Map<string, unknown>>();
+  const kv = {
+    get: async <T>(scope: string, key: string) => rows.get(scope)?.get(key) as T ?? null,
+    set: vi.fn(async (scope: string, key: string, value: unknown) => {
+      if (!rows.has(scope)) rows.set(scope, new Map());
+      rows.get(scope)!.set(key, structuredClone(value));
+    }),
+    getVersioned: async <T>(scope: string, key: string) => ({ exists: rows.get(scope)?.has(key) ?? false,
+      value: rows.get(scope)?.get(key) as T ?? null, version: JSON.stringify(rows.get(scope)?.get(key)) }),
+    list: async <T>(scope: string) => [...(rows.get(scope)?.values() ?? [])] as T[],
+    pages: async function* <T>(scope: string, options: { limit: number }) {
+      const values = [...(rows.get(scope)?.values() ?? [])] as T[];
+      for (let start = 0; start < values.length; start += options.limit)
+        yield { items: values.slice(start, start + options.limit), next_cursor: start + options.limit < values.length ? "more" : null };
     },
   };
-}
-
-function summaryXml(opts: {
-  title: string;
-  narrative?: string;
-  decisions?: string[];
-  files?: string[];
-  concepts?: string[];
-}): string {
-  const d = (opts.decisions ?? []).map((x) => `<decision>${x}</decision>`).join("");
-  const f = (opts.files ?? []).map((x) => `<file>${x}</file>`).join("");
-  const c = (opts.concepts ?? []).map((x) => `<concept>${x}</concept>`).join("");
-  return `<summary>
-<title>${opts.title}</title>
-<narrative>${opts.narrative ?? "narrative"}</narrative>
-<decisions>${d}</decisions>
-<files>${f}</files>
-<concepts>${c}</concepts>
-</summary>`;
-}
-
-function mapCalls(calls: Array<{ system: string; user: string }>) {
-  return calls.filter((call) => call.system.includes("session summarizer"));
-}
-
-function observationRange(prompt: string): [number, number] {
-  const indexes = [...prompt.matchAll(/^\[(\d+)\]\s/gm)].map((match) => Number(match[1]));
-  if (!indexes.length) throw new Error("map prompt contains no observation indexes");
-  return [Math.min(...indexes), Math.max(...indexes)];
-}
-
-function reducedRanges(prompt: string): Array<[number, number]> {
-  return [...prompt.matchAll(/obs (\d+)-(\d+)/g)]
-    .map((match) => [Number(match[1]), Number(match[2])]);
-}
-
-async function setupHandler(opts: {
-  sessionId: string;
-  obsCount: number;
-  provider: MemoryProvider;
-}) {
-  const sdk = mockSdk();
-  const kv = mockKV();
-  const session: Session = {
-    id: opts.sessionId,
-    project: "test-project",
-    cwd: "/tmp",
-    startedAt: new Date().toISOString(),
-    status: "completed",
-    observationCount: opts.obsCount,
+  const session: Session = { id: "s", project: "project", cwd: "/tmp", startedAt: "2026-10-11", status: "active", observationCount: count };
+  await kv.set(KV.sessions, "s", session);
+  for (let i = 0; i < count; i++) await kv.set(KV.observations("s"), `o${i}`, {
+    id: `o${i}`, sessionId: "s", timestamp: "2026-10-11", type: "tool_use", title: `Read source ${i}`,
+    narrative: "Opened src/a.ts to inspect existing behavior. No changes were made.", facts: ["Inspected existing behavior"],
+    files: ["src/a.ts"], concepts: [],
+  } as CompressedObservation);
+  let handler: (data: unknown) => Promise<any>;
+  const sdk = { registerFunction: (_id: string, fn: typeof handler) => { handler = fn; },
+    trigger: vi.fn(async () => ({ success: true, queued: true, jobId: "queue-job", continuation: { jobId: "queue-job" } })) };
+  let verdict = "supported";
+  let generated = "<summary><title>Inspection</title><narrative>The existing source behavior was inspected without making changes.</narrative><decisions></decisions><files></files><concepts></concepts></summary>";
+  const provider = { name: "test", compress: vi.fn(),
+    prepareRequest: (_operation: string, system: string, prompt: string, options: unknown) => ({
+      endpoint: "POST https://provider.example/v1/chat/completions", body: JSON.stringify({ system, prompt, options }) }),
+    summarize: vi.fn(async (system: string, prompt: string) => {
+      if (system.startsWith("You evaluate publication evidence")) {
+        return verdict === "invalid" ? "bad json" : JSON.stringify({ verdict, reason: "Controlled semantic fixture" });
+      }
+      return generated;
+    }),
   };
-  await kv.set("sessions", opts.sessionId, session);
-  for (let i = 0; i < opts.obsCount; i++) {
-    const o = makeObs(i, opts.sessionId);
-    await kv.set(`obs:${opts.sessionId}`, o.id, o);
-  }
-  registerSummarizeFunction(sdk as any, kv as any, opts.provider);
-  const handler = sdk.functions.get("mem::summarize")!;
-  return { handler, kv };
+  registerSummarizeFunction(sdk as any, kv as any, provider as any, undefined, undefined, accounting);
+  kv.set.mockClear();
+  return { kv, rows, sdk, provider, run: (data: unknown = { sessionId: "s" }) => handler!(data),
+    verdict: (value: string) => { verdict = value; }, raw: (value: string) => { generated = value; } };
 }
 
-describe("mem::summarize chunking", () => {
-  const ORIGINAL_ENV = { ...process.env };
-
-  beforeEach(() => {
-    // Keep chunking tests independent of the developer's ~/.agentmemory/.env.
-    process.env.AGENTMEMORY_SUMMARY_CONTEXT_TOKENS = "1000000";
-    process.env.AGENTMEMORY_SUMMARY_OUTPUT_TOKENS = "8192";
-    process.env.AGENTMEMORY_SUMMARY_SAFETY_MARGIN_TOKENS = "4096";
-    delete process.env.SUMMARIZE_CHUNK_SIZE;
-    delete process.env.SUMMARIZE_CHUNK_CONCURRENCY;
+describe("direct summary public contract", () => {
+  const original = { ...process.env };
+  beforeEach(() => { process.env.AGENTMEMORY_SUMMARY_CONTEXT_TOKENS = "1000000";
+    process.env.AGENTMEMORY_SUMMARY_OUTPUT_TOKENS = "8192"; process.env.AGENTMEMORY_SUMMARY_SAFETY_MARGIN_TOKENS = "4096";
+    delete process.env.SUMMARIZE_CHUNK_SIZE; });
+  afterEach(() => { process.env = { ...original }; });
+  it("dispatches generation and publication through distinct daemon identities, replay dispatches neither", async () => {
+    const accounting = new WorkflowAttemptAccounting([], []);
+    const run = vi.spyOn(accounting, "run");
+    const h = await harness(1, accounting);
+    expect((await h.run()).success).toBe(true);
+    const identities = run.mock.calls.map(call => call[1]);
+    expect(identities.map(value => value.phase)).toEqual(["generation", "publication"]);
+    expect(identities[0]).toMatchObject({ functionId: "mem::summarize", sourceId: "s", continuation: "direct" });
+    expect(identities[0].unitId).not.toBe(identities[1].unitId);
+    await h.run(); expect(run).toHaveBeenCalledTimes(2); expect(h.provider.summarize).toHaveBeenCalledTimes(2);
   });
-
-  it("keeps original observationCount after splitting one giant Unicode observation", async () => {
-    process.env.AGENTMEMORY_SUMMARY_CONTEXT_TOKENS = "4096";
-    process.env.AGENTMEMORY_SUMMARY_OUTPUT_TOKENS = "512";
-    process.env.AGENTMEMORY_SUMMARY_SAFETY_MARGIN_TOKENS = "256";
-    const provider = makeProvider([summaryXml({ title: "giant" })]);
-    const { handler, kv } = await setupHandler({ sessionId: "giant", obsCount: 1, provider });
-    await kv.set("obs:giant", "obs_0", { ...makeObs(0, "giant"), narrative: "🧠漢字".repeat(2000) });
-    const result = await handler({ sessionId: "giant" });
-    expect(result.success).toBe(true);
-    expect(provider.calls.length).toBeGreaterThan(2);
-    expect(await kv.get("summaries", "giant")).toMatchObject({ observationCount: 1 });
+  it("denies a scoped unmatched direct unit before any provider call", async () => {
+    const accounting = new WorkflowAttemptAccounting([{ workflow: "summary", project: "project", sourceId: "s" }], []);
+    const h = await harness(1, accounting);
+    expect(await h.run()).toMatchObject({ success: false, error: "workflow_binding_identity_mismatch" });
+    expect(h.provider.summarize).not.toHaveBeenCalled();
+    expect(await h.run()).toMatchObject({ success: false, error: "summary_dispatch_outcome_unknown" });
+    expect(h.provider.summarize).not.toHaveBeenCalled();
   });
-
-  it("does not persist a summary when the reserve leaves no prompt capacity", async () => {
-    process.env.AGENTMEMORY_SUMMARY_CONTEXT_TOKENS = "5000";
-    const provider = makeProvider([summaryXml({ title: "invalid budget" })]);
-    const { handler, kv } = await setupHandler({ sessionId: "invalid-budget", obsCount: 1, provider });
-    const result = await handler({ sessionId: "invalid-budget" });
-    expect(result.success).toBe(false);
-    expect(result.error).toContain("invalid_summary_budget");
-    expect(provider.calls).toHaveLength(0);
-    expect(await kv.get("summaries", "invalid-budget")).toBeNull();
+  it("uses separately approved private bindings at actual direct dispatch; capture replay makes no claims", async () => {
+    const discovery = new WorkflowAttemptAccounting([], []); const spy = vi.spyOn(discovery, "run");
+    await (await harness(1, discovery)).run();
+    const identities = spy.mock.calls.map(call => call[1]);
+    const bindings = identities.map((identity, index) => ({ ...identity, operationId: `approved-${index}`, windowId: "private-window", ceiling: 2 }));
+    attempts.enter.mockClear();
+    const h = await harness(1, new WorkflowAttemptAccounting([identities[0]], bindings));
+    expect((await h.run()).success).toBe(true);
+    expect(attempts.enter.mock.calls.map(call => call[0])).toEqual(bindings.map(value => ({
+      operationId: value.operationId, windowId: value.windowId, ceiling: value.ceiling,
+      context: { workflow: value.workflow, functionId: value.functionId, sourceId: value.sourceId,
+        jobId: value.jobId, unitId: value.unitId, phase: value.phase,
+        continuationId: fingerprintId("workflow-continuation", value.continuation) } })));
+    await h.run(); expect(attempts.enter).toHaveBeenCalledTimes(2); expect(h.provider.summarize).toHaveBeenCalledTimes(2);
   });
-
-  it("empty sessions make no provider calls", async () => {
-    const provider = makeProvider([summaryXml({ title: "empty" })]);
-    const { handler, kv } = await setupHandler({ sessionId: "empty", obsCount: 0, provider });
-    expect(await handler({ sessionId: "empty" })).toMatchObject({ success: false, error: "no_observations" });
-    expect(provider.calls).toHaveLength(0);
-    expect(await kv.get("summaries", "empty")).toBeNull();
+  it("preserves the completed success shape after generation plus judge", async () => {
+    const h = await harness();
+    expect(await h.run()).toMatchObject({ success: true, summary: { sessionId: "s", observationCount: 1 }, qualityScore: expect.any(Number) });
+    expect(h.provider.summarize).toHaveBeenCalledTimes(2);
   });
+  it("waits for the shared canonical lock before publishing the summary", async () => {
+    const h = await harness();
+    let signalLockHeld!: () => void;
+    let releaseLock!: () => void;
+    const lockHeld = new Promise<void>(resolve => { signalLockHeld = resolve; });
+    const lockRelease = new Promise<void>(resolve => { releaseLock = resolve; });
+    const heldLock = withKeyedLock("summary-canonical:s", async () => {
+      signalLockHeld();
+      await lockRelease;
+    });
+    await lockHeld;
 
-  it("does not persist a reducer result when reduction makes no progress", async () => {
-    process.env.AGENTMEMORY_SUMMARY_CONTEXT_TOKENS = "4096";
-    process.env.AGENTMEMORY_SUMMARY_OUTPUT_TOKENS = "512";
-    process.env.AGENTMEMORY_SUMMARY_SAFETY_MARGIN_TOKENS = "256";
+    let settled = false;
+    const result = h.run().finally(() => { settled = true; });
+    try {
+      await vi.waitFor(async () => {
+        expect(await h.kv.get(KV.state, "direct-summary:s")).toMatchObject({
+          effect: expect.objectContaining({ sessionId: "s", project: "project" }),
+        });
+      });
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(await h.kv.get(KV.summaries, "s")).toBeNull();
+      expect(settled).toBe(false);
+    } finally {
+      releaseLock();
+    }
+
+    await heldLock;
+    expect(await result).toMatchObject({ success: true, summary: { sessionId: "s" } });
+    expect(await h.kv.get(KV.summaries, "s")).toMatchObject({ sessionId: "s", project: "project" });
+  });
+  it.each(["deleted", "replaced", "project-changed"] as const)(
+    "rejects late publication when the session is %s before the canonical write",
+    async change => {
+      const h = await harness();
+      const originalSet = h.kv.set.getMockImplementation()!;
+      h.kv.set.mockImplementation(async (scope, key, value) => {
+        await originalSet(scope, key, value);
+        if (scope !== KV.state || key !== "direct-summary:s" || !(value as any)?.effect) return;
+        const sessions = h.rows.get(KV.sessions)!;
+        if (change === "deleted") sessions.delete("s");
+        else if (change === "replaced") {
+          const current = sessions.get("s") as Session;
+          sessions.set("s", { ...current, startedAt: "2026-10-12T00:00:00.000Z" });
+        } else {
+          const current = sessions.get("s") as Session;
+          sessions.set("s", { ...current, project: "replacement-project" });
+        }
+      });
+
+      expect(await h.run()).toMatchObject({ success: false, error: "summary_source_changed" });
+      expect(h.provider.summarize).toHaveBeenCalledTimes(2);
+      expect(h.kv.set.mock.calls.filter(([scope]) => scope === KV.summaries)).toHaveLength(0);
+      expect(await h.kv.get(KV.summaries, "s")).toBeNull();
+    },
+  );
+  it("returns no_observations with zero calls", async () => {
+    const h = await harness(0);
+    expect(await h.run()).toEqual({ success: false, error: "no_observations" });
+    expect(h.provider.summarize).not.toHaveBeenCalled();
+  });
+  it("rejects missing session and input", async () => {
+    const h = await harness();
+    expect(await h.run({})).toMatchObject({ success: false });
+    expect(await h.run({ sessionId: "missing" })).toMatchObject({ error: "session_not_found" });
+  });
+  it.each([129, 4096])("queues %i observations from an active session without partial publication", async count => {
+    const h = await harness(count);
+    expect(await h.run()).toMatchObject({ success: true, queued: true, completed: false, jobId: "queue-job" });
+    expect(h.sdk.trigger).toHaveBeenCalledWith({ function_id: "mem::summary-enqueue", payload: { sessionId: "s" } });
+    expect(h.provider.summarize).not.toHaveBeenCalled();
+    expect(await h.kv.get(KV.summaries, "s")).toBeNull();
+    expect((await h.kv.get<Session>(KV.sessions, "s"))!.status).toBe("active");
+  });
+  it("queues configured chunking even when original evidence fits", async () => {
     process.env.SUMMARIZE_CHUNK_SIZE = "1";
-    const provider = makeProvider([summaryXml({ title: "no progress", narrative: "x".repeat(1400) })]);
-    const { handler, kv } = await setupHandler({ sessionId: "no-progress", obsCount: 4, provider });
-    expect(await handler({ sessionId: "no-progress" })).toMatchObject({ success: false, error: "summary_reduce_no_progress" });
-    expect(await kv.get("summaries", "no-progress")).toBeNull();
+    const h = await harness(2);
+    expect(await h.run()).toMatchObject({ queued: true, completed: false });
+    expect(h.provider.summarize).not.toHaveBeenCalled();
   });
-
-  afterEach(() => {
-    process.env = { ...ORIGINAL_ENV };
-  });
-
-  it("small session takes the single-call path (no chunking, no reduce)", async () => {
-    const provider = makeProvider([
-      summaryXml({
-        title: "Small session",
-        decisions: ["decision A"],
-        files: ["src/a.ts"],
-        concepts: ["concept-a"],
-      }),
-    ]);
-    const { handler, kv } = await setupHandler({
-      sessionId: "ses_small",
-      obsCount: 10,
-      provider,
+  it("resumes a completed queue with the historical success shape", async () => {
+    const h = await harness(129);
+    h.sdk.trigger.mockImplementationOnce(async () => {
+      await h.kv.set(KV.summaries, "s", { sessionId: "s", project: "project", title: "Queued", narrative: "A grounded complete queued result.",
+        keyDecisions: [], filesModified: [], concepts: [], observationCount: 129 });
+      return { success: true, completed: true } as any;
     });
-
-    const result: any = await handler({ sessionId: "ses_small" });
-
-    expect(result.success).toBe(true);
-    expect(provider.calls).toHaveLength(1);
-    expect(provider.calls[0].user).toContain("Session observations (10 total)");
-    const stored: any = await kv.get("summaries", "ses_small");
-    expect(stored?.title).toBe("Small session");
+    expect(await h.run()).toMatchObject({ success: true, summary: { title: "Queued" }, qualityScore: expect.any(Number) });
   });
-
-  it("large session map-reduces within the per-call ceiling", async () => {
-    process.env.SUMMARIZE_CHUNK_SIZE = "100";
-    process.env.SUMMARIZE_CHUNK_CONCURRENCY = "1"; // serial keeps call ordering deterministic
-    const provider = makeProvider([
-      summaryXml({ title: "Chunk 1", decisions: ["dA"], files: ["src/a.ts"], concepts: ["ca"] }),
-      summaryXml({ title: "Chunk 2", decisions: ["dB"], files: ["src/b.ts"], concepts: ["cb"] }),
-      summaryXml({ title: "Chunk 3", decisions: ["dC"], files: ["src/c.ts"], concepts: ["cc"] }),
-      summaryXml({ title: "Chunk 4", decisions: ["dD"], files: ["src/d.ts"], concepts: ["cd"] }),
-      summaryXml({
-        title: "Merged",
-        decisions: ["dA", "dB", "dC", "dD"],
-        files: ["src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts"],
-        concepts: ["ca", "cb", "cc", "cd"],
-      }),
-    ]);
-    const { handler, kv } = await setupHandler({
-      sessionId: "ses_large",
-      obsCount: 250,
-      provider,
-    });
-
-    const result: any = await handler({ sessionId: "ses_large" });
-
-    expect(result.success).toBe(true);
-    const chunks = mapCalls(provider.calls);
-    expect(chunks.length).toBeGreaterThanOrEqual(4);
-    expect(provider.calls).toHaveLength(chunks.length + 1);
-    expect(provider.calls.every(call => estimateSummaryTokens(call.system, call.user) <= 7500)).toBe(true);
-    expect(provider.calls[3].system).toContain("session summarizer");
-    const reduceCall = provider.calls.at(-1)!;
-    expect(reduceCall.system).toContain("merging multiple partial summaries");
-    expect(reduceCall.user).toContain(`Chunk 1 of ${chunks.length}`);
-    expect(reduceCall.user).toContain(`Chunk ${chunks.length} of ${chunks.length}`);
-
-    const stored: any = await kv.get("summaries", "ses_large");
-    expect(stored?.title).toBe("Merged");
-    // observationCount on the persisted summary should reflect the full session,
-    // not just the final chunk.
-    expect(stored?.observationCount).toBe(250);
-    expect(stored?.keyDecisions).toEqual(["dA", "dB", "dC", "dD"]);
+  it("invalid raw is retained with no automatic retry", async () => {
+    const h = await harness(); h.raw("<garbage/>");
+    expect(await h.run()).toMatchObject({ error: "parse_failed" });
+    expect(await h.run()).toMatchObject({ error: "parse_failed" });
+    expect(h.provider.summarize).toHaveBeenCalledTimes(1);
+    expect(await h.kv.get(KV.state, "direct-summary:s")).toMatchObject({ raw: "<garbage/>" });
   });
+});
 
-  it("SUMMARIZE_CHUNK_SIZE env override is respected", async () => {
-    process.env.SUMMARIZE_CHUNK_SIZE = "50";
-    process.env.SUMMARIZE_CHUNK_CONCURRENCY = "1";
-    const provider = makeProvider([
-      summaryXml({ title: "chunk" }),
-      summaryXml({ title: "chunk" }),
-      summaryXml({ title: "chunk" }),
-      summaryXml({ title: "chunk" }),
-      summaryXml({ title: "merged" }),
-    ]);
-    const { handler } = await setupHandler({
-      sessionId: "ses_env",
-      obsCount: 175,
-      provider,
-    });
-
-    const result: any = await handler({ sessionId: "ses_env" });
-
-    expect(result.success).toBe(true);
-    // 175 obs ÷ 50 = 4 chunks (last chunk has 25) + 1 reduce = 5 calls.
-    const chunks = mapCalls(provider.calls);
-    expect(chunks.length).toBeGreaterThanOrEqual(4);
-    expect(provider.calls).toHaveLength(chunks.length + 1);
-    const counts = chunks.map((call) => Number(call.user.match(/^Session observations \((\d+) total\)/)?.[1]));
-    expect(counts.every((count) => count > 0 && count <= 50)).toBe(true);
-    expect(counts.reduce((total, count) => total + count, 0)).toBe(175);
+describe("manual summary REST adapter", () => {
+  async function adapter() {
+    const h = await harness();
+    const handlers = new Map<string, (request: any) => Promise<any>>();
+    const trigger = vi.fn(async () => ({ success: true, completed: true }));
+    const registerTrigger = vi.fn();
+    registerApiTriggers({ registerFunction: (id: string, fn: (request: any) => Promise<any>) => handlers.set(id, fn),
+      registerTrigger, trigger } as never, h.kv as never, "test-secret");
+    return { ...h, trigger, registerTrigger, handlers,
+      request: (body: unknown) => handlers.get("api::summarize")!({ body }) };
+  }
+  it("uses ordinary continuation routing and drops removed provider controls", async () => {
+    const h = await adapter();
+    const continuation = { operationId: "recovery", step: 0, jobId: "child", project: "project", sessionId: "s",
+      sourceFingerprint: "source", round: 0, unitId: "unit", deliveryId: "delivery", recoveryGeneration: "full-originals-v2" };
+    expect(await h.request({ sessionId: "s", continuation, providerCalls: 0, providerBinding: { fake: true }, prepare: true }))
+      .toEqual({ status_code: 200, body: { success: true, completed: true } });
+    expect(h.trigger).toHaveBeenCalledWith({ function_id: "mem::summarize", timeoutMs: 360_000, payload: {
+      sessionId: "s", manual: true, continuation,
+    } });
   });
-
-  it("flaky chunk: parse fails once, retried, then succeeds — no skip", async () => {
-    process.env.SUMMARIZE_CHUNK_SIZE = "100";
-    process.env.SUMMARIZE_CHUNK_CONCURRENCY = "1";
-    const provider = makeProvider([
-      summaryXml({ title: "ok1" }),
-      "<garbage/>",                  // chunk 2 attempt 1: parse-fail
-      summaryXml({ title: "ok2" }),  // chunk 2 attempt 2 (retry): success
-      summaryXml({ title: "ok3" }),
-      summaryXml({ title: "merged" }),
-    ]);
-    const { handler, kv } = await setupHandler({
-      sessionId: "ses_flaky",
-      obsCount: 250,
-      provider,
-    });
-
-    const result: any = await handler({ sessionId: "ses_flaky" });
-
-    expect(result.success).toBe(true);
-    const chunks = mapCalls(provider.calls);
-    const uniqueChunkPrompts = new Set(chunks.map((call) => call.user));
-    expect(chunks.length).toBe(uniqueChunkPrompts.size + 1);
-    expect(provider.calls.at(-1)?.system).toContain("merging multiple partial summaries");
-    const stored: any = await kv.get("summaries", "ses_flaky");
-    expect(stored?.title).toBe("merged");
-  });
-
-  it("persistently-broken chunk is skipped, reduce still runs on remaining partials", async () => {
-    process.env.SUMMARIZE_CHUNK_SIZE = "100";
-    process.env.SUMMARIZE_CHUNK_CONCURRENCY = "1";
-    const provider = makeProvider([
-      summaryXml({ title: "ok1" }),
-      "<garbage/>", "<garbage/>",   // chunk 2: both attempts parse-fail
-      summaryXml({ title: "ok3" }),
-      summaryXml({ title: "merged-with-skip" }),
-    ]);
-    const { handler, kv } = await setupHandler({
-      sessionId: "ses_skip",
-      obsCount: 250,
-      provider,
-    });
-
-    const result: any = await handler({ sessionId: "ses_skip" });
-
-    expect(result.success).toBe(true);
-    const chunks = mapCalls(provider.calls);
-    const uniquePrompts = [...new Set(chunks.map((call) => call.user))];
-    expect(chunks.length).toBe(uniquePrompts.length + 1);
-    const reduceCall = provider.calls.at(-1)!;
-    expect(reduceCall.system).toContain("merging multiple partial summaries");
-    const expectedRanges = uniquePrompts
-      .filter((_, index) => index !== 1)
-      .map(observationRange);
-    expect(reducedRanges(reduceCall.user)).toEqual(expectedRanges);
-    const stored: any = await kv.get("summaries", "ses_skip");
-    expect(stored?.title).toBe("merged-with-skip");
-  });
-
-  it("too many skipped chunks bails out with a clear error", async () => {
-    process.env.SUMMARIZE_CHUNK_SIZE = "100";
-    process.env.SUMMARIZE_CHUNK_CONCURRENCY = "1";
-    // 3 chunks, 2 fully broken → >50% skipped → bail.
-    const provider = makeProvider([
-      summaryXml({ title: "ok1" }),
-      "<garbage/>", "<garbage/>",
-      "<garbage/>", "<garbage/>",
-    ]);
-    const { handler } = await setupHandler({
-      sessionId: "ses_too_broken",
-      obsCount: 250,
-      provider,
-    });
-
-    const result: any = await handler({ sessionId: "ses_too_broken" });
-
-    expect(result.success).toBe(false);
-    const skipped = result.error?.match(/too_many_chunks_skipped: (\d+)\/(\d+)/);
-    expect(skipped).not.toBeNull();
-    expect(Number(skipped?.[1])).toBeGreaterThan(Number(skipped?.[2]) / 2);
-  });
-
-  it("provider error on one chunk after retry is skipped, not propagated", async () => {
-    process.env.SUMMARIZE_CHUNK_SIZE = "100";
-    process.env.SUMMARIZE_CHUNK_CONCURRENCY = "1";
-    let i = 0;
-    const provider: MemoryProvider & { calls: any[] } = {
-      name: "test",
-      calls: [],
-      compress: async () => "",
-      summarize: async (system: string, user: string) => {
-        (provider as any).calls.push({ system, user });
-        i += 1;
-        if (i === 1) return summaryXml({ title: "ok1" });
-        // chunk 2: both attempts throw (e.g. provider 400)
-        if (i === 2 || i === 3) throw new Error("OpenAI API error (400): content rejected");
-        if (i === 4) return summaryXml({ title: "ok3" });
-        return summaryXml({ title: "merged-with-skip" });
-      },
-    };
-    const { handler, kv } = await setupHandler({
-      sessionId: "ses_net",
-      obsCount: 250,
-      provider,
-    });
-
-    const result: any = await handler({ sessionId: "ses_net" });
-
-    expect(result.success).toBe(true);
-    const chunks = mapCalls((provider as any).calls);
-    expect(chunks.length).toBe(new Set(chunks.map((call) => call.user)).size + 1);
-    expect((provider as any).calls.at(-1).system).toContain("merging multiple partial summaries");
-    const stored: any = await kv.get("summaries", "ses_net");
-    expect(stored?.title).toBe("merged-with-skip");
-  });
-
-  it("every chunk failing on provider error trips too_many_chunks_skipped", async () => {
-    process.env.SUMMARIZE_CHUNK_SIZE = "100";
-    process.env.SUMMARIZE_CHUNK_CONCURRENCY = "1";
-    // 3 chunks, all chunk calls throw → 3/3 skipped → bail.
-    const provider: MemoryProvider & { calls: any[] } = {
-      name: "test",
-      calls: [],
-      compress: async () => "",
-      summarize: async (system: string, user: string) => {
-        (provider as any).calls.push({ system, user });
-        throw new Error("OpenAI API error (400): invalid request");
-      },
-    };
-    const { handler } = await setupHandler({
-      sessionId: "ses_all_400",
-      obsCount: 250,
-      provider,
-    });
-
-    const result: any = await handler({ sessionId: "ses_all_400" });
-
-    expect(result.success).toBe(false);
-    const skipped = result.error?.match(/too_many_chunks_skipped: (\d+)\/(\d+)/);
-    expect(skipped).not.toBeNull();
-    expect(skipped?.[1]).toBe(skipped?.[2]);
-  });
-
-  it("chunks run in parallel batches according to SUMMARIZE_CHUNK_CONCURRENCY", async () => {
-    process.env.SUMMARIZE_CHUNK_SIZE = "100";
-    process.env.SUMMARIZE_CHUNK_CONCURRENCY = "2";
-    let inflight = 0;
-    let maxInflight = 0;
-    const provider: MemoryProvider & { calls: any[] } = {
-      name: "test",
-      calls: [],
-      compress: async () => "",
-      summarize: async (system: string, user: string) => {
-        (provider as any).calls.push({ system, user });
-        inflight += 1;
-        maxInflight = Math.max(maxInflight, inflight);
-        // Yield to event loop so siblings can also enter before we resolve.
-        await new Promise((r) => setTimeout(r, 5));
-        inflight -= 1;
-        if (system.includes("merging")) return summaryXml({ title: "merged" });
-        return summaryXml({ title: "ok" });
-      },
-    };
-    const { handler } = await setupHandler({
-      sessionId: "ses_par",
-      obsCount: 400, // 4 chunks at chunkSize=100
-      provider,
-    });
-
-    const result: any = await handler({ sessionId: "ses_par" });
-
-    expect(result.success).toBe(true);
-    // 4 chunks at concurrency 2 → max 2 in flight at once during the chunk phase.
-    // Reduce is a single call so doesn't bump it.
-    expect(maxInflight).toBe(2);
-  });
-
-  // #783: markdown-wrapped XML used to silently fail parsing because
-  // the tag regex looked for <title> in the raw payload. stripXmlWrappers
-  // now peels ```xml ... ``` fences and conversational pre/postamble
-  // before the regex runs.
-  it("parses a summary even when the LLM wraps XML in markdown fences", async () => {
-    const wrappedXml = "Here's the summary:\n```xml\n" + summaryXml({
-      title: "wrapped",
-      narrative: "n",
-      decisions: ["d1"],
-      files: ["src/a.ts"],
-      concepts: ["c1"],
-    }) + "\n```\nLet me know if you need anything else.";
-    const provider = makeProvider([wrappedXml]);
-    const { handler, kv } = await setupHandler({
-      sessionId: "ses_md",
-      obsCount: 1,
-      provider,
-    });
-
-    const result: any = await handler({ sessionId: "ses_md" });
-
-    expect(result.success).toBe(true);
-    expect(result.summary.title).toBe("wrapped");
-    const stored = await kv.get("summaries", "ses_md");
-    expect((stored as any).title).toBe("wrapped");
-  });
-
-  it("retries the final summarize once on first-attempt parse failure", async () => {
-    // First call returns garbage (no <title>), second returns valid XML.
-    // The chunk-level retry is bypassed for a 1-obs session (no chunking),
-    // so this exercises the new final-summarize retry path.
-    const provider = makeProvider([
-      "not xml, just a sentence with no tags",
-      summaryXml({ title: "second-attempt" }),
-    ]);
-    const { handler } = await setupHandler({
-      sessionId: "ses_retry",
-      obsCount: 1,
-      provider,
-    });
-
-    const result: any = await handler({ sessionId: "ses_retry" });
-
-    expect(result.success).toBe(true);
-    expect(result.summary.title).toBe("second-attempt");
-    expect((provider as any).calls.length).toBeGreaterThanOrEqual(2);
-  });
-
-  it("returns parse_failed only after both attempts fail", async () => {
-    const provider = makeProvider([
-      "garbage one",
-      "garbage two",
-    ]);
-    const { handler } = await setupHandler({
-      sessionId: "ses_fail",
-      obsCount: 1,
-      provider,
-    });
-
-    const result: any = await handler({ sessionId: "ses_fail" });
-
-    expect(result.success).toBe(false);
-    expect(result.error).toBe("parse_failed");
+  it("retains bearer authentication middleware for summarize", async () => {
+    const h = await adapter();
+    expect(h.registerTrigger).toHaveBeenCalledWith({ type: "http", function_id: "api::summarize",
+      config: { api_path: "/agentmemory/summarize", http_method: "POST", middleware_function_ids: ["middleware::api-auth"] } });
+    const authenticate = h.handlers.get("middleware::api-auth")!;
+    expect(await authenticate({ request: { headers: {} } })).toMatchObject({ action: "respond", response: { status_code: 401 } });
+    expect(await authenticate({ request: { headers: { authorization: "Bearer test-secret" } } })).toEqual({ action: "continue" });
   });
 });
