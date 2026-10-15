@@ -1,9 +1,11 @@
 # Native lossless compaction source candidate
 
-This is uncompiled, untested source. No installation, migration, database access,
-provider call, service action, checksum, health probe or physical measurement was
-performed for this delivery. It establishes neither a reduction ratio nor runtime
-acceptance. The installed engine remains a separate artifact.
+This delivery has emitted application bundles without typechecking. Native
+compilation is pending dependency recovery; it has not produced an accepted
+engine artifact. No tests, installation, migration, database access, provider
+call, service action, checksum, health probe or physical measurement was performed.
+It establishes neither a reduction ratio nor runtime acceptance. The installed
+engine remains a separate artifact.
 
 ## Source composition
 
@@ -199,12 +201,26 @@ the owned adapter delta; do not apply a full upstream patch over its existing
 changes. No cache or binary trees need copying. Current cache/toolchain readiness
 has not been checked.
 
-`native-candidate/build-native.cmd` is an unexecuted compilation/emission recipe.
+`native-candidate/build-native.cmd` is the compilation/emission recipe.
 It requires the actual integrated workspace `Cargo.toml` as its first argument,
-uses those existing caches, sets TEMP/TMP under the delivery directory, writes
+uses the existing target cache and a candidate-local Cargo home, sets TEMP/TMP under the delivery directory, writes
 logs/exit and emits to `native-candidate/artifacts/win32-x64/iii.exe`. It performs
 no tests, typecheck, checksum or capability probe. Necessary compilation and
-emission may precede installation approval; this unit has not run that recipe.
+emission may precede installation approval. Initial offline invocations failed
+before Rust compilation on missing `anyhow`, then `fs2`; their logs/exit files
+are retained as `initial-offline-build.*` and `selected-cache-build.*`.
+
+The owned `build-workspace` is a source-only mirror, excluding `.git`, `target`,
+`artifacts`, `node_modules` and generated build directories; the accepted source
+tree was not overwritten. Selective registry metadata/archives named in its
+Cargo.lock were copied to candidate-local `cargo-home` (172638548 bytes,
+1440 files), without credential/config files. Necessary locked dependency fetch
+uses this owned home and the Windows target; it is not a provider request or a
+version change. Compiler/dependency outcome is recorded in build/fetch logs.
+
+`tsdown.config.mts` emitted current index/CLI/standalone/reranker and hook bundles
+to `app-dist` with `dts:false`, followed by existing runtime asset copies.
+`app-build.exit.txt` records exit 0. No typecheck or runtime acceptance is implied.
 
 Later acceptance must cover exact reconstruction, mixed inline/compact writes,
 collision handling, list widening/order/duplicates, both membership directions,
