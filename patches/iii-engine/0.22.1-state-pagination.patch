@@ -854,7 +854,7 @@ diff --git a/engine/src/main.rs b/engine/src/main.rs
 +    if cli_args.capabilities {
 +        println!(
 +            "{}",
-+            serde_json::json!({ "capabilities": ["state::list_page", "state::get_versioned", "state::lease", "state::commit_batch", "state::sqlite_wal_v2", "state::native_storage_v2", "state::shadow_migration_v1", "state::terminal_retention_v1", "state::scope_revision_v1", "state::storage", "state::observation_admit_v1", "state::observation_replace_v1", "state::storage_retention_v1", "state::viewer_recent_v1", "state::graph_concept_seeds_v1", "state::crystal_page_v1", "state::provider_attempt_budget_v1", "state::graph_automatic_recovery_v1", "state::list_page_keyset_live_v1", "state::graph_automatic_unspent_reservation_adoption_v1", "state::compact_copy_chunked_window_v1"] })
++            serde_json::json!({ "unspent_child_proof_revision": "staging-checkpoint-recovery-v1", "capabilities": ["state::list_page", "state::get_versioned", "state::lease", "state::commit_batch", "state::sqlite_wal_v2", "state::native_storage_v2", "state::shadow_migration_v1", "state::terminal_retention_v1", "state::scope_revision_v1", "state::storage", "state::observation_admit_v1", "state::observation_replace_v1", "state::storage_retention_v1", "state::viewer_recent_v1", "state::graph_concept_seeds_v1", "state::crystal_page_v1", "state::provider_attempt_budget_v1", "state::graph_automatic_recovery_v1", "state::list_page_keyset_live_v1", "state::graph_automatic_unspent_reservation_adoption_v1", "state::compact_copy_chunked_window_v1", "state::graph_automatic_unspent_child_recovery_v1"] })
 +        );
 +        return Ok(());
 +    }
@@ -6464,7 +6464,7 @@ diff --git a/engine/src/workers/state/adapters/sqlite/compact/copy_progress.rs b
 new file mode 100644
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/compact/copy_progress.rs
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,136 @@
 +use rusqlite::{params, Connection, OptionalExtension};
 +use serde_json::{json, Value};
 +
@@ -6555,15 +6555,28 @@ new file mode 100644
 +        return Ok((rows, true));
 +    }
 +    let (scope,key,started):(String,String,bool)=c.query_row("SELECT last_scope,last_key,started FROM compact_config WHERE singleton=1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-+    let rows = c.prepare("SELECT r.scope,r.key,r.version,r.value_bytes,length(r.value),r.position
++    let query = if started {
++        "SELECT r.scope,r.key,r.version,r.value_bytes,length(r.value),r.position
 +        FROM state_rows r JOIN compact_copy_bounds b ON b.scope=r.scope
-+        WHERE r.value IS NOT NULL AND (r.position IS NULL OR r.position<=b.upper_position) AND (?3=0 OR (r.scope,r.key)>(?1,?2))
-+        ORDER BY r.scope,r.key LIMIT ?4")?
-+        .query_map(params![scope,key,started,limit], |r| {
-+            let position: Option<i64> = r.get(5)?;
-+            if !matches!(position, Some(value) if value>=0) {return Err(rusqlite::Error::InvalidQuery);}
-+            Ok(Row {scope:r.get(0)?,key:r.get(1)?,version:r.get(2)?,logical:r.get(3)?,stored:r.get(4)?,ticket:None})
-+        })?.collect::<rusqlite::Result<Vec<_>>>()?;
++        WHERE r.value IS NOT NULL AND (r.position IS NULL OR r.position<=b.upper_position) AND (r.scope,r.key)>(?1,?2)
++        ORDER BY r.scope,r.key LIMIT ?3"
++    } else {
++        "SELECT r.scope,r.key,r.version,r.value_bytes,length(r.value),r.position
++        FROM state_rows r JOIN compact_copy_bounds b ON b.scope=r.scope
++        WHERE r.value IS NOT NULL AND (r.position IS NULL OR r.position<=b.upper_position)
++        ORDER BY r.scope,r.key LIMIT ?1"
++    };
++    let map_row = |r: &rusqlite::Row<'_>| {
++        let position: Option<i64> = r.get(5)?;
++        if !matches!(position, Some(value) if value>=0) {return Err(rusqlite::Error::InvalidQuery);}
++        Ok(Row {scope:r.get(0)?,key:r.get(1)?,version:r.get(2)?,logical:r.get(3)?,stored:r.get(4)?,ticket:None})
++    };
++    let mut statement = c.prepare(query)?;
++    let rows = if started {
++        statement.query_map(params![scope,key,limit], map_row)?.collect::<rusqlite::Result<Vec<_>>>()?
++    } else {
++        statement.query_map(params![limit], map_row)?.collect::<rusqlite::Result<Vec<_>>>()?
++    };
 +    Ok((rows, false))
 +}
 +
@@ -8215,7 +8228,7 @@ diff --git a/engine/src/workers/state/adapters/sqlite/graph_automatic_recovery.r
 new file mode 100644
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/graph_automatic_recovery.rs
-@@ -0,0 +1,361 @@
+@@ -0,0 +1,369 @@
 +mod binding;
 +mod authority;
 +mod terminal;
@@ -8224,9 +8237,10 @@ new file mode 100644
 +mod store;
 +mod wire;
 +mod adoption;
++mod child;
 +
 +pub(super) use wire::Request;
-+use super::{database, protocol::{error, TxError}};
++use super::{database, protocol::{self, error, TxError}};
 +use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 +use serde_json::{json, Value};
 +use std::path::Path;
@@ -8369,7 +8383,14 @@ new file mode 100644
 +    let job=binding::anchor(connection,&anchor,staging)?;
 +    if store::slot(connection,id)?.is_some() { store::save_anchor(connection,id,&anchor,now)?; }
 +    match request {
-+        Request::Prepare {binding:definition,regeneration_id,..}=>{
++        Request::Prepare {binding:definition,mut regeneration_id,..}=>{
++            if let Some(token)=regeneration_id.as_deref() {
++                if let Some(refreshed)=adoption::prepare_child(connection,&anchor,&job,token,now,trusted)? {
++                    regeneration_id=Some(refreshed);
++                    anchor.job_version=database::row_version(connection,protocol::JOBS,&anchor.job_id)?.to_string();
++                }
++            }
++            let job=binding::anchor(connection,&anchor,true)?;
 +            terminal::prepare(connection,&anchor,&job,&definition,regeneration_id.as_deref(),now)?;
 +            if let Some(slot)=store::slot(connection,id)? {
 +                need(slot.binding.as_ref()==Some(&definition),"STATE_GRAPH_AUTOMATIC_ID_CONFLICT")?;
@@ -8581,8 +8602,8 @@ diff --git a/engine/src/workers/state/adapters/sqlite/graph_automatic_recovery/a
 new file mode 100644
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/graph_automatic_recovery/adoption.rs
-@@ -0,0 +1,103 @@
-+use super::{authority, binding, error, need, store, terminal, wire::Anchor};
+@@ -0,0 +1,154 @@
++use super::{authority, binding, child, error, need, store, terminal, wire::{Anchor, TerminalAnchor}};
 +use super::super::{database, protocol};
 +use rusqlite::{params, Connection, OptionalExtension};
 +use serde_json::{json, Value};
@@ -8598,7 +8619,7 @@ new file mode 100644
 +    need(stored.0==1 && stored.1==declaration,"STATE_GRAPH_AUTOMATIC_POLICY_CHANGED")
 +}
 +pub(super) fn admitted(c:&Connection,now:i64)->anyhow::Result<i64> {
-+    Ok(c.query_row("SELECT (SELECT count(*) FROM engine_graph_auto_admissions WHERE admitted_at_ms>?1)+(SELECT count(*) FROM engine_graph_auto_reservation_adoptions WHERE admitted_at_ms>?1)",[now-3_600_000],|r|r.get(0))?)
++    Ok(c.query_row("SELECT (SELECT count(*) FROM engine_graph_auto_admissions WHERE admitted_at_ms>?1)+(SELECT count(*) FROM engine_graph_auto_reservation_adoptions WHERE admitted_at_ms>?1)+(SELECT count(*) FROM engine_graph_auto_prepare_renewals WHERE admitted_at_ms>?1)",[now-3_600_000],|r|r.get(0))?)
 +}
 +pub(super) fn wait(c:&Connection,now:i64)->anyhow::Result<Option<&'static str>> {
 +    let last:Option<i64>=c.query_row("SELECT last_admitted_ms FROM engine_graph_auto_policy WHERE singleton=1",[],|r|r.get(0))?;
@@ -8633,12 +8654,15 @@ new file mode 100644
 +pub(super) fn dispatch(c:&Connection,slot:&store::Slot,attempt:&store::Attempt)->anyhow::Result<()> {
 +    let Some((epoch,token,profile))=latest(c,&slot.root)? else {return Ok(());};
 +    let claimed:Option<(String,Option<String>,i64)>=c.query_row("SELECT regeneration_id,claimed_slot_id,deadline_ms FROM engine_graph_auto_regenerations WHERE root_id=?1",[&slot.root],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-+    let deadline:i64=c.query_row("SELECT deadline_ms FROM engine_graph_auto_reservation_adoptions WHERE root_id=?1 AND epoch=?2",params![slot.root,epoch],|r|r.get(0))?;
++    let deadline:i64=c.query_row("SELECT COALESCE((SELECT deadline_ms FROM engine_graph_auto_prepare_renewals WHERE root_id=?1 AND epoch=?2 ORDER BY admitted_at_ms DESC LIMIT 1),(SELECT deadline_ms FROM engine_graph_auto_reservation_adoptions WHERE root_id=?1 AND epoch=?2))",params![slot.root,epoch],|r|r.get(0))?;
 +    let prepared:Option<i64>=c.query_row("SELECT epoch FROM engine_graph_auto_attempt_epochs WHERE attempt_id=?1",[&attempt.id],|r|r.get(0)).optional()?;
 +    need(attempt.ordinal==1 && prepared==Some(epoch) && attempt.deadline==deadline && slot.authority_id.as_deref()==Some(profile.as_str())
 +        && claimed.as_ref().is_some_and(|(current,claimed,current_deadline)|current==&token && *current_deadline==deadline && claimed.as_deref()==Some(slot.id.as_str())),"STATE_GRAPH_AUTOMATIC_ADOPTION_EPOCH_CONFLICT")
 +}
 +pub(super) fn adopt(c:&Connection,path:&Path,anchor:&Anchor,job:&Value,proof:&Value,now:i64,rollback:bool,trusted:&mut Option<authority::Trusted>)->anyhow::Result<Outcome> {
++    adopt_inner(c,Some(path),anchor,job,proof,now,rollback,trusted,None)
++}
++fn adopt_inner(c:&Connection,path:Option<&Path>,anchor:&Anchor,job:&Value,proof:&Value,now:i64,rollback:bool,trusted:&mut Option<authority::Trusted>,staging:Option<&Anchor>)->anyhow::Result<Outcome> {
 +    let id=binding::slot_id(anchor)?;
 +    let Some(root)=store::slot(c,&id)? else {return Ok(Outcome::Unchanged);};
 +    if root.root!=id || !root.retry || root.regeneration.is_none() {return Ok(Outcome::Unchanged);}
@@ -8652,8 +8676,16 @@ new file mode 100644
 +        || root.regeneration.as_deref()!=Some(old_token.as_str()) || root.new_job.as_deref()!=Some(child.as_str()) {
 +        return Ok(Outcome::Deferred("GRAPH_AUTOMATIC_ADOPTION_UNPROVEN"));
 +    }
++    let parts:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM engine_graph_auto_parts WHERE attempt_id=?1)",[&attempt.id],|r|r.get(0))?;
++    if parts {return Ok(Outcome::Deferred("GRAPH_AUTOMATIC_ADOPTION_UNPROVEN"));}
 +    let child_slot:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM engine_graph_auto_slots WHERE json_extract(anchor_json,'$.job_id')=?1)",[&child],|r|r.get(0))?;
-+    if child_slot || database::row(c,protocol::JOBS,&child)?.value.is_some() {return Ok(Outcome::Deferred("GRAPH_AUTOMATIC_ADOPTION_CHILD_PRESENT"));}
++    if child_slot {return Ok(Outcome::Deferred("GRAPH_AUTOMATIC_ADOPTION_CHILD_PRESENT"));}
++    let child_proof=if database::row(c,protocol::JOBS,&child)?.value.is_some() {
++        match child::prove(c,anchor,proof,&child,&old_token,staging) {
++            Ok(proven)=>Some(proven),
++            Err(_)=>return Ok(Outcome::Deferred("GRAPH_AUTOMATIC_UNSPENT_CHILD_UNPROVEN")),
++        }
++    } else {None};
 +    let retained:Option<String>=c.query_row("SELECT proof_json FROM engine_graph_auto_terminal_sources WHERE root_id=?1 AND local_value_digest IS NULL",[&id],|r|r.get(0)).optional()?;
 +    let Some(retained)=retained else {return Ok(Outcome::Deferred("GRAPH_AUTOMATIC_ADOPTION_UNPROVEN"));};
 +    let retained=protocol::strict_value(&retained)?;
@@ -8662,7 +8694,7 @@ new file mode 100644
 +    }
 +    if let Some(reason)=terminal::history(c,anchor,root.original_intent.as_ref())? {return Ok(Outcome::Deferred(reason));}
 +    if trusted.is_none() {
-+        match authority::Trusted::read(path) {Ok(value)=>*trusted=Some(value),Err(_)=>return Ok(Outcome::Deferred("GRAPH_AUTOMATIC_ADOPTION_AUTHORITY_UNPROVEN"))}
++        match path.map(authority::Trusted::read).transpose() {Ok(Some(value))=>*trusted=Some(value),_=>return Ok(Outcome::Deferred("GRAPH_AUTOMATIC_ADOPTION_AUTHORITY_UNPROVEN"))}
 +    }
 +    let (authority_id,request_digest)=match trusted.as_ref().ok_or_else(||error("STATE_GRAPH_AUTOMATIC_AUTHORITY_UNAVAILABLE"))?.authorize_terminal(c,anchor,job) {
 +        Ok(value)=>value,Err(_)=>return Ok(Outcome::Deferred("GRAPH_AUTOMATIC_ADOPTION_AUTHORITY_UNPROVEN")),
@@ -8682,8 +8714,48 @@ new file mode 100644
 +    need(changed==1,"STATE_GRAPH_AUTOMATIC_ADOPTION_EPOCH_CONFLICT")?;
 +    c.execute("UPDATE engine_graph_auto_slots SET regeneration_id=?2,terminal_reason='GRAPH_AUTOMATIC_REGENERATION_READY',updated_at_ms=?3 WHERE slot_id=?1 AND retry_admitted=1",params![id,token,now])?;
 +    c.execute("UPDATE engine_graph_auto_policy SET total_admitted=total_admitted+1,last_admitted_ms=?1 WHERE singleton=1",[now])?;
++    if let Some(proven)=child_proof {child::reopen(c,&id,&child,&token,&proven,now,staging.is_some())?;}
 +    store::event(c,&id,Some(&attempt.id),"unspent_reservation_adopted",now,json!({"revision":REVISION,"epoch":epoch,"original_deadline_ms":old_deadline,"deadline_ms":deadline,"authority_id":authority_id,"same_attempt":true,"same_child":true}))?;
 +    Ok(Outcome::Adopted)
++}
++
++pub(super) fn prepare_child(c:&Connection,anchor:&Anchor,job:&Value,token:&str,now:i64,trusted:Option<&authority::Trusted>)->anyhow::Result<Option<String>> {
++    let reservation:Option<(String,String,i64,Option<String>)>=c.query_row("SELECT root_id,regeneration_id,deadline_ms,claimed_slot_id FROM engine_graph_auto_regenerations WHERE new_job_id=?1",[&anchor.job_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
++    let Some((root,current,deadline,claimed))=reservation else {return Ok(None);};
++    if claimed.is_some() || deadline>now {return Ok(None);}
++    need(current==token,"STATE_GRAPH_AUTOMATIC_ADOPTION_EPOCH_CONFLICT")?;
++    let mut parent=store::slot(c,&root)?.ok_or_else(||error("STATE_GRAPH_AUTOMATIC_SLOT_MISSING"))?.anchor;
++    parent.guard=anchor.guard.clone();
++    let parent_job=database::row(c,protocol::JOBS,&parent.job_id)?;
++    let point=database::row(c,database::CHECKPOINT_SCOPE,&parent.job_id)?;
++    parent.job_version=parent_job.version.to_string();parent.checkpoint_version=point.version.to_string();
++    let parent_job=parent_job.value.ok_or_else(||error("STATE_GRAPH_AUTOMATIC_JOB_MISSING"))?;
++    let checkpoint:protocol::Checkpoint=protocol::decode(point.value.ok_or_else(||error("STATE_TX_CHECKPOINT_CONFLICT"))?)?;
++    let current=TerminalAnchor {guard:anchor.guard.clone(),job_id:parent.job_id.clone(),job_version:parent.job_version.clone(),checkpoint_version:parent.checkpoint_version.clone()};
++    let (parent,proof,_)=terminal::derive(c,&current,&parent_job,&checkpoint)?;
++    store::reconcile(c,now,Some(&root))?;
++    let retained:String=c.query_row("SELECT proof_json FROM engine_graph_auto_terminal_sources WHERE root_id=?1 AND local_value_digest IS NULL",[&root],|r|r.get(0))?;
++    let retained=protocol::strict_value(&retained)?;
++    need(["capture","source_digest","selection","progress","pages","reference"].iter().all(|key|retained[*key]==proof[*key]),"STATE_GRAPH_AUTOMATIC_SOURCE_CHANGED")?;
++    let proven=child::prove(c,&parent,&proof,&anchor.job_id,token,Some(anchor))?;
++    need(&proven["job"]==job,"STATE_TX_CONFLICT")?;
++    let attempt=store::attempt(c,&format!("{root}:1"))?.ok_or_else(||error("STATE_GRAPH_AUTOMATIC_ATTEMPT_MISSING"))?;
++    let parts:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM engine_graph_auto_parts WHERE attempt_id=?1)",[&attempt.id],|r|r.get(0))?;
++    need(attempt.slot==root && attempt.ordinal==1 && attempt.state=="expired" && !attempt.consumed
++        && attempt.reason.as_deref()==Some("GRAPH_AUTOMATIC_PREPARED_DEADLINE") && attempt.deadline==deadline
++        && attempt.parts.is_none() && attempt.bytes.is_none() && attempt.digest.is_none() && !parts,"STATE_GRAPH_AUTOMATIC_UNSPENT_CHILD_UNPROVEN")?;
++    let (authority_id,_)=trusted.ok_or_else(||error("STATE_GRAPH_AUTOMATIC_AUTHORITY_UNAVAILABLE"))?.authorize_terminal(c,&parent,&parent_job)?;
++    prepare(c,&root,token,&authority_id)?;
++    if wait(c,now)?.is_some() {return Err(error("STATE_GRAPH_AUTOMATIC_UNSPENT_PREPARE_WAIT_V1"));}
++    let new_deadline=now.checked_add(120_000).filter(|value|*value<=9_007_199_254_740_991).ok_or_else(||error("STATE_GRAPH_AUTOMATIC_CLOCK_INVALID"))?;
++    let epoch=latest(c,&root)?.map_or(0,|record|record.0);
++    c.execute("INSERT INTO engine_graph_auto_prepare_renewals(root_id,epoch,admitted_at_ms,prior_deadline_ms,deadline_ms,regeneration_id,proof_json) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![root,epoch,now,deadline,new_deadline,token,serde_json::to_string(&proven)?])?;
++    need(c.execute("UPDATE engine_graph_auto_attempts SET state='prepared',reason=NULL,deadline_ms=?2,updated_at_ms=?3 WHERE attempt_id=?1 AND slot_id=?4 AND consumed=0 AND state='expired' AND deadline_ms=?5",params![attempt.id,new_deadline,now,root,deadline])?==1,"STATE_GRAPH_AUTOMATIC_ADOPTION_EPOCH_CONFLICT")?;
++    need(c.execute("UPDATE engine_graph_auto_regenerations SET deadline_ms=?2 WHERE root_id=?1 AND regeneration_id=?3 AND claimed_slot_id IS NULL AND deadline_ms=?4",params![root,new_deadline,token,deadline])?==1,"STATE_GRAPH_AUTOMATIC_ADOPTION_EPOCH_CONFLICT")?;
++    c.execute("UPDATE engine_graph_auto_slots SET terminal_reason='GRAPH_AUTOMATIC_REGENERATION_READY',updated_at_ms=?2 WHERE slot_id=?1",params![root,now])?;
++    need(c.execute("UPDATE engine_graph_auto_policy SET total_admitted=total_admitted+1,last_admitted_ms=?1 WHERE singleton=1 AND total_admitted<9007199254740990",[now])?==1,"STATE_GRAPH_AUTOMATIC_COUNTER_EXHAUSTED")?;
++    store::event(c,&root,Some(&attempt.id),"unspent_prepare_renewed",now,json!({"revision":child::REVISION,"epoch":epoch,"same_token":true,"same_attempt":true,"prior_deadline_ms":deadline,"deadline_ms":new_deadline}))?;
++    Ok(Some(token.to_owned()))
 +}
 diff --git a/engine/src/workers/state/adapters/sqlite/graph_automatic_recovery/authority.rs b/engine/src/workers/state/adapters/sqlite/graph_automatic_recovery/authority.rs
 new file mode 100644
@@ -8997,6 +9069,108 @@ new file mode 100644
 +    need(reference["digest"]==digest(text.as_bytes()),"STATE_GRAPH_AUTOMATIC_SOURCE_CHANGED")?;
 +    serde_json::from_str(&text).map_err(|_|super::error("STATE_GRAPH_AUTOMATIC_SOURCE_INCOMPLETE"))
 +}
+diff --git a/engine/src/workers/state/adapters/sqlite/graph_automatic_recovery/child.rs b/engine/src/workers/state/adapters/sqlite/graph_automatic_recovery/child.rs
+new file mode 100644
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/graph_automatic_recovery/child.rs
+@@ -0,0 +1,97 @@
++use super::{binding, error, need, store, terminal, wire::{Anchor, TerminalAnchor}};
++use super::super::{commit, database, protocol::{self, Checkpoint, JOBS}};
++use rusqlite::{params, Connection};
++use serde_json::{json, Value};
++
++pub(super) const REVISION:&str="unspent-child-recovery-v1";
++pub(super) const PROOF_REVISION:&str="staging-checkpoint-recovery-v1";
++const UNPROVEN:&str="STATE_GRAPH_AUTOMATIC_UNSPENT_CHILD_UNPROVEN";
++
++fn technical(scope:&str,key:&str,job:&str)->bool {
++    scope==JOBS && key==job || [format!("mem:graph:inputs:{job}"),format!("mem:graph:provider-results:{job}"),
++        format!("mem:graph:deltas:{job}"),format!("mem:graph:remaps:{job}")].iter().any(|allowed|scope==allowed)
++}
++fn no_effects(c:&Connection,job:&str,generation:&str,checkpoint_version:u64,checkpoint:&Checkpoint)->anyhow::Result<()> {
++    let prefix=serde_json::to_string(&(generation,job))?;
++    let prefix=format!("{},",prefix.strip_suffix(']').ok_or_else(||error(UNPROVEN))?);
++    let mut statement=c.prepare("SELECT key FROM state_values WHERE scope=?1 AND key>=?2 AND key<?3 AND value IS NOT NULL ORDER BY key LIMIT 4097")?;
++    let keys=statement.query_map(params![database::RECEIPT_SCOPE,prefix,format!("{prefix}\u{10ffff}")],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
++    need(!keys.is_empty() && keys.len()<=4096,UNPROVEN)?;
++    let mut versions=std::collections::BTreeSet::new();
++    for key in keys {
++        let receipt=database::row(c,database::RECEIPT_SCOPE,&key)?.value.ok_or_else(||error(UNPROVEN))?;
++        need(receipt["identity"]["job_id"]==job && receipt["identity"]["generation"]==generation,UNPROVEN)?;
++        let version=protocol::counter(receipt["checkpoint_version"].as_str().ok_or_else(||error(UNPROVEN))?)?;
++        need(version>0 && version<=checkpoint_version && versions.insert(version),UNPROVEN)?;
++        if version==checkpoint_version {
++            need(receipt["identity"]["logical_delta_id"]==checkpoint.logical_delta_id
++                && receipt["identity"]["chunk_ordinal"].as_u64().and_then(|ordinal|ordinal.checked_add(1))==Some(checkpoint.next_chunk_ordinal),UNPROVEN)?;
++        }
++        let rows=receipt["row_versions"].as_array().ok_or_else(||error(UNPROVEN))?;
++        for row in rows {
++            need(row["scope"].as_str().zip(row["key"].as_str()).is_some_and(|(scope,key)|technical(scope,key,job)),UNPROVEN)?;
++        }
++    }
++    need(u64::try_from(versions.len())?==checkpoint_version,UNPROVEN)?;
++    Ok(())
++}
++pub(super) fn prove(c:&Connection,parent:&Anchor,proof:&Value,child:&str,token:&str,staging:Option<&Anchor>)->anyhow::Result<Value> {
++    commit::read_allowed(c,JOBS,child,Some(&parent.guard))?;
++    let row=database::row(c,JOBS,child)?;
++    let job=row.value.ok_or_else(||error(UNPROVEN))?;
++    need(job["id"]==child && job["kind"]=="extraction" && job["version"]==1
++        && job["generation"]==parent.guard.generation && job["captureComplete"]==true
++        && job["automaticReplacementOf"]==parent.job_id && job["automaticRegenerationId"]==token
++        && job.get("automaticRegenerationClaimedSlot").is_none(),UNPROVEN)?;
++    if let Some(anchor)=staging {
++        need(anchor.job_id==child && anchor.job_version==row.version.to_string() && job["state"]=="staging"
++            && job["recoveryStopped"]!=true,UNPROVEN)?;
++    } else {
++        need(job["state"]=="failed" && job["recoveryStopped"]==true
++            && job["failureCode"]=="STATE_GRAPH_AUTOMATIC_REGENERATION_REQUIRED",UNPROVEN)?;
++    }
++    let occupied:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM engine_graph_auto_slots WHERE json_extract(anchor_json,'$.job_id')=?1) OR EXISTS(SELECT 1 FROM engine_graph_auto_units WHERE job_id=?1)",[child],|row|row.get(0))?;
++    need(!occupied,UNPROVEN)?;
++    let point=database::row(c,database::CHECKPOINT_SCOPE,child)?;
++    let checkpoint:Checkpoint=protocol::decode(point.value.ok_or_else(||error(UNPROVEN))?)?;
++    need(checkpoint.job_id==child && checkpoint.generation==parent.guard.generation
++        && ["staging","complete"].contains(&checkpoint.visibility.as_str())
++        && checkpoint.delta_ordinal>0 && checkpoint.logical_delta_id==format!("delta:{}",checkpoint.delta_ordinal)
++        && checkpoint.next_chunk_ordinal>0,UNPROVEN)?;
++    if checkpoint.visibility=="staging" {
++        need(job["continuationState"]["activeUnit"]["resultOrdinal"]==checkpoint.delta_ordinal
++            && (staging.is_some() || job.get("continuationFromOrdinal").is_none()),UNPROVEN)?;
++    }
++    let current=TerminalAnchor {guard:parent.guard.clone(),job_id:child.to_owned(),job_version:row.version.to_string(),checkpoint_version:point.version.to_string()};
++    let (anchor,child_proof,reference)=terminal::derive(c,&current,&job,&checkpoint)?;
++    need(reference.is_null() && child_proof["capture"]==proof["capture"] && child_proof["selection"]==proof["selection"]
++        && job["continuationState"]["version"]==2 && job["continuationState"]["pageIndex"]==0
++        && job["continuationState"]["cursor"]==proof["progress"]["cursor"],UNPROVEN)?;
++    if let Some(expected)=staging {need(binding::slot_id(&anchor)?==binding::slot_id(expected)?,UNPROVEN)?;}
++    need(terminal::history(c,&anchor,None)?.is_none(),UNPROVEN)?;
++    let source_key=format!("value:{}:automatic-source",anchor.delta_ordinal);
++    let source_parts=format!("{source_key}:part:");
++    let mut statement=c.prepare("SELECT key FROM state_values WHERE scope=?1 AND key>='value:' AND key<'value;' AND value IS NOT NULL ORDER BY key LIMIT 514")?;
++    let outputs=statement.query_map([anchor.provider_scope()],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
++    need(outputs.len()<=513 && outputs.iter().all(|key|key==&source_key || key.strip_prefix(&source_parts).and_then(|part|part.parse::<u32>().ok()).is_some_and(|part|part<512)),UNPROVEN)?;
++    no_effects(c,child,&parent.guard.generation,point.version,&checkpoint)?;
++    Ok(json!({"job":job,"job_version":row.version.to_string(),"checkpoint_version":point.version.to_string(),"checkpoint":checkpoint}))
++}
++pub(super) fn reopen(c:&Connection,root:&str,child:&str,token:&str,proven:&Value,now:i64,staging:bool)->anyhow::Result<()> {
++    let row=database::row(c,JOBS,child)?;
++    need(row.version.to_string()==proven["job_version"] && row.value.as_ref()==Some(&proven["job"]),"STATE_TX_CONFLICT")?;
++    let checkpoint=database::row(c,database::CHECKPOINT_SCOPE,child)?;
++    need(checkpoint.version.to_string()==proven["checkpoint_version"] && checkpoint.value.as_ref()==Some(&proven["checkpoint"]),"STATE_TX_CHECKPOINT_CONFLICT")?;
++    let mut job=proven["job"].clone();
++    job["automaticRegenerationId"]=json!(token);
++    if !staging {
++        job["state"]=json!("staging");job["recoveryStopped"]=json!(false);job["recoveryAfter"]=Value::Null;
++        if proven["checkpoint"]["visibility"]=="complete" {
++            job["continuationFromOrdinal"]=proven["checkpoint"]["delta_ordinal"].clone();
++        }
++    }
++    let version=database::write(c,JOBS,child,Some(&job))?;
++    store::event(c,root,Some(&format!("{root}:1")),if staging {"unspent_child_prepare_refreshed"}else{"unspent_child_reopened"},now,
++        json!({"revision":REVISION,"child_job_id":child,"previous":proven,"job_version":version.to_string(),"checkpoint_preserved":true,"same_attempt":true}))?;
++    Ok(())
++}
 diff --git a/engine/src/workers/state/adapters/sqlite/graph_automatic_recovery/cleanup.rs b/engine/src/workers/state/adapters/sqlite/graph_automatic_recovery/cleanup.rs
 new file mode 100644
 --- /dev/null
@@ -9187,7 +9361,7 @@ diff --git a/engine/src/workers/state/adapters/sqlite/graph_automatic_recovery/s
 new file mode 100644
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/graph_automatic_recovery/schema.sql
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,73 @@
 +CREATE TABLE IF NOT EXISTS engine_graph_auto_policy (
 +  singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL CHECK(version=1), declaration TEXT NOT NULL,
 +  total_admitted INTEGER NOT NULL DEFAULT 0 CHECK(total_admitted>=0),
@@ -9255,6 +9429,12 @@ new file mode 100644
 +CREATE INDEX IF NOT EXISTS engine_graph_auto_adoption_at ON engine_graph_auto_reservation_adoptions(admitted_at_ms);
 +CREATE TABLE IF NOT EXISTS engine_graph_auto_attempt_epochs (
 +  attempt_id TEXT PRIMARY KEY REFERENCES engine_graph_auto_attempts(attempt_id),epoch INTEGER NOT NULL CHECK(epoch>0)) WITHOUT ROWID;
++CREATE TABLE IF NOT EXISTS engine_graph_auto_prepare_renewals (
++  root_id TEXT NOT NULL REFERENCES engine_graph_auto_slots(slot_id),epoch INTEGER NOT NULL CHECK(epoch>=0),
++  admitted_at_ms INTEGER NOT NULL,prior_deadline_ms INTEGER NOT NULL,deadline_ms INTEGER NOT NULL,
++  regeneration_id TEXT NOT NULL,proof_json TEXT NOT NULL,
++  PRIMARY KEY(root_id,admitted_at_ms)) WITHOUT ROWID;
++CREATE INDEX IF NOT EXISTS engine_graph_auto_prepare_renewal_at ON engine_graph_auto_prepare_renewals(admitted_at_ms);
 diff --git a/engine/src/workers/state/adapters/sqlite/graph_automatic_recovery/store.rs b/engine/src/workers/state/adapters/sqlite/graph_automatic_recovery/store.rs
 new file mode 100644
 --- /dev/null
@@ -9390,7 +9570,7 @@ new file mode 100644
 +pub(super) fn retry_after(connection:&Connection,reason:Option<&str>)->anyhow::Result<Option<i64>> {
 +    if !matches!(reason,Some("GRAPH_AUTOMATIC_COOLDOWN"|"GRAPH_AUTOMATIC_GLOBAL_LIMIT")) {return Ok(None);}
 +    let (now,last):(i64,Option<i64>)=connection.query_row("SELECT last_clock_ms,last_admitted_ms FROM engine_graph_auto_policy WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?)))?;
-+    let fourth:Option<i64>=connection.query_row("SELECT admitted_at_ms FROM (SELECT admitted_at_ms FROM engine_graph_auto_admissions WHERE admitted_at_ms>?1 UNION ALL SELECT admitted_at_ms FROM engine_graph_auto_reservation_adoptions WHERE admitted_at_ms>?1) ORDER BY admitted_at_ms DESC LIMIT 1 OFFSET 3",[now-3_600_000],|row|row.get(0)).optional()?;
++    let fourth:Option<i64>=connection.query_row("SELECT admitted_at_ms FROM (SELECT admitted_at_ms FROM engine_graph_auto_admissions WHERE admitted_at_ms>?1 UNION ALL SELECT admitted_at_ms FROM engine_graph_auto_reservation_adoptions WHERE admitted_at_ms>?1 UNION ALL SELECT admitted_at_ms FROM engine_graph_auto_prepare_renewals WHERE admitted_at_ms>?1) ORDER BY admitted_at_ms DESC LIMIT 1 OFFSET 3",[now-3_600_000],|row|row.get(0)).optional()?;
 +    let cooldown=last.map(|last|last.checked_add(60_000).ok_or_else(||super::error("STATE_GRAPH_AUTOMATIC_CLOCK_INVALID"))).transpose()?.unwrap_or(now);
 +    let global=fourth.map(|oldest|oldest.checked_add(3_600_000).ok_or_else(||super::error("STATE_GRAPH_AUTOMATIC_CLOCK_INVALID"))).transpose()?.unwrap_or(now);
 +    let at=now.max(cooldown).max(global);
@@ -9417,7 +9597,7 @@ new file mode 100644
 +        "deadline_ms":deadline,"consumed":attempt.as_ref().is_some_and(|attempt|attempt.consumed),
 +        "retry_admitted":root.retry,"total_admitted":total,"fresh":fresh,"dispatch_allowed":command=="dispatch" && fresh,
 +        "regeneration_id":root.regeneration,"new_job_id":root.new_job,"anchor":slot.anchor,"binding_digest":slot.binding_digest,"capture":capture,
-+        "adoption_revision":super::adoption::REVISION,"reservation":super::adoption::reservation(connection,&root)?});
++        "adoption_revision":super::adoption::REVISION,"unspent_child_revision":super::child::REVISION,"unspent_child_proof_revision":super::child::PROOF_REVISION,"reservation":super::adoption::reservation(connection,&root)?});
 +    if command == "dispatch" && fresh { response["prepared"] = serde_json::to_value(slot.binding)?; }
 +    Ok(response)
 +}
@@ -9425,7 +9605,7 @@ diff --git a/engine/src/workers/state/adapters/sqlite/graph_automatic_recovery/t
 new file mode 100644
 --- /dev/null
 +++ b/engine/src/workers/state/adapters/sqlite/graph_automatic_recovery/terminal.rs
-@@ -0,0 +1,462 @@
+@@ -0,0 +1,463 @@
 +use super::{adoption, authority, binding, grouped, need, policy, store, wire::{Anchor, Binding, TerminalAnchor}, CAPABILITY, error};
 +use super::super::{commit, database, protocol::{self, Checkpoint, JOBS}};
 +use rusqlite::{params, Connection, OptionalExtension};
@@ -9533,7 +9713,7 @@ new file mode 100644
 +    }
 +    Ok(())
 +}
-+fn derive(connection:&Connection,current:&TerminalAnchor,job:&Value,checkpoint:&Checkpoint)->anyhow::Result<(Anchor,Value,Value)> {
++pub(super) fn derive(connection:&Connection,current:&TerminalAnchor,job:&Value,checkpoint:&Checkpoint)->anyhow::Result<(Anchor,Value,Value)> {
 +    let generation=string(&job["generation"],UNPROVEN)?.to_owned();protocol::counter(&generation)?;
 +    let progress=&job["continuationState"];
 +    let (delta,name)=if progress["version"]==2 {
@@ -9659,7 +9839,7 @@ new file mode 100644
 +        }
 +    }
 +    Ok(json!({"capability":CAPABILITY,"policy":policy(),"command":"terminal_recover","job_id":current.job_id,"job_version":current.job_version,"checkpoint_version":current.checkpoint_version,
-+        "resolution":resolution,"reason":why,"retry_after_ms":retry,"fresh":fresh,"adoption_revision":adoption::REVISION,
++        "resolution":resolution,"reason":why,"retry_after_ms":retry,"fresh":fresh,"adoption_revision":adoption::REVISION,"unspent_child_revision":super::child::REVISION,"unspent_child_proof_revision":super::child::PROOF_REVISION,
 +        "original_slot":slot.map(|anchor|json!({"generation":anchor.source_generation.as_ref().unwrap_or(&anchor.guard.generation),"delta_ordinal":anchor.delta_ordinal,"value_name":anchor.value_name,"manifest_version":anchor.manifest_version,"manifest_attempt":anchor.manifest_attempt,"value_ref":value_ref})),"recovery":recovery,"replacement":replacement}))
 +}
 +fn stopped(connection:&Connection,current:&TerminalAnchor,generation:&str,reason:&str,now:i64)->anyhow::Result<Value> {
@@ -9709,7 +9889,8 @@ new file mode 100644
 +    let mut revising_source=false;
 +    if let Some((job_version,checkpoint_version,reason,revision))=cached {
 +        let reconsider=reason=="GRAPH_AUTOMATIC_SOURCE_UNIT_UNPROVEN" && revision.as_deref()!=Some(SOURCE_PROOF_REVISION)
-+            || reason=="GRAPH_AUTOMATIC_SLOT_EXHAUSTED" && revision.as_deref()!=Some(adoption::REVISION);
++            || reason=="GRAPH_AUTOMATIC_SLOT_EXHAUSTED" && revision.as_deref()!=Some(adoption::REVISION)
++            || reason=="GRAPH_AUTOMATIC_ADOPTION_CHILD_PRESENT";
 +        if job_version==current.job_version && checkpoint_version==current.checkpoint_version && !reconsider {return output(connection,current,None,Value::Null,Some(&reason),false);}
 +        revising_source=job_version==current.job_version && checkpoint_version==current.checkpoint_version && reconsider && reason=="GRAPH_AUTOMATIC_SOURCE_UNIT_UNPROVEN";
 +    }

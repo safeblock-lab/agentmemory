@@ -1,5 +1,6 @@
 export const SHUTDOWN_FLUSH_TIMEOUT_MS = 4000;
 export const SHUTDOWN_HARD_EXIT_MS = 8000;
+export const SHUTDOWN_ADMITTED_DRAIN_MS = 180000;
 
 export async function settleWithin(
   work: Promise<unknown>,

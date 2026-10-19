@@ -10,11 +10,11 @@ import type { CompressedObservation, GraphControlState, GraphExtractionJob, Work
 import { isStateCounter, StateTransactionError, type StateCommitOperation, type StateGraphGuard, type StateGraphLease, type StateJsonValue } from "../state/state-transactions.js";
 import { StatePageError } from "../state/state-pages.js";
 import { withGraphLeaseAdmission } from "../state/batch-effects.js";
-import { acquireGraphWorkTurn } from "../state/graph-work-queue.js";
+import { GraphWorkQueueDrainingError, acquireGraphWorkTurn, type GraphWorkIdentity, type GraphWorkRelease } from "../state/graph-work-queue.js";
 import { GraphJobStorage, graphJson, graphRecordDigest, type GraphDeltaPreparation } from "./graph-job-storage.js";
 import { readGraphSessionCapture } from "./graph-session-capture.js";
 import { createNextGraphWorkUnit, type GraphWorkCursor, type GraphWorkSource } from "./graph-work-groups.js";
-import { graphRecoveryDispatchPermit, graphRecoverySlotId, type GraphRecoveryAnchor, type GraphAutomaticRecoveryResponse } from "../state/graph-automatic-recovery.js";
+import { GraphAutomaticUnspentPrepareWait, graphUnspentPrepareWaitResult, isGraphUnspentPrepareWaitResult, graphRecoveryDispatchPermit, graphRecoverySlotId, type GraphRecoveryAnchor, type GraphAutomaticRecoveryResponse } from "../state/graph-automatic-recovery.js";
 import type { PreparedGraphAutomaticCall } from "../providers/graph-automatic.js";
 import { GraphAutomaticRecoveryRequired, graphAutomaticRecoveryView, type GraphAutomaticRecoveryView } from "./graph-automatic-workflow.js";
 import { discoverStoppedGraphJobs, dispatchGraphTerminalRecovery, installGraphTerminalDispatcher, installGraphTerminalRecovery, readGraphTerminalRecovery,
@@ -264,8 +264,9 @@ const originals = new WeakMap<StateKV, StateKV>();
 const handlers = new WeakMap<StateKV, Map<GraphExtractionJob["kind"], GraphHandler>>();
 const baseKV = (kv: StateKV): StateKV => originals.get(kv) ?? kv;
 
-async function withGraphWorkAdmission<T>(kv: StateKV, run: (releaseQueue: () => void) => Promise<T>): Promise<T> {
-  const releaseQueue = await acquireGraphWorkTurn(kv);
+async function withGraphWorkAdmission<T>(kv: StateKV, identity: GraphWorkIdentity, run: (releaseQueue: GraphWorkRelease) => Promise<T>): Promise<T> {
+  const releaseQueue = await acquireGraphWorkTurn(kv, identity);
+  releaseQueue.setPhase("batch_admission");
   try { return await withGraphLeaseAdmission(() => run(releaseQueue)); }
   catch (error) { releaseQueue(); throw error; }
 }
@@ -392,12 +393,15 @@ export async function readCompletedGraphJobReplay(
 ): Promise<CompletedGraphJobReplay> {
   validateCompletedReplayRequest(request);
   const base = baseKV(kv);
-  return withGraphWorkAdmission(base, async releaseQueue => {
+  return withGraphWorkAdmission(base, { category: "graph_recovery", functionId: null }, async releaseQueue => {
+    releaseQueue.setPhase("control_read");
     const initial = (await base.getVersioned<GraphControlState>(KV.graphControl, "current")).value;
     if (!initial || initial.recovery) throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
+    releaseQueue.setPhase("lease_acquire");
     const lease = await base.lease({ action: "acquire", owner_id: randomUUID(), generation: initial.generation, ttl_ms: LEASE_TTL_MS }) as StateGraphLease;
     const storage = new GraphJobStorage(base, { owner_id: lease.owner_id, generation: lease.generation, fence: lease.fence }, request.jobId);
     try {
+      releaseQueue.setPhase("inspection");
       const control = await leasedControl(storage);
       if (control.recovery) throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
       await storage.restore();
@@ -455,6 +459,7 @@ export async function readCompletedGraphJobReplay(
         input, values, deltas, callbacks,
       };
     } finally {
+      releaseQueue.setPhase("lease_release");
       try { await base.lease({ action: "release", ...storage.guard }); }
       finally { releaseQueue(); }
     }
@@ -462,7 +467,7 @@ export async function readCompletedGraphJobReplay(
 }
 
 export function graphTransactionFailure(error: unknown): boolean {
-  if (error instanceof GraphProviderOutcomeUnknown || error instanceof GraphProviderRecoveryRequired || error instanceof GraphLocalRecoveryDeferred || error instanceof GraphSourceRecoveryRequired) return true;
+  if (error instanceof GraphAutomaticUnspentPrepareWait || error instanceof GraphProviderOutcomeUnknown || error instanceof GraphProviderRecoveryRequired || error instanceof GraphLocalRecoveryDeferred || error instanceof GraphSourceRecoveryRequired) return true;
   if (error instanceof StateTransactionError) return true;
   if (typeof error !== "object" || error === null) return false;
   const record = error as { code?: unknown; message?: unknown; cause?: unknown };
@@ -1238,10 +1243,12 @@ async function readCapture(storage: CaptureReader, job: DurableGraphJob): Promis
   return JSON.parse(text) as unknown;
 }
 
-async function pendingJob(kv: StateKV, generation?: string, migrate = false, fence = "0"): Promise<DurableGraphJob | null> {
+async function pendingJob(kv: StateKV, generation?: string, migrate = false, fence = "0", guard?: StateGraphGuard): Promise<DurableGraphJob | null> {
+  const readJob = (id: string) => guard ? kv.getVersioned<DurableGraphJob>(KV.graphJobs, id, guard).then(row => row.value)
+    : kv.get<DurableGraphJob>(KV.graphJobs, id);
   const pointer = await kv.get<GraphActivePointer>(KV.config, ACTIVE_JOB_KEY);
   if (pointer?.jobId) {
-    const job = await kv.get<DurableGraphJob>(KV.graphJobs, pointer.jobId);
+    const job = await readJob(pointer.jobId);
     if (!job) throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
     if (job.state !== "completed" && job.state !== "invalidated" && job.recoveryStopped !== true) {
       assertGraphOrigin(job);
@@ -1312,6 +1319,7 @@ function terminalPayloadFailureCode(error: unknown, seen = new Set<object>()): s
 }
 
 const nativeAutomaticFailureCodes = new Set([
+  "STATE_GRAPH_AUTOMATIC_UNSPENT_PREPARE_WAIT_V1",
   "STATE_GRAPH_AUTOMATIC_ALREADY_APPLYING", "STATE_GRAPH_AUTOMATIC_ATTEMPT_ACTIVE", "STATE_GRAPH_AUTOMATIC_ATTEMPT_CLOSED",
   "STATE_GRAPH_AUTOMATIC_ATTEMPT_MISSING", "STATE_GRAPH_AUTOMATIC_AUTHORITY_CHANGED", "STATE_GRAPH_AUTOMATIC_AUTHORITY_INVALID",
   "STATE_GRAPH_AUTOMATIC_AUTHORITY_UNAVAILABLE", "STATE_GRAPH_AUTOMATIC_BINDING_MISMATCH", "STATE_GRAPH_AUTOMATIC_CAPTURE_INCOMPLETE",
@@ -1333,7 +1341,7 @@ const nativeAutomaticFailureCodes = new Set([
 export function graphFailureDiagnostic(error: unknown): { code: string; errorClass: string; errorCategory?: string; sourceFrames: string[];
   stateFunction?: string; transportCode?: string; failureKind?: "native-rejection" | "transport" | "unknown";
   recoveryStep?: string; recoveryOperation?: string } {
-  const names = ["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "DOMException", "StateTransactionError", "StatePageError", "IndexedRetrievalError", "InvocationError", "GraphProviderRecoveryRequired"];
+  const names = ["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "DOMException", "StateTransactionError", "StatePageError", "IndexedRetrievalError", "InvocationError", "GraphProviderRecoveryRequired", "GraphAutomaticUnspentPrepareWait"];
   const candidate = error instanceof Error ? error.constructor.name : "unknown";
   const errorClass = names.includes(candidate) ? candidate : "unknown";
   const record = typeof error === "object" && error !== null ? error as { code?: unknown; function_id?: unknown } : null;
@@ -1443,13 +1451,17 @@ async function discoverJob(storage: GraphJobStorage, control: GraphControlState,
 export async function runGraphJob<T>(kv: StateKV, kind: GraphExtractionJob["kind"], input: unknown, run: (frozen: unknown) => Promise<T>, durableId?: string, preflight?: GraphJobPreflight<T>): Promise<T> {
   const base = baseKV(kv), nested = execution.getStore(), origin = selectedOrigin.getStore();
   if (nested?.storage.kv === base) return run(input);
-  const admitted = await withGraphWorkAdmission(base, async releaseQueue => {
+  const admitted = await withGraphWorkAdmission(base, { category: "graph_job", functionId: kind === "extraction" || kind === "batch_callback" ? "mem::graph-extract"
+      : kind === "rebuild" ? "mem::graph-rebuild" : kind === "reset" ? "mem::graph-reset" : null }, async releaseQueue => {
+      releaseQueue.setPhase("control_read");
       const control = (await base.getVersioned<GraphControlState>(KV.graphControl, "current")).value;
       if (!control) throw new StateTransactionError("STATE_TX_UNSUPPORTED");
+      releaseQueue.setPhase("lease_acquire");
       const lease = await base.lease({ action: "acquire", owner_id: randomUUID(), generation: control.generation, ttl_ms: LEASE_TTL_MS }) as StateGraphLease;
       return { control, lease, releaseQueue };
   });
   try {
+    admitted.releaseQueue.setPhase("restore");
     let { control } = admitted;
     const { lease } = admitted;
     const storage = new GraphJobStorage(base, { owner_id: lease.owner_id, generation: lease.generation, fence: lease.fence }, durableId ?? generateId("graphjob"));
@@ -1491,10 +1503,12 @@ export async function runGraphJob<T>(kv: StateKV, kind: GraphExtractionJob["kind
     heartbeat.unref();
     const suspendHeartbeat = async () => {
       clearInterval(heartbeat);
+      admitted.releaseQueue.setPhase("heartbeat_drain");
       if (renewal) await renewal;
       await storage.drainForNativeRecovery();
     };
     const resumeHeartbeat = () => {
+      admitted.releaseQueue.setPhase("handler");
       clearInterval(heartbeat);
       heartbeat = setInterval(() => { void renewLease().catch(() => undefined); }, LEASE_TTL_MS / 3);
       heartbeat.unref();
@@ -1562,7 +1576,9 @@ export async function runGraphJob<T>(kv: StateKV, kind: GraphExtractionJob["kind
         ...(selectedOrigin.getStore() ? { selectedOrigin: selectedOrigin.getStore() } : {}) };
       if (!job.captureComplete) {
         if (existing && graphRecordDigest(JSON.stringify(input)) !== existing.captureDigest) throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
+        admitted.releaseQueue.setPhase("input_capture");
         await capture(storage, job, input);
+        admitted.releaseQueue.setPhase("restore");
       }
       if (storage.checkpoint?.logical_delta_id === "capture" && storage.checkpoint.visibility !== "complete") {
         await storage.completeStaging({ id: "capture", ordinal: 0, capturedAt: job.createdAt, attempt: "capture", phase: "preparing" });
@@ -1570,7 +1586,9 @@ export async function runGraphJob<T>(kv: StateKV, kind: GraphExtractionJob["kind
       const frozen = await readCapture(storage, job);
       const resume = await groupedResume(storage, job, frozen);
       const context: GraphExecution = { storage, job, cursor: resume.ordinal, suspendHeartbeat, resumeHeartbeat };
+      admitted.releaseQueue.setPhase("handler");
       const executed = await execution.run(context, () => resume.finalization !== undefined ? resume.finalization as T : run(frozen));
+      admitted.releaseQueue.setPhase("checkpoint_finalize");
       const yielded = isGraphJobYield(executed);
       const result = yielded ? executed.progress : executed;
       const terminalWorkFailure = !yielded && isTerminalGraphWorkFailure(result) && kind === "extraction"
@@ -1618,6 +1636,16 @@ export async function runGraphJob<T>(kv: StateKV, kind: GraphExtractionJob["kind
       const failedCheckpoint = storage.checkpoint;
       let recoveryOutcome: "retry-scheduled" | "stopped" | "invalidated" | false = false;
       const checkpoint = storage.checkpoint;
+      if (error instanceof GraphAutomaticUnspentPrepareWait) {
+        if (error.jobId !== storage.jobId) throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
+        if (checkpoint?.visibility === "staging") {
+          const latest = await storage.get<DurableGraphJob>(KV.graphJobs, storage.jobId);
+          const delta = await storage.get<GraphDeltaPreparation>(KV.graphDeltas(storage.jobId), `manifest:${checkpoint.delta_ordinal}`);
+          if (latest && delta) await storage.stage(KV.graphJobs, storage.jobId,
+            { ...latest, recoveryAfter: error.retryAfter, updatedAt: new Date().toISOString() }, delta);
+        }
+        recoveryDeferred = true;
+      }
       if (error instanceof GraphAutomaticRecoveryRequired && checkpoint?.visibility === "staging") {
         await suspendHeartbeat();
         const latest = await storage.get<DurableGraphJob>(KV.graphJobs, storage.jobId);
@@ -1660,13 +1688,15 @@ export async function runGraphJob<T>(kv: StateKV, kind: GraphExtractionJob["kind
         }
       }
       const diagnostic = { jobId: storage.jobId, ...graphFailureDiagnostic(error), ...(error instanceof StateTransactionError ? error.diagnostic : undefined), ...(error instanceof GraphProviderOutcomeUnknown && error.frozenOutcome ? { frozenOutcome: error.frozenOutcome } : {}), ...(error instanceof GraphGroupedContinuityRequired ? { continuityReason: error.reason } : {}), deltaOrdinal: failedCheckpoint?.delta_ordinal, chunkOrdinal: failedCheckpoint?.next_chunk_ordinal, visibility: failedCheckpoint?.visibility };
-      if (error instanceof GraphProviderRecoveryRequired) logger.info("Local graph recovery paused before provider operation", diagnostic);
+      if (error instanceof GraphAutomaticUnspentPrepareWait) logger.info("Graph provider preparation deferred by native reservation admission", { ...diagnostic, retryAfter: error.retryAfter });
+      else if (error instanceof GraphProviderRecoveryRequired) logger.info("Local graph recovery paused before provider operation", diagnostic);
       else if (recoveryOutcome === "invalidated") logger.warn("Initial graph source capture invalidated; retry with a fresh complete request", diagnostic);
       else if (recoveryOutcome === "stopped") logger.error("Graph job stopped after repeated or permanent staging failure", diagnostic);
       else if (recoveryOutcome === "retry-scheduled") logger.warn("Graph job retry scheduled with bounded backoff", diagnostic);
       else logger.error("Graph job paused for recovery", diagnostic);
       throw error;
     } finally {
+      admitted.releaseQueue.setPhase("heartbeat_drain");
       clearInterval(heartbeat);
       let finalizationFailed = false;
       let finalizationError: unknown;
@@ -1674,6 +1704,7 @@ export async function runGraphJob<T>(kv: StateKV, kind: GraphExtractionJob["kind
         try { await renewal; }
         catch (error) { finalizationFailed = true; finalizationError = error; }
       }
+      admitted.releaseQueue.setPhase("checkpoint_finalize");
       if (!origin) {
         try {
           const pointer = await base.get<GraphActivePointer>(KV.config, ACTIVE_JOB_KEY);
@@ -1692,6 +1723,7 @@ export async function runGraphJob<T>(kv: StateKV, kind: GraphExtractionJob["kind
         }
       }
       if (kind === "extraction") {
+        admitted.releaseQueue.setPhase("terminal_statistics");
         try {
           const terminal = await base.get<DurableGraphJob>(KV.graphJobs, storage.jobId);
           if (terminal?.state === "completed" || terminal?.state === "failed" && terminal.recoveryStopped === true) {
@@ -1700,6 +1732,7 @@ export async function runGraphJob<T>(kv: StateKV, kind: GraphExtractionJob["kind
           }
         } catch { await markWorkflowStatisticsGap(base, "graph"); }
       }
+      admitted.releaseQueue.setPhase("lease_release");
       try { await base.lease({ action: "release", ...storage.guard }); }
       catch (error) {
         if (!(error instanceof StateTransactionError) || !["STATE_TX_FENCED", "STATE_TX_GENERATION_STALE"].includes(error.code)) {
@@ -1774,11 +1807,13 @@ export function registerGraphJobRecovery(sdk: IIIClient, kv: StateKV): void {
   installGraphTerminalRecovery(terminalBase, async (jobId, localContinuation) => {
     if (terminalLocalDelivery.getStore()) return readGraphTerminalRecovery(terminalBase, jobId);
     if (!automaticRecoveryEnabled.has(terminalBase)) return null;
-    const admitted = await withGraphTerminalStep("terminal_turn_wait", "admission", () => withGraphWorkAdmission(terminalBase, async releaseQueue => {
+    const admitted = await withGraphTerminalStep("terminal_turn_wait", "admission", () => withGraphWorkAdmission(terminalBase, { category: "terminal_recovery", functionId: "mem::graph-recover" }, async releaseQueue => {
       try {
+        releaseQueue.setPhase("control_read");
         const control = await withGraphTerminalStep("control_after_turn", "get", () => terminalBase.get<GraphControlState>(KV.graphControl, "current"));
         if (!control) { releaseQueue(); return null; }
         if (control.recovery || control.lease && control.lease.expires_at_ms > Date.now()) throw new GraphTerminalRecoveryDeferred();
+        releaseQueue.setPhase("lease_acquire");
         const lease = await withGraphTerminalStep("terminal_lease_acquire", "lease_acquire", () => terminalBase.lease({ action: "acquire", owner_id: randomUUID(),
           generation: control.generation, ttl_ms: LEASE_TTL_MS })) as StateGraphLease;
         return { guard: { owner_id: lease.owner_id, generation: lease.generation, fence: lease.fence }, releaseQueue };
@@ -1786,14 +1821,26 @@ export function registerGraphJobRecovery(sdk: IIIClient, kv: StateKV): void {
         if (graphFailureDiagnostic(error).code === "STATE_TX_LEASE_BUSY") throw new GraphTerminalRecoveryDeferred();
         throw error;
       }
-    }));
+    })).catch(error => {
+      if (error instanceof GraphWorkQueueDrainingError) throw new GraphTerminalRecoveryDeferred();
+      throw error;
+    });
     if (!admitted) return null;
     const guard = admitted.guard;
     let record: GraphTerminalRecoveryRecord;
     let input: unknown;
     let childDeliveryNeeded = true;
     try {
+      admitted.releaseQueue.setPhase("terminal_proof");
       const storage = new GraphJobStorage(terminalBase, guard, jobId);
+      let blocker: DurableGraphJob | null;
+      try { blocker = await pendingJob(terminalBase, guard.generation, false, guard.fence, guard); }
+      catch (error) {
+        if (error instanceof GraphDiscoveryDeferred || error instanceof StateTransactionError && error.code === "STATE_GRAPH_RECOVERY_REQUIRED")
+          throw new GraphTerminalRecoveryDeferred();
+        throw error;
+      }
+      if (blocker) throw new GraphTerminalRecoveryDeferred();
       const row = await terminalBase.getVersioned<DurableGraphJob>(KV.graphJobs, jobId, guard);
       if (!row.value || row.value.state !== "failed" || row.value.recoveryStopped !== true || row.value.kind !== "extraction") return null;
       if (selectedOrigin.getStore()) assertGraphOrigin(row.value);
@@ -1810,6 +1857,7 @@ export function registerGraphJobRecovery(sdk: IIIClient, kv: StateKV): void {
         if (reconsideration === "source" && !emptyOutputRepair) return { ...previous, sourceProofRevision: GRAPH_TERMINAL_SOURCE_PROOF_REVISION,
           emptyOutputRepairEligibility: "ineligible", updatedAt: new Date().toISOString() };
       }
+      admitted.releaseQueue.setPhase("terminal_ack");
       const receipt = await withGraphTerminalStep("native_terminal", "terminal_recover", () => terminalBase.graphAutomaticRecovery({ command: "terminal_recover", anchor: {
         guard: { ...guard }, job_id: jobId, job_version: row.version, checkpoint_version: storage.checkpointVersion,
       } }));
@@ -1831,10 +1879,13 @@ export function registerGraphJobRecovery(sdk: IIIClient, kv: StateKV): void {
             revision: receipt.adoption_revision, epoch: receipt.recovery.reservation.epoch, regenerationId: receipt.replacement.regeneration_id } } : {}),
           ...(row.value.selectedOrigin ?? row.value.automaticSelectedSource ? { selection: row.value.selectedOrigin ?? row.value.automaticSelectedSource } : {}),
           ...(receipt.replacement.mode === "local_replay" && replayRef ? { replayRef } : {}) };
+        admitted.releaseQueue.setPhase("input_capture");
         input = await readCapture(storage, row.value);
       }
       record = { version: 1, sourceJobId: jobId, sourceJobVersion: receipt.job_version, updatedAt: new Date().toISOString(), recovery,
         sourceProofRevision: GRAPH_TERMINAL_SOURCE_PROOF_REVISION, adoptionRevision: receipt.adoption_revision,
+        unspentChildRevision: receipt.unspent_child_revision,
+        unspentChildProofRevision: receipt.unspent_child_proof_revision,
         emptyOutputRepairEligibility: emptyOutputRepair ? "eligible" : "ineligible",
         ...(emptyOutputRepair ? { localParseRepair: { parser: emptyOutputRepair.parser, unitId: emptyOutputRepair.unitId,
           checkpointVersion: emptyOutputRepair.checkpointVersion, responseVersion: emptyOutputRepair.provider.version } } : {}),
@@ -1848,6 +1899,7 @@ export function registerGraphJobRecovery(sdk: IIIClient, kv: StateKV): void {
       recordGraphTerminalFailure(error, "guarded_proof", "get_versioned");
       throw error;
     } finally {
+      admitted.releaseQueue.setPhase("lease_release");
       try { await withGraphTerminalStep("terminal_lease_release", "lease_release", () => terminalBase.lease({ action: "release", ...guard })); }
       finally { admitted.releaseQueue(); }
     }
@@ -1911,9 +1963,11 @@ export function registerGraphJobRecovery(sdk: IIIClient, kv: StateKV): void {
       if (await pendingJob(base)) throw new StateTransactionError("STATE_TX_UNSUPPORTED");
       return { success: true, recovered: false };
     }
-    const admitted = await withGraphWorkAdmission(base, async releaseQueue => {
+    const admitted = await withGraphWorkAdmission(base, { category: "graph_recovery", functionId: "mem::graph-recover" }, async releaseQueue => {
+      releaseQueue.setPhase("control_read");
       const current = (await base.getVersioned<GraphControlState>(KV.graphControl, "current")).value;
       if (!current) throw new StateTransactionError("STATE_TX_UNSUPPORTED");
+      releaseQueue.setPhase("lease_acquire");
       const lease = await base.lease({ action: "acquire", owner_id: randomUUID(), generation: current.generation, ttl_ms: LEASE_TTL_MS }) as StateGraphLease;
       return { control: current, lease, releaseQueue };
     });
@@ -1925,6 +1979,7 @@ export function registerGraphJobRecovery(sdk: IIIClient, kv: StateKV): void {
     let handler: GraphHandler | undefined;
     let providerProofOrdinal: number | undefined;
     try {
+      admitted.releaseQueue.setPhase("restore");
       const control = await leasedControl(storage);
       if (request?.localOnly === true && !control.recovery) return { success: true, recovered: false, localOnly: true, reason: "no_local_apply_pending" };
       if (request?.localOnly === true && control.recovery?.visibility !== "applying") return { success: true, recovered: false,
@@ -1937,6 +1992,7 @@ export function registerGraphJobRecovery(sdk: IIIClient, kv: StateKV): void {
       const jobCheckpoint = jobStorage.checkpoint;
       if (control.recovery?.job_id === job.id && jobCheckpoint?.visibility === "applying") {
         recoveryPhase = "local-apply";
+        admitted.releaseQueue.setPhase("local_apply");
         const manifest = await jobStorage.get<GraphDeltaPreparation>(KV.graphDeltas(job.id), `manifest:${jobCheckpoint.delta_ordinal}`);
         if (!manifest || manifest.id !== jobCheckpoint.logical_delta_id || manifest.ordinal !== jobCheckpoint.delta_ordinal
           || !["freezing", "prepared"].includes(manifest.phase)) throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
@@ -2037,6 +2093,7 @@ export function registerGraphJobRecovery(sdk: IIIClient, kv: StateKV): void {
       }
       handler = handlers.get(base)?.get(job.kind);
       if (!handler) throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
+      admitted.releaseQueue.setPhase("input_capture");
       try { input = await readCapture(storage, job); }
       catch (error) {
         if (!(error instanceof GraphCaptureUnavailableError)) throw error;
@@ -2046,17 +2103,25 @@ export function registerGraphJobRecovery(sdk: IIIClient, kv: StateKV): void {
     } finally {
       // Reconstruction must finish releasing its fence before the handler
       // acquires a new lease and independently validates the durable request.
+      admitted.releaseQueue.setPhase("lease_release");
       try { await base.lease({ action: "release", ...storage.guard }); }
       finally { admitted.releaseQueue(); }
     }
     try {
       recoveryPhase = "execution";
+      let deferredPreparation: unknown;
       const recover = () => providerContinuation.run(providerProofOrdinal !== undefined ? { jobId: job!.id, ordinal: providerProofOrdinal } : undefined,
-        () => withLocalGraphRecovery(request?.localOnly === true, () => handler!(input, job!.id)));
+        () => withLocalGraphRecovery(request?.localOnly === true, async () => {
+          const result = await handler!(input, job!.id);
+          if (isGraphUnspentPrepareWaitResult(result)) deferredPreparation = result;
+          return result;
+        }));
       if (repeat) await unknownCompactionRepeat.run({ request: repeat, admitted: false }, recover);
       else if (response) await providerResponseAdmission.run({ request: response, admitted: false }, recover);
       else await recover();
+      if (isGraphUnspentPrepareWaitResult(deferredPreparation)) return { ...deferredPreparation, recovered: false };
     } catch (error) {
+      if (error instanceof GraphAutomaticUnspentPrepareWait) return { ...graphUnspentPrepareWaitResult(error), recovered: false };
       if (error instanceof GraphGroupedContinuityRequired) return { success: true, recovered: false, jobId: job.id,
         continuityRequired: true, reason: error.reason };
       if (error instanceof GraphProviderResponseStopped) return { success: true, recovered: false, jobId: job.id,
@@ -2074,6 +2139,8 @@ export function registerGraphJobRecovery(sdk: IIIClient, kv: StateKV): void {
     }
     return { success: true, recovered: true, jobId: job.id };
     } catch (error) {
+      if (error instanceof GraphWorkQueueDrainingError) return { success: true, recovered: false, deferred: true,
+        localOnly: request?.localOnly === true, reason: "graph_work_queue_draining" };
       if (error instanceof GraphTerminalRecoveryDeferred) return { success: true, recovered: false, deferred: true,
         localOnly: request?.localOnly === true, reason: "graph_lease_busy" };
       if (error instanceof GraphSelectedForegroundRequired) return { success: true, recovered: false, deferred: true, reason: "selected_foreground_required" };

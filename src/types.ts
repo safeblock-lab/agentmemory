@@ -497,6 +497,9 @@ export interface SummaryQueueJob {
   executionOrigin?: "selected" | "manual";
   recoveryGeneration?: "full-originals-v2";
   zeroSpendRecoveryOfJobId?: string;
+  generationRevision?: "summary-sparse-evidence-v1";
+  promptCorrectionOfJobId?: string;
+  promptCorrectionRevision?: "summary-sparse-evidence-v1";
   recoveryMode?: "full-originals-v1";
   recoveryOfJobId?: string;
   dispatchPending?: boolean;

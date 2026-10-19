@@ -1,4 +1,4 @@
-import { GRAPH_AUTOMATIC_ADOPTION_REVISION } from "../state/graph-automatic-recovery.js";
+import { GRAPH_AUTOMATIC_ADOPTION_REVISION, GRAPH_AUTOMATIC_UNSPENT_CHILD_REVISION, GRAPH_AUTOMATIC_UNSPENT_CHILD_PROOF_REVISION } from "../state/graph-automatic-recovery.js";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
 import { StatePageError } from "../state/state-pages.js";
@@ -7,7 +7,8 @@ import { withKeyedLock } from "../state/keyed-mutex.js";
 import { graphAutomaticRecoveryView, type GraphAutomaticRecoveryView } from "./graph-automatic-workflow.js";
 
 export const GRAPH_TERMINAL_SOURCE_PROOF_REVISION = "applied-receipt-postcommit-v1";
-const TERMINAL_PROJECTION_REVISION = "terminal-adoption-outcome-v1";
+const TERMINAL_PROJECTION_REVISION = "terminal-staging-child-proof-v1";
+const JOBS_PROJECTION_REVISION = "jobs-derived-child-source-v1";
 
 type TerminalDiagnosticStep = "terminal_cache_read" | "terminal_cache_write" | "terminal_job_read"
   | "terminal_turn_wait" | "control_after_turn" | "terminal_lease_acquire" | "terminal_lease_release"
@@ -65,6 +66,8 @@ export interface GraphTerminalRecoveryRecord {
   localParseRepair?: { parser: string; unitId: string; checkpointVersion: string; responseVersion: string };
   sourceProofRevision?: string;
   adoptionRevision?: string;
+  unspentChildRevision?: string;
+  unspentChildProofRevision?: string;
   emptyOutputRepairEligibility?: "eligible" | "ineligible";
 }
 function expiredUnspentAdoption(record: GraphTerminalRecoveryRecord): boolean {
@@ -84,6 +87,12 @@ function expiredUnspentAdoption(record: GraphTerminalRecoveryRecord): boolean {
 }
 export function graphTerminalCacheReconsideration(record: GraphTerminalRecoveryRecord): "source" | "adoption" | null {
   if (expiredUnspentAdoption(record)) return "adoption";
+  if (["GRAPH_AUTOMATIC_ADOPTION_CHILD_PRESENT", "GRAPH_AUTOMATIC_UNSPENT_CHILD_UNPROVEN"].includes(record.outcome.reason ?? "")
+    && record.unspentChildProofRevision !== GRAPH_AUTOMATIC_UNSPENT_CHILD_PROOF_REVISION
+    && (record.outcome.nextCheckAt === null || record.outcome.nextCheckAt <= Date.now())) return "adoption";
+  if (record.outcome.reason === "GRAPH_AUTOMATIC_ADOPTION_CHILD_PRESENT"
+    && record.unspentChildRevision !== GRAPH_AUTOMATIC_UNSPENT_CHILD_REVISION
+    && (record.outcome.nextCheckAt === null || record.outcome.nextCheckAt <= Date.now())) return "adoption";
   if (record.outcome.action !== "none") return null;
   if (!record.link && record.outcome.reason === "GRAPH_AUTOMATIC_SOURCE_UNIT_UNPROVEN"
     && record.sourceProofRevision !== GRAPH_TERMINAL_SOURCE_PROOF_REVISION) return "source";
@@ -101,6 +110,7 @@ const terminalTickCodes = new Set([
   "STATE_PAGE_CURSOR_INVALID", "STATE_PAGE_CURSOR_STALE", "STATE_PAGE_INVALID_RESPONSE", "STATE_PAGE_UNSUPPORTED",
   "STATE_PAGE_INVALID_REQUEST", "STATE_GRAPH_AUTOMATIC_INVALID_RESPONSE", "STATE_GRAPH_AUTOMATIC_ID_CONFLICT",
   "STATE_GRAPH_AUTOMATIC_ADOPTION_EPOCH_CONFLICT", "STATE_GRAPH_AUTOMATIC_ADOPTION_AUTHORITY_UNPROVEN",
+  "STATE_GRAPH_AUTOMATIC_SOURCE_UNIT_UNPROVEN", "STATE_GRAPH_AUTOMATIC_BINDING_MISMATCH",
 ]);
 const terminalTickNames = new Set(["Error", "TypeError", "RangeError", "SyntaxError", "InvocationError", "StateTransactionError", "StatePageError"]);
 const terminalTickFunctions = new Set(["state::get", "state::get_versioned", "state::storage", "state::list_page", "state::lease", "state::commit"]);
@@ -131,7 +141,8 @@ function terminalTickError(error: unknown, stage: TerminalTickError["stage"], ca
   return { at: new Date().toISOString(), candidateJobId, stage, errorName, code, stateFunction };
 }
 
-type Candidate = { id: string; state: string; kind: string; recoveryStopped?: boolean; selectedOrigin?: unknown };
+type Candidate = { id: string; state: string; kind: string; recoveryStopped?: boolean; selectedOrigin?: unknown;
+  generation?: string; automaticReplacementOf?: unknown };
 export interface GraphTerminalLocalContinuation {
   jobId: string;
   generation: string;
@@ -158,6 +169,24 @@ export function readGraphTerminalRecovery(kv: StateKV, jobId: string): Promise<G
 export async function recoverStoppedGraphJob(kv: StateKV, jobId: string, localContinuation?: GraphTerminalLocalContinuation): Promise<GraphTerminalRecoveryRecord | null> {
   const recover = executors.get(kv);
   if (!recover) return readGraphTerminalRecovery(kv, jobId);
+  const visited = new Set<string>();
+  let generation: string | undefined;
+  let resolved = false;
+  for (let depth = 0; depth < 8; depth++) {
+    if (visited.has(jobId)) return null;
+    visited.add(jobId);
+    const row = await withGraphTerminalStep("terminal_job_read", "get_versioned", () => kv.getVersioned<Candidate>(KV.graphJobs, jobId));
+    const job = row.value;
+    if (!job || job.id !== jobId || job.kind !== "extraction" || job.state !== "failed" || job.recoveryStopped !== true
+      || !isStateCounter(job.generation) || generation !== undefined && job.generation !== generation) return null;
+    generation ??= job.generation;
+    if (job.automaticReplacementOf == null) { resolved = true; break; }
+    if (localContinuation) throw new StateTransactionError("STATE_GRAPH_AUTOMATIC_SOURCE_UNIT_UNPROVEN");
+    if (typeof job.automaticReplacementOf !== "string" || job.automaticReplacementOf.length > 128
+      || !/^(?:graphjob_[A-Za-z0-9_-]+|graphbuild_[a-f0-9]{16})$/.test(job.automaticReplacementOf)) return null;
+    jobId = job.automaticReplacementOf;
+  }
+  if (!resolved) return null;
   return withKeyedLock(`graph-terminal-recovery:${jobId}`, async () => {
     const previous = await readGraphTerminalRecovery(kv, jobId);
     let confirmed = previous;
@@ -204,7 +233,7 @@ export async function discoverStoppedGraphJobs(kv: StateKV): Promise<{ scanned: 
     const deadline = Date.now() + 2_500;
     const raw = await kv.get<{ cursor?: string | null; terminalCursor?: string | null; historyIndex?: number; deferredJobId?: string;
       consistency?: "keyset_live"; page?: PendingPage; firstSource?: Source; nextHead?: "deferred" | "history";
-      totalRowsVisited?: number; terminalProjectionRevision?: string; lastTickError?: TerminalTickError }>(KV.config, SCAN_KEY);
+      totalRowsVisited?: number; terminalProjectionRevision?: string; jobsProjectionRevision?: string; lastTickError?: TerminalTickError }>(KV.config, SCAN_KEY);
     const validId = (value: unknown): value is string => typeof value === "string" && Buffer.byteLength(value) <= 128
       && /^(?:graphjob_[A-Za-z0-9_-]+|graphbuild_[a-f0-9]{16})$/.test(value);
     const object = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
@@ -212,6 +241,8 @@ export async function discoverStoppedGraphJobs(kv: StateKV): Promise<{ scanned: 
       || typeof value === "string" && Buffer.byteLength(value) <= 4096;
     const trustedCursor = (value: unknown) => raw?.consistency === "keyset_live" && validCursor(value) ? value : null;
     const cursors: Record<Source, string | null> = { jobs: trustedCursor(raw?.cursor), terminal: trustedCursor(raw?.terminalCursor) };
+    const jobsProjectionCompatible = raw?.jobsProjectionRevision === JOBS_PROJECTION_REVISION;
+    if (!jobsProjectionCompatible) cursors.jobs = null;
     const terminalProjectionCompatible = raw?.terminalProjectionRevision === TERMINAL_PROJECTION_REVISION;
     if (!terminalProjectionCompatible) cursors.terminal = null;
     let pendingPage = raw?.consistency === "keyset_live" ? raw.page : undefined;
@@ -219,6 +250,7 @@ export async function discoverStoppedGraphJobs(kv: StateKV): Promise<{ scanned: 
       || pendingPage.source !== undefined && pendingPage.source !== "jobs" && pendingPage.source !== "terminal"
       || Buffer.byteLength(JSON.stringify(pendingPage.items)) > 32 * 1024)) throw new StatePageError("STATE_PAGE_INVALID_RESPONSE");
     if (pendingPage) pendingPage = { ...pendingPage, source: pendingPage.source ?? "jobs" };
+    if (!jobsProjectionCompatible && pendingPage?.source === "jobs") pendingPage = undefined;
     if (!terminalProjectionCompatible && pendingPage?.source === "terminal") pendingPage = undefined;
     let rowsVisited = 0, candidatesVisited = 0, headVisits = 0, linked = 0, metadataBytes = 0;
     let historyIndex = Number.isSafeInteger(raw?.historyIndex) && raw!.historyIndex! >= 0 ? raw!.historyIndex! : 0;
@@ -258,6 +290,10 @@ export async function discoverStoppedGraphJobs(kv: StateKV): Promise<{ scanned: 
         && (value.sourceProofRevision == null || typeof value.sourceProofRevision === "string" && value.sourceProofRevision.length <= 128)
         && (value.sourceProofRevision !== GRAPH_TERMINAL_SOURCE_PROOF_REVISION
           || value.adoptionRevision !== GRAPH_AUTOMATIC_ADOPTION_REVISION
+          || object(value.outcome) && value.outcome.reason === "GRAPH_AUTOMATIC_ADOPTION_CHILD_PRESENT"
+            && value.unspentChildRevision !== GRAPH_AUTOMATIC_UNSPENT_CHILD_REVISION
+          || object(value.outcome) && ["GRAPH_AUTOMATIC_ADOPTION_CHILD_PRESENT", "GRAPH_AUTOMATIC_UNSPENT_CHILD_UNPROVEN"].includes(String(value.outcome.reason))
+            && value.unspentChildProofRevision !== GRAPH_AUTOMATIC_UNSPENT_CHILD_PROOF_REVISION
           || object(value.outcome) && ["none", "continue"].includes(String(value.outcome.action))
             && ["GRAPH_AUTOMATIC_SLOT_EXHAUSTED", "GRAPH_AUTOMATIC_REGENERATION_READY", "GRAPH_AUTOMATIC_REGENERATION_DEADLINE"].includes(String(value.outcome.reason))) ? value.sourceJobId : null;
     };
@@ -269,6 +305,7 @@ export async function discoverStoppedGraphJobs(kv: StateKV): Promise<{ scanned: 
     };
     const save = () => withGraphTerminalStep("terminal_cache_write", "set", () => kv.set(KV.config, SCAN_KEY, {
       cursor: cursors.jobs, terminalCursor: cursors.terminal, terminalProjectionRevision: TERMINAL_PROJECTION_REVISION,
+      jobsProjectionRevision: JOBS_PROJECTION_REVISION,
       historyIndex, consistency: "keyset_live",
       firstSource: nextFirstSource, nextHead, ...(pendingPage ? { page: pendingPage } : {}),
       ...(deferredJobId ? { deferredJobId } : {}),
@@ -294,6 +331,7 @@ export async function discoverStoppedGraphJobs(kv: StateKV): Promise<{ scanned: 
         deferredReason ??= "graph_lease_busy";
         return true;
       }
+      if (result?.sourceJobId) attempted.add(result.sourceJobId);
       if (deferredJobId === jobId) deferredJobId = undefined;
       if (result?.outcome.action === "wait" && !result.link) { deferredJobId ??= jobId; deferredReason ??= "native_cooldown"; }
       if (result?.link && (!previous?.link || result.link.regenerationId !== previous.link.regenerationId)) linked++;
@@ -313,16 +351,20 @@ export async function discoverStoppedGraphJobs(kv: StateKV): Promise<{ scanned: 
         try {
           const page = await kv.pages<unknown>(source === "jobs" ? KV.graphJobs : KV.config, {
             ...(cursors[source] ? { cursor: cursors[source]! } : {}), consistency: "keyset_live", limit: 3, maxBytes: remainingBytes,
-            fields: source === "jobs" ? ["id", "kind", "state", "recoveryStopped"]
-              : ["version", "sourceJobId", "sourceJobVersion", "sourceProofRevision", "adoptionRevision", "outcome"],
+            fields: source === "jobs" ? ["id", "kind", "state", "recoveryStopped", "generation", "automaticReplacementOf"]
+              : ["version", "sourceJobId", "sourceJobVersion", "sourceProofRevision", "adoptionRevision", "unspentChildRevision", "unspentChildProofRevision", "outcome"],
           }).next();
           if (page.done) { cursors[source] = null; completedSources.add(source); if (source === "jobs") cycleComplete = true; return false; }
           metadataBytes += Buffer.byteLength(JSON.stringify(page.value.items));
           pendingPage = { source, items: page.value.items, nextCursor: page.value.next_cursor };
         } catch (error) {
           if (!(error instanceof StatePageError)) throw error;
-          if (error.code === "STATE_PAGE_CURSOR_STALE") {
-            cursors[source] = null; completedSources.add(source); deferredReason ??= "page_cursor_stale"; return false;
+          if (error.code === "STATE_PAGE_CURSOR_STALE" || error.code === "STATE_PAGE_CURSOR_INVALID") {
+            cursors[source] = null;
+            pendingPage = undefined;
+            completedSources.add(source);
+            deferredReason ??= error.code === "STATE_PAGE_CURSOR_INVALID" ? "page_cursor_invalid" : "page_cursor_stale";
+            return false;
           }
           if (error.code === "STATE_RECORD_TOO_LARGE") {
             completedSources.add(source); deferredReason ??= remainingBytes < 32 * 1024 ? "metadata_byte_budget" : "metadata_row_too_large"; return false;

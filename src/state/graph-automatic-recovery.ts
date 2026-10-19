@@ -5,6 +5,33 @@ import { isStateCounter, type StateCounter, type StateGraphGuard } from "./state
 
 export const GRAPH_AUTOMATIC_RECOVERY_CAPABILITY = "state::graph_automatic_recovery_v1";
 export const GRAPH_AUTOMATIC_ADOPTION_REVISION = "unspent-reservation-adoption-v1";
+export const GRAPH_AUTOMATIC_UNSPENT_CHILD_REVISION = "unspent-child-recovery-v1";
+export const GRAPH_AUTOMATIC_UNSPENT_CHILD_PROOF_REVISION = "staging-checkpoint-recovery-v1";
+export class GraphAutomaticUnspentPrepareWait extends Error {
+  readonly retryAfter = new Date(Date.now() + 60_000).toISOString();
+  constructor(readonly jobId: string) {
+    super("STATE_GRAPH_AUTOMATIC_UNSPENT_PREPARE_WAIT_V1");
+    this.name = "GraphAutomaticUnspentPrepareWait";
+  }
+}
+interface GraphUnspentPrepareWaitResult {
+  success: true;
+  queued: true;
+  deferred: true;
+  jobId: string;
+  retryAfter: string;
+  reason: "STATE_GRAPH_AUTOMATIC_UNSPENT_PREPARE_WAIT_V1";
+}
+const unspentPrepareWaitResults = new WeakSet<object>();
+export function graphUnspentPrepareWaitResult(wait: GraphAutomaticUnspentPrepareWait): GraphUnspentPrepareWaitResult {
+  const result: GraphUnspentPrepareWaitResult = { success: true, queued: true, deferred: true,
+    jobId: wait.jobId, retryAfter: wait.retryAfter, reason: "STATE_GRAPH_AUTOMATIC_UNSPENT_PREPARE_WAIT_V1" };
+  unspentPrepareWaitResults.add(result);
+  return result;
+}
+export function isGraphUnspentPrepareWaitResult(value: unknown): value is GraphUnspentPrepareWaitResult {
+  return typeof value === "object" && value !== null && unspentPrepareWaitResults.has(value);
+}
 export const GRAPH_AUTOMATIC_RECOVERY_POLICY = Object.freeze({
   version: 1, additional_attempts_per_slot: 1, admissions_per_hour: 4,
   cooldown_ms: 60_000, deadline_ms: 120_000,
@@ -97,6 +124,8 @@ export interface GraphRecoveryReservation {
 }
 export interface GraphAutomaticRecoveryResponse {
   capability: typeof GRAPH_AUTOMATIC_RECOVERY_CAPABILITY;
+  unspent_child_revision: typeof GRAPH_AUTOMATIC_UNSPENT_CHILD_REVISION;
+  unspent_child_proof_revision: typeof GRAPH_AUTOMATIC_UNSPENT_CHILD_PROOF_REVISION;
   adoption_revision: typeof GRAPH_AUTOMATIC_ADOPTION_REVISION;
   reservation: GraphRecoveryReservation | null;
   policy: typeof GRAPH_AUTOMATIC_RECOVERY_POLICY;
@@ -125,6 +154,8 @@ export interface GraphAutomaticRecoveryResponse {
 }
 export interface GraphTerminalRecoveryResponse {
   capability: typeof GRAPH_AUTOMATIC_RECOVERY_CAPABILITY;
+  unspent_child_revision: typeof GRAPH_AUTOMATIC_UNSPENT_CHILD_REVISION;
+  unspent_child_proof_revision: typeof GRAPH_AUTOMATIC_UNSPENT_CHILD_PROOF_REVISION;
   adoption_revision: typeof GRAPH_AUTOMATIC_ADOPTION_REVISION;
   policy: typeof GRAPH_AUTOMATIC_RECOVERY_POLICY;
   command: "terminal_recover";
@@ -261,7 +292,8 @@ export function validGraphAutomaticRecoveryResponse(request: GraphAutomaticRecov
   if (request.request.command === "terminal_recover") return false;
   if (!object(value) || !object(value.policy)) return false;
   const policy = value.policy;
-  if (!object(value) || value.capability !== GRAPH_AUTOMATIC_RECOVERY_CAPABILITY || value.adoption_revision !== GRAPH_AUTOMATIC_ADOPTION_REVISION
+  if (!object(value) || value.capability !== GRAPH_AUTOMATIC_RECOVERY_CAPABILITY || value.unspent_child_revision !== GRAPH_AUTOMATIC_UNSPENT_CHILD_REVISION || value.adoption_revision !== GRAPH_AUTOMATIC_ADOPTION_REVISION
+    || value.unspent_child_proof_revision !== GRAPH_AUTOMATIC_UNSPENT_CHILD_PROOF_REVISION
     || !validReservation(value.reservation) || value.command !== request.request.command
     || Object.keys(GRAPH_AUTOMATIC_RECOVERY_POLICY).some(key => policy[key] !== GRAPH_AUTOMATIC_RECOVERY_POLICY[key as keyof typeof GRAPH_AUTOMATIC_RECOVERY_POLICY])
     || !text(value.slot_id, 128) || !text(value.root_id, 128) || !validAnchor(value.anchor)
@@ -298,6 +330,8 @@ export function validGraphAutomaticRecoveryResponse(request: GraphAutomaticRecov
 }
 export function validGraphTerminalRecoveryResponse(command: GraphTerminalRecoveryCommand, value: unknown): value is GraphTerminalRecoveryResponse {
   if (!object(value) || !object(value.policy) || value.capability !== GRAPH_AUTOMATIC_RECOVERY_CAPABILITY
+    || value.unspent_child_revision !== GRAPH_AUTOMATIC_UNSPENT_CHILD_REVISION
+    || value.unspent_child_proof_revision !== GRAPH_AUTOMATIC_UNSPENT_CHILD_PROOF_REVISION
     || value.adoption_revision !== GRAPH_AUTOMATIC_ADOPTION_REVISION || value.command !== "terminal_recover") return false;
   const policy = value.policy;
   if (Object.keys(GRAPH_AUTOMATIC_RECOVERY_POLICY).some(key => policy[key] !== GRAPH_AUTOMATIC_RECOVERY_POLICY[key as keyof typeof GRAPH_AUTOMATIC_RECOVERY_POLICY])
@@ -343,7 +377,18 @@ export function createGraphAutomaticRecoveryTransport(sdk: IIIClient) {
   async function transport(command: GraphRecoveryCommand | GraphTerminalRecoveryCommand): Promise<GraphAutomaticRecoveryResponse | GraphTerminalRecoveryResponse> {
     const request: GraphAutomaticRecoveryRequest = { action: "graph_automatic_recovery", request: command };
     validateGraphAutomaticRecoveryRequest(request);
-    const result = await sdk.trigger<GraphAutomaticRecoveryRequest, unknown>({ function_id: "state::storage", payload: request, timeoutMs: 30_000 });
+    let result: unknown;
+    try {
+      result = await sdk.trigger<GraphAutomaticRecoveryRequest, unknown>({ function_id: "state::storage", payload: request, timeoutMs: 30_000 });
+    } catch (error) {
+      const record = error instanceof Error ? error as Error & { function_id?: unknown; code?: unknown } : null;
+      if (command.command === "prepare" && record
+        && (record.function_id === undefined || record.function_id === "state::storage")
+        && (record.code === "STATE_GRAPH_AUTOMATIC_UNSPENT_PREPARE_WAIT_V1"
+          || /\bSTATE_GRAPH_AUTOMATIC_UNSPENT_PREPARE_WAIT_V1\b/.test(record.message.slice(0, 8192))))
+        throw new GraphAutomaticUnspentPrepareWait(command.anchor.job_id);
+      throw error;
+    }
     if (command.command === "terminal_recover") {
       if (!validGraphTerminalRecoveryResponse(command, result)) throw new Error("STATE_GRAPH_AUTOMATIC_INVALID_RESPONSE");
       return result;

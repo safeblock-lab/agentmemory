@@ -4,6 +4,7 @@ import { KV, fingerprintId } from "../state/schema.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { SummaryBudgetError } from "./summary-budget.js";
 import type { ManualOperation, SummaryQueueUnit } from "./summary-queue.js";
+import { summaryPromptCorrectionReady } from "./summary-prompt-correction.js";
 
 export interface SummaryRecoveryConstruction {
   state: "creating" | "ready";
@@ -26,6 +27,7 @@ export function zeroSpendSummaryIdentity(predecessor: SummaryQueueJob, root: Sum
 }
 
 export async function summaryRecoveryReady(kv: StateKV, job: SummaryQueueJob): Promise<boolean> {
+  if (!await summaryPromptCorrectionReady(kv, job)) return false;
   const journal = await kv.get<SummaryRecoveryConstruction>(KV.state, summaryConstructionKey(job.id));
   if (!journal) return job.zeroSpendRecoveryOfJobId === undefined;
   return journal.state === "ready" && journal.job.id === job.id && journal.job.sessionId === job.sessionId &&

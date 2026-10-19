@@ -1,3 +1,4 @@
+import { GraphWorkQueueDrainingError, peekGraphWorkQueue } from "../state/graph-work-queue.js";
 import { randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { IIIClient } from "iii-sdk";
@@ -13,7 +14,7 @@ import { graphDispatchBlocker, graphFailureDiagnostic, graphResult, recoverGraph
 import { graphAutomaticRecoveryView } from "./graph-automatic-workflow.js";
 import { logger } from "../logger.js";
 import { readGraphTerminalRecovery, type GraphTerminalRecoveryLink } from "./graph-automatic-terminal.js";
-import { GRAPH_AUTOMATIC_ADOPTION_REVISION } from "../state/graph-automatic-recovery.js";
+import { GRAPH_AUTOMATIC_ADOPTION_REVISION, GRAPH_AUTOMATIC_UNSPENT_CHILD_REVISION, isGraphUnspentPrepareWaitResult } from "../state/graph-automatic-recovery.js";
 import type { GraphAutomaticRecoveryView } from "./graph-automatic-workflow.js";
 import { readGraphSessionCapture } from "./graph-session-capture.js";
 
@@ -126,9 +127,60 @@ export function registerGraphDispatch(sdk: IIIClient, kv: StateKV, execute: Exec
     return native;
   }
 
-  async function reconcile(intent: GraphDispatchIntent): Promise<unknown | undefined> {
+  async function retireSuperseded(intent: GraphDispatchIntent, lockHeld: boolean): Promise<unknown | undefined> {
+    const old = intent.automaticTerminalLink;
+    if (intent.state !== "pending" || !old) return undefined;
+    const saved = await readGraphTerminalRecovery(kv, old.sourceJobId);
+    const next = saved?.link;
+    const epoch = old.adoption?.epoch ?? 0;
+    const newerEpoch = next?.adoption?.epoch;
+    const reservation = saved?.recovery?.reservation;
+    if (!saved || saved.version !== 1 || saved.sourceJobId !== old.sourceJobId
+      || typeof saved.sourceJobVersion !== "string" || !/^(?:0|[1-9][0-9]*)$/.test(saved.sourceJobVersion)
+      || !next || next.sourceJobId !== old.sourceJobId || next.jobId !== old.jobId || next.slotId !== old.slotId
+      || intent.jobId !== old.jobId || next.mode !== old.mode || next.mode !== "provider"
+      || saved.adoptionRevision !== GRAPH_AUTOMATIC_ADOPTION_REVISION
+      || saved.recovery?.adoptionRevision !== GRAPH_AUTOMATIC_ADOPTION_REVISION
+      || saved.recovery.slotId !== old.slotId || saved.outcome.sourceJobId !== old.sourceJobId
+      || saved.outcome.replacementJobId !== old.jobId
+      || !next.adoption || next.adoption.revision !== GRAPH_AUTOMATIC_ADOPTION_REVISION
+      || typeof old.regenerationId !== "string" || !old.regenerationId
+      || typeof next.regenerationId !== "string" || !next.regenerationId
+      || next.adoption.regenerationId !== next.regenerationId || next.regenerationId === old.regenerationId
+      || !Number.isSafeInteger(epoch) || epoch < 0 || epoch >= Number.MAX_SAFE_INTEGER
+      || old.adoption && (old.adoption.revision !== GRAPH_AUTOMATIC_ADOPTION_REVISION
+        || old.adoption.regenerationId !== old.regenerationId || epoch < 1)
+      || !Number.isSafeInteger(newerEpoch) || newerEpoch! <= epoch || newerEpoch! >= Number.MAX_SAFE_INTEGER
+      || !reservation || reservation.epoch !== newerEpoch
+      || reservation.attempt_ordinal !== 1 || reservation.adoption_count !== newerEpoch
+      || canonical({ selection: next.selection }) !== canonical({ selection: old.selection })
+      || typeof saved.dispatchIntentId !== "string" || !/^graphintent_[a-f0-9]{64}$/.test(saved.dispatchIntentId)
+      || saved.dispatchIntentId === intent.id) return undefined;
+    const successor = await read(saved.dispatchIntentId);
+    if (!successor || successor.id !== saved.dispatchIntentId || successor.jobId !== intent.jobId
+      || successor.digest !== intent.digest || successor.captureParts !== intent.captureParts
+      || canonical({ link: successor.automaticTerminalLink }) !== canonical({ link: next })) throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
+    const native = await terminalSnapshot(next);
+    if (native.root_id !== saved.recovery.rootId || native.slot_id !== old.slotId
+      || native.reservation?.attempt_ordinal !== 1 || native.reservation.epoch !== newerEpoch
+      || native.reservation.adoption_count !== newerEpoch
+      || native.reservation.attempt_id !== reservation.attempt_id)
+      throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
+    const retire = async () => {
+      const latest = await read(intent.id);
+      if (!latest || latest.state !== "pending" || latest.id !== intent.id || latest.jobId !== intent.jobId
+        || latest.digest !== intent.digest || canonical({ link: latest.automaticTerminalLink }) !== canonical({ link: old }))
+        return { success: true, stale: true, jobId: intent.jobId };
+      await write({ ...latest, state: "failed", failureCode: "GRAPH_DISPATCH_SUPERSEDED", updatedAt: new Date().toISOString() });
+      return { success: false, failed: true, stopped: true, superseded: true, jobId: intent.jobId };
+    };
+    return lockHeld ? retire() : lock(intent.id, retire);
+  }
+  async function reconcile(intent: GraphDispatchIntent, lockHeld = false): Promise<unknown | undefined> {
     let job = await kv.get<{ state: string; recoveryStopped?: boolean; failureCode?: string; continuationState?: { version?: unknown }; captureDigest?: string; result?: Parameters<typeof graphResult>[0]; automaticRecovery?: GraphAutomaticRecoveryView }>(KV.graphJobs, intent.jobId);
     if (!job && intent.automaticTerminalLink) {
+      const superseded = await retireSuperseded(intent, lockHeld);
+      if (superseded !== undefined) return superseded;
       const current = graphAutomaticRecoveryView(await terminalSnapshot(intent.automaticTerminalLink));
       if (current.action === "none") {
         if (intent.state === "pending") await write({ ...intent, state: "failed", failureCode: current.reason ?? "GRAPH_AUTOMATIC_TERMINAL", updatedAt: new Date().toISOString() });
@@ -231,14 +283,16 @@ export function registerGraphDispatch(sdk: IIIClient, kv: StateKV, execute: Exec
         || data.selected.sourceFingerprint !== intent.digest || data.selected.deliveryId !== data.deliveryId)) throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
       if (data.selected) await selectedRequest(intent, data.selected);
       if (data.selected && intent.state === "pending" && intent.executionOrigin !== "selected") throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
-      const completed = await reconcile(intent);
+      const completed = await reconcile(intent, true);
       if (completed !== undefined) return completed;
       if (intent.state !== "pending") return { success: true, completed: intent.state === "completed", failed: intent.state === "failed", jobId: intent.jobId };
       if (!data.selected && isBackgroundRecoveryPaused()) return defer(intent, { failureCode: "GRAPH_RECOVERY_PAUSED" });
       let groupedWork = false;
       try {
         const blocker = await withSelectedGraphOrigin(data.selected, () => graphDispatchBlocker(kv));
-        const original = await kv.get<{ automaticRecovery?: { replacementJobId: string | null } }>(KV.graphJobs, intent.jobId);
+        const original = await kv.get<{ state?: string; recoveryStopped?: boolean; automaticRegenerationId?: string;
+          automaticReplacementOf?: string; automaticRegenerationClaimedSlot?: string;
+          automaticRecovery?: { replacementJobId: string | null } }>(KV.graphJobs, intent.jobId);
         if (blocker && blocker.id !== intent.jobId && blocker.id !== original?.automaticRecovery?.replacementJobId) return defer(intent, { blockingJobId: blocker.id,
           ...(blocker.recoveryAfter ? { retryAfter: blocker.recoveryAfter } : {}) });
         const request = await load(intent);
@@ -247,6 +301,7 @@ export function registerGraphDispatch(sdk: IIIClient, kv: StateKV, execute: Exec
           if (job?.recoveryStopped || job?.recoveryAfter && Date.parse(job.recoveryAfter) > Date.now()) return defer(intent, { failureCode: "STATE_GRAPH_RECOVERY_REQUIRED" });
         }
         groupedWork = request.graphWorkGroupsVersion === 2;
+        if (peekGraphWorkQueue(kv).draining) throw new GraphWorkQueueDrainingError();
         const active = { ...intent, attempts: intent.attempts + (groupedWork ? 0 : 1), updatedAt: new Date().toISOString() };
         await write(active);
         const executeRequest = () => withSelectedGraphOrigin(data.selected, () => withSelectedGraphGeneration(data.selected,
@@ -255,7 +310,18 @@ export function registerGraphDispatch(sdk: IIIClient, kv: StateKV, execute: Exec
           const link = intent.automaticTerminalLink;
           const native = await terminalSnapshot(link);
           const current = graphAutomaticRecoveryView(native);
-          if (current.action === "none") {
+          const reservation = native.reservation;
+          const canReachNativePreparation = link.mode === "provider"
+            && native.unspent_child_revision === GRAPH_AUTOMATIC_UNSPENT_CHILD_REVISION
+            && native.root_id === link.slotId && native.slot_id === link.slotId
+            && native.new_job_id === intent.jobId && native.regeneration_id === link.regenerationId
+            && ["GRAPH_AUTOMATIC_SLOT_EXHAUSTED", "GRAPH_AUTOMATIC_REGENERATION_DEADLINE", "GRAPH_AUTOMATIC_PREPARED_DEADLINE"].includes(native.reason ?? "")
+            && reservation?.attempt_ordinal === 1 && reservation.state === "expired"
+            && reservation.consumed === false && reservation.capture === null && reservation.claim_present === false
+            && original?.state === "staging" && original.recoveryStopped !== true
+            && original.automaticReplacementOf === link.sourceJobId && original.automaticRegenerationId === link.regenerationId
+            && original.automaticRegenerationClaimedSlot === undefined;
+          if (current.action === "none" && !canReachNativePreparation) {
             await write({ ...active, state: "failed", failureCode: current.reason ?? "GRAPH_AUTOMATIC_TERMINAL", updatedAt: new Date().toISOString() });
             return { success: false, failed: true, stopped: true, jobId: active.jobId, automaticRecovery: current };
           }
@@ -271,6 +337,10 @@ export function registerGraphDispatch(sdk: IIIClient, kv: StateKV, execute: Exec
           ? await withGraphAutomaticRegeneration(intent.automaticTerminalLink.regenerationId, intent.automaticTerminalLink.sourceJobId, executeRequest,
             intent.automaticTerminalLink.mode === "local_replay" ? intent.automaticTerminalLink.replayRef : undefined, intent.automaticTerminalLink.selection)
           : await executeRequest();
+        if (isGraphUnspentPrepareWaitResult(result)) {
+          if (result.jobId !== active.jobId) throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
+          return defer(active, { attempts: intent.attempts, retryAfter: result.retryAfter });
+        }
         const progress = groupedContinuation(result);
         if (progress) {
           const latest = await read(active.id);
@@ -290,9 +360,27 @@ export function registerGraphDispatch(sdk: IIIClient, kv: StateKV, execute: Exec
           }
           return queued(continuation, { progress });
         }
-        if (await reconcile(active) === undefined) await write({ ...active, state: "completed", updatedAt: new Date().toISOString() });
+        if (await reconcile(active, true) === undefined) await write({ ...active, state: "completed", updatedAt: new Date().toISOString() });
         return result;
       } catch (error) {
+        if (error instanceof GraphWorkQueueDrainingError) {
+          if (!groupedWork) {
+            try {
+              const latest = await read(intent.id);
+              if (latest?.state === "pending" && latest.id === intent.id && latest.jobId === intent.jobId
+                && latest.deliveryId === data.deliveryId && latest.deliveryId === intent.deliveryId
+                && latest.claimedAt === intent.claimedAt && latest.claimUntil === intent.claimUntil
+                && latest.digest === intent.digest && latest.captureParts === intent.captureParts
+                && latest.attempts === intent.attempts + 1
+                && canonical({ link: latest.automaticTerminalLink }) === canonical({ link: intent.automaticTerminalLink }))
+                await write({ ...latest, attempts: intent.attempts });
+            } catch {
+              logger.warn("Graph drain counter compensation outcome unknown", { code: "GRAPH_DRAIN_COMPENSATION_UNKNOWN" });
+              return queued(intent, { reason: "graph_work_queue_draining", counterCompensation: "unknown" });
+            }
+          }
+          return queued(intent, { reason: "graph_work_queue_draining" });
+        }
         if (error instanceof GraphTerminalLocalDeliveryStopped) return queued((await read(intent.id)) ?? intent, {
           localOnly: true, reason: "captured_local_delivery_already_materialized",
         });

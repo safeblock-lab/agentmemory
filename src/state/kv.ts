@@ -10,7 +10,7 @@ import {
   type GraphStorageMetadataPrepareResult,
 } from './storage.js'
 import {
-  commitStateBatch, getVersionedState, requestStateLease, pruneStateWork,
+  commitStateBatch, getVersionedState, requestStateLease, pruneStateWork, StateTransactionError,
   type StateBatchReceipt, type StateGraphGuard, type StateGraphLease,
   type StateLeaseReleased, type StateLeaseRequest, type StatePreparedBatch,
   type StateTransactionTrigger, type StateVersioned, type StateGraphPruneRequest, type StateAuditPruneRequest, type StatePruneResult,
@@ -27,6 +27,18 @@ import {
 
 export type { StatePage, StatePageOptions } from './state-pages.js'
 export type { StateGraphGuard, StateGraphLease, StateLeaseRequest, StatePreparedBatch, StateBatchReceipt, StateVersioned } from './state-transactions.js'
+
+export type StateUpdateMutationOutcome = 'not_applied' | 'applied_with_errors' | 'unknown'
+export interface StateUpdateOperationError { code: string; op_index: number }
+export class StateUpdateError extends Error {
+  readonly name = 'StateUpdateError'
+  readonly retryable = false
+  constructor(
+    readonly code: 'STATE_UPDATE_REJECTED' | 'STATE_UPDATE_PARTIAL_FAILURE' | 'STATE_TX_INVALID_RESPONSE',
+    readonly mutationOutcome: StateUpdateMutationOutcome,
+    readonly operationErrors: readonly StateUpdateOperationError[] = [],
+  ) { super(code) }
+}
 
 type StateWriteListener = (event: { scope: string; key: string; value: unknown }) => void
 
@@ -108,10 +120,15 @@ export class StateKV {
   }
 
   async set<T = unknown>(scope: string, key: string, value: T): Promise<T> {
-    const committedValue = await this.sdk.trigger<{ scope: string; key: string; value: T }, T>({
+    const result = await this.sdk.trigger<{ scope: string; key: string; value: T }, unknown>({
       function_id: 'state::set',
       payload: { scope, key, value },
     })
+    if (typeof result !== 'object' || result === null || Array.isArray(result)
+      || Object.keys(result).length !== 2 || !Object.hasOwn(result, 'old_value') || !Object.hasOwn(result, 'new_value')) {
+      throw new StateTransactionError('STATE_TX_INVALID_RESPONSE')
+    }
+    const committedValue = (result as { new_value: T }).new_value
     notifyStateWrite({ scope, key, value: committedValue })
     return committedValue
   }
@@ -119,17 +136,39 @@ export class StateKV {
   async update<T = unknown>(
     scope: string,
     key: string,
-    ops: Array<{ type: string; path: string; value?: unknown }>,
+    ops: Array<{ type: string; path: string; value?: unknown; by?: number }>,
   ): Promise<T> {
-    const committedValue = await this.sdk.trigger<
-      { scope: string; key: string; ops: Array<{ type: string; path: string; value?: unknown }> },
-      T
+    const result = await this.sdk.trigger<
+      { scope: string; key: string; ops: Array<{ type: string; path: string; value?: unknown; by?: number }> },
+      unknown
     >({
       function_id: 'state::update',
       payload: { scope, key, ops },
     })
-    notifyStateWrite({ scope, key, value: committedValue })
-    return committedValue
+    const invalid = (): never => { throw new StateUpdateError('STATE_TX_INVALID_RESPONSE', 'unknown') }
+    if (typeof result !== 'object' || result === null || Array.isArray(result)
+      || !Object.hasOwn(result, 'old_value') || !Object.hasOwn(result, 'new_value')
+      || Object.keys(result).some(key => !['old_value', 'new_value', 'errors'].includes(key))) invalid()
+    const envelope = result as { new_value: T; errors?: unknown }
+    const failures: StateUpdateOperationError[] = []
+    if (Object.hasOwn(envelope, 'errors')) {
+      if (!Array.isArray(envelope.errors)) return invalid()
+      for (const error of envelope.errors) {
+        if (typeof error !== 'object' || error === null || Array.isArray(error)
+          || !Object.hasOwn(error, 'op_index') || !Number.isSafeInteger(error.op_index) || error.op_index < 0
+          || !Object.hasOwn(error, 'code') || typeof error.code !== 'string' || !error.code.length
+          || !Object.hasOwn(error, 'message') || typeof error.message !== 'string'
+          || Object.keys(error).some(key => !['op_index', 'code', 'message', 'doc_url'].includes(key))
+          || Object.hasOwn(error, 'doc_url') && typeof error.doc_url !== 'string') return invalid()
+        failures.push({ code: /^[A-Za-z][A-Za-z0-9_.-]{0,95}$/.test(error.code) ? error.code : 'UNKNOWN', op_index: error.op_index })
+      }
+    }
+    if (failures.length && (envelope.errors as Array<{ code: string }>).some(error => error.code.startsWith('append_bounded.'))) {
+      throw new StateUpdateError('STATE_UPDATE_REJECTED', 'not_applied', failures)
+    }
+    notifyStateWrite({ scope, key, value: envelope.new_value })
+    if (failures.length) throw new StateUpdateError('STATE_UPDATE_PARTIAL_FAILURE', 'applied_with_errors', failures)
+    return envelope.new_value
   }
 
   async delete(scope: string, key: string): Promise<void> {

@@ -1,3 +1,5 @@
+import { GraphWorkQueueDrainingError } from "../state/graph-work-queue.js";
+import { GraphAutomaticUnspentPrepareWait, graphUnspentPrepareWaitResult } from "../state/graph-automatic-recovery.js";
 import type { IIIClient } from "iii-sdk";
 import { IndexedRetrievalError } from "../state/indexed-retrieval.js";
 import type {
@@ -1862,7 +1864,12 @@ export async function registerGraphFunction(
       });
       return result;
     } catch (error) {
-      if (error instanceof GraphTerminalLocalDeliveryStopped) throw error;
+      if (error instanceof GraphTerminalLocalDeliveryStopped || error instanceof GraphWorkQueueDrainingError) throw error;
+      if (error instanceof GraphAutomaticUnspentPrepareWait) {
+        await recordOperation(kv, "mem::graph-extract", "queued", {}, undefined,
+          { operationId, jobId, executionLevel: "unit", durationMs: Date.now() - startMs });
+        return graphUnspentPrepareWaitResult(error);
+      }
       await recordOperation(kv, "mem::graph-extract", "failed", {}, undefined, {
         operationId, jobId,
         executionLevel: "unit", durationMs: Date.now() - startMs, errorCode: "graph_extraction_failed",

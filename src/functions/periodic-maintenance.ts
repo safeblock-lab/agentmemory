@@ -161,6 +161,7 @@ async function apply(
 async function reconcilePending(input: PeriodicCompactionInput): Promise<PeriodicCompactionResult | null> {
   const request = input.progress.pendingRequest;
   if (!request) return null;
+  await input.refreshSameLease();
   const saved = await readReceipt(input.sdk, request);
   if (saved.status === "applied") {
     await saveApplied(input, request, saved.result);
@@ -175,7 +176,34 @@ async function reconcilePending(input: PeriodicCompactionInput): Promise<Periodi
     await input.persistProgress();
     return result("pending_generation_changed", null, input.progress);
   }
-  if (!sameFence(request, input.lease)) return result("pending_fence_stale", null, input.progress);
+  if (!sameFence(request, input.lease)) {
+    if (saved.status !== "not_found" || saved.operation_id !== request.operation_id || saved.result !== null
+      || !["activate", "copy", "cut", "collect"].includes(request.step) || current.phase === "rollback"
+      || request.lease_owner_id === input.lease.ownerId || !Number.isSafeInteger(input.lease.fence)
+      || input.lease.fence <= request.lease_fence) {
+      return result("pending_fence_stale", null, input.progress);
+    }
+    await input.refreshSameLease();
+    const previousProof = input.progress.lastNotApplied;
+    input.progress.lastNotApplied = {
+      request: { ...request }, receiptStatus: "not_found", receiptOperationId: request.operation_id,
+      observedGeneration: current.generation, observedPhase: current.phase,
+      verifiedAt: new Date().toISOString(),
+      currentLease: { ownerId: input.lease.ownerId, fence: input.lease.fence },
+    };
+    input.progress.pendingRequest = null;
+    input.progress.lastDisposition = "previous_request_not_applied";
+    input.progress.lastErrorCode = null;
+    try {
+      await input.persistProgress();
+    } catch (error) {
+      input.progress.pendingRequest = request;
+      input.progress.lastNotApplied = previousProof;
+      input.progress.lastDisposition = "outcome_unknown";
+      throw error;
+    }
+    return { ...result("previous_request_not_applied", null, input.progress), operationId: request.operation_id };
+  }
   if (!isPeriodicAdmissionReady(input.admission)) return result("admission_pending", null, input.progress);
   if (!input.admission.runtimeCompatible) return result("runtime_compatibility_pending", null, input.progress);
 

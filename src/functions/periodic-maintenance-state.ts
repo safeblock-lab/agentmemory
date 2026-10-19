@@ -40,6 +40,18 @@ export interface PeriodicCompactionProgress {
   lastOperationId: string | null;
   lastDisposition: string | null;
   lastErrorCode: string | null;
+  lastNotApplied: PeriodicCompactionNotApplied | null;
+  lastNotAppliedRaw: unknown | null;
+}
+
+export interface PeriodicCompactionNotApplied {
+  request: NativeCompactionApply;
+  receiptStatus: "not_found";
+  receiptOperationId: string;
+  observedGeneration: string;
+  observedPhase: NativeCompactionStatus["phase"];
+  verifiedAt: string;
+  currentLease: PeriodicMaintenanceLease;
 }
 
 export interface PeriodicCompactionCycle {
@@ -74,6 +86,7 @@ export type PeriodicCompactionDisposition =
   | "pending_fence_stale"
   | "pending_generation_changed"
   | "manual_reconciliation_required"
+  | "previous_request_not_applied"
   | "terminal_evidence_pending"
   | "candidate_terminal";
 
@@ -210,12 +223,29 @@ function parseStatus(value: unknown): NativeCompactionStatus | null {
   };
 }
 
+function parseNotApplied(value: unknown): PeriodicCompactionNotApplied | null {
+  if (!isRecord(value)) return null;
+  const request = parseApplyRequest(value.request);
+  const phase = compactionPhase(value.observedPhase);
+  const lease = isRecord(value.currentLease) ? value.currentLease : null;
+  if (!request || request.step === "rollback" || !phase || phase === "rollback"
+    || value.receiptStatus !== "not_found" || value.receiptOperationId !== request.operation_id
+    || value.observedGeneration !== request.expected_generation
+    || typeof value.verifiedAt !== "string" || !Number.isFinite(Date.parse(value.verifiedAt))
+    || !lease || typeof lease.ownerId !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(lease.ownerId)
+    || lease.ownerId === request.lease_owner_id || !count(lease.fence) || lease.fence <= request.lease_fence) return null;
+  return { request, receiptStatus: "not_found", receiptOperationId: request.operation_id,
+    observedGeneration: request.expected_generation, observedPhase: phase, verifiedAt: value.verifiedAt,
+    currentLease: { ownerId: lease.ownerId, fence: lease.fence } };
+}
+
 export function emptyPeriodicCompactionProgress(): PeriodicCompactionProgress {
   return {
     cycle: null, cycleRaw: null, growthBaseline: null, growthBaselineRaw: null,
     pendingRequest: null, pendingRequestRaw: null, recoveryRequired: false,
     lastStatus: null, lastAppliedRequest: null, lastApplyResult: null,
     lastOperationId: null, lastDisposition: null, lastErrorCode: null,
+    lastNotApplied: null, lastNotAppliedRaw: null,
   };
 }
 
@@ -231,6 +261,9 @@ export function normalizePeriodicCompactionProgress(value: unknown): PeriodicCom
   const rawPending = row.pendingRequest;
   const pendingRequest = rawPending == null ? null : parseApplyRequest(rawPending);
   const invalidPending = rawPending != null && pendingRequest === null;
+  const rawNotApplied = row.lastNotApplied;
+  const lastNotApplied = rawNotApplied == null ? null : parseNotApplied(rawNotApplied);
+  const invalidNotApplied = rawNotApplied != null && lastNotApplied === null;
   const lastAppliedRequest = parseApplyRequest(row.lastAppliedRequest);
   const parsedApplyResult = parseStatus(row.lastApplyResult);
   const validApplyResult = lastAppliedRequest && parsedApplyResult
@@ -252,8 +285,10 @@ export function normalizePeriodicCompactionProgress(value: unknown): PeriodicCom
     growthBaselineRaw: invalidBaseline ? rawBaseline : row.growthBaselineRaw ?? null,
     pendingRequest,
     pendingRequestRaw: invalidPending ? rawPending : row.pendingRequestRaw ?? null,
-    recoveryRequired: invalidBaseline || invalidPending || invalidCycle || row.recoveryRequired === true
-      || row.cycleRaw != null || row.growthBaselineRaw != null || row.pendingRequestRaw != null,
+    recoveryRequired: invalidBaseline || invalidPending || invalidCycle || invalidNotApplied || row.recoveryRequired === true
+      || row.cycleRaw != null || row.growthBaselineRaw != null || row.pendingRequestRaw != null || row.lastNotAppliedRaw != null,
+    lastNotApplied,
+    lastNotAppliedRaw: invalidNotApplied ? rawNotApplied : row.lastNotAppliedRaw ?? null,
     lastStatus: parseStatus(row.lastStatus),
     lastAppliedRequest,
     lastApplyResult: validApplyResult,

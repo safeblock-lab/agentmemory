@@ -8,11 +8,16 @@ La capacidad anunciada es `state::recovery_inspection_v1`.
 ## Paginación nativa opt-in `keyset_live`
 
 La fuente añade `consistency: "keyset_live"` a `state::list_page`, anunciada
-como `state::list_page_keyset_live_v1`. El paquete conjunto de aplicación 0.9.90
-y engine nativo con las 21 capacidades CLI requeridas está instalado. Las
-compilaciones de aplicación y nativo y la instalación terminaron con salida 0;
-la instalación concluyó el 2026-10-19 a las 06:01:03 UTC. No se ejecutaron tests. La instalación no
-acredita aceptación operativa completa ni resolución de todas las incidencias.
+como `state::list_page_keyset_live_v1`. Las actualizaciones de aplicación y motor
+se instalaron conjuntamente por última vez el 2026-10-19 a las 09:12:39 UTC,
+con 22 capacidades nativas anunciadas. Los procesos anteriores finalizaron
+mediante CTRL-C normal; no se copió SQLite y se restauró el watchdog. La
+actualización nativa anterior, de las 08:00 UTC, conservó la aplicación. A las 08:37 UTC se observó
+la ausencia inesperada de ambos procesos; el arranque se recuperó a las 08:39:41
+UTC corrigiendo el manejo de sustitución de archivos del launcher existente,
+sin reinstalar ni copiar SQLite. La causa de la salida anterior sigue siendo
+desconocida. No se ejecutaron tests. La instalación no acredita
+aceptación operativa completa ni resolución de todas las incidencias.
 
 El modo es opt-in. Omitir `consistency` conserva la paginación estricta y sus
 cursores v2/v3, sin cambiar su validación ni tolerancia a mutaciones. Una llamada
@@ -168,23 +173,33 @@ de reparación `explicitEmptyXML`, con cero nodos y cero aristas. Su workflow
 vinculado figura como `COMPLETED`, con 10 nodos, 20 aristas y cinco unidades,
 según la observación del 2026-10-19 a las 05:01:38 UTC. La fecha de finalización
 precede a la última instalación: no se atribuye ese resultado a dicha
-instalación. Se observó la adopción normal de una segunda reserva con época 1;
-la última observación retenida, a las 05:42 UTC, aún la mostraba caducada,
-sin gasto y sin claim privado. No se ha establecido la finalización de su
-workflow. Los resultados posteriores a la última instalación siguen pendientes.
+instalación. El job que bloqueaba el segundo workflow terminó, pero su hijo
+falló con `STATE_GRAPH_AUTOMATIC_REGENERATION_REQUIRED` mientras la caché seguía
+indicando que existía el hijo. La última actualización instalada implementa la
+recuperación automática de ese hijo caducado antes de ejecutarse; su resultado
+operativo en el workflow afectado sigue pendiente. Su finalización y la aceptación
+operativa completa siguen pendientes.
 Una inspección anterior de una copia aislada informó cobertura completa,
 `integrity_ok: true` y cero errores comprobados. Su alcance es esa copia, no la
 integridad actual del estado vivo.
 
 La fuente nativa actual cierra una semilla y límites finitos de posición para
 COPY, adopción del progreso legado sin reiniciar el cursor, cola coalescida para
-escrituras inline y no-ops de cabeceras sin cambios. COPY y la verificación de
-texto avanzan, pero GC, reclaim y el avance del baseline físico no están
-completos. No se ha demostrado reducción física ni un ciclo completo.
+escrituras inline y no-ops de cabeceras sin cambios. La última observación válida
+de mantenimiento del 2026-10-19 a las 08:41:30 UTC mostró el layout de texto en
+`CUTTING`, ordinal 4.969. La semilla COPY, el recorrido de filas, GC, el reclaim final y el avance
+del baseline físico seguían incompletos. Una observación posterior, a las 08:47
+UTC, registró avance del cursor sin demostrar finalización. Recuperar el arranque tras la ausencia
+posterior de los procesos no demuestra reanudación ni finalización del
+mantenimiento. No se ha demostrado reducción
+física ni un ciclo completo.
 Las nuevas peticiones COPY admiten hasta 1.024 filas, en chunks internos de 128
 con lookahead de 129 filas. Se conservan el límite de 1 MiB, el presupuesto de
 trabajo de 2.500 ms y el timeout de transporte de 45 segundos; esos límites no
 demuestran mejora de velocidad ni compactación completa.
+La actualización nativa instalada separa el SQL de primera página y continuación
+de COPY, eliminando el `OR` que elegía el modo. Su compilación terminó con salida
+0; la aceptación runtime completa sigue pendiente, sin mejora temporal medida.
 La aplicación programa la recuperación de arranque tras
 la política y el registro de funciones, antes de inicializar índices, con lecturas
 pareadas acotadas. La proyección de uso deja de condicionar la recuperación.
@@ -198,10 +213,47 @@ reclamada y que no exista slot hijo. Conserva la misma única reserva adicional;
 no crea otra autorización. La rotación de época no reinicia gasto ni permite
 reintentar resultados de proveedor desconocidos.
 
+La nueva recuperación de un hijo caducado antes de ejecutarse exige prueba
+nativa vinculada al mismo hijo y a su historial retenido. Conserva la misma
+reserva adicional y el historial de gasto; limita la recuperación a cuatro
+intentos por hora con un intervalo de 60 segundos, renueva la reserva de 120
+segundos antes de preparar y devuelve resultados tipados de espera. La fuente
+está compilada e instalada; aún no acredita reparación del workflow afectado.
+
+Los cambios adicionales compilados endurecen la reevaluación de revisión y
+caché mediante la prueba nativa requerida y reinician el cursor de consulta
+cuando cambia la selección. Retirar una operación antigua pendiente exige
+prueba atómica `notApplied` bajo el lease nuevo más fuerte; el estado local
+obsoleto no autoriza retirarla, reproducirla ni llamar de nuevo al proveedor.
+También se incluye un prompt específico para resúmenes de sesiones con pocos
+datos. El resultado de instalación y los resultados operativos de estos cambios
+siguen pendientes: no se acredita éxito del resumen antes no soportado,
+recuperación del grafo ni finalización de GC y reclaim.
+El intento de actualización posterior permanece en HOLD tras los 210 segundos
+de espera de cierre, sin haber copiado archivos de actualización. Los cambios
+adicionales de revisión correctora de resúmenes y diagnóstico acotado del drenaje
+de índices siguen en fuente. La poda opcional se aplaza hasta el
+cierre; no se presenta como ejecutada.
+
 La reevaluación de reservas caducadas y sin gasto exige prueba nativa fresca y
 conserva la misma reserva adicional y su presupuesto nativo. La migración de
 proyección terminal se limita al cursor incompatible. Los errores de candidato
 se atribuyen de forma segura sin exponer contenido raw.
+
+La aplicación instalada comprueba trabajo pendiente antes de reservar capacidad y retira
+únicamente trabajo supersedido con prueba canónica y nativa vinculada al
+fingerprint del sucesor. El cierre coordinado espera las promesas reales de
+callbacks, el trabajo FIFO y mantenimiento; las admisiones HTTP/MCP responden
+503 durante el drenaje. Tras 180 segundos sin finalizar mantiene HOLD, sin
+abortar el SDK ni forzar el cierre. La reentrada externa directa por SDK y el
+trabajo asíncrono desacoplado quedan fuera del seguimiento: no se garantiza
+atomicidad universal. Estas funciones están instaladas y aún requieren aceptación
+operativa completa. Los cambios adicionales del cierre por CLI se compilaron e
+instalaron a las 08:41:44 UTC mediante una actualización limitada a la CLI, sin
+reiniciar el backend. No se ejecutó una prueba funcional de cierre gradual;
+la instalación no acredita aceptación operativa. A las 08:43 UTC se restauró
+el estado habilitado original del watchdog sin forzar su ejecución; la tarea
+principal se mantuvo deshabilitada.
 
 La release sigue sin publicarse y en curso; los resultados operativos finales
 deben incorporarse antes de publicar.

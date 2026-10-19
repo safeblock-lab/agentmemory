@@ -23,7 +23,16 @@ export const REQUIRED_ENGINE_CAPABILITIES = [
   "state::list_page_keyset_live_v1",
   "state::graph_automatic_unspent_reservation_adoption_v1",
   "state::compact_copy_chunked_window_v1",
+  "state::graph_automatic_unspent_child_recovery_v1",
 ] as const;
+const UNSPENT_CHILD_REVISION = "unspent-child-recovery-v1";
+const UNSPENT_CHILD_PROOF_REVISION = "staging-checkpoint-recovery-v1";
+const UNSPENT_CHILD_MIGRATION = {
+  kind: "additive_table",
+  table: "engine_graph_auto_prepare_renewals",
+  destructive: false,
+  storageFormatChanged: false,
+} as const;
 export const PINNED_ENGINE_VERSION = "0.22.1";
 export const PINNED_ENGINE_REPOSITORY = "https://github.com/iii-hq/iii.git";
 export const PINNED_ENGINE_PATCH_PATH =
@@ -41,6 +50,9 @@ type EngineArtifactManifest = {
   schemaVersion: 1;
   engineVersion: string;
   capabilities: string[];
+  unspentChildRevision: typeof UNSPENT_CHILD_REVISION;
+  unspentChildProofRevision: typeof UNSPENT_CHILD_PROOF_REVISION;
+  migrationDeclaration: typeof UNSPENT_CHILD_MIGRATION;
   source: {
     repository: string;
     commit: string;
@@ -114,6 +126,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function hasRequiredUnspentChildMetadata(value: Record<string, unknown>): boolean {
+  const migration = value.migrationDeclaration;
+  return value.unspentChildRevision === UNSPENT_CHILD_REVISION &&
+    value.unspentChildProofRevision === UNSPENT_CHILD_PROOF_REVISION &&
+    isRecord(migration) &&
+    Object.keys(migration).length === Object.keys(UNSPENT_CHILD_MIGRATION).length &&
+    Object.entries(UNSPENT_CHILD_MIGRATION).every(([key, expected]) => migration[key] === expected);
+}
+
 function isSha256(value: unknown): value is string {
   return typeof value === "string" && /^[a-f0-9]{64}$/i.test(value);
 }
@@ -153,7 +174,8 @@ function parseManifest(
   if (
     expectedVersion !== PINNED_ENGINE_VERSION ||
     value.engineVersion !== expectedVersion ||
-    !hasRequiredEngineCapabilities(value.capabilities)
+    !hasRequiredEngineCapabilities(value.capabilities) ||
+    !hasRequiredUnspentChildMetadata(value)
   ) {
     return null;
   }
@@ -192,6 +214,9 @@ function parseManifest(
     schemaVersion: 1,
     engineVersion: value.engineVersion,
     capabilities: value.capabilities as string[],
+    unspentChildRevision: UNSPENT_CHILD_REVISION,
+    unspentChildProofRevision: UNSPENT_CHILD_PROOF_REVISION,
+    migrationDeclaration: UNSPENT_CHILD_MIGRATION,
     source: {
       repository: value.source.repository,
       commit: value.source.commit,
@@ -315,20 +340,14 @@ function hasRequiredEngineCapabilities(value: unknown): value is string[] {
 }
 
 export function hasRequiredEngineCapabilitiesOutput(output: string): boolean {
-  const trimmed = output.trim();
   try {
-    const parsed: unknown = JSON.parse(trimmed);
-    if (Array.isArray(parsed)) {
-      return hasRequiredEngineCapabilities(parsed);
-    }
-    if (isRecord(parsed) && Array.isArray(parsed.capabilities)) {
-      return hasRequiredEngineCapabilities(parsed.capabilities);
-    }
+    const parsed: unknown = JSON.parse(output.trim());
+    return isRecord(parsed) &&
+      parsed.unspent_child_proof_revision === UNSPENT_CHILD_PROOF_REVISION &&
+      hasRequiredEngineCapabilities(parsed.capabilities);
   } catch {
-    // The native probe may emit one capability per line.
+    return false;
   }
-  const advertised = trimmed.split(/[\r\n,\s]+/).filter(Boolean);
-  return hasRequiredEngineCapabilities(advertised);
 }
 
 export function createStateMigrationReceipt(

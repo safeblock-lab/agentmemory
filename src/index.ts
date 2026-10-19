@@ -28,6 +28,7 @@ import {
 import { TypeSafeDecisionProvider } from "./providers/typesafe.js";
 import { LlmTaskRouter } from "./providers/task-router.js";
 import { StateKV } from "./state/kv.js";
+import { beginGraphWorkDrain } from "./state/graph-work-queue.js";
 import { createProviderAttemptBudgetTransport } from "./state/provider-attempt-budget.js";
 import { installProviderAttemptBudgetTransport } from "./providers/provider-attempt-budget.js";
 import { batchEffectKey } from "./state/batch-effects.js";
@@ -38,7 +39,7 @@ import { IndexedRetrievalError, createProjectIndexMaintenance } from './state/in
 import { IndexedLocalEmbedding } from './state/indexed-embedding.js';
 import { HybridSearch } from "./state/hybrid-search.js";
 import { IndexPersistence } from "./state/index-persistence.js";
-import { SHUTDOWN_FLUSH_TIMEOUT_MS, SHUTDOWN_HARD_EXIT_MS, settleWithin } from "./shutdown.js";
+import { SHUTDOWN_FLUSH_TIMEOUT_MS, SHUTDOWN_HARD_EXIT_MS, SHUTDOWN_ADMITTED_DRAIN_MS, settleWithin } from "./shutdown.js";
 import { registerPrivacyFunction } from "./functions/privacy.js";
 import { registerObserveFunction, extractImage } from "./functions/observe.js";
 import { registerImageQuotaCleanup } from "./functions/image-quota-cleanup.js";
@@ -85,7 +86,8 @@ import { registerGraphFunction } from "./functions/graph.js";
 import { registerGraphJobRecovery } from "./functions/graph-jobs.js";
 import { pruneTerminalGraphWork } from "./functions/graph-retention.js";
 import { registerIndexedSourceRecovery } from './functions/indexed-source-recovery.js';
-import { registerStorageMaintenance, releaseUnclaimedStorageMaintenanceTurn } from "./functions/storage-maintenance.js";
+import { registerStorageMaintenance, releaseUnclaimedStorageMaintenanceTurn, beginStorageMaintenanceDrain,
+  type StorageMaintenanceControllerSnapshot, type StorageMaintenanceForegroundObservation } from "./functions/storage-maintenance.js";
 import type { StorageForegroundPressure, StorageMaintenanceContinuation } from "./functions/physical-maintenance.js";
 import { registerGraphImportFunction } from "./functions/graph-import.js";
 import { registerConsolidationPipelineFunction } from "./functions/consolidation-pipeline.js";
@@ -318,7 +320,8 @@ function createStorageMaintenanceScheduler(
   log: (message: string) => void,
   pressure: () => StorageForegroundPressure,
   releaseUnclaimedTurn: () => void,
-): { wake: () => void; start: () => void; stop: () => void } {
+  lastObservedForeground: () => StorageMaintenanceForegroundObservation | null,
+): { wake: () => void; start: () => void; stop: () => void; stopAndDrain: () => Promise<void>; snapshot: () => StorageMaintenanceControllerSnapshot } {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let running: Promise<void> | null = null;
   let wakePending = false;
@@ -326,11 +329,23 @@ function createStorageMaintenanceScheduler(
   let started = false;
   let cooldownUntil = 0;
   let noProgress = 0;
-  const clearTimer = () => { if (timer !== undefined) clearTimeout(timer); timer = undefined; };
+  let nextDueAt: string | null = null;
+  let lastWindowStartedAt: string | null = null;
+  let lastWindowEndedAt: string | null = null;
+  let lastResultKind: StorageMaintenanceContinuation["kind"] | null = null;
+  let lastResultReason: string | null = null;
+  let lastResultAt: string | null = null;
+  let lastDecision: StorageMaintenanceControllerSnapshot["lastDecision"] = null;
+  const decide = (kind: NonNullable<StorageMaintenanceControllerSnapshot["lastDecision"]>["kind"], reason: string) => {
+    lastDecision = { at: new Date().toISOString(), kind, reason };
+  };
+  const clearTimer = () => { if (timer !== undefined) clearTimeout(timer); timer = undefined; nextDueAt = null; };
   const arm = (delay: number) => {
     clearTimer();
     if (stopped) return;
-    timer = setTimeout(() => { timer = undefined; wake(); }, Math.max(0, Math.ceil(delay)));
+    const waitMs = Math.max(0, Math.ceil(delay));
+    nextDueAt = new Date(Date.now() + waitMs).toISOString();
+    timer = setTimeout(() => { timer = undefined; nextDueAt = null; wake(); }, waitMs);
     timer.unref();
   };
   const wake = () => {
@@ -340,11 +355,13 @@ function createStorageMaintenanceScheduler(
     if (running) return;
     clearTimer();
     if (Date.now() < cooldownUntil) {
+      decide("cooldown", "scheduled_rest");
       releaseUnclaimedTurn();
       arm(cooldownUntil - Date.now());
       return;
     }
     if (isAutomaticStorageMaintenancePaused()) {
+      decide("paused", "paused");
       releaseUnclaimedTurn();
       wakePending = false;
       arm(60_000);
@@ -352,6 +369,7 @@ function createStorageMaintenanceScheduler(
     }
     const foreground = pressure();
     if (foreground.busy) {
+      decide("foreground", foreground.phase === "active" ? "active_requests" : "quiet_window");
       releaseUnclaimedTurn();
       wakePending = false;
       const delay = Math.max(1_000, Math.min(10_000,
@@ -363,8 +381,15 @@ function createStorageMaintenanceScheduler(
     wakePending = false;
     let outcome: StorageMaintenanceContinuation = { version: 1, kind: "hold", reason: "invocation_unknown",
       incomplete: true, progressMade: false, retryAfterMs: 300_000 };
+    lastWindowStartedAt = new Date().toISOString();
+    decide("dispatch", "automatic_tick");
     running = runAutomaticStorageMaintenance(sdk, log).then(next => { outcome = next; }).catch(() => {}).finally(() => {
       running = null;
+      lastWindowEndedAt = new Date().toISOString();
+      lastResultAt = lastWindowEndedAt;
+      lastResultKind = outcome.kind;
+      lastResultReason = outcome.reason;
+      decide("result", outcome.reason);
       if (stopped) { releaseUnclaimedTurn(); return; }
       const requested = wakePending;
       wakePending = false;
@@ -391,8 +416,20 @@ function createStorageMaintenanceScheduler(
       arm(delay);
     });
   };
+  const stop = () => { stopped = true; decide("stopped", "shutdown"); wakePending = false; clearTimer(); releaseUnclaimedTurn(); };
   return { wake, start: () => { if (!started && !stopped) { started = true; wake(); } },
-    stop: () => { stopped = true; wakePending = false; clearTimer(); releaseUnclaimedTurn(); } };
+    snapshot: () => {
+      const now = Date.now();
+      const foreground = lastObservedForeground();
+      return { sampledAt: new Date(now).toISOString(), started, stopped, running: running !== null,
+        lastWindowStartedAt, lastWindowEndedAt, lastResultKind, lastResultReason, lastResultAt,
+        lastDecision: lastDecision === null ? null : { ...lastDecision }, nextDueAt,
+        cooldownUntil: cooldownUntil > 0 ? new Date(cooldownUntil).toISOString() : null,
+        cooldownRemainingMs: Math.max(0, cooldownUntil - now), wakePending,
+        paused: isAutomaticStorageMaintenancePaused(),
+        lastObservedForeground: foreground === null ? null : { ...foreground } };
+    },
+    stop, stopAndDrain: () => { stop(); return running ?? Promise.resolve(); } };
 }
 
 export async function runAutomaticTemporalRecovery(sdk: Pick<IIIClient, "trigger">): Promise<void> {
@@ -608,6 +645,19 @@ process.on("unhandledRejection", (reason) => {
 });
 
 async function main() {
+  let closing = false;
+  const backgroundTimers = new Set<ReturnType<typeof setInterval>>();
+  const activeHandlers = new Set<Promise<unknown>>();
+  const activeHandlerDetails = new Map<Promise<unknown>, { functionId: string; startedAtMs: number }>();
+  const handlerIdleWaiters = new Set<() => void>();
+  const waitForHandlers = async () => {
+    while (activeHandlers.size > 0) await new Promise<void>(resolve => handlerIdleWaiters.add(resolve));
+  };
+  const backgroundInterval = (run: () => void | Promise<void>, delay: number) => {
+    const timer = setInterval(() => { if (!closing) void run(); }, delay);
+    backgroundTimers.add(timer);
+    return timer;
+  };
   // Fold ~/.agentmemory/.env into process.env before anything reads config
   // or raw process.env. Only-if-unset, so real process.env still wins.
   hydrateProcessEnvFromFile();
@@ -725,15 +775,48 @@ async function main() {
   const kv = new StateKV(sdk);
   installProviderAttemptBudgetTransport(createProviderAttemptBudgetTransport(sdk));
   const workflowAttemptAccounting = loadWorkflowAttemptAccounting(getEnvVar("AGENTMEMORY_WORKFLOW_ATTEMPT_ACCOUNTING"));
+  const registerWithLifetime = sdk.registerFunction.bind(sdk);
+  sdk.registerFunction = (id, handler, options) => {
+    if (typeof handler !== "function") return registerWithLifetime(id, handler, options);
+    return registerWithLifetime(id, (...args) => {
+      if (closing && /^(api::|mcp::)/.test(id)) return Promise.resolve({
+        status_code: 503, headers: { "Retry-After": "60" },
+        body: id.startsWith("mcp::")
+          ? { content: [{ type: "text", text: "Maintenance shutdown is draining admitted work; retry later." }], deferred: true, reason: "shutdown_draining" }
+          : { success: true, deferred: true, reason: "shutdown_draining" },
+      });
+      const pending = Promise.resolve().then(() => handler(...args));
+      activeHandlers.add(pending);
+      activeHandlerDetails.set(pending, { functionId: id, startedAtMs: Date.now() });
+      const settled = () => {
+        activeHandlers.delete(pending);
+        activeHandlerDetails.delete(pending);
+        if (activeHandlers.size === 0) {
+          for (const resolve of handlerIdleWaiters) resolve();
+          handlerIdleWaiters.clear();
+        }
+      };
+      void pending.then(settled, settled);
+      return pending;
+    }, options);
+  };
   installOperationTracking(sdk, kv);
   let foregroundRequests = 0;
   let lastForegroundAt = 0;
   let lastForegroundFunctionId: string | null = null;
   const foregroundFunctions = new Map<string, number>();
+  let lastMaintenanceForegroundObservation: StorageMaintenanceForegroundObservation | null = null;
   const foregroundPressureSnapshot = (): StorageForegroundPressure => {
     const now = Date.now();
     const age = lastForegroundAt > 0 ? Math.max(0, now - lastForegroundAt) : null;
     const remaining = age === null ? 0 : Math.max(0, 5_000 - age);
+    lastMaintenanceForegroundObservation = {
+      sampleAt: new Date(now).toISOString(),
+      busy: foregroundRequests > 0 || remaining > 0,
+      phase: foregroundRequests > 0 ? "active" : remaining > 0 ? "cooldown" : "idle",
+      activeRequests: foregroundRequests, activeFunctionCount: foregroundFunctions.size,
+      quietWindowRemainingMs: remaining,
+    };
     return {
       busy: foregroundRequests > 0 || remaining > 0,
       phase: foregroundRequests > 0 ? "active" : remaining > 0 ? "cooldown" : "idle",
@@ -970,7 +1053,7 @@ async function main() {
     // never keeps the process alive), mirroring the auto-forget timer.
     // mem::snapshot-create serializes overlapping runs internally (git-lock
     // safety), so the timer can stay a simple fire-and-forget tick.
-    const snapshotTimer = setInterval(() => {
+    const snapshotTimer = backgroundInterval(() => {
       sdk
         .trigger({
           function_id: "mem::snapshot-create",
@@ -1007,9 +1090,10 @@ async function main() {
   setHybridRanker(hybridRanker);
   registerRecentSearchesSweepFunction(sdk, kv);
   const storageMaintenanceScheduler = createStorageMaintenanceScheduler(sdk, bootLog,
-    foregroundPressureSnapshot, () => releaseUnclaimedStorageMaintenanceTurn(kv));
+    foregroundPressureSnapshot, () => releaseUnclaimedStorageMaintenanceTurn(kv),
+    () => lastMaintenanceForegroundObservation);
   registerStorageMaintenance(sdk, kv, () => foregroundRequests > 0 || Date.now() - lastForegroundAt < 5_000,
-    foregroundPressureSnapshot, storageMaintenanceScheduler.wake);
+    foregroundPressureSnapshot, storageMaintenanceScheduler.wake, storageMaintenanceScheduler.snapshot);
 
   registerApiTriggers(sdk, kv, secret, metricsStore, provider);
   registerEventTriggers(sdk, kv);
@@ -1022,8 +1106,9 @@ async function main() {
 
   const backgroundRecoveryPaused = isBackgroundRecoveryPaused();
   let graphRecoveryRunning = false;
+  const graphRecoveryTasks = new Set<Promise<void>>();
   const recoverGraphJobs = async () => {
-    if (isBackgroundRecoveryPaused() || graphRecoveryRunning) return;
+    if (closing || isBackgroundRecoveryPaused() || graphRecoveryRunning) return;
     graphRecoveryRunning = true;
     try {
       await sdk.trigger({ function_id: "mem::graph-dispatch", payload: { localOnly: false } });
@@ -1031,15 +1116,21 @@ async function main() {
       console.warn("[agentmemory] Graph recovery paused; durable inputs retained");
     } finally {
       try {
-        await pruneTerminalGraphWork(kv);
+        if (!closing) await pruneTerminalGraphWork(kv);
       } catch (error) {
         console.warn("[agentmemory] Graph terminal retention paused", error instanceof Error ? error.message : "STATE_TX_FAILED");
       } finally { graphRecoveryRunning = false; }
     }
   };
+  const scheduleGraphRecovery = () => {
+    if (closing) return;
+    const task = recoverGraphJobs();
+    graphRecoveryTasks.add(task);
+    void task.then(() => graphRecoveryTasks.delete(task), () => graphRecoveryTasks.delete(task));
+  };
   if (!backgroundRecoveryPaused) {
-    void recoverGraphJobs();
-    const graphRecoveryTimer = setInterval(() => void recoverGraphJobs(), 30_000);
+    scheduleGraphRecovery();
+    const graphRecoveryTimer = backgroundInterval(scheduleGraphRecovery, 30_000);
     graphRecoveryTimer.unref();
   } else {
     bootLog("Graph recovery and terminal retention are paused by AGENTMEMORY_BACKGROUND_RECOVERY_PAUSED=1.");
@@ -1198,25 +1289,25 @@ async function main() {
   const projectIndexTick = createProjectIndexMaintenance(kv, isAutomaticStorageMaintenancePaused,
     () => foregroundRequests > 0 || Date.now() - lastForegroundAt < 5_000, bootLog);
   void projectIndexTick().catch(() => bootLog("Project index progress could not be saved."));
-  const projectIndexTimer = setInterval(() => {
+  const projectIndexTimer = backgroundInterval(() => {
     void projectIndexTick().catch(() => bootLog("Project index progress could not be saved."));
   }, 60_000);
   projectIndexTimer.unref();
   let temporalRecoveryRunning = false;
   const temporalRecoveryTick = async () => {
-    if (isBackgroundRecoveryPaused() || temporalRecoveryRunning) return;
+    if (closing || isBackgroundRecoveryPaused() || temporalRecoveryRunning) return;
     temporalRecoveryRunning = true;
     try { await runAutomaticTemporalRecovery(sdk); }
     catch { bootLog("Temporal recovery deferred; durable inputs retained."); }
     finally { temporalRecoveryRunning = false; }
   };
   void temporalRecoveryTick();
-  const temporalRecoveryTimer = setInterval(() => void temporalRecoveryTick(), 60_000);
+  const temporalRecoveryTimer = backgroundInterval(() => void temporalRecoveryTick(), 60_000);
   temporalRecoveryTimer.unref();
 
   let workflowRecoveryRunning = false;
   const recoverWorkflowQueues = async () => {
-    if (isBackgroundRecoveryPaused() || workflowRecoveryRunning) return;
+    if (closing || isBackgroundRecoveryPaused() || workflowRecoveryRunning) return;
     workflowRecoveryRunning = true;
     try {
       const calls = await Promise.allSettled([
@@ -1242,7 +1333,7 @@ async function main() {
   };
   if (!backgroundRecoveryPaused) {
     void recoverWorkflowQueues();
-    const workflowRecoveryTimer = setInterval(() => void recoverWorkflowQueues(), 60_000);
+    const workflowRecoveryTimer = backgroundInterval(() => void recoverWorkflowQueues(), 60_000);
     workflowRecoveryTimer.unref();
   } else {
     bootLog("Reflect and skill lifecycle queue recovery is paused by AGENTMEMORY_BACKGROUND_RECOVERY_PAUSED=1.");
@@ -1277,16 +1368,16 @@ async function main() {
       }
     };
     void recoverSummaryQueue("mem::summary-recover");
-    const summaryRecoveryTimer = setInterval(() => void recoverSummaryQueue("mem::summary-recover"), 60 * 60 * 1000);
+    const summaryRecoveryTimer = backgroundInterval(() => void recoverSummaryQueue("mem::summary-recover"), 60 * 60 * 1000);
     summaryRecoveryTimer.unref();
-    const summaryReconcileTimer = setInterval(() => void recoverSummaryQueue("mem::summary-reconcile"), 30 * 1000);
+    const summaryReconcileTimer = backgroundInterval(() => void recoverSummaryQueue("mem::summary-reconcile"), 30 * 1000);
     summaryReconcileTimer.unref();
   } else {
     bootLog("Summary queue recovery is paused by AGENTMEMORY_BACKGROUND_RECOVERY_PAUSED=1.");
   }
 
   if (process.env.AUTO_FORGET_ENABLED !== "false") {
-    const autoForgetTimer = setInterval(async () => {
+    const autoForgetTimer = backgroundInterval(async () => {
       try {
         await sdk.trigger({ function_id: "mem::auto-forget", payload: { dryRun: false } });
       } catch {}
@@ -1296,7 +1387,7 @@ async function main() {
   }
 
   if (process.env.LESSON_DECAY_ENABLED !== "false") {
-    const lessonDecayTimer = setInterval(async () => {
+    const lessonDecayTimer = backgroundInterval(async () => {
       try {
         await sdk.trigger({ function_id: "mem::lesson-decay-sweep", payload: {} });
       } catch {}
@@ -1306,7 +1397,7 @@ async function main() {
   }
 
   if (process.env.INSIGHT_DECAY_ENABLED !== "false") {
-    const insightDecayTimer = setInterval(async () => {
+    const insightDecayTimer = backgroundInterval(async () => {
       try {
         await sdk.trigger({ function_id: "mem::insight-decay-sweep", payload: {} });
       } catch {}
@@ -1318,7 +1409,7 @@ async function main() {
   // recent-searches scope only needs the last entry per session;
   // sweeping anything older than the retention window keeps the scope
   // from growing unbounded across long-lived deployments.
-  const recentSearchesSweepTimer = setInterval(async () => {
+  const recentSearchesSweepTimer = backgroundInterval(async () => {
     try {
       await sdk.trigger({
         function_id: "mem::diagnostic::recent-searches-sweep",
@@ -1329,7 +1420,7 @@ async function main() {
   recentSearchesSweepTimer.unref();
 
   if (isConsolidationEnabled()) {
-    const consolidationTimer = setInterval(async () => {
+    const consolidationTimer = backgroundInterval(async () => {
       try {
         await sdk.trigger({ function_id: "mem::consolidate-pipeline", payload: { deferred: true } });
       } catch {}
@@ -1339,7 +1430,7 @@ async function main() {
   }
 
   if (config.fireworksBatch.enabled) {
-    const fireworksBatchTimer = setInterval(() => {
+    const fireworksBatchTimer = backgroundInterval(() => {
       void fireworksBatch.process().catch((error) => {
         const message = error instanceof Error ? error.message : String(error);
         bootLog(`Fireworks Batch processing failed: ${message}`);
@@ -1354,20 +1445,56 @@ async function main() {
   }
 
   const shutdown = async () => {
+    if (closing) return;
+    closing = true;
+    const graphDrained = beginGraphWorkDrain(kv);
+    const maintenanceHandlersDrained = beginStorageMaintenanceDrain(kv);
+    for (const timer of backgroundTimers) clearInterval(timer);
+    backgroundTimers.clear();
+    const maintenanceDrained = storageMaintenanceScheduler.stopAndDrain();
     stopMemoryDiagnostics();
     console.log(`\n[agentmemory] Shutting down...`);
-    const hardExit = setTimeout(() => {
-      console.warn(
-        `[agentmemory] Shutdown still blocked after ${SHUTDOWN_HARD_EXIT_MS}ms; exiting now.`,
-      );
-      clearWorkerPidfile();
-      process.exit(1);
-    }, SHUTDOWN_HARD_EXIT_MS);
-    hardExit.unref();
-    storageMaintenanceScheduler.stop();
     healthMonitor.stop();
     dedupMap.stop();
     indexPersistence.stop();
+    const recoveryDrained = Promise.allSettled([...graphRecoveryTasks]);
+    const drainStates: Record<string, "pending" | "fulfilled" | "rejected"> = {};
+    const observeDrain = (name: string, pending: Promise<unknown>): Promise<unknown> => {
+      drainStates[name] = "pending";
+      void pending.then(() => { drainStates[name] = "fulfilled"; }, () => { drainStates[name] = "rejected"; });
+      return pending;
+    };
+    const admittedDrained = Promise.all([
+      observeDrain("graphQueue", graphDrained),
+      observeDrain("maintenanceScheduler", maintenanceDrained),
+      observeDrain("maintenanceHandlers", maintenanceHandlersDrained),
+      observeDrain("graphRecoveryTasks", recoveryDrained),
+      observeDrain("registeredHandlers", waitForHandlers()),
+    ]);
+    const reportShutdownHold = () => {
+      const now = Date.now();
+      console.warn("[agentmemory] Shutdown drain diagnostics", {
+        sampledAt: new Date(now).toISOString(),
+        drainStates: { ...drainStates },
+        graphRecoveryTaskCount: graphRecoveryTasks.size,
+        activeHandlerCount: activeHandlers.size,
+        activeHandlersTruncated: activeHandlerDetails.size > 16,
+        activeHandlers: [...activeHandlerDetails.values()].slice(0, 16).map(({ functionId, startedAtMs }) => ({
+          functionId: functionId.slice(0, 160), elapsedMs: Math.max(0, now - startedAtMs),
+        })),
+      });
+    };
+    try {
+      if (!await settleWithin(admittedDrained, SHUTDOWN_ADMITTED_DRAIN_MS)) {
+        console.warn("[agentmemory] Shutdown held: admitted graph or maintenance work is still settling; SDK remains connected.");
+        reportShutdownHold();
+        await admittedDrained;
+      }
+    } catch {
+      console.warn("[agentmemory] Shutdown held: admitted work did not acknowledge settlement; SDK remains connected.");
+      reportShutdownHold();
+      return;
+    }
     const viewerClosed = new Promise<void>((resolve) =>
       viewerServer.close(() => resolve()),
     );
@@ -1382,6 +1509,13 @@ async function main() {
         `[agentmemory] Search index flush did not finish within ${SHUTDOWN_FLUSH_TIMEOUT_MS}ms; the engine is probably gone. Observations are already in the engine's state store and the index reconciles them on the next boot.`,
       );
     }
+    await waitForHandlers();
+    const hardExit = setTimeout(() => {
+      console.warn(`[agentmemory] SDK shutdown still blocked after ${SHUTDOWN_HARD_EXIT_MS}ms; exiting now.`);
+      clearWorkerPidfile();
+      process.exit(1);
+    }, SHUTDOWN_HARD_EXIT_MS);
+    hardExit.unref();
     await settleWithin(sdk.shutdown(), SHUTDOWN_FLUSH_TIMEOUT_MS).catch((err) => {
       console.warn(`[agentmemory] SDK shutdown failed:`, err);
     });

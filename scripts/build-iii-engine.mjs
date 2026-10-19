@@ -44,7 +44,16 @@ const REQUIRED_CAPABILITIES = [
   "state::list_page_keyset_live_v1",
   "state::graph_automatic_unspent_reservation_adoption_v1",
   "state::compact_copy_chunked_window_v1",
+  "state::graph_automatic_unspent_child_recovery_v1",
 ];
+const UNSPENT_CHILD_REVISION = "unspent-child-recovery-v1";
+const UNSPENT_CHILD_PROOF_REVISION = "staging-checkpoint-recovery-v1";
+const UNSPENT_CHILD_MIGRATION = {
+  kind: "additive_table",
+  table: "engine_graph_auto_prepare_renewals",
+  destructive: false,
+  storageFormatChanged: false,
+};
 const BUILD_TIMEOUT_MS = 30 * 60 * 1000;
 const TARGETS = {
   "win32-x64": { platform: "win32", arch: "x64", triple: "x86_64-pc-windows-msvc", executable: "iii.exe" },
@@ -63,6 +72,15 @@ function hasRequiredCapabilities(value) {
   return Array.isArray(value) &&
     value.length === REQUIRED_CAPABILITIES.length &&
     REQUIRED_CAPABILITIES.every((capability) => value.includes(capability));
+}
+
+function hasRequiredUnspentChildMetadata(value) {
+  const migration = value.migrationDeclaration;
+  return value.unspentChildRevision === UNSPENT_CHILD_REVISION &&
+    value.unspentChildProofRevision === UNSPENT_CHILD_PROOF_REVISION &&
+    migration !== null && typeof migration === "object" && !Array.isArray(migration) &&
+    Object.keys(migration).length === Object.keys(UNSPENT_CHILD_MIGRATION).length &&
+    Object.entries(UNSPENT_CHILD_MIGRATION).every(([key, expected]) => migration[key] === expected);
 }
 
 function run(command, args, options = {}) {
@@ -149,6 +167,9 @@ function readNativeManifest(patchPath, { verifyPatchDigest = true } = {}) {
   if (!hasRequiredCapabilities(value.capabilities)) {
     fail(`Native patch manifest must declare all ${REQUIRED_CAPABILITIES.length} required state capabilities.`);
   }
+  if (!hasRequiredUnspentChildMetadata(value)) {
+    fail("Native patch manifest must declare the exact unspent-child revision and additive prepare-renewals migration.");
+  }
   if (
     value.storageFormatVersion !== 2 ||
     value.nativeFormatReady !== true ||
@@ -165,6 +186,9 @@ function readNativeManifest(patchPath, { verifyPatchDigest = true } = {}) {
     nativeFormatReady: true,
     deploymentReady: true,
     artifactProfile: value.buildProfile?.name ?? null,
+    unspentChildRevision: value.unspentChildRevision,
+    unspentChildProofRevision: value.unspentChildProofRevision,
+    migrationDeclaration: value.migrationDeclaration,
   };
 }
 
@@ -197,6 +221,7 @@ export function validateStagedEngineArtifacts(
     manifest.schemaVersion !== 1 ||
     manifest.engineVersion !== VERSION ||
     !hasRequiredCapabilities(manifest.capabilities) ||
+    !hasRequiredUnspentChildMetadata(manifest) ||
     manifest.source?.repository !== REPOSITORY ||
     manifest.source?.commit !== SOURCE_COMMIT ||
     manifest.source?.patchPath !== PATCH_RELATIVE_PATH ||
@@ -275,15 +300,19 @@ function verifyBinary(binaryPath) {
     fail(`Engine binary does not report pinned version ${VERSION}.`);
   }
   let capabilities = [];
+  let proofRevision;
   try {
     const parsed = JSON.parse(capabilityOutput);
-    capabilities = Array.isArray(parsed) ? parsed : parsed?.capabilities ?? [];
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      capabilities = Array.isArray(parsed.capabilities) ? parsed.capabilities : [];
+      proofRevision = parsed.unspent_child_proof_revision;
+    }
   } catch {
-    capabilities = capabilityOutput.trim().split(/[\r\n,\s]+/);
+    fail("Engine binary must advertise a JSON capability object with the required unspent-child proof revision.");
   }
-  if (!hasRequiredCapabilities(capabilities)) {
+  if (!hasRequiredCapabilities(capabilities) || proofRevision !== UNSPENT_CHILD_PROOF_REVISION) {
     const missing = REQUIRED_CAPABILITIES.filter((capability) => !capabilities.includes(capability));
-    fail(`Engine binary does not advertise required state capabilities: ${missing.join(", ")}.`);
+    fail(`Engine binary must advertise all required state capabilities and proof revision ${UNSPENT_CHILD_PROOF_REVISION}; missing capabilities: ${missing.join(", ")}.`);
   }
 }
 
@@ -392,6 +421,11 @@ function stageArtifact(binaryPath, key, target, buildDir, patchSha256, nativeMan
     nativeFormatReady: nativeManifest.nativeFormatReady,
     deploymentReady: nativeManifest.deploymentReady,
     capabilities: REQUIRED_CAPABILITIES,
+    unspentChildRevision: nativeManifest.unspentChildRevision,
+    unspentChildProofRevision: nativeManifest.unspentChildProofRevision,
+    schemaChanged: true,
+    storageFormatChanged: false,
+    migrationDeclaration: nativeManifest.migrationDeclaration,
     source: {
       repository: REPOSITORY,
       commit: SOURCE_COMMIT,

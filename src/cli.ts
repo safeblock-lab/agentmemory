@@ -94,7 +94,7 @@ import {
   renderEngineConfig,
   stateMigrationReceiptPath,
 } from "./cli/engine-config.js";
-import { SHUTDOWN_HARD_EXIT_MS } from "./shutdown.js";
+import { stopWorkerGracefully } from "./cli/graceful-stop.js";
 import { consoleArgs, defaultConsolePort, parseConsoleArgs } from "./cli/console.js";
 import { processStatIsRunning } from "./cli/process-state.js";
 import {
@@ -2596,6 +2596,10 @@ function buildDoctorEffects(): DoctorEffects {
     },
     runStop: async () => {
       try {
+        const workerPid = readWorkerPidfile();
+        if (workerPid && !(await stopWorkerPid(workerPid))) {
+          return { ok: false, message: "DRAINING: worker shutdown is held; engine and lifecycle metadata were preserved." };
+        }
         // runStop calls process.exit on its own — guard against that here
         // by short-circuiting when there's nothing to stop.
         const port = getRestPort();
@@ -2604,6 +2608,7 @@ function buildDoctorEffects(): DoctorEffects {
         if (portPids.length === 0 && pidfilePid === null) {
           clearEnginePidfile();
           clearEngineState();
+          clearWorkerPidfile();
           return { ok: true, message: "Nothing to stop." };
         }
         const candidates = new Set<number>();
@@ -2614,11 +2619,14 @@ function buildDoctorEffects(): DoctorEffects {
           const ok = await signalAndWait(pid, "SIGTERM", 3000);
           if (!ok) allStopped = false;
         }
-        clearEnginePidfile();
-        clearEngineState();
+        if (allStopped) {
+          clearEnginePidfile();
+          clearEngineState();
+          clearWorkerPidfile();
+        }
         return {
           ok: allStopped,
-          message: allStopped ? "Engine stopped." : "Some engine pids survived.",
+          message: allStopped ? "Engine stopped." : "Shutdown held: an engine remains alive; lifecycle metadata was preserved.",
         };
       } catch (err) {
         return {
@@ -3163,6 +3171,10 @@ async function startServerForDemo(): Promise<() => Promise<void>> {
 
   return async () => {
     if (!startedEngine) return;
+    const workerPid = readWorkerPidfile();
+    if (workerPid && !(await stopWorkerPid(workerPid))) {
+      throw new Error("DRAINING: demo worker is still alive; engine and lifecycle metadata were preserved.");
+    }
     const port = getRestPort();
     const state = readEngineState();
     if (state?.kind === "docker") {
@@ -3173,7 +3185,9 @@ async function startServerForDemo(): Promise<() => Promise<void>> {
     const pidfilePid = readEnginePidfile();
     if (pidfilePid) pids.add(pidfilePid);
     for (const pid of pids) {
-      await signalAndWait(pid, "SIGTERM", 3000).catch(() => {});
+      if (!(await signalAndWait(pid, "SIGTERM", 3000))) {
+        throw new Error("Shutdown held: demo engine is still alive; lifecycle metadata was preserved.");
+      }
     }
     clearEnginePidfile();
     clearEngineState();
@@ -3447,27 +3461,20 @@ async function signalAndWait(
     if (!pidAlive(pid)) return true;
     await new Promise((r) => setTimeout(r, 200));
   }
-  if (!pidAlive(pid)) return true;
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException)?.code === "ESRCH") return true;
-    vlog(`SIGKILL ${pid}: ${err instanceof Error ? err.message : String(err)}`);
-    return false;
-  }
-  await new Promise((r) => setTimeout(r, 200));
   return !pidAlive(pid);
 }
 
-// Shared worker-reap: SIGTERM with a grace window sized for the worker's
-// shutdown flush (index snapshots land via the engine, so the worker must
-// die before the engine does, with time to commit).
-async function stopWorkerPid(pid: number, graceMs: number): Promise<boolean> {
+async function stopWorkerPid(pid: number): Promise<boolean> {
   const s = p.spinner();
-  s.start(`Stopping agentmemory worker (pid ${pid})... [flushing state]`);
-  const ok = await signalAndWait(pid, "SIGTERM", graceMs);
-  s.stop(ok ? `Stopped worker pid ${pid}` : `Failed to stop worker pid ${pid}`);
-  return ok;
+  s.start(`Stopping agentmemory worker (pid ${pid})... [draining admitted work]`);
+  const result = await stopWorkerGracefully(
+    pid,
+    [join(__dirname, "index.mjs"), join(__dirname, "cli.mjs")],
+    pidAlive,
+  );
+  s.stop(result.exited ? `Stopped worker pid ${pid}` : `DRAINING: shutdown held for worker pid ${pid}`);
+  if (!result.exited) p.log.warn(result.reason);
+  return result.exited;
 }
 
 type NativeRemovalStopResult =
@@ -3493,7 +3500,7 @@ async function stopNativeEngineForRemoval(): Promise<NativeRemovalStopResult> {
   }
 
   if (workerPid) {
-    if (!(await stopWorkerPid(workerPid, 5000))) {
+    if (!(await stopWorkerPid(workerPid))) {
       return {
         ok: false,
         reason: `worker pid ${workerPid} could not be stopped; no engine or files were removed`,
@@ -3552,7 +3559,6 @@ function findEnginePidsByPort(port: number): number[] {
   // this, lsof also returns client-side PIDs (any process with an
   // active TCP connection to :port), which includes the agentmemory
   // CLI itself thanks to the keep-alive fetch in isEngineRunning().
-  // signalAndWait would then SIGKILL its own parent — exit code 137.
   const selfPid = process.pid;
   try {
     const out = execFileSync(lsof, ["-i", `:${port}`, "-sTCP:LISTEN", "-t"], {
@@ -3592,7 +3598,7 @@ async function stopDockerEngine(
   const resolvedState = persistDockerInspection(state, inspection);
 
   const workerPid = readWorkerPidfile();
-  if (workerPid && !(await stopWorkerPid(workerPid, 5000))) {
+  if (workerPid && !(await stopWorkerPid(workerPid))) {
     p.log.error("The agentmemory worker could not be stopped; Docker ownership state was preserved.");
     process.exit(1);
   }
@@ -3603,7 +3609,7 @@ async function stopDockerEngine(
       inspection.status === "running" &&
       !runCommand(
         dockerBin,
-        ["stop", "--time", "10", inspection.containerId],
+        ["stop", "--timeout", "-1", inspection.containerId],
         { label: `Stopping preserved Docker container ${inspection.containerId}` },
       )
     ) {
@@ -3620,58 +3626,8 @@ async function stopDockerEngine(
     return;
   }
 
-  const projectName = inspection.projectName ?? resolvedState.projectName;
-  if (!projectName) {
-    p.log.error("No verified Docker Compose project name is available. Refusing an unscoped stop.");
-    process.exit(1);
-  }
-  const effectiveComposeFile = existsSync(inspection.composeFile)
-    ? inspection.composeFile
-    : discoverComposeFile();
-  if (!effectiveComposeFile) {
-    p.log.error("No agentmemory compose file is available. Docker ownership state was preserved.");
-    process.exit(1);
-  }
-  const composeText = readFileSync(effectiveComposeFile, "utf-8");
-  const ownServices = ["iii-engine", "iii-init"].filter((service) =>
-    new RegExp(`^\\s+${service}:`, "m").test(composeText),
-  );
-  if (ownServices.length === 0) {
-    p.log.error(`${effectiveComposeFile} does not define iii-engine or iii-init. Refusing an unscoped stop.`);
-    process.exit(1);
-  }
-
-  const composeCommand = [
-    "docker",
-    ...dockerComposeArgs(effectiveComposeFile, projectName, []),
-  ].join(" ");
-
-  const ok = runCommand(
-    dockerBin,
-    dockerComposeArgs(effectiveComposeFile, projectName, [
-      "rm",
-      "-s",
-      "-f",
-      ...ownServices,
-    ]),
-    {
-      label: `${composeCommand} rm -s -f ${ownServices.join(" ")}`,
-    },
-  );
-  // Clear each piece of state only after its shutdown succeeded, so a
-  // failed stop stays retryable.
-  if (ok) {
-    clearEnginePidfile();
-    clearEngineState();
-  } else {
-    p.log.error(
-      `docker compose rm failed. The engine may still be running on :${port}. Inspect with:\n  ${composeCommand} ps`,
-    );
-    process.exit(1);
-  }
-  if (!suppressOutro) {
-    p.outro("Stopped. Memories persisted to disk; restart anytime with: agentmemory");
-  }
+  p.log.error(`No validated Docker container is available for a graceful stop on :${port}. Docker lifecycle metadata was preserved; reconcile the recorded container before continuing.`);
+  process.exit(1);
 }
 
 async function runStop(): Promise<void> {
@@ -3708,17 +3664,14 @@ async function runStop(): Promise<void> {
     if (workerPid !== null && portPids.length === 0 && pidfilePid === null) {
       // Engine already gone but worker is lingering — reap it directly
       // instead of preserving for manual cleanup.
-      const s = p.spinner();
-      s.start(`Stopping orphaned agentmemory worker (pid ${workerPid})...`);
-      const ok = await signalAndWait(workerPid, "SIGTERM", SHUTDOWN_HARD_EXIT_MS + 1000);
-      s.stop(ok ? `Stopped worker pid ${workerPid}` : `Failed to stop worker pid ${workerPid}`);
+      const ok = await stopWorkerPid(workerPid);
+      if (!ok) {
+        p.log.error(`DRAINING: worker pid ${workerPid} remains alive. Lifecycle metadata was preserved.`);
+        process.exit(1);
+      }
       clearEnginePidfile();
       clearEngineState();
       clearWorkerPidfile();
-      if (!ok) {
-        p.log.error(`Worker pid ${workerPid} survived SIGKILL. Investigate with \`ps\`.`);
-        process.exit(1);
-      }
       p.outro("Stopped orphaned worker. Memories persisted to disk.");
       return;
     }
@@ -3770,15 +3723,11 @@ async function runStop(): Promise<void> {
   }
 
   let allStopped = true;
-  // stop worker first, then engine. The worker's shutdown
-  // handler calls indexPersistence.save() -> kv.set() -> iii state::set
-  // to flush BM25/vector snapshots + audit rows. Killing iii first
-  // leaves those writes with no engine to land on, and the index +
-  // observations end up as in-memory state the iii process never
-  // persists. Worker SIGTERM grace bumped 3s -> 5s to give a large
-  // index a real chance to commit before the engine goes away.
   for (const pid of workerCandidates) {
-    if (!(await stopWorkerPid(pid, 5000))) allStopped = false;
+    if (!(await stopWorkerPid(pid))) {
+      p.log.error("DRAINING: worker shutdown is held. Engine and lifecycle metadata were preserved.");
+      process.exit(1);
+    }
   }
   const skippedForeign: Array<{ pid: number; comm: string }> = [];
   for (const pid of candidates) {
@@ -3798,9 +3747,6 @@ async function runStop(): Promise<void> {
     if (!ok) allStopped = false;
   }
 
-  clearEnginePidfile();
-  clearEngineState();
-  clearWorkerPidfile();
   if (skippedForeign.length > 0) {
     const list = skippedForeign
       .map((sf) => `  pid ${sf.pid}  ${sf.comm}`)
@@ -3811,9 +3757,12 @@ async function runStop(): Promise<void> {
     process.exit(1);
   }
   if (!allStopped) {
-    p.log.error("One or more processes survived SIGKILL. Investigate with `ps`.");
+    p.log.error("Shutdown held: an engine process is still alive. Lifecycle metadata was preserved.");
     process.exit(1);
   }
+  clearEnginePidfile();
+  clearEngineState();
+  clearWorkerPidfile();
   p.outro("Stopped. Memories persisted to disk; restart anytime with: agentmemory");
 }
 
@@ -4213,9 +4162,10 @@ async function runConsole(): Promise<void> {
   );
   const child = spawn(iiiBin, consoleArgs(launch), {
     stdio: "inherit",
-    detached: true,
+    detached: !IS_WINDOWS,
   });
   const forward = (signal: NodeJS.Signals): void => {
+    if (IS_WINDOWS) return;
     try {
       process.kill(-child.pid!, signal);
     } catch {

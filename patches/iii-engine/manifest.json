@@ -4,10 +4,10 @@
   "sourceRepository": "https://github.com/iii-hq/iii.git",
   "sourceCommit": "e7de3820d1e558f3762edf95e4440552444d48d3",
   "patchPath": "patches/iii-engine/0.22.1-state-pagination.patch",
-  "patchSha256": "071974fa24158cd2960a507cd0c3e642be492240d96092a99559c00e9d52b1b7",
+  "patchSha256": "b344cfdded736973a43120007d46165f5ae88ff10f4580fb026281c0e479be61",
   "artifactPath": "dist/engine/win32-x64/iii.exe",
-  "artifactSha256": "572cf51128c04c1c727ed20854cae27ead6b558a98469504ef2dae1ac2c5c59e",
-  "artifactBytes": 35524096,
+  "artifactSha256": "6cf122509b1a1d2224ac0ee3b1fc64bab5d566400a0c60bc284e53ae089f5edf",
+  "artifactBytes": 35590144,
   "buildTarget": "x86_64-pc-windows-msvc",
   "verifiedPlatform": null,
   "capabilities": [
@@ -31,7 +31,8 @@
     "state::graph_automatic_recovery_v1",
     "state::list_page_keyset_live_v1",
     "state::graph_automatic_unspent_reservation_adoption_v1",
-    "state::compact_copy_chunked_window_v1"
+    "state::compact_copy_chunked_window_v1",
+    "state::graph_automatic_unspent_child_recovery_v1"
   ],
   "retrievalCapabilities": [
     "state::indexed_graph_v1",
@@ -46,27 +47,27 @@
   ],
   "capabilityProbe": {
     "performed": false,
-    "evidence": "Native source declaration; normal startup acceptance pending"
+    "evidence": "Native source declaration; normal startup and actual business acceptance pending"
   },
   "buildProfile": {
-    "incremental": false,
-    "optimized": true,
-    "jobs": 1,
-    "codegenUnits": 16,
-    "offline": true,
-    "locked": true,
     "optLevel": "s",
+    "offline": true,
+    "noDefaultFeatures": true,
+    "codegenUnits": 16,
     "packageCodegenUnits": 16,
     "name": "release",
-    "strip": true,
+    "incremental": false,
     "lto": false,
-    "target": "x86_64-pc-windows-msvc",
+    "locked": true,
+    "optimized": true,
     "debugInfo": false,
-    "noDefaultFeatures": true
+    "target": "x86_64-pc-windows-msvc",
+    "strip": true,
+    "jobs": 1
   },
   "deploymentReady": false,
   "rustToolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)",
-  "builtAt": "2026-10-19T05:50:04.3014998Z",
+  "builtAt": "2026-10-19T09:53:55.4728737Z",
   "storageRetentionSource": {
     "status": "final-combined-source-compiled",
     "functions": [
@@ -1211,9 +1212,9 @@
   },
   "currentReleaseBuild": {
     "version": "0.9.90",
-    "nativeEmission": "graph-copy-chunked-v13-20261019",
+    "nativeEmission": "graph-proof-maintenance-v19-20261019",
     "exitCode": 0,
-    "builtAt": "2026-10-19T05:50:04.3014998Z",
+    "builtAt": "2026-10-19T09:53:55.4728737Z",
     "testsRun": false,
     "typecheckRun": false,
     "runtimeAcceptancePending": true
@@ -1857,6 +1858,7 @@
       "engine/src/workers/state/adapters/sqlite/graph_automatic_recovery/adoption.rs",
       "engine/src/workers/state/adapters/sqlite/graph_automatic_recovery/authority.rs",
       "engine/src/workers/state/adapters/sqlite/graph_automatic_recovery/binding.rs",
+      "engine/src/workers/state/adapters/sqlite/graph_automatic_recovery/child.rs",
       "engine/src/workers/state/adapters/sqlite/graph_automatic_recovery/cleanup.rs",
       "engine/src/workers/state/adapters/sqlite/graph_automatic_recovery/grouped.rs",
       "engine/src/workers/state/adapters/sqlite/graph_automatic_recovery/schema.sql",
@@ -2054,6 +2056,18 @@
     "testsRun": false,
     "buildRunBySourceWorker": false,
     "priorBuildAndValidationEvidenceIsHistorical": true,
+    "unspentChildRevision": "unspent-child-recovery-v1",
+    "schemaChanged": true,
+    "storageFormatChanged": false,
+    "migrationDeclaration": {
+      "kind": "additive_table",
+      "table": "engine_graph_auto_prepare_renewals",
+      "destructive": false,
+      "storageFormatChanged": false
+    },
+    "stagingCorrectionSchemaChanged": false,
+    "schemaChangeReference": "Full patch relative to pinned upstream includes initial additive table; v19 proof revision adds no schema changes relative to installed v18",
+    "unspentChildProofRevision": "staging-checkpoint-recovery-v1",
     "retrievalContracts": [
       "state::workflow_statistics_v1",
       "state::recovery_inspection_v1"
@@ -2062,7 +2076,8 @@
       "state::graph_automatic_recovery_v1",
       "state::list_page_keyset_live_v1",
       "state::graph_automatic_unspent_reservation_adoption_v1",
-      "state::compact_copy_chunked_window_v1"
+      "state::compact_copy_chunked_window_v1",
+      "state::graph_automatic_unspent_child_recovery_v1"
     ]
   },
   "historicalPreAutomaticGraphRecoveryBuild": {
@@ -2250,5 +2265,39 @@
   "historicalPreChunkedCopyCapabilityProbe": {
     "performed": false,
     "evidence": "Native source declaration; normal startup acceptance pending"
-  }
+  },
+  "historicalPreCopySeekValidation": {
+    "requiredNativeBuildCompleted": true,
+    "testsRun": false,
+    "typecheckRun": false,
+    "artifactReviewsRun": false,
+    "checksumComparisonsRun": false,
+    "runtimeAcceptancePending": true
+  },
+  "historicalPreCopySeekCapabilityProbe": {
+    "performed": false,
+    "evidence": "Native source declaration; normal startup acceptance pending"
+  },
+  "unspentChildRevision": "unspent-child-recovery-v1",
+  "migrationDeclaration": {
+    "kind": "additive_table",
+    "table": "engine_graph_auto_prepare_renewals",
+    "destructive": false,
+    "storageFormatChanged": false
+  },
+  "historicalPreUnspentChildValidation": {
+    "requiredNativeBuildCompleted": true,
+    "testsRun": false,
+    "typecheckRun": false,
+    "artifactReviewsRun": false,
+    "checksumComparisonsRun": false,
+    "runtimeAcceptancePending": true
+  },
+  "historicalPreUnspentChildCapabilityProbe": {
+    "performed": false,
+    "evidence": "Native source declaration; normal startup and actual business acceptance pending"
+  },
+  "stagingCorrectionSchemaChanged": false,
+  "schemaChangeReference": "Full patch relative to pinned upstream includes initial additive table; v19 proof revision adds no schema changes relative to installed v18",
+  "unspentChildProofRevision": "staging-checkpoint-recovery-v1"
 }

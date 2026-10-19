@@ -87,17 +87,48 @@ request, and price-category details needed to match their cost to profile
 usage. The lifetime LLM metric totals use a different period and do not supply
 that missing cost attribution.
 
-The separate fixed seven-day snapshot from 2026-10-11T15:30:24.833Z through
-2026-10-18T15:30:24.833Z contains
-123,591 emitted-context tokens and 3,159,393 processing tokens. Its explicit
-zero-proven-benefit scenario contributes -3,282,984 tokens over a denominator
-range of 9,018,514,251–9,021,673,644 tokens, or approximately -0.0364%
-(-0.0364027% to -0.0363900%). This later window must not be combined with the
-10:04 UTC study above. Semantic review found response-level usage deduplicated
-by response identity, without reading cumulative usage counters; it justified
-no numerical change. Coverage, processing overlap, actual context consumption
-and causal benefit remain unknown. This is a partial-window scenario, not
-measured causal savings or proof that actual benefit is zero.
+The separate fixed seven-day snapshot spans 2026-10-11T15:30:24.833Z through
+2026-10-18T15:30:24.833Z. Its retained inputs are:
+
+| Input | Observed value | Interpretation |
+| --- | ---: | --- |
+| E: emitted context | 123,591 tokens | Local `o200k_base` text count; consumption and repeated exposure unknown |
+| P: processing | 3,159,393 tokens | 3,023,180 input + 136,213 output; reported telemetry, not invoice evidence |
+| D: profile usage | 9,018,514,251 tokens | Available local profile sample; complete account coverage is not established |
+
+No comparable avoided-read baseline is retained, so the actual causal numerator
+and percentage remain unknown. The closest reproducible sensitivity calculation
+credits zero proven avoided-read tokens **as a scenario assumption** and assumes
+each emitted context token was consumed once:
+
+```text
+scenario numerator = 0 - E - P
+                   = 0 - 123591 - 3159393
+                   = -3282984 tokens
+denominator = D + disjoint processing
+            in [9018514251, 9018514251 + 3159393]
+            = [9018514251, 9021673644]
+scenario percentage = 100 * -3282984 / denominator
+                    in [-0.0364027146%, -0.0363899663%]
+```
+
+The lower denominator assumes full processing overlap with profile usage; the
+upper assumes full disjointness. These endpoints bound only that overlap
+assumption. They do not bound actual savings, omitted history, repeated context
+exposure or avoided work. The result, approximately **-0.0364%**, is a retained
+sample cost-contribution scenario, not measured causal savings, statistical
+confidence bounds or proof that actual benefit is zero. The scenario subtracts
+context from its hypothetical benefit numerator; it does not add context again
+to the already observed profile-usage denominator.
+
+This later window must not be combined with the 10:04 UTC study above. Semantic
+review found response-level usage deduplicated by response identity, without
+reading cumulative usage counters; it justified no numerical change. Coverage,
+processing overlap, actual context consumption and causal benefit remain
+unknown. Establishing real net savings requires comparable avoided-read pairs,
+linked context consumption, complete processing coverage and request identities
+that resolve overlap over this same window. Actual net tokens, percentage and
+USD remain unknown until that evidence exists.
 
 ## Price estimates
 
@@ -161,22 +192,64 @@ are bounded to 1,024 rows with internal chunks of 128 and a 129-row lookahead;
 the 1-MiB byte bound, 2,500-ms work budget and 45-second transport timeout are
 unchanged. No speed improvement is inferred from these bounds.
 
-The paired 0.9.90 application and native package with 21 required CLI capabilities
-is installed; application and native compilation and installation completed with
-exit code 0. Installation completed on 2026-10-19 at 06:01:03 UTC. No tests were run.
-Installation does not establish complete runtime acceptance or savings, and
-the release remains unpublished and work in progress.
+The latest paired application and native update was installed on 2026-10-19 at
+09:12:39 UTC, advertising 22 native capabilities. Both prior processes completed
+normal CTRL-C shutdown; no SQLite copy was performed and the watchdog was
+restored. The earlier native update at 08:00 UTC retained the application.
+Installed COPY SQL separates first-page and continuation queries and removes
+the mode-selecting `OR`; its native build exited with code 0. This establishes
+no measured speed improvement or complete runtime acceptance.
 
-COPY and text verification are advancing; GC, reclaim and physical-baseline
-advancement are not complete, and physical reduction is not proven. The retained
+The installed application gates pending graph work before reservation and retires superseded
+work only with canonical and native proof bound to the successor fingerprint.
+Shutdown draining tracks actual callback promises, FIFO work and maintenance,
+gates HTTP/MCP admissions with 503, and holds after 180 seconds without SDK
+abort. External direct SDK reentry and detached asynchronous work remain outside
+that boundary; universal atomicity is not claimed. Full runtime acceptance
+remains pending. No tests were run, and the release remains unpublished.
+Further CLI shutdown changes were compiled and installed at 08:41:44 UTC through
+a CLI-only update, without restarting the backend. No graceful-stop functional
+test was run; installation alone supplies no operational acceptance result.
+
+The maintenance observation at 2026-10-19 08:41:30 UTC showed text
+layout in `CUTTING` at ordinal 4,969, with COPY seed, row traversal, GC, final reclaim and
+physical-baseline advancement incomplete. A later observation at 08:47 UTC
+recorded cursor advancement, without proving completion. Physical reduction is not proven.
+At 08:37 UTC the application and engine processes were unexpectedly absent;
+their startup was recovered at 08:39:41 UTC after correcting the existing
+launcher's file-replacement handling. Recovery required no reinstallation or
+SQLite copy. The cause of the earlier process exit remains unknown. Startup
+does not establish that maintenance has resumed or completed. The retained
 failed empty-XML operation now has a durable `explicitEmptyXML` repair record
 with zero nodes and zero edges, and its linked workflow is completed with
 10 nodes, 20 edges and five units. This was observed on 2026-10-19 at 05:01:38 UTC;
 the completion timestamp predates the latest installation and is not attributed
-to it. A second reservation was observed adopted normally with epoch 1; the
-latest retained observation at 05:42 UTC still showed it expired, unspent and
-without a private claim. Final workflow completion and results after the latest
-installation remain pending. Hook changes cover 18 configurations; no measured
+to it. The previously blocking graph job completed, but the second workflow's
+child failed with `STATE_GRAPH_AUTOMATIC_REGENERATION_REQUIRED` while its cache
+still reported a child present. The latest installed update adds automatic
+recovery of an expired child before execution using native proof bound to the
+same child and its retained history. It preserves the same allowance and spent
+history, limits recovery to four attempts per hour with a 60-second interval,
+renews the 120-second reservation before preparation, and uses typed waiting
+outcomes. The affected workflow's outcome under this update remains pending;
+installation does not establish its repair. The
+watchdog's original enabled state was restored at 08:43 UTC without forcing a
+run; the primary task remained disabled. Full runtime acceptance remains pending.
+Hook changes cover 18 configurations; no measured
 time savings have been established. None of these facts supplies comparable
 avoided-read pairs or alters either fixed savings window. Global and causal
 savings remain unknown.
+
+The latest compiled source tightens revision and cache reevaluation using the
+required native proof and resets the query cursor when selection changes.
+Retirement of an old pending operation requires atomic `notApplied` proof under
+the newer, stronger lease. A dedicated sparse-session summary prompt is also
+included. Installation and operational results for these further changes remain
+pending, including the previously unsupported summary, graph recovery, GC and
+final reclaim. No token benefit or positive global net savings is inferred
+from source completion or compilation.
+
+The attempted further update remains on a shutdown HOLD after its 210-second
+wait; no update files have been copied. Additional summary corrective-revision
+and bounded index-drain diagnostic changes remain source work. Optional pruning
+is deferred until closure. None supplies an operational outcome.

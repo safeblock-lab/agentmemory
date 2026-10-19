@@ -2,7 +2,7 @@ import { markWorkflowStatisticsGap } from "./dashboard-activity.js";
 import type { IIIClient } from "iii-sdk";
 import { runAdmittedPhysicalMaintenance, type StorageForegroundPressure, type StorageMaintenanceContinuation } from "./physical-maintenance.js";
 import { runPeriodicLayouts, emptyLayoutCycle, normalizeLayoutCycle, isLayoutAdmissionAccepted, bindLayoutGraphTurn, LAYOUT_LEASE_CONTEXT_RECOVERY_VERSION, type LayoutCycle, type LayoutAdmission } from "./periodic-layouts.js";
-import { requestGraphWorkTurn, type GraphWorkTurn } from "../state/graph-work-queue.js";
+import { requestGraphWorkTurn, peekGraphWorkQueue, type GraphWorkTurn } from "../state/graph-work-queue.js";
 import { runPeriodicCompactionCandidate, preservePeriodicLease } from "./periodic-maintenance.js";
 import { emptyPeriodicCompactionProgress, normalizePeriodicCompactionProgress,
   type PeriodicCompactionProgress, type PeriodicExecutionAdmission } from "./periodic-maintenance-state.js";
@@ -38,6 +38,50 @@ const RECLAIM_IDLE_POLL_MS = 60_000;
 const RECLAIM_ERROR_BACKOFF_MS = 15 * 60_000;
 const RECLAIM_OVERLAP_LEASE_MS = 5 * 60_000;
 const active = new WeakSet<StateKV>();
+const maintenanceClosing = new WeakSet<StateKV>();
+const maintenanceRuns = new WeakMap<StateKV, Set<Promise<unknown>>>();
+export function beginStorageMaintenanceDrain(kv: StateKV): Promise<void> {
+  maintenanceClosing.add(kv);
+  return Promise.allSettled([...(maintenanceRuns.get(kv) ?? [])]).then(() => undefined);
+}
+type StorageMaintenancePhysicalObservation = {
+  sampleAt: string;
+  layouts: string | null;
+  periodic: string | null;
+  cancellationReason: "foreground_pressure" | "deadline" | null;
+  preserveLease: boolean;
+  progressMade: boolean;
+  incomplete: boolean;
+  reclaimed: boolean;
+  elapsedMs: number;
+};
+const lastPhysicalObservations = new WeakMap<StateKV, StorageMaintenancePhysicalObservation>();
+export type StorageMaintenanceForegroundObservation = {
+  sampleAt: string;
+  busy: boolean;
+  phase: StorageForegroundPressure["phase"];
+  activeRequests: number;
+  activeFunctionCount: number;
+  quietWindowRemainingMs: number;
+};
+export type StorageMaintenanceControllerSnapshot = {
+  sampledAt: string;
+  started: boolean;
+  stopped: boolean;
+  running: boolean;
+  lastWindowStartedAt: string | null;
+  lastWindowEndedAt: string | null;
+  lastResultKind: StorageMaintenanceContinuation["kind"] | null;
+  lastResultReason: string | null;
+  lastResultAt: string | null;
+  lastDecision: { at: string; kind: "paused" | "foreground" | "cooldown" | "dispatch" | "result" | "stopped"; reason: string } | null;
+  nextDueAt: string | null;
+  cooldownUntil: string | null;
+  cooldownRemainingMs: number;
+  wakePending: boolean;
+  paused: boolean;
+  lastObservedForeground: StorageMaintenanceForegroundObservation | null;
+};
 type LayoutTurnTicket = { turn?: GraphWorkTurn; waited: boolean; claimed: boolean };
 const layoutTurnTickets = new WeakMap<StateKV, LayoutTurnTicket>();
 function releaseLayoutTurn(kv: StateKV, ticket: LayoutTurnTicket): void {
@@ -889,8 +933,9 @@ function growth(state: MaintenanceState): Record<string, unknown> | null {
 }
 
 export function registerStorageMaintenance(sdk: IIIClient, kv: StateKV, isForegroundBusy: () => boolean = () => false,
-  foregroundPressureSnapshot?: () => StorageForegroundPressure, onGraphTurnGranted?: () => void): void {
-  sdk.registerFunction("mem::storage-maintenance", async (request?: {
+  foregroundPressureSnapshot?: () => StorageForegroundPressure, onGraphTurnGranted?: () => void,
+  controllerSnapshot?: () => StorageMaintenanceControllerSnapshot): void {
+  const run = async (request?: {
     action?: unknown; allow_blocking?: unknown; max_ms?: unknown; closed_owner_id?: unknown;
   }) => {
     const action = typeof request?.action === "string" ? request.action : "tick";
@@ -904,7 +949,21 @@ export function registerStorageMaintenance(sdk: IIIClient, kv: StateKV, isForegr
     }
     if (action === "status") {
       const state = await readState(kv);
+      const ticket = layoutTurnTickets.get(kv);
+      const lastPhysical = lastPhysicalObservations.get(kv);
+      const localRuntime = {
+        sampledAt: new Date().toISOString(),
+        controller: controllerSnapshot?.() ?? null,
+        maintenanceActive: active.has(kv),
+        maintenanceDraining: maintenanceClosing.has(kv),
+        layoutTicketPresent: ticket !== undefined,
+        layoutTicketGranted: ticket?.turn?.granted ?? false,
+        layoutTicketClaimed: ticket?.claimed ?? false,
+        graphWorkQueue: peekGraphWorkQueue(kv),
+        lastPhysicalWindow: lastPhysical === undefined ? null : { ...lastPhysical },
+      };
       return { success: true, state, layoutLeaseContextRecoveryVersion: LAYOUT_LEASE_CONTEXT_RECOVERY_VERSION,
+        localRuntime,
         retentionPolicy: STORAGE_RETENTION, retentionUseIntegration: RETENTION_USE_INTEGRATION, growth: growth(state), maintenanceReview: state.maintenanceReview };
     }
     if (action === "migrate_incremental" && (request?.allow_blocking !== true || !Number.isInteger(request.max_ms)
@@ -937,7 +996,7 @@ export function registerStorageMaintenance(sdk: IIIClient, kv: StateKV, isForegr
             void sdk.trigger({ function_id: "mem::storage-maintenance", payload: { action: "tick" } }).catch(() => {
               if (!queued.claimed) releaseLayoutTurn(kv, queued);
             });
-          });
+          }, { category: "layout", functionId: "mem::storage-maintenance" });
           queued.waited = !queued.turn.granted;
         }
         if (ticket.claimed) return respond({ success: true, busy: true }, continuation("busy", "local_running"));
@@ -1051,6 +1110,14 @@ export function registerStorageMaintenance(sdk: IIIClient, kv: StateKV, isForegr
           persist: () => saveState(kv, state!),
           reclaimMaintenance: () => reclaim(sdk, kv, state!, lease!, true, "maintenance"), isForegroundBusy,
           foregroundPressureSnapshot });
+        lastPhysicalObservations.set(kv, {
+          sampleAt: new Date().toISOString(),
+          layouts: /^[a-z_]{1,128}$/.test(physical.layouts) ? physical.layouts : null,
+          periodic: /^[a-z_]{1,128}$/.test(physical.periodic) ? physical.periodic : null,
+          cancellationReason: physical.cancellationReason,
+          preserveLease: physical.preserveLease, progressMade: physical.progressMade,
+          incomplete: physical.incomplete, reclaimed: physical.reclaimed, elapsedMs: physical.elapsedMs,
+        });
         preserveLeaseUntilExpiry = physical.preserveLease;
         let next: StorageMaintenanceContinuation;
         if (physical.preserveLease || state.layoutCycle.recoveryRequired || state.layoutCycle.pending !== null || state.layoutCycle.pendingRaw !== null
@@ -1164,5 +1231,19 @@ export function registerStorageMaintenance(sdk: IIIClient, kv: StateKV, isForegr
       unbindLayoutTurn?.();
       if (layoutTicket) releaseLayoutTurn(kv, layoutTicket);
     }
+  };
+  sdk.registerFunction("mem::storage-maintenance", (request?: {
+    action?: unknown; allow_blocking?: unknown; max_ms?: unknown; closed_owner_id?: unknown;
+  }) => {
+    if (request?.action === "status") return run(request);
+    if (maintenanceClosing.has(kv)) return Promise.resolve({ success: true, deferred: true, reason: "shutdown_draining",
+      continuation: continuation("hold", "shutdown_draining", true, false, 300_000) });
+    let runs = maintenanceRuns.get(kv);
+    if (!runs) { runs = new Set(); maintenanceRuns.set(kv, runs); }
+    const admittedRuns = runs;
+    const pending = run(request);
+    admittedRuns.add(pending);
+    void pending.then(() => admittedRuns.delete(pending), () => admittedRuns.delete(pending));
+    return pending;
   });
 }

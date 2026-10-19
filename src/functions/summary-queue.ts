@@ -9,7 +9,7 @@ import type { LlmTaskRouter } from "../providers/task-router.js";
 import type { StateKV } from "../state/kv.js";
 import { readSummarySnapshotSource } from "./summary-snapshot-source.js";
 import { KV, fingerprintId, generateId } from "../state/schema.js";
-import { evaluatePublicationEvidence, preparePublicationEvidence, type PublicationEvidenceSource } from "./publication-evidence.js";
+import { evaluatePublicationEvidence, observePublicationEvidence, preparePublicationEvidence, type PublicationEvidenceSource } from "./publication-evidence.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { getSummaryBudgetConfig, isBackgroundRecoveryPaused } from "../config.js";
 import { recordAudit } from "./audit.js";
@@ -23,7 +23,7 @@ import {
   formatSummaryObservation, formatSummaryPartial, type SummaryPromptItem,
 } from "../prompts/summary.js";
 import {
-  REDUCE_SYSTEM, SUMMARY_RECOVERY_FIDELITY_VERSION, SUMMARY_SYSTEM,
+  REDUCE_SYSTEM, SUMMARY_GENERATION_REVISION, SUMMARY_RECOVERY_FIDELITY_VERSION, SUMMARY_SYSTEM,
   buildReduceItemsPrompt, buildSummaryItemsPrompt,
 } from "./summary-queue-prompts.js";
 import {
@@ -41,6 +41,8 @@ import { recordOperation } from "./dashboard-activity.js";
 import { prepareFullOriginalSummaryRequest } from "./summary-recovery.js";
 import { assertZeroSpendSummaryPredecessor, constructSummaryRecovery, summaryConstructionKey,
   summaryRecoveryReady, zeroSpendSummaryIdentity, type SummaryRecoveryConstruction } from "./summary-zero-spend-recovery.js";
+import { claimSummaryPromptCorrection, eligibleSummaryPromptPredecessor, summaryPromptCorrectionId,
+  summaryPromptCorrectionKey, type SummaryPromptCorrection } from "./summary-prompt-correction.js";
 
 const DISPATCH_TOPIC = "agentmemory.summary.dispatch";
 const UNIT_TOPIC = "agentmemory.summary.unit";
@@ -916,6 +918,97 @@ export function registerSummaryQueueFunctions(
     if (result.status !== "supported") throw new SummaryBudgetError(`summary_publication_${result.status}`);
     return result.requestId;
   };
+  const completedPromptCorrection = async (job: SummaryQueueJob): Promise<string | null> => {
+    const childId = summaryPromptCorrectionId(job);
+    const journal = await kv.get<SummaryPromptCorrection>(KV.state, summaryPromptCorrectionKey(childId));
+    if (journal?.state !== "ready" || journal.revision !== SUMMARY_GENERATION_REVISION
+      || journal.predecessorJobId !== job.id || journal.jobId !== childId
+      || journal.sessionId !== job.sessionId || journal.project !== job.project
+      || journal.sourceFingerprint !== job.snapshotFingerprint) return null;
+    const marker = await kv.get<CompletedSnapshot>(KV.summaryQueueCompleted, job.sessionId);
+    if (marker?.jobId !== childId || marker.fingerprint !== job.snapshotFingerprint) return null;
+    const summary = await kv.get<SessionSummary>(KV.summaries, job.sessionId);
+    return summary?.sessionId === job.sessionId && summary.project === job.project
+      && summary.observationCount === job.observationCount ? childId : null;
+  };
+  const correctUnsupportedSummary = async (candidate: SummaryQueueJob): Promise<boolean> => {
+    if (!eligibleSummaryPromptPredecessor(candidate)) return false;
+    return withKeyedLock(`summary-session:${candidate.sessionId}`, () =>
+      withKeyedLock(`summary-job:${candidate.id}`, async () => {
+        const row = await kv.getVersioned<SummaryQueueJob>(KV.summaryQueueJobs, candidate.id);
+        const job = row.value;
+        if (!row.exists || !job || !eligibleSummaryPromptPredecessor(job)) return false;
+        if (await completedPromptCorrection(job)) return true;
+        const marker = await kv.get<{ jobId: string; reason: string }>(KV.state,
+          `${job.sessionId}:failed-summary:${job.snapshotFingerprint}`);
+        if (marker?.jobId !== job.id || marker.reason !== job.failure
+          || await kv.get(KV.summaryQueueActive, job.sessionId)) return false;
+        const current = await snapshot(kv, job.sessionId, job.project, true);
+        if (current.fingerprint !== job.snapshotFingerprint || current.observations.length !== 1) return false;
+        const unit = await kv.get<SummaryQueueUnit>(KV.summaryQueueUnits(job.id), job.unitIds[0]);
+        if (!unit || unit.id !== job.unitIds[0] || unit.jobId !== job.id || unit.stage !== "map"
+          || unit.round !== 0 || !unit.summary || !unit.output || unit.startedAt
+          || unit.summary.sessionId !== job.sessionId || unit.summary.project !== job.project
+          || unit.summary.observationCount !== job.observationCount
+          || unit.outputInputHash !== inputHash(unit)) return false;
+        const capture = await kv.get<{ state: string; inputHash?: string; raw?: string; overflow?: boolean }>(
+          KV.state, `${job.id}:raw:${unit.id}`);
+        if (capture?.state !== "captured" || capture.inputHash !== inputHash(unit)
+          || typeof capture.raw !== "string" || !capture.raw || capture.overflow
+          || Buffer.byteLength(capture.raw, "utf8") > 65_536) return false;
+        const root = await getSummaryEvidenceRoot(kv, job);
+        if (!root || root.mode !== "complete" || root.count !== 1) return false;
+        const sources = await verifyJobEvidence(job, root);
+        const verdict = await observePublicationEvidence(kv, {
+          workflow: "summary", operationId: job.id, project: job.project,
+          candidate: JSON.stringify(summaryFields(unit.summary)), sources, evidenceComplete: true,
+        });
+        if (!("state" in verdict) || verdict.state !== "decided" || !verdict.hasRaw
+          || verdict.responseOverflow || verdict.decisionStatus !== "unsupported" || verdict.diagnostic)
+          return false;
+        const latest = await kv.getVersioned<SummaryQueueJob>(KV.summaryQueueJobs, job.id);
+        if (!latest.exists || latest.version !== row.version
+          || await kv.get(KV.summaryQueueActive, job.sessionId)) return false;
+        const now = new Date().toISOString();
+        const admission = await claimSummaryPromptCorrection(kv, job, verdict.requestId, now);
+        if (!admission) return false;
+        const next = await snapshot(kv, job.sessionId, job.project, true);
+        if (next.fingerprint !== job.snapshotFingerprint
+          || await kv.get(KV.summaryQueueActive, job.sessionId)) return false;
+        const config = getSummaryBudgetConfig();
+        const groups = packSummaryItems(next.items, SUMMARY_SYSTEM, buildSummaryItemsPrompt,
+          summaryChunkInputLimit(config), config.chunkSize);
+        if (groups.length !== 1) return false;
+        const units = createUnits(admission.jobId, "map", 0, groups);
+        const child: SummaryQueueJob = {
+          id: admission.jobId, sessionId: job.sessionId, project: job.project,
+          snapshotFingerprint: job.snapshotFingerprint, observationCount: job.observationCount,
+          config, createdAt: now, updatedAt: now, status: "pending", stage: "map", round: 0,
+          unitIds: units.map(value => value.id), sourceProgressSize: summaryProgressSize(next.items),
+          generationRevision: SUMMARY_GENERATION_REVISION, promptCorrectionRevision: SUMMARY_GENERATION_REVISION,
+          promptCorrectionOfJobId: job.id, dispatchPending: true,
+        };
+        const childRoot = await captureSummaryEvidence(kv, child, next.observations);
+        if (childRoot.mode !== "complete" || childRoot.count !== root.count)
+          throw new SummaryBudgetError("summary_prompt_correction_source_mismatch");
+        await writeUnits(kv, child.id, units);
+        await kv.set(KV.summaryQueueJobs, child.id, child);
+        await setSummaryActiveJob(kv, child.sessionId, child.id);
+        await kv.set(KV.state, summaryPromptCorrectionKey(child.id), { ...admission, state: "ready" });
+        await recordAudit(kv, "compress", "mem::summary-enqueue", [job.sessionId],
+          { jobId: child.id, predecessorJobId: job.id, correctionRevision: SUMMARY_GENERATION_REVISION,
+            unitCount: units.length, outcome: "queued" }, undefined, undefined, `${child.id}:queued`);
+        await enqueue(sdk, "mem::summary-dispatch", { jobId: child.id, round: 0, offset: 0 });
+        await recordOperation(kv, "mem::summary-enqueue", "queued", { unitsQueued: units.length }, undefined,
+          { executionId: child.id, executionLevel: "workflow", occurredAt: now });
+        return true;
+      })).catch(error => {
+        if (!(error instanceof SummaryBudgetError)) throw error;
+        logger.warn("Summary prompt correction deferred", { jobId: candidate.id,
+          reason: /^[A-Za-z0-9_:.-]{1,160}$/.test(error.message) ? error.message : "summary_source_unavailable" });
+        return false;
+      });
+  };
   const publish = async (job: SummaryQueueJob, summary: SessionSummary, method: SummaryMethod,
     foreground: boolean, selection?: SelectedSummary, units: SummaryQueueUnit[] = []): Promise<void> => {
     const root = await evidenceRoot(job);
@@ -1219,6 +1312,8 @@ export function registerSummaryQueueFunctions(
       }
       if (retained && (!recoveryOf || retained.jobId !== recoveryOf.id)) {
         const retainedJob = await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, retained.jobId);
+        const corrected = retainedJob ? await completedPromptCorrection(retainedJob) : null;
+        if (corrected) return { success: true, queued: false, completed: true, jobId: corrected };
         const recoveryRoot = manual && retainedJob ? await manualRecoveryRootForMarker(retainedJob) : undefined;
         const continuation = recoveryRoot ? manualRecoveryContinuation(recoveryRoot) : undefined;
         return { success: false, queued: false, retained: true, jobId: retained.jobId, error: retained.reason,
@@ -1260,6 +1355,7 @@ export function registerSummaryQueueFunctions(
         snapshotFingerprint: current.fingerprint, observationCount: current.observations.length,
         config, createdAt: now, updatedAt: now, status: "pending", stage: "map",
         round: 0, unitIds: units.map(unit => unit.id), sourceProgressSize: summaryProgressSize(current.items),
+        generationRevision: SUMMARY_GENERATION_REVISION,
         dispatchPending: true,
         ...(foreground && { executionOrigin: origin }),
       };
@@ -2131,7 +2227,7 @@ export function registerSummaryQueueFunctions(
     let recovered = 0;
     let replayed = 0;
     for (const candidate of await kv.list<SummaryQueueJob>(KV.summaryQueueJobs)) {
-      if (candidate.status !== "pending" || candidate.executionOrigin) continue;
+      if (candidate.status !== "pending" || candidate.executionOrigin || !await summaryRecoveryReady(kv, candidate)) continue;
       await withKeyedLock(`summary-job:${candidate.id}`, async () => {
         const job = await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, candidate.id);
         if (!job || job.status !== "pending" || job.executionOrigin) return;
@@ -2201,6 +2297,9 @@ export function registerSummaryQueueFunctions(
         await summaryRecoveryStep("recover.cleanup_units", { jobId: job.id, sessionId: job.sessionId }, () => cleanupUnits(kv, job.id));
         await kv.delete(KV.summaryQueueJobs, job.id);
         cleaned++;
+      } else if (eligibleSummaryPromptPredecessor(job) && await correctUnsupportedSummary(job)) {
+        coveredSessions.add(job.sessionId);
+        recovered++;
       } else if (job.failedAt && Date.now() - Date.parse(job.failedAt) >= FAILED_RETENTION_MS) {
         await summaryRecoveryStep("recover.cleanup_units", { jobId: job.id, sessionId: job.sessionId }, () => cleanupUnits(kv, job.id));
         await kv.delete(KV.summaryQueueJobs, job.id);
