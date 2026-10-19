@@ -1,4 +1,4 @@
-import type { FireworksBatchActiveIndex, FireworksBatchConfig, FireworksBatchEnqueueIntent, FireworksBatchEnqueueJournal, FireworksBatchJob, FireworksBatchRequest, FireworksBatchWorkItem, LlmUsage } from "../types.js";
+import type { FireworksBatchActiveIndex, FireworksBatchConfig, FireworksBatchEnqueueIntent, FireworksBatchEnqueueJournal, FireworksBatchJob, FireworksBatchRequest as BaseBatchRequest, FireworksBatchWorkItem as BaseBatchWorkItem, LlmUsage } from "../types.js";
 import { fingerprintId, generateId, KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
@@ -8,8 +8,27 @@ import { logger } from "../logger.js";
 import { batchTaskLlmTask, taskOutputTokens } from "../providers/task-output-limits.js";
 import { retrievalRequest } from "../state/indexed-retrieval.js";
 import { REFLECT_CONTROL, REFLECT_JOBS, type ReflectJob, type ConceptCluster } from "./reflect-queue-types.js";
+import { canonicalStructuredJson, sameStructuredJsonValue, validatedProceduralContract, proceduralOutputContractV2, type ProceduralOutputContractV2 } from "./consolidation-procedural-format.js";
+import { FIREWORKS_BATCH_OUTPUT_CAPABILITY } from "../providers/structured-output-contract.js";
+
+type FireworksBatchRequest = BaseBatchRequest & { outputContract?: ProceduralOutputContractV2 };
+export type ProceduralBatchWorkItem = BaseBatchWorkItem & { outputContract?: ProceduralOutputContractV2 };
+type FireworksBatchWorkItem = ProceduralBatchWorkItem;
+
+function validateBatchOutput(value: { outputContract?: unknown; responseFormat?: unknown; model?: unknown }): void {
+  if (value.outputContract === undefined) return;
+  const contract = proceduralOutputContractV2();
+  if (!isRecord(value.outputContract) || !isRecord(value.outputContract.transport)
+    || value.outputContract.version !== contract.version || value.outputContract.transport.kind !== "fireworks-batch"
+    || !sameStructuredJsonValue(value.outputContract.options, contract.options)
+    || !sameStructuredJsonValue(value.outputContract.transport.capability, FIREWORKS_BATCH_OUTPUT_CAPABILITY)
+    || typeof value.outputContract.transport.model !== "string" || !value.outputContract.transport.model.trim()
+    || value.model !== value.outputContract.transport.model
+    || !sameStructuredJsonValue(value.responseFormat, contract.options.responseFormat)) throw new Error("procedural_batch_contract_mismatch");
+}
 
 export interface FireworksBatchQueue {
+  prepareProceduralContract?(contract: ProceduralOutputContractV2): ProceduralOutputContractV2;
   enqueue(request: FireworksBatchRequest): Promise<{ queued: boolean; workItemId?: string; reason?: string }>;
 }
 
@@ -96,6 +115,7 @@ function validEnqueueIntent(value: unknown): value is FireworksBatchEnqueueInten
     || typeof value.createdAt !== "string" || typeof value.updatedAt !== "string") {
     return false;
   }
+  validateBatchOutput(value.item);
   return typeof value.item.customId === "string"
     && typeof value.item.correlationId === "string"
     && typeof value.item.task === "string"
@@ -372,6 +392,7 @@ function isAmbiguousSubmitError(error: unknown): boolean {
 }
 
 function batchJsonlLine(item: FireworksBatchWorkItem): string {
+  validateBatchOutput(item);
   return JSON.stringify({
     custom_id: item.customId,
     body: {
@@ -380,6 +401,7 @@ function batchJsonlLine(item: FireworksBatchWorkItem): string {
         { role: "user", content: item.userPrompt },
       ],
       max_tokens: item.maxTokens,
+      ...(item.responseFormat === undefined ? {} : { response_format: item.responseFormat }),
     },
   });
 }
@@ -487,6 +509,12 @@ function remoteStatusBelongsToJob(
 }
 
 export class FireworksBatchCoordinator implements FireworksBatchQueue {
+  prepareProceduralContract(contract: ProceduralOutputContractV2): ProceduralOutputContractV2 {
+    if (!this.config.enabled || !this.transport || !this.config.model) throw new Error("procedural_batch_capability_unavailable");
+    const bound = { ...contract, transport: { kind: "fireworks-batch" as const, capability: FIREWORKS_BATCH_OUTPUT_CAPABILITY, model: this.config.model } };
+    validatedProceduralContract(bound);
+    return bound;
+  }
   private readonly payloadVersions = new WeakMap<FireworksBatchWorkItem, { version: string; fingerprint: string }>();
   async canReplace(workItemId: string): Promise<boolean> {
     const old = await this.kv.get<FireworksBatchWorkItem>(KV.fireworksBatchWorkItems, workItemId);
@@ -571,6 +599,8 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
         remaining.push(intent);
         continue;
       }
+      if (existing && (!sameStructuredJsonValue(existing.outputContract, "outputContract" in intent.item ? intent.item.outputContract : undefined)
+        || !sameStructuredJsonValue(existing.responseFormat, intent.item.responseFormat))) throw new FireworksBatchReconciliationError("batch enqueue contract identity mismatch");
       if (existing && !ACTIVE_WORK_STATES.has(existing.state)) continue;
       if (!existing) {
         await this.kv.set(KV.fireworksBatchWorkItems, intent.id, intent.item);
@@ -1047,17 +1077,25 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
     if (metadataChars > MAX_PERSISTED_METADATA_CHARS) {
       return { queued: false, reason: "Batch provenance metadata exceeded local limits" };
     }
+    const responseFormat = request.responseFormat === undefined ? undefined : structuredClone(request.responseFormat);
+    const outputContract = request.outputContract === undefined ? undefined : structuredClone(request.outputContract);
+    validateBatchOutput({ outputContract, responseFormat, model: request.model || this.config.model });
     return withKeyedLock(ENQUEUE_LOCK, async () => {
       await this.recoverEnqueueIntentsUnsafe();
       if (request.replacementOf && (!request.metadata?.sourceFingerprint || !await this.canReplace(request.replacementOf))) {
         return { queued: false, reason: "Replacement source is unsafe or missing its fingerprint" };
       }
-      const fingerprint = request.replacementOf
+      const legacyFingerprint = request.replacementOf
         ? fingerprintId("fwbrepl", `${request.replacementOf}\0${request.metadata!.sourceFingerprint}`)
         : fingerprintId("fwb", `${request.task}\0${request.systemPrompt}\0${request.userPrompt}`);
+      const fingerprint = outputContract !== undefined ? fingerprintId("fwbcontract", canonicalStructuredJson([legacyFingerprint, responseFormat, outputContract]))
+        : responseFormat === undefined ? legacyFingerprint : fingerprintId("fwbfmt", JSON.stringify([legacyFingerprint, responseFormat]));
       const existingId = await this.kv.get<string>(KV.fireworksBatchFingerprints, fingerprint);
       if (existingId) {
         const existing = await this.kv.get<FireworksBatchWorkItem>(KV.fireworksBatchWorkItems, existingId);
+        if (existing && (!sameStructuredJsonValue(existing.responseFormat, responseFormat) || !sameStructuredJsonValue(existing.outputContract, outputContract))) {
+          return { queued: false, reason: "Batch response format identity mismatch" };
+        }
         if (existing?.state === "completed" && request.metadata?.sourceFingerprint
           && existing.metadata?.sourceFingerprint === request.metadata.sourceFingerprint) {
           return { queued: true, workItemId: existing.id };
@@ -1096,6 +1134,8 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
         systemPrompt: request.systemPrompt,
         userPrompt: request.userPrompt,
         maxTokens,
+        ...(responseFormat === undefined ? {} : { responseFormat }),
+        ...(outputContract === undefined ? {} : { outputContract }),
         metadata: request.metadata,
         state: "queued",
         attempts: 0,
@@ -1475,13 +1515,25 @@ export class FireworksBatchCoordinator implements FireworksBatchQueue {
       try {
         if (!item.completionIntent) {
           item.completionIntent = intent;
+          if (item.outputContract !== undefined || item.responseFormat !== undefined) {
+            item.result = { customId: item.customId, content: row.content, receivedAt: new Date().toISOString() };
+          }
           await this.kv.set(KV.fireworksBatchWorkItems, item.id, item);
         }
+        validateBatchOutput(item);
         if (row.usage && this.onUsage) await this.onUsage(item, row.usage);
         completion = await this.onCompleted(item, row.content);
         const failure = completionFailure(completion);
         if (failure) throw new Error(failure);
       } catch (error) {
+        if (item.task === "consolidation" && (item.outputContract !== undefined || item.responseFormat !== undefined)) {
+          const receivedAt = new Date().toISOString();
+          item.result = { customId: item.customId, content: row.content, receivedAt };
+          item.updatedAt = receivedAt;
+          await this.kv.set(KV.fireworksBatchWorkItems, item.id, item);
+          await this.markDeadLetter([item.id], safeBatchErrorMessage(error, "structured consolidation callback failed"));
+          throw new FireworksBatchCallbackError(safeBatchErrorMessage(error, "structured consolidation callback failed"));
+        }
         throw new FireworksBatchCallbackError(safeBatchErrorMessage(error, "batch callback failed"));
       }
       item.state = completion === "stale" ? "stale" : "completed";

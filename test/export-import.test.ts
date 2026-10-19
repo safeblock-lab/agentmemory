@@ -142,7 +142,7 @@ describe("Export/Import Functions", () => {
   it("export produces valid ExportData structure", async () => {
     const result = (await sdk.trigger("mem::export", {})) as ExportData;
 
-    expect(result.version).toBe("0.9.89");
+    expect(result.version).toBe("0.9.90");
     expect(result.exportedAt).toBeDefined();
     expect(result.sessions.length).toBe(1);
     expect(result.sessions[0].id).toBe("ses_1");
@@ -252,7 +252,7 @@ describe("Export/Import Functions", () => {
     const importedSummary = { ...testSummary, sessionId, title: "Imported summary" };
     const publishedSummary = { ...testSummary, sessionId, title: "Published while import waited" };
     const exportData: ExportData = {
-      version: "0.9.89",
+      version: "0.9.90",
       exportedAt: new Date().toISOString(),
       sessions: [{ ...testSession, id: sessionId }],
       observations: {},
@@ -300,7 +300,7 @@ describe("Export/Import Functions", () => {
     const sessionId = "ses_imported";
     const importedSummary = { ...testSummary, sessionId, title: "Imported summary" };
     const exportData: ExportData = {
-      version: "0.9.89",
+      version: "0.9.90",
       exportedAt: new Date().toISOString(),
       sessions: [{ ...testSession, id: sessionId }],
       observations: {},
@@ -392,7 +392,7 @@ describe("Export/Import Functions", () => {
     let importSettled = false;
     const importPromise = (sdk.trigger("mem::import", {
       exportData: {
-        version: "0.9.89",
+        version: "0.9.90",
         exportedAt: new Date().toISOString(),
         sessions: [newSession],
         observations: {},

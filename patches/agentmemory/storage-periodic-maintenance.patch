@@ -1,0 +1,699 @@
+diff --git a/src/functions/storage-maintenance.ts b/src/functions/storage-maintenance.ts
+--- a/src/functions/storage-maintenance.ts
++++ b/src/functions/storage-maintenance.ts
+@@ -11,6 +11,10 @@
+ import type { StateKV } from "../state/kv.js";
+ import { StatePageError } from "../state/state-pages.js";
+ import { storageTtlPage, type StorageTtlReceipt } from "../state/storage-ttl.js";
++import {
++  validateNativeCompactionRequest,
++  type NativeCompactionApply, type NativeCompactionStatus, type NativeCompactionStep,
++} from "../state/native-compaction.js";
+ import type { GraphControlState } from "../types.js";
+ import type { StateGraphGuard } from "../state/state-transactions.js";
+ import {
+@@ -24,10 +28,19 @@
+ const MAX_CANDIDATES = 24;
+ const RECLAIM_PAGE_MS = 25;
+ const RECLAIM_MAX_PAGES = 16;
++const MAINTENANCE_RECLAIM_MAX_PAGES = 4096;
++const MAINTENANCE_RECLAIM_MAX_MS = 3_000;
+ const RECLAIM_MIN_INTERVAL_MS = 5_000;
+ const RECLAIM_IDLE_POLL_MS = 60_000;
+ const RECLAIM_ERROR_BACKOFF_MS = 15 * 60_000;
+ const RECLAIM_OVERLAP_LEASE_MS = 2 * 60_000;
++const MAINTENANCE_WINDOW_MS = 45_000;
++const COMPACTION_BATCH_LIMIT = 128;
++const COMPACTION_BATCH_MAX_BYTES = 16 * 1024 * 1024;
++const COLLECTION_LIMIT = 4096;
++const COLLECTION_MAX_BYTES = 4 * 1024 * 1024;
++const COMPACTION_MAX_MS = 3_000;
++const GROWTH_TRIGGER_BYTES = 1_000_000_000;
+ const active = new WeakSet<StateKV>();
+ const stateWriters = new WeakMap<StateKV, { sdk: IIIClient; lease: MaintenanceLease; unavailable?: boolean }>();
+ type Row = Record<string, unknown>;
+@@ -46,15 +59,25 @@
+ };
+ 
+ type StoragePhysicalSample = StorageGrowthSample["physical"];
++type CompactStatusSnapshot = Pick<NativeCompactionStatus,
++  "phase" | "cursor" | "active" | "rows_complete" | "vectors_complete" | "complete">;
++type PendingCompactOperation = { request: NativeCompactionApply; before: CompactStatusSnapshot };
++type CompactOperationHistory = PendingCompactOperation & { outcome: "not_applied"; recordedAt: string };
+ type MaintenanceReview = {
+   footprintBaselineBytes: number | null;
+   footprintBaselineAt: string | null;
++  footprintBaselineKind: "initial_observation" | "successful_cycle" | null;
+   freePagePendingSince: string | null;
+-  dueReasons: Array<"growth_20_percent" | "free_pages_24h">;
++  dueReasons: Array<"growth_1gb" | "free_pages_24h">;
+ };
+ type MaintenanceState = StorageMaintenanceState & {
+   ttlRunId?: string;
+   ttlReceipt?: StorageTtlReceipt;
++  compactOperation?: PendingCompactOperation;
++  compactOperationHistory?: CompactOperationHistory[];
++  compactCycleActive?: boolean;
++  compactGcComplete?: boolean;
++  compactOutcomeUnknown?: boolean;
+   maintenanceHistory: MaintenanceHistoryEntry[];
+   maintenanceReview: MaintenanceReview;
+ };
+@@ -127,8 +150,9 @@
+     },
+     diagnostics: { inProgress: { ...EMPTY_DIAGNOSTIC }, samples: [] },
+     maintenanceHistory: [],
++    compactOperationHistory: [],
+     maintenanceReview: {
+-      footprintBaselineBytes: null, footprintBaselineAt: null,
++      footprintBaselineBytes: null, footprintBaselineAt: null, footprintBaselineKind: null,
+       freePagePendingSince: null, dueReasons: [],
+     },
+     technical: {
+@@ -149,6 +173,48 @@
+   const savedCompaction = state.compaction ?? defaults.compaction;
+   const saved = state as MaintenanceState;
+   const savedReview = isRow(saved.maintenanceReview) ? saved.maintenanceReview : defaults.maintenanceReview;
++  const footprintBaselineKind = savedReview.footprintBaselineKind === "initial_observation"
++    || savedReview.footprintBaselineKind === "successful_cycle" ? savedReview.footprintBaselineKind : null;
++  let compactOperation: PendingCompactOperation | undefined;
++  if (saved.compactOperation !== undefined) {
++    const pending = saved.compactOperation as unknown;
++    if (!isRow(pending) || !isRow(pending.request) || !isRow(pending.before) || !isRow(pending.before.cursor)) {
++      throw new Error("STATE_STORAGE_INVALID_RESPONSE");
++    }
++    const request = pending.request as unknown as NativeCompactionApply;
++    validateNativeCompactionRequest({ action: "compact_apply", request });
++    const before = pending.before;
++    if (!["legacy", "copy", "compact", "rollback"].includes(String(before.phase))
++      || typeof before.cursor.scope !== "string" || typeof before.cursor.key !== "string"
++      || typeof before.active !== "boolean" || typeof before.rows_complete !== "boolean"
++      || typeof before.vectors_complete !== "boolean" || typeof before.complete !== "boolean") {
++      throw new Error("STATE_STORAGE_INVALID_RESPONSE");
++    }
++    compactOperation = { request, before: before as CompactStatusSnapshot };
++  }
++  const compactOperationHistory: CompactOperationHistory[] = [];
++  if (saved.compactOperationHistory !== undefined) {
++    if (!Array.isArray(saved.compactOperationHistory) || saved.compactOperationHistory.length > 30) {
++      throw new Error("STATE_STORAGE_INVALID_RESPONSE");
++    }
++    for (const item of saved.compactOperationHistory) {
++      if (!isRow(item) || item.outcome !== "not_applied" || typeof item.recordedAt !== "string"
++        || !Number.isFinite(Date.parse(item.recordedAt)) || !isRow(item.request)
++        || !isRow(item.before) || !isRow(item.before.cursor)) throw new Error("STATE_STORAGE_INVALID_RESPONSE");
++      const request = item.request as unknown as NativeCompactionApply;
++      validateNativeCompactionRequest({ action: "compact_apply", request });
++      const before = item.before;
++      if (!["legacy", "copy", "compact", "rollback"].includes(String(before.phase))
++        || typeof before.cursor.scope !== "string" || typeof before.cursor.key !== "string"
++        || typeof before.active !== "boolean" || typeof before.rows_complete !== "boolean"
++        || typeof before.vectors_complete !== "boolean" || typeof before.complete !== "boolean") {
++        throw new Error("STATE_STORAGE_INVALID_RESPONSE");
++      }
++      compactOperationHistory.push({
++        request, before: before as CompactStatusSnapshot, outcome: "not_applied", recordedAt: item.recordedAt,
++      });
++    }
++  }
+   return {
+     ...defaults, ...state,
+     compaction: {
+@@ -172,14 +238,21 @@
+     },
+     maintenanceHistory: Array.isArray(saved.maintenanceHistory) ? saved.maintenanceHistory.slice(-30) : [],
+     maintenanceReview: {
+-      footprintBaselineBytes: Number.isSafeInteger(savedReview.footprintBaselineBytes)
++      footprintBaselineBytes: footprintBaselineKind !== null && Number.isSafeInteger(savedReview.footprintBaselineBytes)
+         && Number(savedReview.footprintBaselineBytes) >= 0 ? Number(savedReview.footprintBaselineBytes) : null,
+-      footprintBaselineAt: typeof savedReview.footprintBaselineAt === "string" ? savedReview.footprintBaselineAt : null,
++      footprintBaselineAt: footprintBaselineKind !== null && typeof savedReview.footprintBaselineAt === "string"
++        ? savedReview.footprintBaselineAt : null,
++      footprintBaselineKind,
+       freePagePendingSince: typeof savedReview.freePagePendingSince === "string" ? savedReview.freePagePendingSince : null,
+       dueReasons: Array.isArray(savedReview.dueReasons)
+         ? savedReview.dueReasons.filter((reason): reason is MaintenanceReview["dueReasons"][number] =>
+-          reason === "growth_20_percent" || reason === "free_pages_24h") : [],
++          reason === "growth_1gb" || reason === "free_pages_24h") : [],
+     },
++    compactCycleActive: saved.compactCycleActive === true,
++    compactGcComplete: saved.compactGcComplete === true,
++    compactOutcomeUnknown: saved.compactOutcomeUnknown === true,
++    compactOperation,
++    compactOperationHistory,
+     technical: { ...defaults.technical, ...state.technical, cursors: state.technical?.cursors ?? {} },
+   };
+ }
+@@ -225,10 +298,13 @@
+ 
+ async function triggerFencedReclaim(
+   sdk: IIIClient, lease: MaintenanceLease, maxPages: number,
++  maintenance = false,
+ ): Promise<StorageReclaimResult> {
+   try {
+     return await triggerStateStorage<StorageReclaimResult>(sdk, {
+-      action: "reclaim", max_pages: maxPages, max_ms: RECLAIM_PAGE_MS,
++      action: "reclaim", max_pages: maxPages,
++      max_ms: maintenance ? MAINTENANCE_RECLAIM_MAX_MS : RECLAIM_PAGE_MS,
++      ...(maintenance ? { maintenance: true as const } : {}),
+       lease_owner_id: lease.ownerId, lease_fence: lease.fence,
+     });
+   } catch (error) {
+@@ -262,14 +338,16 @@
+   const review = state.maintenanceReview;
+   const footprintBytes = sample.physical.database_bytes + sample.physical.wal_bytes;
+   if (review.footprintBaselineBytes === null && state.cleanupActivatedAt
+-    && state.lastCleanup && !state.lastCleanup.pending) {
++    && state.lastCleanup && !state.lastCleanup.pending
++    && Date.parse(sample.sampledAt) >= Date.parse(state.lastCleanup.completedAt)) {
+     review.footprintBaselineBytes = footprintBytes;
+     review.footprintBaselineAt = sample.sampledAt;
++    review.footprintBaselineKind = "initial_observation";
+   }
+   const due = new Set(review.dueReasons);
+-  if (review.footprintBaselineBytes !== null && review.footprintBaselineBytes > 0
+-    && footprintBytes >= review.footprintBaselineBytes * 1.2) {
+-    due.add("growth_20_percent");
++  if (review.footprintBaselineBytes !== null
++    && footprintBytes >= review.footprintBaselineBytes + GROWTH_TRIGGER_BYTES) {
++    due.add("growth_1gb");
+   }
+   if (sample.physical.freelist_count > 0) {
+     review.freePagePendingSince ??= sample.sampledAt;
+@@ -714,9 +792,6 @@
+     pagesReclaimed: result.pages_reclaimed, physicalBytesReclaimed: result.physical_bytes_reclaimed,
+     before: result.before, after: result.after,
+   });
+-  if (result.physical_bytes_reclaimed > 0) {
+-    state.lastSuccessfulCompactionAt = new Date(now).toISOString();
+-  }
+ }
+ 
+ async function reclaim(
+@@ -725,6 +800,8 @@
+   state: MaintenanceState,
+   lease: MaintenanceLease,
+   force = false,
++  maintenance = false,
++  shouldYieldEffect: () => boolean = () => false,
+ ): Promise<{ result: StorageReclaimResult | null; outcomeUnknown: boolean }> {
+   const now = Date.now();
+   const progress = state.compaction;
+@@ -732,9 +809,6 @@
+   if (backoffUntil > now) return { result: null, outcomeUnknown: false };
+   const nextEligibleAt = progress.nextEligibleAt ? Date.parse(progress.nextEligibleAt) : 0;
+   if (!force && nextEligibleAt > now) return { result: null, outcomeUnknown: false };
+-  progress.attempts++;
+-  await saveState(kv, state);
+-
+   try {
+     const renewed = await triggerMaintenanceLease(sdk, {
+       action: "maintenance_lease_refresh", owner_id: lease.ownerId,
+@@ -745,8 +819,12 @@
+     }
+     lease.expiresAt = renewed.expires_at;
+     progress.overlap = { ownerId: lease.ownerId, startedAt: new Date(now).toISOString(), expiresAt: lease.expiresAt };
++    if (shouldYieldEffect()) return { result: null, outcomeUnknown: false };
++    progress.attempts++;
++    await saveState(kv, state);
+     const result = await triggerFencedReclaim(sdk, lease,
+-      Math.max(1, Math.min(RECLAIM_MAX_PAGES, progress.nextMaxPages)));
++      maintenance ? MAINTENANCE_RECLAIM_MAX_PAGES : Math.max(1, Math.min(RECLAIM_MAX_PAGES, progress.nextMaxPages)),
++      maintenance);
+     updateReclaimState(state, result, Date.now());
+     return { result, outcomeUnknown: false };
+   } catch (error) {
+@@ -770,6 +848,153 @@
+   }
+ }
+ 
++function shouldYield(deadlineAt: number, shouldPause: () => boolean): boolean {
++  return Date.now() >= deadlineAt || shouldPause();
++}
++
++async function waitForMaintenanceSlot(until: number, deadlineAt: number, shouldPause: () => boolean): Promise<boolean> {
++  while (Date.now() < until && !shouldYield(deadlineAt, shouldPause)) {
++    const remaining = Math.min(until - Date.now(), deadlineAt - Date.now(), 250);
++    if (remaining <= 0) break;
++    await new Promise((resolve) => setTimeout(resolve, remaining));
++  }
++  return Date.now() >= until && !shouldYield(deadlineAt, shouldPause);
++}
++
++async function nativeCompactionStatus(sdk: IIIClient): Promise<NativeCompactionStatus> {
++  return triggerStateStorage<NativeCompactionStatus>(sdk, { action: "compact_status" });
++}
++
++async function nativeCompactionBatch(
++  sdk: IIIClient,
++  kv: StateKV,
++  state: MaintenanceState,
++  lease: MaintenanceLease,
++  refreshLease: () => Promise<void>,
++  status: NativeCompactionStatus,
++  step: NativeCompactionStep,
++  deadlineAt: number,
++  shouldPause: () => boolean,
++): Promise<NativeCompactionStatus> {
++  let request: NativeCompactionApply;
++  let pending = state.compactOperation;
++  await refreshLease();
++  if (shouldYield(deadlineAt, shouldPause)) return status;
++  if (pending) {
++    if (pending.request.lease_owner_id === lease.ownerId && pending.request.lease_fence === lease.fence) {
++      request = pending.request;
++    } else {
++      if (status.generation !== pending.request.expected_generation) {
++        state.compactOutcomeUnknown = true;
++        await saveState(kv, state);
++        return status;
++      }
++      state.compactOperationHistory = [...(state.compactOperationHistory ?? []), {
++        ...pending, outcome: "not_applied", recordedAt: new Date().toISOString(),
++      }].slice(-30);
++      state.compactOperation = undefined;
++      await saveState(kv, state);
++      pending = undefined;
++    }
++  }
++  if (!pending) {
++    const collection = step === "collect";
++    request = {
++      operation_id: generateId("storage-compact"), expected_generation: status.generation, step,
++      limit: collection ? COLLECTION_LIMIT : COMPACTION_BATCH_LIMIT,
++      max_bytes: collection ? COLLECTION_MAX_BYTES : COMPACTION_BATCH_MAX_BYTES,
++      max_ms: COMPACTION_MAX_MS, lease_owner_id: lease.ownerId, lease_fence: lease.fence,
++    };
++    state.compactOperation = {
++      request,
++      before: {
++        phase: status.phase, cursor: { ...status.cursor }, active: status.active,
++        rows_complete: status.rows_complete, vectors_complete: status.vectors_complete,
++        complete: status.complete,
++      },
++    };
++  }
++  await saveState(kv, state);
++  const result = await triggerStateStorage<NativeCompactionStatus>(sdk, { action: "compact_apply", request });
++  if (request.step === "collect") {
++    if (typeof result.gc_complete !== "boolean") throw new Error("STATE_STORAGE_INVALID_RESPONSE");
++    state.compactGcComplete = result.gc_complete;
++  }
++  state.compactOperation = undefined;
++  await saveState(kv, state);
++  return result;
++}
++
++async function runNativeCompactionCycle(
++  sdk: IIIClient,
++  kv: StateKV,
++  state: MaintenanceState,
++  lease: MaintenanceLease,
++  refreshLease: () => Promise<void>,
++  deadlineAt: number,
++  shouldPause: () => boolean,
++): Promise<{ completed: boolean; status: StorageReclaimResult | null; outcomeUnknown: boolean }> {
++  if (state.compactOutcomeUnknown) return { completed: false, status: null, outcomeUnknown: false };
++  let status = await nativeCompactionStatus(sdk);
++  if (status.phase === "rollback") throw new Error("STATE_STORAGE_COMPACTION_ROLLBACK_ACTIVE");
++  const nativeWork = status.active || status.phase === "copy" || status.phase === "compact";
++  if (!state.compactCycleActive && !nativeWork
++    && (!state.ttlReceipt?.done || state.maintenanceReview.dueReasons.length === 0)) {
++    return { completed: false, status: null, outcomeUnknown: false };
++  }
++  state.compactCycleActive = true;
++  await saveState(kv, state);
++
++  while (!state.compactGcComplete && !state.compactOutcomeUnknown && !shouldYield(deadlineAt, shouldPause)) {
++    status = await nativeCompactionStatus(sdk);
++    if (status.phase === "rollback") throw new Error("STATE_STORAGE_COMPACTION_ROLLBACK_ACTIVE");
++    let step: NativeCompactionStep;
++    if (status.phase === "legacy" && !status.active) step = "activate";
++    else if (status.phase === "copy") {
++      step = status.rows_complete && status.vectors_complete ? "cut" : "copy";
++    } else if (status.phase === "compact") step = "collect";
++    else throw new Error("STATE_STORAGE_COMPACTION_STATE_UNKNOWN");
++    status = await nativeCompactionBatch(
++      sdk, kv, state, lease, refreshLease, status, step, deadlineAt, shouldPause,
++    );
++    if (state.compactOutcomeUnknown) return { completed: false, status: null, outcomeUnknown: false };
++    if (step === "collect" && status.gc_complete === true) state.compactGcComplete = true;
++  }
++  if (!state.compactGcComplete) return { completed: false, status: null, outcomeUnknown: false };
++
++  let lastResult: StorageReclaimResult | null = null;
++  while (!shouldYield(deadlineAt, shouldPause)) {
++    const backoffUntil = state.compaction.backoffUntil ? Date.parse(state.compaction.backoffUntil) : 0;
++    if (backoffUntil > Date.now()) break;
++    const nextEligibleAt = state.compaction.nextEligibleAt ? Date.parse(state.compaction.nextEligibleAt) : 0;
++    if (nextEligibleAt > Date.now()
++      && !await waitForMaintenanceSlot(nextEligibleAt, deadlineAt, shouldPause)) break;
++    const outcome = await reclaim(
++      sdk, kv, state, lease, false, true, () => shouldYield(deadlineAt, shouldPause),
++    );
++    if (outcome.outcomeUnknown) return { completed: false, status: outcome.result, outcomeUnknown: true };
++    const result = outcome.result;
++    if (!result) break;
++    lastResult = result;
++    if (result.status === "complete" && result.after.freelist_count === 0) {
++      const completedAt = new Date().toISOString();
++      const review = state.maintenanceReview;
++      review.footprintBaselineBytes = result.after.database_bytes + result.after.wal_bytes;
++      review.footprintBaselineAt = completedAt;
++      review.footprintBaselineKind = "successful_cycle";
++      review.freePagePendingSince = null;
++      review.dueReasons = [];
++      state.lastSuccessfulCompactionAt = completedAt;
++      state.compactCycleActive = false;
++      state.compactGcComplete = false;
++      await saveState(kv, state);
++      return { completed: true, status: result, outcomeUnknown: false };
++    }
++    if (!["progress", "complete"].includes(result.status)) break;
++  }
++  return { completed: false, status: lastResult, outcomeUnknown: false };
++}
++
+ async function migrateIncremental(
+   sdk: IIIClient,
+   kv: StateKV,
+@@ -789,9 +1014,6 @@
+     now,
+     state.compaction.pending ? state.compaction.minIntervalMs : RECLAIM_IDLE_POLL_MS,
+   );
+-  if (result.blocking_rebuild && result.after.database_bytes < result.before.database_bytes) {
+-    state.lastSuccessfulCompactionAt = new Date(now).toISOString();
+-  }
+   appendHistory(state, {
+     at: new Date(now).toISOString(), action: "migrate_incremental", outcome: result.status,
+     reason: result.reason, elapsedMs: result.elapsed_ms,
+@@ -877,7 +1099,7 @@
+   };
+ }
+ 
+-export function registerStorageMaintenance(sdk: IIIClient, kv: StateKV): void {
++export function registerStorageMaintenance(sdk: IIIClient, kv: StateKV, shouldPause: () => boolean = () => false): void {
+   sdk.registerFunction("mem::storage-maintenance", async (request?: {
+     action?: unknown; allow_blocking?: unknown; max_ms?: unknown;
+   }) => {
+@@ -893,29 +1115,64 @@
+       || Number(request.max_ms) < 1 || Number(request.max_ms) > 86_400_000)) {
+       return { success: false, code: "STATE_STORAGE_INVALID_REQUEST" };
+     }
++    if (action === "tick" && shouldPause()) {
++      return { success: true, deferred: true, reason: "foreground_pressure" };
++    }
+     if (active.has(kv)) return { success: true, busy: true };
+     active.add(kv);
+     let state: MaintenanceState | null = null;
+     let lease: MaintenanceLease | null = null;
+     let preserveLeaseUntilExpiry = false;
+-    const ownerId = generateId("storage-maintenance");
++    let ownerId = generateId("storage-maintenance");
+     const startedAt = new Date().toISOString();
++    const deadlineAt = Date.now() + MAINTENANCE_WINDOW_MS;
+     try {
+-      const admitted = await triggerMaintenanceLease(sdk, {
+-        action: "maintenance_lease_acquire", owner_id: ownerId, lease_ms: RECLAIM_OVERLAP_LEASE_MS,
+-      });
+-      if (admitted.status === "busy") {
++      if (action === "tick") {
+         state = await readState(kv);
+-        return { success: true, busy: true, reason: "native_lease_busy", leaseExpiresAt: admitted.expires_at, state };
+-      }
+-      if (admitted.status !== "acquired") {
+-        throw new StorageMaintenanceOutcomeUnknown("STATE_STORAGE_MAINTENANCE_LEASE_FENCED");
+-      }
+-      lease = { ownerId, fence: admitted.fence, expiresAt: admitted.expires_at };
++        const pending = state.compactOperation;
++        const overlap = state.compaction.overlap;
++        if (!state.compactOutcomeUnknown && pending && overlap?.ownerId === pending.request.lease_owner_id
++          && Date.parse(overlap.expiresAt) > Date.now()) {
++          lease = {
++            ownerId: pending.request.lease_owner_id,
++            fence: pending.request.lease_fence,
++            expiresAt: overlap.expiresAt,
++          };
++          const resumed = await triggerMaintenanceLease(sdk, {
++            action: "maintenance_lease_refresh", owner_id: lease.ownerId,
++            fence: lease.fence, lease_ms: RECLAIM_OVERLAP_LEASE_MS,
++          });
++          if (resumed.status === "refreshed") {
++            if (resumed.fence !== lease.fence) {
++              throw new StorageMaintenanceOutcomeUnknown("STATE_STORAGE_MAINTENANCE_LEASE_FENCED");
++            }
++            lease.expiresAt = resumed.expires_at;
++            ownerId = lease.ownerId;
++          } else {
++            lease = null;
++          }
++        }
++      }
++      let recoveredExpired = false;
++      if (!lease) {
++        ownerId = generateId("storage-maintenance");
++        const admitted = await triggerMaintenanceLease(sdk, {
++          action: "maintenance_lease_acquire", owner_id: ownerId, lease_ms: RECLAIM_OVERLAP_LEASE_MS,
++        });
++        if (admitted.status === "busy") {
++          state ??= await readState(kv);
++          return { success: true, busy: true, reason: "native_lease_busy", leaseExpiresAt: admitted.expires_at, state };
++        }
++        if (admitted.status !== "acquired") {
++          throw new StorageMaintenanceOutcomeUnknown("STATE_STORAGE_MAINTENANCE_LEASE_FENCED");
++        }
++        lease = { ownerId, fence: admitted.fence, expiresAt: admitted.expires_at };
++        recoveredExpired = admitted.recovered_expired;
++      }
+       stateWriters.set(kv, { sdk, lease });
+-      state = await readState(kv);
++      state ??= await readState(kv);
+       state.compaction.overlap = { ownerId, startedAt, expiresAt: lease.expiresAt };
+-      if (admitted.recovered_expired) {
++      if (recoveredExpired) {
+         appendHistory(state, {
+           at: new Date().toISOString(), action: "lease_recovery", outcome: "outcome_unknown",
+           reason: "expired_owner", elapsedMs: null, pagesReclaimed: null, physicalBytesReclaimed: null,
+@@ -972,34 +1229,60 @@
+       }
+       if (!state.diagnostics.lastComplete || state.observationIndex.complete) {
+         await refreshLease();
+-        await diagnosticsStep(sdk, kv, state);
+-      }
+-      await refreshLease();
+-      await observationIndexStep(sdk, kv, state);
++        if (!shouldYield(deadlineAt, shouldPause)) await diagnosticsStep(sdk, kv, state);
++      }
++      if (!shouldYield(deadlineAt, shouldPause)) {
++        await refreshLease();
++        if (!shouldYield(deadlineAt, shouldPause)) await observationIndexStep(sdk, kv, state);
++      }
+       state = await readState(kv);
+       let cleanup: StorageCleanupSummary | null = null;
+       let compaction: StorageReclaimResult | null = null;
+       if (state.cleanupActivatedAt) {
+-        await refreshLease();
+-        if (state.ttlReceipt?.done) {
+-          state.ttlRunId = undefined;
+-          state.ttlReceipt = undefined;
++        let cycle = await runNativeCompactionCycle(
++          sdk, kv, state, lease!, refreshLease, deadlineAt, shouldPause,
++        );
++        compaction = cycle.status;
++        preserveLeaseUntilExpiry = cycle.outcomeUnknown;
++        if (!state.compactCycleActive && !shouldYield(deadlineAt, shouldPause)) {
++          if (state.ttlReceipt?.done) {
++            state.ttlRunId = undefined;
++            state.ttlReceipt = undefined;
++          }
++          let receipt: StorageTtlReceipt | null = null;
++          while (!shouldYield(deadlineAt, shouldPause)) {
++            await refreshLease();
++            if (shouldYield(deadlineAt, shouldPause)) break;
++            receipt = await ttlStep(sdk, kv, state, lease!);
++            cleanup = {
++              startedAt, completedAt: new Date().toISOString(), graphRowsDeleted: 0,
++              technicalCandidatesProcessed: receipt.inspected, technicalDeleted: receipt.deleted,
++              rawStripped: receipt.rawStripped, deletedLogicalBytes: receipt.logicalBytesDeleted,
++              deletedStoredBytes: receipt.storedBytesDeleted, operationRowsDeleted: 0,
++              skipped: receipt.excluded, excludedUnresolved: receipt.excluded, excludedUnknownAge: 0,
++              pending: !receipt.done,
++              exclusions: ["Unknown ownership or dates, protected references, original bodies, backups, receipts and replay remain retained."],
++            };
++            state.lastCleanup = cleanup;
++            await saveState(kv, state);
++            if (receipt.done) break;
++          }
++          if (receipt?.done && state.maintenanceReview.dueReasons.length > 0
++            && !shouldYield(deadlineAt, shouldPause)) {
++            cycle = await runNativeCompactionCycle(
++              sdk, kv, state, lease!, refreshLease, deadlineAt, shouldPause,
++            );
++            compaction = cycle.status ?? compaction;
++            preserveLeaseUntilExpiry = cycle.outcomeUnknown;
++          } else if (!shouldYield(deadlineAt, shouldPause)) {
++            await refreshLease();
++            const outcome = await reclaim(
++              sdk, kv, state, lease!, false, false, () => shouldYield(deadlineAt, shouldPause),
++            );
++            compaction = outcome.result ?? compaction;
++            preserveLeaseUntilExpiry = outcome.outcomeUnknown;
++          }
+         }
+-        const receipt = await ttlStep(sdk, kv, state, lease!);
+-        cleanup = {
+-          startedAt, completedAt: new Date().toISOString(), graphRowsDeleted: 0,
+-          technicalCandidatesProcessed: receipt.inspected, technicalDeleted: receipt.deleted,
+-          rawStripped: receipt.rawStripped, deletedLogicalBytes: receipt.logicalBytesDeleted,
+-          deletedStoredBytes: receipt.storedBytesDeleted, operationRowsDeleted: 0,
+-          skipped: receipt.excluded, excludedUnresolved: receipt.excluded, excludedUnknownAge: 0,
+-          pending: !receipt.done,
+-          exclusions: ["Unknown ownership or dates, protected references, original bodies, backups, receipts and replay remain retained."],
+-        };
+-        state.lastCleanup = cleanup;
+-        await refreshLease();
+-        const outcome = await reclaim(sdk, kv, state, lease!);
+-        compaction = outcome.result;
+-        preserveLeaseUntilExpiry = outcome.outcomeUnknown;
+       }
+       return { success: true, baselineComplete: Boolean(state.diagnostics.lastComplete), indexComplete: state.observationIndex.complete,
+         cleanupActivated: Boolean(state.cleanupActivatedAt), cleanup,
+diff --git a/src/index.ts b/src/index.ts
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -817,7 +817,7 @@
+   setHybridRanker(hybridRanker);
+   registerRecentSearchesSweepFunction(sdk, kv);
+   registerOperationErrorEvidenceSweepFunction(sdk, kv);
+-  registerStorageMaintenance(sdk, kv);
++  registerStorageMaintenance(sdk, kv, () => foregroundRequests > 0 || Date.now() - lastForegroundAt < 5_000);
+ 
+   registerApiTriggers(sdk, kv, secret, metricsStore, provider);
+   registerEventTriggers(sdk, kv);
+diff --git a/src/state/storage.ts b/src/state/storage.ts
+--- a/src/state/storage.ts
++++ b/src/state/storage.ts
+@@ -106,7 +106,7 @@
+   | ({ action: "graph_metadata_prepare" } & GraphStorageMetadataPrepareOptions)
+   | { action: "prune_technical"; candidates: StorageCandidate[]; max_bytes: number; max_ms: number }
+   | { action: "prune_operations"; expected_version: string; max_ms: number }
+-  | { action: "reclaim"; max_pages: number; max_ms: number; lease_owner_id: string; lease_fence: number }
++  | { action: "reclaim"; max_pages: number; max_ms: number; lease_owner_id: string; lease_fence: number; maintenance?: true }
+   | { action: "migrate_incremental"; allow_blocking: true; max_ms: number }
+   | {
+       action: "observation_index";
+@@ -143,7 +143,7 @@
+   checkpoint_busy: boolean;
+   wal_frames: number;
+   checkpointed_frames: number;
+-  checkpoint_performed: false;
++  checkpoint_performed: boolean;
+   status: "progress" | "deferred" | "migration_required" | "complete";
+   reason: string;
+   elapsed_ms: number;
+@@ -208,8 +208,9 @@
+     && isCount(value.wal_bytes);
+ }
+ 
+-function validResponse(action: StateStorageRequest["action"], value: unknown): boolean {
++function validResponse(request: StateStorageRequest, value: unknown): boolean {
+   if (!isRecord(value)) return false;
++  const action = request.action;
+   if (action === "maintenance_state_save") return value.status === "saved" && isFence(value.fence)
+     && isVersion(value.version) && value.version !== "0" && typeof value.released === "boolean";
+   if (action === "maintenance_lease_acquire") {
+@@ -296,13 +297,14 @@
+       && typeof value.checkpoint_busy === "boolean"
+       && isCount(value.wal_frames)
+       && isCount(value.checkpointed_frames)
+-      && value.checkpoint_performed === false
++      && (maintenance ? typeof value.checkpoint_performed === "boolean" : value.checkpoint_performed === false)
+       && ["progress", "deferred", "migration_required", "complete"].includes(String(value.status))
+       && typeof value.reason === "string"
+       && isCount(value.elapsed_ms)
+       && isCount(value.pages_reclaimed)
+       && isCount(value.physical_bytes_reclaimed)
+-      && (value.next_max_pages === undefined || (isCount(value.next_max_pages) && value.next_max_pages >= 1 && value.next_max_pages <= 16))
++      && (value.next_max_pages === undefined || (isCount(value.next_max_pages)
++        && value.next_max_pages >= 1 && value.next_max_pages <= (maintenance ? 4096 : 16)))
+       && (value.min_interval_ms === undefined || isCount(value.min_interval_ms))
+       && isPhysical(value.before)
+       && isPhysical(value.after);
+@@ -376,9 +378,11 @@
+     return;
+   }
+   if (request.action === "reclaim") {
++    const maintenance = request.maintenance === true;
+     if (!isMaintenanceOwner(request.lease_owner_id) || !isFence(request.lease_fence)
+-      || !Number.isInteger(request.max_pages) || request.max_pages < 1 || request.max_pages > 16
+-      || !Number.isInteger(request.max_ms) || request.max_ms < 1 || request.max_ms > 25) {
++      || request.maintenance !== undefined && !maintenance
++      || !Number.isInteger(request.max_pages) || request.max_pages < 1 || request.max_pages > (maintenance ? 4096 : 16)
++      || !Number.isInteger(request.max_ms) || request.max_ms < 1 || request.max_ms > (maintenance ? 3000 : 25)) {
+       throw new Error("STATE_STORAGE_INVALID_REQUEST");
+     }
+     return;
+@@ -409,7 +413,7 @@
+     if (!validNativeCompactionResponse(request, result)) throw new Error("STATE_STORAGE_INVALID_RESPONSE");
+     return result as T;
+   }
+-  if (!validResponse(request.action, result)) throw new Error("STATE_STORAGE_INVALID_RESPONSE");
++  if (!validResponse(request, result)) throw new Error("STATE_STORAGE_INVALID_RESPONSE");
+   if (request.action === "maintenance_state_save") {
+     const saved = result as { fence: number; released: boolean };
+     if (saved.fence !== request.fence || saved.released !== request.release) throw new Error("STATE_STORAGE_INVALID_RESPONSE");
+diff --git a/src/state/native-compaction.ts b/src/state/native-compaction.ts
+--- a/src/state/native-compaction.ts
++++ b/src/state/native-compaction.ts
+@@ -25,6 +25,7 @@
+   vectors_complete: boolean;
+   complete: boolean;
+   physical_bytes_reclaimed: null;
++  gc_complete?: boolean;
+   operation_id?: string;
+   processed_count?: number;
+   input_bytes?: number;
+@@ -43,10 +44,12 @@
+ export function validateNativeCompactionRequest(value: NativeCompactionRequest): void {
+   if (value.action === 'compact_status') return;
+   const request = value.request;
+-  if (!record(request) || typeof request.operation_id !== 'string' || !request.operation_id || request.operation_id.length > 128 ||
++  if (!record(request)) throw new Error('STATE_STORAGE_INVALID_REQUEST');
++  const collect = request.step === 'collect';
++  if (typeof request.operation_id !== 'string' || !request.operation_id || request.operation_id.length > 128 ||
+     !counter(request.expected_generation) || !['activate', 'copy', 'cut', 'rollback', 'collect', 'checkpoint', 'enable_incremental'].includes(request.step) ||
+-    !count(request.limit) || request.limit < 1 || request.limit > 128 ||
+-    !count(request.max_bytes) || request.max_bytes < 1024 || request.max_bytes > 16 * 1024 * 1024 ||
++    !count(request.limit) || request.limit < 1 || request.limit > (collect ? 4096 : 128) ||
++    !count(request.max_bytes) || request.max_bytes < 1024 || request.max_bytes > (collect ? 4 * 1024 * 1024 : 16 * 1024 * 1024) ||
+     !count(request.max_ms) || request.max_ms < 1 || request.max_ms > (request.step === 'enable_incremental' ? 86_400_000 : request.step === 'checkpoint' ? 25 : 3000) ||
+     typeof request.lease_owner_id !== 'string' || !/^[A-Za-z0-9._:-]{1,128}$/.test(request.lease_owner_id) ||
+     !count(request.lease_fence) || request.lease_fence < 1) throw new Error('STATE_STORAGE_INVALID_REQUEST');
+@@ -60,5 +63,6 @@
+     typeof value.complete !== 'boolean' || value.physical_bytes_reclaimed !== null) return false;
+   return request.action === 'compact_status' || (value.operation_id === request.request.operation_id &&
+     count(value.processed_count) && value.processed_count <= request.request.limit * 6 &&
+-    count(value.input_bytes) && value.input_bytes <= request.request.max_bytes);
++    count(value.input_bytes) && value.input_bytes <= request.request.max_bytes &&
++    (request.request.step !== 'collect' || typeof value.gc_complete === 'boolean'));
+ }
+diff --git a/docs/operations/storage-periodic-maintenance.md b/docs/operations/storage-periodic-maintenance.md
+new file mode 100644
+--- /dev/null
++++ b/docs/operations/storage-periodic-maintenance.md
+--- /dev/null
++++ b/docs/operations/storage-periodic-maintenance.md
+@@ -0,0 +1,13 @@
++# Periodic storage maintenance
++
++The existing local 60-second maintenance caller continues to honor startup quiet mode and now yields while foreground requests are active or were active in the previous five seconds. Each tick has a 45-second work window, leaving room before the next timer event. It reuses the existing TTL handler and native state-storage operations; no new timer, provider, or queue is introduced.
++
++TTL pages run under the same durable `runId` and ordinal until the handler reports completion or the window yields. The handler owns its stable run origin and cutoff. A later tick resumes the saved run, and a completed run is not counted as physical compaction.
++
++When due, the caller drives native compaction through `compact_status` and bounded `compact_apply` batches: activate an idle migration, resume copy at the engine cursor, cut only after rows and vectors are complete, then collect until the native receipt reports `gc_complete`. Copy requests use a 128-item limit; collection uses the accepted 4,096-item limit while the native engine processes 128-item chunks, with a 4 MiB and 3-second request budget. Each tick can drain multiple requests within its 45-second window. Reclaim uses the accepted maintenance mode of up to 4,096 pages or 3 seconds per request; the ordinary reclaim path retains its 16-page, 25-millisecond limit and 5-second cooldown. The cycle respects native eligibility, backoff, lease/fence checks, and foreground pressure. Progress is retained by the native phase/cursors and the periodic state. Rollback, stale identity, unknown responses, pressure, or an incomplete reclaim stop the cycle without advancing the success baseline.
++
++The exact `compact_apply` request is stored before dispatch. An uncertain acknowledgement is retried with the same operation ID and unchanged request while the same owner/fence can still be refreshed. If the lease expires, a new exclusive lease compares `compact_status.generation`: an unchanged generation proves the request did not commit, so its exact request is archived as `not_applied` before a new ID is allocated. If generation advanced, `compact_status` does not expose an operation ID and the current contract has no receipt lookup. The caller records `compactOutcomeUnknown`, preserves the pending request and baseline, and pauses later automatic cycles; it does not infer success or issue another compaction request. This state needs receipt evidence before automatic work can resume.
++
++The first growth reference is an initial observation taken from a complete diagnostic sample after TTL cleanup has completed. It does not update `lastSuccessfulCompactionAt`. Subsequent growth maintenance is due at an additional 1,000,000,000 decimal bytes over that reference; the existing 24-hour free-page trigger remains. The reference advances only after copy/cut, collection, and reclaim all complete with no remaining free pages. Zero reclaimed bytes can still be a successful full cycle; partial reclaim cannot.
++
++Older percentage-based references are discarded when read so the first qualifying post-TTL sample initializes the new reference. The last credited full compaction timestamp and native generation remain unchanged until a complete new cycle is recorded. Manual incremental migration and opportunistic reclaim do not advance this periodic-cycle baseline.

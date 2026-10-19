@@ -1,6 +1,8 @@
 import { isNativeCompactionRequest, validateNativeCompactionRequest, validNativeCompactionResponse, type NativeCompactionRequest } from "./native-compaction.js";
 import type { IIIClient } from "iii-sdk";
 import type { StorageMaintenanceState } from "../types.js";
+import { isGraphAutomaticRecoveryRequest, validateGraphAutomaticRecoveryRequest, createGraphAutomaticRecoveryTransport,
+  type GraphAutomaticRecoveryRequest } from "./graph-automatic-recovery.js";
 import { isProviderBudgetRequest, validateProviderBudgetRequest, validProviderBudgetResponse,
   type ProviderBudgetRequest } from "./provider-attempt-budget.js";
 
@@ -85,6 +87,33 @@ export interface StorageCandidate {
   };
 }
 
+export interface RetentionResourceReference {
+  scope: string;
+  key: string;
+  expected_version: string;
+}
+export const RETENTION_CONTEXT_USE_LIMITS = {
+  maxResources: 128,
+  maxReferenceBytes: 4096,
+  maxRequestBytes: 1_048_576,
+  replayWindowMs: 86_400_000,
+  futureSkewMs: 60_000,
+} as const;
+export interface RetentionContextDeliveryRequest {
+  action: "retention_context_delivery";
+  event_id: string;
+  task_id: string;
+  project: string;
+  resources: RetentionResourceReference[];
+}
+export interface RetentionContextDeliveryResult {
+  event_id: string;
+  observed_at: string;
+  admitted: number;
+  skipped: number;
+  replayed: boolean;
+}
+
 export type StorageMaintenanceLeaseRequest =
   | { action: "maintenance_lease_acquire"; owner_id: string; lease_ms: number }
   | { action: "maintenance_lease_refresh"; owner_id: string; fence: number; lease_ms: number }
@@ -99,9 +128,32 @@ export type StorageMaintenanceLeaseResponse =
 
 export type StorageMaintenanceSnapshot = StorageMaintenanceState & { maintenanceHistory: unknown[] };
 
+export type StorageReclaimRequest =
+  | {
+      action: "reclaim";
+      maintenance?: never;
+      checkpoint?: never;
+      max_pages: number;
+      max_ms: number;
+      lease_owner_id: string;
+      lease_fence: number;
+    }
+  | {
+      action: "reclaim";
+      maintenance: true;
+      checkpoint: "truncate";
+      max_pages: number;
+      max_ms: number;
+      lease_owner_id: string;
+      lease_fence: number;
+    };
+
 export type StateStorageRequest =
+  | { action: "physical" }
+  | GraphAutomaticRecoveryRequest
   | NativeCompactionRequest
   | ProviderBudgetRequest
+  | RetentionContextDeliveryRequest
   | StorageMaintenanceLeaseRequest
   | { action: "maintenance_state_save"; owner_id: string; fence: number; value: StorageMaintenanceSnapshot; release: boolean }
   | { action: "diagnostics"; cursor?: StorageCursor; limit: number; max_bytes: number; max_ms: number }
@@ -109,7 +161,7 @@ export type StateStorageRequest =
   | ({ action: "graph_metadata_prepare" } & GraphStorageMetadataPrepareOptions)
   | { action: "prune_technical"; candidates: StorageCandidate[]; max_bytes: number; max_ms: number }
   | { action: "prune_operations"; expected_version: string; max_ms: number }
-  | { action: "reclaim"; max_pages: number; max_ms: number; lease_owner_id: string; lease_fence: number }
+  | StorageReclaimRequest
   | { action: "migrate_incremental"; allow_blocking: true; max_ms: number }
   | {
       action: "observation_index";
@@ -140,22 +192,66 @@ export interface OperationsPruneResult {
   version: string;
 }
 
-export interface StorageReclaimResult {
+interface StorageReclaimResultBase {
   mode: "incremental" | "checkpoint_only";
   requires_explicit_full_rebuild: boolean;
   checkpoint_busy: boolean;
   wal_frames: number;
   checkpointed_frames: number;
-  checkpoint_performed: false;
+  checkpoint_performed: boolean;
   status: "progress" | "deferred" | "migration_required" | "complete";
   reason: string;
   elapsed_ms: number;
   pages_reclaimed: number;
   physical_bytes_reclaimed: number;
-  next_max_pages?: number;
-  min_interval_ms?: number;
   before: StoragePhysicalStats;
   after: StoragePhysicalStats;
+}
+
+export interface StorageOrdinaryReclaimResult extends StorageReclaimResultBase {
+  maintenance?: undefined;
+  max_chunk_pages?: undefined;
+  checkpoint_performed: false;
+  next_max_pages?: number;
+  min_interval_ms?: number;
+}
+
+export interface StorageMaintenanceReclaimResult extends StorageReclaimResultBase {
+  maintenance: true;
+  min_interval_ms: 0;
+  max_chunk_pages: 128;
+  next_max_pages?: never;
+}
+
+export type StorageReclaimResult = StorageOrdinaryReclaimResult | StorageMaintenanceReclaimResult;
+
+function validReclaimResponse(request: StorageReclaimRequest, value: Record<string, unknown>): boolean {
+  const common = (value.mode === "incremental" || value.mode === "checkpoint_only")
+    && typeof value.requires_explicit_full_rebuild === "boolean"
+    && typeof value.checkpoint_busy === "boolean"
+    && isCount(value.wal_frames)
+    && isCount(value.checkpointed_frames)
+    && ["progress", "deferred", "migration_required", "complete"].includes(String(value.status))
+    && typeof value.reason === "string"
+    && isCount(value.elapsed_ms)
+    && isCount(value.pages_reclaimed)
+    && isCount(value.physical_bytes_reclaimed)
+    && isPhysical(value.before)
+    && isPhysical(value.after);
+  if (!common) return false;
+  if (request.maintenance === true) {
+    return value.maintenance === true
+      && value.min_interval_ms === 0
+      && value.max_chunk_pages === 128
+      && typeof value.checkpoint_performed === "boolean"
+      && value.next_max_pages === undefined;
+  }
+  return value.maintenance === undefined
+    && value.max_chunk_pages === undefined
+    && value.checkpoint_performed === false
+    && (value.next_max_pages === undefined || (isCount(value.next_max_pages)
+      && value.next_max_pages >= 1 && value.next_max_pages <= 16))
+    && (value.min_interval_ms === undefined || isCount(value.min_interval_ms));
 }
 
 export interface StorageMigrationResult {
@@ -211,8 +307,14 @@ function isPhysical(value: unknown): value is StoragePhysicalStats {
     && isCount(value.wal_bytes);
 }
 
-function validResponse(action: StateStorageRequest["action"], value: unknown): boolean {
+function validResponse(request: StateStorageRequest, value: unknown): boolean {
   if (!isRecord(value)) return false;
+  const action = request.action;
+  if (action === "physical") return isPhysical(value);
+  if (action === "retention_context_delivery") {
+    return typeof value.event_id === "string" && isTimestamp(value.observed_at)
+      && isCount(value.admitted) && isCount(value.skipped) && typeof value.replayed === "boolean";
+  }
   if (action === "maintenance_state_save") return value.status === "saved" && isFence(value.fence)
     && isVersion(value.version) && value.version !== "0" && typeof value.released === "boolean";
   if (action === "maintenance_lease_acquire") {
@@ -292,23 +394,7 @@ function validResponse(action: StateStorageRequest["action"], value: unknown): b
       && isCount(value.deleted_logical_bytes)
       && isVersion(value.version);
   }
-  if (action === "reclaim") {
-    return (value.mode === "incremental" || value.mode === "checkpoint_only")
-      && typeof value.requires_explicit_full_rebuild === "boolean"
-      && typeof value.checkpoint_busy === "boolean"
-      && isCount(value.wal_frames)
-      && isCount(value.checkpointed_frames)
-      && value.checkpoint_performed === false
-      && ["progress", "deferred", "migration_required", "complete"].includes(String(value.status))
-      && typeof value.reason === "string"
-      && isCount(value.elapsed_ms)
-      && isCount(value.pages_reclaimed)
-      && isCount(value.physical_bytes_reclaimed)
-      && (value.next_max_pages === undefined || (isCount(value.next_max_pages) && value.next_max_pages >= 1 && value.next_max_pages <= 16))
-      && (value.min_interval_ms === undefined || isCount(value.min_interval_ms))
-      && isPhysical(value.before)
-      && isPhysical(value.after);
-  }
+  if (request.action === "reclaim") return validReclaimResponse(request, value);
   if (action === "migrate_incremental") {
     return value.status === "complete"
       && typeof value.reason === "string"
@@ -321,6 +407,30 @@ function validResponse(action: StateStorageRequest["action"], value: unknown): b
 }
 
 function validateRequest(request: StateStorageRequest): void {
+  if (request.action === "physical") return;
+  if (request.action === "retention_context_delivery") {
+    const validText = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0
+      && Buffer.byteLength(value, "utf8") <= RETENTION_CONTEXT_USE_LIMITS.maxReferenceBytes;
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(request.event_id)
+      || !validText(request.task_id) || !validText(request.project) || !Array.isArray(request.resources)
+      || request.resources.length < 1 || request.resources.length > RETENTION_CONTEXT_USE_LIMITS.maxResources
+      || Object.keys(request).some(key => !["action", "event_id", "task_id", "project", "resources"].includes(key))) {
+      throw new Error("STATE_STORAGE_INVALID_REQUEST");
+    }
+    const seen = new Set<string>();
+    for (const resource of request.resources) {
+      if (!resource || !validText(resource.scope) || !resource.scope.startsWith("mem:obs:") || resource.scope.length <= 8
+        || !validText(resource.key) || !isVersion(resource.expected_version) || resource.expected_version === "0"
+        || BigInt(resource.expected_version) > 18_446_744_073_709_551_615n
+        || Object.keys(resource).some(key => !["scope", "key", "expected_version"].includes(key))) throw new Error("STATE_STORAGE_INVALID_REQUEST");
+      const identity = JSON.stringify([resource.scope, resource.key]);
+      if (seen.has(identity)) throw new Error("STATE_RETENTION_RESOURCE_VERSION_CONFLICT");
+      seen.add(identity);
+    }
+    if (Buffer.byteLength(JSON.stringify(request), "utf8") > RETENTION_CONTEXT_USE_LIMITS.maxRequestBytes) throw new Error("STATE_STORAGE_INVALID_REQUEST");
+    return;
+  }
+  if (isGraphAutomaticRecoveryRequest(request)) { validateGraphAutomaticRecoveryRequest(request); return; }
   if (isNativeCompactionRequest(request)) {validateNativeCompactionRequest(request);return;}
   if (isProviderBudgetRequest(request)) {
     validateProviderBudgetRequest(request);
@@ -382,9 +492,16 @@ function validateRequest(request: StateStorageRequest): void {
     return;
   }
   if (request.action === "reclaim") {
-    if (!isMaintenanceOwner(request.lease_owner_id) || !isFence(request.lease_fence)
-      || !Number.isInteger(request.max_pages) || request.max_pages < 1 || request.max_pages > 16
-      || !Number.isInteger(request.max_ms) || request.max_ms < 1 || request.max_ms > 25) {
+    const maintenance = request.maintenance === true;
+    const requestKeys = maintenance
+      ? ["action", "maintenance", "checkpoint", "max_pages", "max_ms", "lease_owner_id", "lease_fence"]
+      : ["action", "max_pages", "max_ms", "lease_owner_id", "lease_fence"];
+    const keys = Object.keys(request);
+    if ((maintenance && request.checkpoint !== "truncate")
+      || keys.length !== requestKeys.length || keys.some(key => !requestKeys.includes(key))
+      || !isMaintenanceOwner(request.lease_owner_id) || !isFence(request.lease_fence)
+      || !Number.isInteger(request.max_pages) || request.max_pages < 1 || request.max_pages > (maintenance ? 4096 : 16)
+      || !Number.isInteger(request.max_ms) || request.max_ms < 1 || request.max_ms > (maintenance ? 3000 : 25)) {
       throw new Error("STATE_STORAGE_INVALID_REQUEST");
     }
     return;
@@ -407,9 +524,11 @@ export async function triggerStateStorage<T extends object>(
   request: StateStorageRequest,
 ): Promise<T> {
   validateRequest(request);
+  if (isGraphAutomaticRecoveryRequest(request)) return await createGraphAutomaticRecoveryTransport(sdk)(request.request) as T;
   const result = await sdk.trigger<StateStorageRequest, unknown>({
     function_id: "state::storage",
     payload: request,
+    ...(request.action === "retention_context_delivery" ? { timeoutMs: 5000 } : {}),
   });
   if (isNativeCompactionRequest(request)) {
     if (!validNativeCompactionResponse(request,result)) throw new Error("STATE_STORAGE_INVALID_RESPONSE");
@@ -419,7 +538,13 @@ export async function triggerStateStorage<T extends object>(
     if (!validProviderBudgetResponse(request, result)) throw new Error("STATE_STORAGE_INVALID_RESPONSE");
     return result as T;
   }
-  if (!validResponse(request.action, result)) throw new Error("STATE_STORAGE_INVALID_RESPONSE");
+  if (!validResponse(request, result)) throw new Error("STATE_STORAGE_INVALID_RESPONSE");
+  if (request.action === "retention_context_delivery") {
+    const admitted = result as RetentionContextDeliveryResult;
+    if (admitted.event_id !== request.event_id || admitted.admitted + admitted.skipped !== request.resources.length) {
+      throw new Error("STATE_STORAGE_INVALID_RESPONSE");
+    }
+  }
   if (request.action === "maintenance_state_save") {
     const saved = result as { fence: number; released: boolean };
     if (saved.fence !== request.fence || saved.released !== request.release) throw new Error("STATE_STORAGE_INVALID_RESPONSE");

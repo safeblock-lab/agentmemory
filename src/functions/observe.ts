@@ -20,7 +20,8 @@ import { logger } from "../logger.js";
 import { recordContextUsage, warnContextUsageFailure } from "./context-usage.js";
 import { saveImageToDisk } from "../utils/image-store.js";
 import type { TypeSafeDecisionProvider, TypeSafeQuestion } from "../providers/typesafe.js";
-import { admitObservation, buildStoredSynthetic, observationIdentity, ObservationAdmissionError, captureTranscriptSnapshot } from "./observation-identity.js";
+import { admitObservation, buildStoredSynthetic, observationIdentity, ObservationAdmissionError, captureTranscriptSnapshot, findObservationReplay } from "./observation-identity.js";
+import { emptyObservationContent, isContextEmissionTelemetry, recordAdmissionSkip } from "./memory-admission.js";
 
 const READ_ONLY_TOOL_TOKENS = new Set([
   "read",
@@ -166,14 +167,21 @@ export function registerObserveFunction(
       if (payload.hookType === "prompt_submit" && telemetryData?.event === "transcript_capture_v1") {
         return captureTranscriptSnapshot(sdk, kv, payload);
       }
-      if (payload.hookType === "notification" && telemetryData?.event === "context_emitted_v1") {
+      if (isContextEmissionTelemetry(payload) && telemetryData) {
         try {
           await recordContextUsage(kv, payload.sessionId, telemetryData);
-          return { success: true, telemetry: true };
+          await recordAdmissionSkip(kv, "recognized_telemetry", Buffer.byteLength(JSON.stringify(telemetryData)));
+          return { success: true, telemetry: true, admission: { action: "skip", reason: "recognized_telemetry" } };
         } catch {
           warnContextUsageFailure();
           return { success: false, error: "Context emission telemetry rejected" };
         }
+      }
+
+      if (emptyObservationContent(payload)) {
+        await recordAdmissionSkip(kv, "empty_content", Buffer.byteLength(JSON.stringify(payload.data) ?? ""));
+        return { success: true, skipped: true, sessionId: payload.sessionId,
+          admission: { action: "skip", reason: "empty_content" }, providerCalls: 0 };
       }
 
       const obsId = generateId("obs");
@@ -241,6 +249,13 @@ export function registerObserveFunction(
       const pendingImageData = extractedImage;
 
       return withKeyedLock(`obs:${payload.sessionId}`, async () => {
+        const replay = await findObservationReplay(kv, identity, payload.sessionId, payload.hookType, sanitizedRaw);
+        if (replay) {
+          await recordAdmissionSkip(kv, "duplicate_event", Buffer.byteLength(serializedData));
+          return { success: true, observationId: replay.id, deduplicated: true, duplicateEvent: true,
+            sessionId: payload.sessionId, occurrenceCount: replay.occurrenceCount,
+            admission: { action: "skip", reason: "duplicate_event" }, providerCalls: 0 };
+        }
         const readiness = await kv.get<{ version?: number; ready?: boolean }>(`mem:obs-identity:${payload.sessionId}`, "__ready__");
         if (readiness?.version !== 1 || readiness.ready !== true) {
           for await (const page of kv.pages<{ id: string }>(`mem:obs:${payload.sessionId}`, { limit: 1, maxBytes: 4096, fields: ["id"] })) {
@@ -293,10 +308,12 @@ export function registerObserveFunction(
               admission.choice === "discard" &&
               admission.confidence >= TYPESAFE_ADMISSION_CONFIDENCE_THRESHOLD
             ) {
+              await recordAdmissionSkip(kv, "configured_policy", Buffer.byteLength(serializedData));
               return {
                 success: true,
                 skipped: true,
                 reason: "TypeSafe admission",
+                admission: { action: "skip", reason: "configured_policy" },
                 sessionId: payload.sessionId,
               };
             }
@@ -389,10 +406,13 @@ export function registerObserveFunction(
             const { decrementImageRef } = await import("./image-refs.js");
             await decrementImageRef(kv, sdk, raw.imageData);
           }
+          const reason = admission.duplicate_event ? "duplicate_event" : "exact_duplicate";
+          await recordAdmissionSkip(kv, reason, Buffer.byteLength(serializedData));
           return {
             observationId: admission.observation_id, deduplicated: true,
             duplicateEvent: admission.duplicate_event, sessionId: payload.sessionId,
             occurrenceCount: admission.occurrence_count,
+            admission: { action: "skip", reason },
           };
         }
         if (raw.imageData && process.env["AGENTMEMORY_IMAGE_EMBEDDINGS"] === "true") {

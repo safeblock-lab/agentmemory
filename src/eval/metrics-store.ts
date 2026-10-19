@@ -4,10 +4,20 @@ import { KV } from "../state/schema.js";
 import { effectMetadata } from "../state/batch-effects.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { recordProcessingUsage } from "../functions/processing-usage.js";
+import { logger } from "../logger.js";
+
+function validFunctionMetrics(value: unknown): value is FunctionMetrics {
+  if (!value || typeof value !== "object") return false;
+  const row = value as Record<string, unknown>;
+  return typeof row.functionId === "string" && row.functionId.length > 0
+    && ["totalCalls", "successCount", "failureCount"].every(key => Number.isSafeInteger(row[key]) && Number(row[key]) >= 0)
+    && ["avgLatencyMs", "avgQualityScore"].every(key => typeof row[key] === "number" && Number.isFinite(row[key]) && row[key] >= 0);
+}
 
 export class MetricsStore {
   private cache = new Map<string, FunctionMetrics>();
   private qualityCallCounts = new Map<string, number>();
+  private invalidMetricsReported = false;
 
   constructor(private kv: StateKV) {}
 
@@ -70,8 +80,16 @@ export class MetricsStore {
       .list<FunctionMetrics>(KV.metrics)
       .catch(() => []);
     const merged = new Map<string, FunctionMetrics>();
-    for (const m of kvMetrics) merged.set(m.functionId, m);
-    for (const [id, m] of this.cache) merged.set(id, m);
+    let invalidCount = 0;
+    for (const m of kvMetrics) {
+      if (validFunctionMetrics(m)) merged.set(m.functionId, m);
+      else invalidCount++;
+    }
+    for (const [id, m] of this.cache) if (validFunctionMetrics(m)) merged.set(id, m);
+    if (invalidCount > 0 && !this.invalidMetricsReported) {
+      this.invalidMetricsReported = true;
+      logger.warn("Invalid function metric rows omitted from presentation", { invalidCount });
+    }
     return Array.from(merged.values());
   }
 
@@ -114,7 +132,7 @@ export class MetricsStore {
     Object.assign(metrics, effectMetadata(existing, effectKey));
     await this.kv.set(KV.metrics, functionId, metrics);
     this.cache.set(functionId, structuredClone(metrics));
-    await recordProcessingUsage(this.kv, usage, effectKey);
+    await recordProcessingUsage(this.kv, usage, effectKey, { task, provider, model });
     });
   }
 }

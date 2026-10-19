@@ -1,0 +1,1914 @@
+--- a/engine/src/workers/state/adapters/sqlite/storage_ttl.rs
++++ b/engine/src/workers/state/adapters/sqlite/storage_ttl.rs
+@@ -16,6 +16,12 @@
+     pub viewer_max_age_ms: i64,
+     pub bodies_max_age_ms: i64,
+     pub tools_max_age_ms: i64,
++    #[serde(default)]
++    pub measure_only: bool,
++    #[serde(default)]
++    pub cutoff_at_ms: Option<i64>,
++    #[serde(default)]
++    pub legacy_vector_cache_only: bool,
+ }
+ 
+ fn expired(connection: &Connection, scope: &str, key: &str, value: &Value, viewer: bool, maximum: i64, now: i64) -> anyhow::Result<bool> {
+@@ -42,13 +48,39 @@
+     Ok(now >= last_use.saturating_add(inactivity).min(origin.saturating_add(maximum)))
+ }
+ 
++fn expiry_reason(connection:&Connection,scope:&str,key:&str,value:&Value,viewer:bool,maximum:i64,now:i64)->anyhow::Result<Option<&'static str>> {
++    if storage_prune::row_protected(value) {return Ok(Some("protected"));}
++    let origin=if viewer {value["at"].as_i64().filter(|at|*at>=0)} else {
++        value.get("completedAt").or_else(||value.get("closedAt")).or_else(||value.get("updatedAt"))
++            .or_else(||value.get("createdAt")).or_else(||value.get("timestamp"))
++            .and_then(Value::as_str).and_then(|at|chrono::DateTime::parse_from_rfc3339(at).ok()).map(|at|at.timestamp_millis())
++    };
++    let Some(origin)=origin else {return Ok(Some("unknown_or_invalid_origin"))};
++    if origin>now {return Ok(Some("future_origin"));}
++    if value.get("meaningfulUse").is_some() || value.get("retentionUse").is_some() {return Ok(Some("unattributed_use"));}
++    if let Some(evidence)=storage_prune::bounded_dependency(connection,STATE,&use_key(scope,key))? {
++        if evidence["producer"]!="server-task-context-delivery"
++            || evidence["targetVersion"]!=database::row_version(connection,scope,key)?.to_string()
++            || evidence["occurredAtMs"].as_i64().is_none_or(|at|at<origin || at>now) {return Ok(Some("invalid_or_stale_use_evidence"));}
++    }
++    Ok(if expired(connection,scope,key,value,viewer,maximum,now)? {None} else {Some("not_expired")})
++}
++
+ fn remove(connection: &Connection, scope: &str, key: &str, value: &Value, maximum: i64, now: i64, guard: &Guard) -> anyhow::Result<Value> {
+-    let empty = || json!({"deleted_count":0,"raw_stripped_count":0,"deleted_logical_bytes":0,"deleted_stored_bytes":0});
++    let empty = |reason: &str| json!({"deleted_count":0,"raw_stripped_count":0,"deleted_logical_bytes":0,"deleted_stored_bytes":0,"reason":reason});
+     if storage_prune::protected(scope) || storage_prune::protected(key)
+-        || storage_prune::protected(&serde_json::to_string(value)?) || storage_prune::row_protected(value) { return Ok(empty()); }
++        || storage_prune::protected(&serde_json::to_string(value)?) || storage_prune::row_protected(value) { return Ok(empty("protected")); }
++    if super::storage_legacy_cache::family(scope) {
++        let reason = super::storage_legacy_cache::reason(connection, scope, key, value)?;
++        if reason != "legacy_cache_stale_dimension_canonical_preserved" { return Ok(empty(reason)); }
++        return Ok(json!({"candidate":{"scope":scope,"key":key,"expected_version":database::row_version(connection,scope,key)?.to_string()},"proof":reason}));
++    }
+     let viewer = scope == "mem:recent-searches";
++    if viewer || scope == "mem:routine-runs" || scope.starts_with("mem:obs:") {
++        if let Some(reason)=expiry_reason(connection,scope,key,value,viewer,maximum,now)? {return Ok(empty(reason));}
++    }
+     if viewer || scope == "mem:routine-runs" {
+-        if (!viewer && value["status"] != "completed") || !expired(connection,scope,key,value,viewer,maximum,now)? { return Ok(empty()); }
++        if !viewer && value["status"] != "completed" { return Ok(empty("not_completed")); }
+         let (logical, stored): (i64,i64) = connection.query_row(
+             "SELECT value_bytes,COALESCE(stored_bytes,0) FROM state_values WHERE scope=?1 AND key=?2 AND live=1",
+             params![scope,key], |row| Ok((row.get(0)?,row.get(1)?)))?;
+@@ -59,10 +91,14 @@
+     }
+     let mut candidate=json!({"scope":scope,"key":key,"expected_version":database::row_version(connection,scope,key)?.to_string()});
+     if let Some(session)=scope.strip_prefix("mem:obs:") {
+-        if !expired(connection,scope,key,value,false,maximum,now)? {return Ok(empty());}
+-        let Some(digest)=value["identityIndexedDigest"].as_str().filter(|digest|value["identityDigest"]==*digest) else {return Ok(empty())};
+-        let Some(identity)=storage_prune::bounded_dependency(connection,&format!("mem:obs-identity:{session}"),digest)? else {return Ok(empty())};
+-        let Some(original)=identity["observationId"].as_str().filter(|original|*original!=key) else {return Ok(empty())};
++        if !matches!(value["hookType"].as_str(),Some("post_tool_use"|"post_tool_failure")) {return Ok(empty("non_tool_original_preserved"));}
++        if value.get("raw").is_none() {return Ok(empty("raw_already_absent"));}
++        let proof=storage_prune::compressed_source_reason(connection,scope,key,value)?;
++        if matches!(proof,"legacy_indexed_compression"|"native_admission_exact_source_compression") {return Ok(json!({"candidate":candidate,"proof":proof}));}
++        if value["compressionMethod"]=="llm" && value.get("identityIndexedDigest").is_none() {return Ok(empty(proof));}
++        let Some(digest)=value["identityIndexedDigest"].as_str().filter(|digest|value["identityDigest"]==*digest) else {return Ok(empty("identity_not_indexed"))};
++        let Some(identity)=storage_prune::bounded_dependency(connection,&format!("mem:obs-identity:{session}"),digest)? else {return Ok(empty("identity_proof_missing_or_oversized"))};
++        let Some(original)=identity["observationId"].as_str().filter(|original|*original!=key) else {return Ok(empty("unique_source_without_durable_compression"))};
+         candidate["preserved"]=json!({"scope":scope,"key":original,"expected_version":database::row_version(connection,scope,original)?.to_string()});
+         return Ok(json!({"candidate":candidate}));
+     }
+@@ -74,15 +110,16 @@
+         Some(("mem:temporal-graph-work".to_owned(),format!("temporal-work:{key}:manifest")))
+     } else { None };
+     if let Some((parent_scope,parent_key))=parent {
+-        let Some(parent)=storage_prune::bounded_dependency(connection,&parent_scope,&parent_key)? else {return Ok(empty())};
+-        if !expired(connection,&parent_scope,&parent_key,&parent,false,maximum,now)? {return Ok(empty());}
++        let Some(parent)=storage_prune::bounded_dependency(connection,&parent_scope,&parent_key)? else {return Ok(empty("parent_missing_or_oversized"))};
++        if let Some(reason)=expiry_reason(connection,&parent_scope,&parent_key,&parent,false,maximum,now)? {return Ok(empty(reason));}
+         candidate["preserved"]=json!({"scope":parent_scope,"key":parent_key,
+             "expected_version":database::row_version(connection,&parent_scope,&parent_key)?.to_string()});
+     } else if let Some(job_id)=scope.strip_prefix("mem:graph:prepared:").or_else(||scope.strip_prefix("mem:graph:remaps:")) {
+         commit::maintenance_allowed(connection,guard,Some(job_id))?;
+         let checkpoint_version=database::row_version(connection,database::CHECKPOINT_SCOPE,job_id)?.to_string();
+-        let Ok((_,job))=super::retention::eligible(connection,job_id,&checkpoint_version) else {return Ok(empty())};
+-        if !expired(connection,protocol::JOBS,job_id,&job,false,maximum,now)? || !storage_prune::temporal_unit_ready(connection,job_id,&job)? {return Ok(empty());}
++        let Ok((_,job))=super::retention::eligible(connection,job_id,&checkpoint_version) else {return Ok(empty("graph_publication_or_recovery_not_closed"))};
++        if let Some(reason)=expiry_reason(connection,protocol::JOBS,job_id,&job,false,maximum,now)? {return Ok(empty(reason));}
++        if !storage_prune::temporal_unit_ready(connection,job_id,&job)? {return Ok(empty("temporal_dependencies_open"));}
+         let (logical,stored):(i64,i64)=connection.query_row("SELECT value_bytes,COALESCE(stored_bytes,0) FROM state_values WHERE scope=?1 AND key=?2 AND live=1",params![scope,key],|row|Ok((row.get(0)?,row.get(1)?)))?;
+         connection.execute("DELETE FROM state_rows WHERE scope=?1 AND key=?2",params![scope,key])?;
+         let revision=protocol::next(database::revision(connection,scope)?)?.to_string();
+@@ -90,7 +127,7 @@
+         return Ok(json!({"deleted_count":1,"raw_stripped_count":0,"deleted_logical_bytes":logical,"deleted_stored_bytes":stored}));
+     } else {
+         // Durable manifests, replay identities and original observations remain owned.
+-        return Ok(empty());
++        return Ok(empty("durable_manifest_or_replay_identity"));
+     }
+     Ok(json!({"candidate":candidate}))
+ }
+@@ -119,6 +156,15 @@
+     Ok(json!({"recorded":recorded}))
+ }
+ 
++
++fn account(stats:&mut Value,category:&str,reason:&str,band:&str,logical:u64,stored:u64) {
++    if !stats[category].is_object() {stats[category]=json!({});}
++    if !stats[category][reason].is_object() {stats[category][reason]=json!({});}
++    if !stats[category][reason][band].is_object() {stats[category][reason][band]=json!({"rows":0,"logicalBytes":0,"storedBytes":0});}
++    let slot=&mut stats[category][reason][band];
++    for (field,delta) in [("rows",1),("logicalBytes",logical),("storedBytes",stored)] {slot[field]=json!(slot[field].as_u64().unwrap_or(0)+delta);}
++}
++
+ pub fn page(connection: &Connection, request: Request) -> anyhow::Result<Value> {
+     let started=std::time::Instant::now();
+     require(storage_maintenance_lease::valid_owner(&request.run_id) && request.ordinal < 1_000_000
+@@ -129,76 +175,85 @@
+     commit::maintenance_allowed(connection,&request.guard,None)?;
+     let run_key=format!("ttl:{}",request.run_id);
+     let receipt_key=format!("{run_key}:{}",request.ordinal);
+-    let policy=json!({"viewerMaxAgeMs":request.viewer_max_age_ms,"bodiesMaxAgeMs":request.bodies_max_age_ms,"toolsMaxAgeMs":request.tools_max_age_ms});
++    require(request.cutoff_at_ms.is_none_or(|at|at>=0 && at<=chrono::Utc::now().timestamp_millis()))?;
++    let policy=json!({"viewerMaxAgeMs":request.viewer_max_age_ms,"bodiesMaxAgeMs":request.bodies_max_age_ms,"toolsMaxAgeMs":request.tools_max_age_ms,"measureOnly":request.measure_only,"cutoffAtMs":request.cutoff_at_ms,"legacyVectorCacheOnly":request.legacy_vector_cache_only,"implementation":5});
+     if let Some(receipt)=database::row(connection,STATE,&receipt_key)?.value {
+         require(receipt["progress"]["policy"]==policy)?;
+         return Ok(receipt);
+     }
+-    let mut run=database::row(connection,STATE,&run_key)?.value.unwrap_or_else(|| json!({
+-        "ordinal":0,"scope":"","key":"","done":false,"policy":policy,
+-        "startedAt":chrono::Utc::now().to_rfc3339(),"cutoffAtMs":chrono::Utc::now().timestamp_millis()}));
++    let mut run=database::row(connection,STATE,&run_key)?.value.unwrap_or_else(||json!({
++        "ordinal":0,"scope":"","key":"","done":false,"policy":policy,"categories":{},
++        "startedAt":chrono::Utc::now().to_rfc3339(),"cutoffAtMs":request.cutoff_at_ms.unwrap_or_else(||chrono::Utc::now().timestamp_millis())}));
+     require(run["ordinal"].as_u64()==Some(request.ordinal) && run["policy"]==policy && run["done"]==false)?;
+     let now=run["cutoffAtMs"].as_i64().ok_or_else(||error("STATE_TX_INVALID_REQUEST"))?;
+     let mut scope=run["scope"].as_str().ok_or_else(||error("STATE_TX_INVALID_REQUEST"))?.to_owned();
+-    let mut inspected=0usize; let mut deleted=0u64; let mut stripped=0u64; let mut logical=0u64; let mut stored=0u64; let mut excluded=0usize;
+-    let mut input=0i64;
+-    let mut oversized=0usize; let mut chunks=0usize; let mut categories=json!({});
+-    while inspected<4096 && input<4_194_304 && started.elapsed().as_millis()<2400 {
++    let mut inspected=0usize;let mut deleted=0u64;let mut stripped=0u64;let mut logical=0u64;let mut stored=0u64;
++    let mut input=0i64;let mut excluded=0u64;let mut eligible=0u64;let mut eligible_logical=0u64;let mut eligible_stored=0u64;
++    let mut oversized=0usize;let mut chunks=0usize;let mut categories=json!({});
++    while inspected<4096 && input<4_194_304 && started.elapsed().as_millis()<2200 {
+         if scope.is_empty() || run["scopeDone"]==true {
+-            scope=connection.query_row("SELECT scope FROM state_scopes WHERE scope>?1 AND (scope IN ('mem:recent-searches','mem:routine-runs','mem:temporal-graph-work','mem:temporal-graph-pending') OR (scope>='mem:summary-queue:units:' AND scope<'mem:summary-queue:units;') OR (scope>='mem:obs:' AND scope<'mem:obs;') OR (scope>='mem:graph:prepared:' AND scope<'mem:graph:prepared;') OR (scope>='mem:graph:remaps:' AND scope<'mem:graph:remaps;')) ORDER BY scope LIMIT 1",[&scope],|row|row.get::<_,String>(0)).optional()?.unwrap_or_default();
+-            run["key"]=json!(""); run["scopeDone"]=json!(false);
+-            if scope.is_empty() {run["done"]=json!(true); break;}
++            let scopes = if request.legacy_vector_cache_only {
++                "SELECT scope FROM state_scopes WHERE scope>?1 AND scope>='mem:index:bm25:vec:' AND scope<'mem:index:bm25:vec;' ORDER BY scope LIMIT 1"
++            } else {
++                "SELECT scope FROM state_scopes WHERE scope>?1 AND (scope IN ('mem:recent-searches','mem:routine-runs','mem:temporal-graph-work','mem:temporal-graph-pending') OR (scope>='mem:summary-queue:units:' AND scope<'mem:summary-queue:units;') OR (scope>='mem:obs:' AND scope<'mem:obs;') OR (scope>='mem:graph:prepared:' AND scope<'mem:graph:prepared;') OR (scope>='mem:graph:remaps:' AND scope<'mem:graph:remaps;')) ORDER BY scope LIMIT 1"
++            };
++            scope=connection.query_row(scopes,[&scope],|row|row.get::<_,String>(0)).optional()?.unwrap_or_default();
++            run["key"]=json!("");run["scopeDone"]=json!(false);
++            if scope.is_empty(){run["done"]=json!(true);break;}
+         }
+         let after=run["key"].as_str().ok_or_else(||error("STATE_TX_INVALID_REQUEST"))?;
+-        let mut rows=Vec::new();
+         let chunk_limit=(4096-inspected).min(128);
+-        {
+-            let mut query=connection.prepare_cached("SELECT key,value_bytes,COALESCE(stored_bytes,0) FROM state_values WHERE scope=?1 AND key>?2 AND live=1 ORDER BY key LIMIT ?3")?;
+-            let mut selected=query.query(params![scope,after,chunk_limit as i64])?;
+-            while let Some(row)=selected.next()? {rows.push((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?));}
+-        }
+-        let mut candidates=Vec::new(); let mut consumed=0usize;
+-        let before=(deleted,stripped,logical,stored);
++        let rows=connection.prepare_cached("SELECT key,value_bytes,COALESCE(stored_bytes,0) FROM state_values WHERE scope=?1 AND key>?2 AND live=1 ORDER BY key LIMIT ?3")?
++            .query_map(params![scope,after,chunk_limit as i64],|row|Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
++        let mut consumed=0;
+         for (key,size,encoded) in &rows {
+             let cost=(*size).max(*encoded);
+-            if started.elapsed().as_millis()>=2400 || (cost<=128*1024 && input.saturating_add(cost)>4_194_304) {break;}
+-            inspected+=1; consumed+=1; run["key"]=json!(key);
+-            if cost>128*1024 {excluded+=1;oversized+=1;continue;}
+-            input+=cost;
+-            let Some(value)=storage_prune::bounded_dependency(connection,&scope,key)? else {excluded+=1;continue};
+-            let maximum=if scope=="mem:recent-searches" {request.viewer_max_age_ms} else if scope.starts_with("mem:obs:") {request.tools_max_age_ms} else {request.bodies_max_age_ms};
+-            let result=remove(connection,&scope,key,&value,maximum,now,&request.guard)?;
+-            if let Some(candidate)=result.get("candidate") {candidates.push(protocol::decode(candidate.clone())?);continue;}
++            if started.elapsed().as_millis()>=2200 || (cost<=1_048_576 && input.saturating_add(cost)>4_194_304){break;}
++            inspected+=1;consumed+=1;run["key"]=json!(key);
++            let category=if request.legacy_vector_cache_only{"legacyVectorCache"}else if scope=="mem:recent-searches"{"viewer"}else if scope.starts_with("mem:obs:"){"toolBodies"}else if scope.starts_with("mem:summary-queue:"){"summaryAuxiliary"}else if scope.starts_with("mem:graph:"){"graphAuxiliary"}else{"completedBodies"};
++            let band=if cost>1_048_576{"above1MiB"}else if cost>131_072{"above128KiBTo1MiB"}else{"upTo128KiB"};
++            let mut reason="row_decode_budget".to_owned();
++            let mut proof=String::new();
++            let mut result=json!({});
++            if cost>1_048_576 {oversized+=1;} else {
++                input+=cost;
++                let value=database::row(connection,&scope,key)?.value.ok_or_else(||error("STATE_TX_CONFLICT"))?;
++                let maximum=if scope=="mem:recent-searches"{request.viewer_max_age_ms}else if scope.starts_with("mem:obs:"){request.tools_max_age_ms}else{request.bodies_max_age_ms};
++                // Simulation rolls back source rows, revisions, memberships and GC invalidation.
++                // Only this page's measurement cursor/receipt is committed by the outer transaction.
++                if request.measure_only {connection.execute_batch("SAVEPOINT ttl_measure_candidate")?;}
++                result=remove(connection,&scope,key,&value,maximum,now,&request.guard)?;
++                proof=result["proof"].as_str().unwrap_or("").to_owned();
++                if let Some(candidate)=result.get("candidate") {
++                    result=storage_prune::prune_at(connection,vec![protocol::decode(candidate.clone())?],4_194_304,now)?;
++                    reason="dependency_or_publication_proof_not_closed".to_owned();
++                }else{reason=result["reason"].as_str().unwrap_or("eligible").to_owned();}
++                if request.measure_only {connection.execute_batch("ROLLBACK TO ttl_measure_candidate; RELEASE ttl_measure_candidate")?;}
++            }
+             let count=result["deleted_count"].as_u64().unwrap_or(0);
+-            deleted+=count; logical+=result["deleted_logical_bytes"].as_u64().unwrap_or(0); stored+=result["deleted_stored_bytes"].as_u64().unwrap_or(0);
+-            if count==0 {excluded+=1;}
++            let raw=result["raw_stripped_count"].as_u64().unwrap_or(0);
++            let removed_logical=result["deleted_logical_bytes"].as_u64().unwrap_or(0);
++            let removed_stored=result["deleted_stored_bytes"].as_u64().unwrap_or(0);
++            if count+raw>0 {
++                reason=if proof=="legacy_cache_stale_dimension_canonical_preserved" {
++                    if request.measure_only{"eligible_stale_vector_cache"}else{"modified_stale_vector_cache"}
++                }else if proof=="native_admission_exact_source_compression" {
++                    if request.measure_only{"eligible_native_admission_exact_source_compression"}else{"modified_native_admission_exact_source_compression"}
++                }else if request.measure_only{"eligible"}else{"modified"}.to_owned();
++                eligible+=1;eligible_logical+=removed_logical;eligible_stored+=removed_stored;
++                if !request.measure_only{deleted+=count;stripped+=raw;logical+=removed_logical;stored+=removed_stored;}
++            }else{excluded+=1;}
++            account(&mut categories,category,&reason,band,u64::try_from(*size)?,u64::try_from(*encoded)?);
++            account(&mut run["categories"],category,&reason,band,u64::try_from(*size)?,u64::try_from(*encoded)?);
+         }
+-        if !candidates.is_empty() {
+-            let count=candidates.len();
+-            let result=storage_prune::prune(connection,candidates,4_194_304)?;
+-            require(result["processed_count"].as_u64()==Some(count as u64))?;
+-            let count=result["deleted_count"].as_u64().unwrap_or(0); let raw=result["raw_stripped_count"].as_u64().unwrap_or(0);
+-            deleted+=count; stripped+=raw; logical+=result["deleted_logical_bytes"].as_u64().unwrap_or(0); stored+=result["deleted_stored_bytes"].as_u64().unwrap_or(0);
+-            excluded+=result["skipped_count"].as_u64().unwrap_or(0) as usize;
+-        }
+-        let category=if scope=="mem:recent-searches" {"viewer"} else if scope.starts_with("mem:obs:") {"duplicateToolBodies"} else {"completedBodies"};
+-        for (field,delta) in [("deleted",deleted-before.0),("rawStripped",stripped-before.1),("logicalBytesDeleted",logical-before.2),("storedBytesDeleted",stored-before.3)] {
+-            if delta>0 {let old=categories[category][field].as_u64().unwrap_or(0); if !categories[category].is_object(){categories[category]=json!({});} categories[category][field]=json!(old+delta);}
+-        }
+-        chunks+=1;
+-        run["scopeDone"]=json!(rows.len()<chunk_limit && consumed==rows.len());
+-        if consumed<rows.len() {break;}
+-    }
+-    run["scope"]=json!(scope); run["ordinal"]=json!(request.ordinal+1);
+-    for (field,delta) in [("inspected",inspected as u64),("deleted",deleted),("rawStripped",stripped),
+-        ("logicalBytesDeleted",logical),("storedBytesDeleted",stored),("excluded",excluded as u64)] {
++        chunks+=1;run["scopeDone"]=json!(rows.len()<chunk_limit && consumed==rows.len());
++        if consumed<rows.len(){break;}
++    }
++    run["scope"]=json!(scope);run["ordinal"]=json!(request.ordinal+1);
++    for(field,delta)in[("inspected",inspected as u64),("deleted",deleted),("rawStripped",stripped),("logicalBytesDeleted",logical),("storedBytesDeleted",stored),("excluded",excluded),("eligible",eligible),("eligibleLogicalBytes",eligible_logical),("eligibleStoredBytes",eligible_stored)]{
+         run[field]=json!(run[field].as_u64().unwrap_or(0).checked_add(delta).ok_or_else(||error("STATE_TX_LIMIT_EXCEEDED"))?);
+     }
+-    let receipt=json!({"runId":request.run_id,"ordinal":request.ordinal,"scope":scope,"inspected":inspected,
+-        "deleted":deleted,"rawStripped":stripped,"logicalBytesDeleted":logical,"storedBytesDeleted":stored,"excluded":excluded,
+-        "inputBytes":input,"oversizedRetained":oversized,"chunks":chunks,"categories":categories,
+-        "elapsedMs":started.elapsed().as_millis(),"done":run["done"],"progress":run,"physicalBytesReclaimed":null,
+-        "leaseFence":request.fence,"graphFence":request.guard.fence,"completedAt":chrono::Utc::now().to_rfc3339()});
++    let receipt=json!({"runId":request.run_id,"ordinal":request.ordinal,"scope":scope,"inspected":inspected,"deleted":deleted,"rawStripped":stripped,"logicalBytesDeleted":logical,"storedBytesDeleted":stored,"excluded":excluded,"eligible":eligible,"eligibleLogicalBytes":eligible_logical,"eligibleStoredBytes":eligible_stored,"inputBytes":input,"oversizedRetained":oversized,"chunks":chunks,"categories":categories,"elapsedMs":started.elapsed().as_millis(),"done":run["done"],"progress":run,"physicalBytesReclaimed":null,"leaseFence":request.fence,"graphFence":request.guard.fence,"completedAt":chrono::Utc::now().to_rfc3339()});
+     database::write(connection,STATE,&run_key,Some(&run))?;
+     database::write(connection,STATE,&receipt_key,Some(&receipt))?;
+     Ok(receipt)
+--- a/engine/src/workers/state/adapters/sqlite/storage_prune.rs
++++ b/engine/src/workers/state/adapters/sqlite/storage_prune.rs
+@@ -183,6 +183,47 @@
+     Ok(["raw","toolInput","toolOutput","userPrompt","assistantResponse","imageData"].iter()
+         .all(|field| value.get(*field).is_none_or(|original| preserved.get(*field) == Some(original))))
+ }
++
++fn canonical_raw(value:&Value)->anyhow::Result<String> {
++    Ok(match value {
++        Value::Object(fields)=>{
++            let mut keys:Vec<_>=fields.keys().collect();keys.sort();
++            let parts=keys.into_iter().map(|key|Ok(format!("{}:{}",serde_json::to_string(key)?,canonical_raw(&fields[key])?))).collect::<anyhow::Result<Vec<_>>>()?;
++            format!("{{{}}}",parts.join(","))
++        }
++        Value::Array(items)=>format!("[{}]",items.iter().map(canonical_raw).collect::<anyhow::Result<Vec<_>>>()?.join(",")),
++        _=>serde_json::to_string(value)?,
++    })
++}
++
++pub(super) fn compressed_source_reason(connection: &Connection, scope: &str, key: &str, value: &Value) -> anyhow::Result<&'static str> {
++    let Some(session)=scope.strip_prefix("mem:obs:") else {return Ok("not_observation_scope")};
++    let Some(digest)=value["identityDigest"].as_str().filter(|digest|digest.len()==64) else {return Ok("compressed_identity_digest_missing")};
++    if value["id"]!=key || value["sessionId"]!=session || value["compressionMethod"]!="llm"
++        || !matches!(value["hookType"].as_str(),Some("post_tool_use"|"post_tool_failure"))
++        || !value["sourceIdentityDigests"].as_array().is_some_and(|ids|ids.contains(&json!(digest)))
++        || !["title","narrative"].iter().all(|field|value[*field].as_str().is_some_and(|text|!text.trim().is_empty()))
++        || !value["facts"].as_array().is_some_and(|facts|facts.iter().all(Value::is_string))
++        || value["occurrenceCount"].as_u64().is_none_or(|count|count==0)
++        || !value["provenance"].as_array().is_some_and(|entries|!entries.is_empty())
++        || !["firstSeenAt","lastSeenAt"].iter().all(|field|value[*field].as_str().is_some_and(|at|chrono::DateTime::parse_from_rfc3339(at).is_ok()))
++        || value["provenanceOverflowCount"].as_u64().unwrap_or(0)!=0
++        || value.get("imageData").is_some() || value.get("imageRef").is_some() {return Ok("compressed_knowledge_or_provenance_not_proven");}
++    let Some(identity)=bounded_dependency(connection,&format!("mem:obs-identity:{session}"),digest)? else {return Ok("native_admission_index_missing_or_oversized")};
++    if identity["identityDigest"]!=digest || identity["observationId"]!=key {return Ok("native_admission_index_owner_mismatch");}
++    if value["identityIndexedDigest"]==digest {return Ok("legacy_indexed_compression");}
++    // Admission's index has no row version. The caller pins the current row version;
++    // recomputation proves that its retained raw still names this exact source.
++    if value.get("identityIndexedDigest").is_some() {return Ok("native_admission_marker_conflict");}
++    let Some(raw)=value.get("raw") else {return Ok("native_admission_raw_missing")};
++    let canonical=format!("{{\"data\":{},\"hookType\":{},\"sessionId\":{},\"version\":1}}",canonical_raw(raw)?,serde_json::to_string(&value["hookType"])?,serde_json::to_string(session)?);
++    if hex::encode(Sha256::digest(canonical.as_bytes()))!=digest {return Ok("native_admission_current_raw_digest_mismatch");}
++    Ok("native_admission_exact_source_compression")
++}
++
++pub(super) fn compressed_source(connection:&Connection,scope:&str,key:&str,value:&Value)->anyhow::Result<bool> {
++    Ok(matches!(compressed_source_reason(connection,scope,key,value)?,"legacy_indexed_compression"|"native_admission_exact_source_compression"))
++}
+ fn plain_eligible(scope: &str, value: &Value) -> bool {
+     match scope {
+         "mem:audit" | "mem:access" | "mem:recent-searches" => true,
+@@ -193,10 +234,13 @@
+     }
+ }
+ pub fn prune(connection: &Connection, candidates: Vec<Candidate>, max_bytes: u64) -> anyhow::Result<Value> {
++    prune_at(connection,candidates,max_bytes,chrono::Utc::now().timestamp_millis())
++}
++pub(super) fn prune_at(connection: &Connection, candidates: Vec<Candidate>, max_bytes: u64, now:i64) -> anyhow::Result<Value> {
+     require(candidates.len() <= 128 && (1..=4*1024*1024).contains(&max_bytes))?;
+     let total = candidates.len();
+     let candidate_keys: HashSet<_> = candidates.iter().map(|candidate| (candidate.scope.clone(),candidate.key.clone())).collect();
+-    let cutoff = chrono::Utc::now().timestamp_millis() - 7 * 24 * 60 * 60 * 1000;
++    let cutoff = now - 7 * 24 * 60 * 60 * 1000;
+     let mut seen = HashSet::new();
+     let mut deleted = 0;
+     let mut stripped = 0;
+@@ -214,7 +258,8 @@
+         let event = candidate.scope.starts_with("mem:obs-events:");
+         let queue = candidate.scope == "mem:summary-queue:jobs" || candidate.scope == "mem:summary-queue:intents" || candidate.scope.starts_with("mem:summary-queue:units:");
+         let temporal = candidate.scope == TEMPORAL_WORK || candidate.scope == TEMPORAL_PENDING;
+-        if !plain && !observation && !queue && !event && !temporal { skipped += 1; processed += 1; continue; }
++        let legacy_cache = super::storage_legacy_cache::family(&candidate.scope);
++        if !plain && !observation && !queue && !event && !temporal && !legacy_cache { skipped += 1; processed += 1; continue; }
+         let bytes: Option<(i64,i64)> = connection.query_row("SELECT value_bytes,COALESCE(stored_bytes,0) FROM state_values WHERE scope=?1 AND key=?2 AND live=1",
+             params![candidate.scope,candidate.key], |row| Ok((row.get(0)?,row.get(1)?))).optional()?;
+         let Some((logical_bytes,stored_bytes)) = bytes else { skipped += 1; processed += 1; continue; };
+@@ -229,17 +274,25 @@
+         let value = row.value.ok_or_else(|| error("STATE_TX_CONFLICT"))?;
+         if row_protected(&value) || protected(&serde_json::to_string(&value)?) { skipped += 1; processed += 1; continue; }
+         // Completed units clear startedAt; their validated parent publication owns terminal age.
+-        if !queue && (!temporal || candidate.key.ends_with(":manifest")) && age(&value).is_none_or(|date| date > cutoff) { skipped += 1; processed += 1; continue; }
++        if !legacy_cache && !queue && (!temporal || candidate.key.ends_with(":manifest")) && age(&value).is_none_or(|date| date > cutoff) { skipped += 1; processed += 1; continue; }
++        // Obsolescence is proven against the current corpus, never a fabricated age.
++        if legacy_cache && super::storage_legacy_cache::reason(connection,&candidate.scope,&candidate.key,&value)? != "legacy_cache_stale_dimension_canonical_preserved" { skipped += 1; processed += 1; continue; }
+         if temporal && !temporal_eligible(connection,&candidate.scope,&candidate.key,&value,candidate.preserved.as_ref(),cutoff)? { skipped += 1; processed += 1; continue; }
+         if queue && !queue_eligible(connection,&candidate.scope,&candidate.key,&value,candidate.preserved.as_ref())? { skipped += 1; processed += 1; continue; }
+         // Event receipts are the only exact replay identities; age cannot prove expiry.
+         if event || (plain && !plain_eligible(&candidate.scope,&value)) { skipped += 1; processed += 1; continue; }
+         if observation {
+-            if candidate.preserved.as_ref().is_none_or(|reference| candidate_keys.contains(&(reference.scope.clone(),reference.key.clone()))) { skipped += 1; processed += 1; continue; }
+-            if value.get("raw").is_none() || !raw_preserved(connection,&candidate.scope,&candidate.key,&value,candidate.preserved.as_ref())? { skipped += 1; processed += 1; continue; }
++            if !matches!(value["hookType"].as_str(),Some("post_tool_use"|"post_tool_failure")) { skipped += 1; processed += 1; continue; }
++            let compressed=candidate.preserved.is_none() && compressed_source(connection,&candidate.scope,&candidate.key,&value)?;
++            if !compressed && candidate.preserved.as_ref().is_none_or(|reference| candidate_keys.contains(&(reference.scope.clone(),reference.key.clone()))) { skipped += 1; processed += 1; continue; }
++            if value.get("raw").is_none() || (!compressed && !raw_preserved(connection,&candidate.scope,&candidate.key,&value,candidate.preserved.as_ref())?) { skipped += 1; processed += 1; continue; }
+             let mut replacement = value.clone();
+             for field in ["raw","toolInput","toolOutput","userPrompt","assistantResponse"] { replacement.as_object_mut().expect("stored object").remove(field); }
+-            replacement["rawSource"] = json!({"scope":candidate.preserved.as_ref().expect("validated source").scope,"key":candidate.preserved.as_ref().expect("validated source").key});
++            if let Some(reference)=candidate.preserved.as_ref() {
++                replacement["rawSource"] = json!({"scope":reference.scope,"key":reference.key});
++            } else {
++                replacement["rawRetentionEvidence"]=json!({"kind":"durable_compressed_observation","sourceVersion":candidate.expected_version,"identityDigest":value["identityDigest"],"knowledgeDigest":hex::encode(Sha256::digest(serde_json::to_vec(&json!([value["title"],value["facts"],value["narrative"]]))?))});
++            }
+             replacement["rawRetained"] = json!(false);
+             replacement["rawExpiredAt"] = json!(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true));
+             let after = protocol::size(&replacement)? as u64;
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/storage_legacy_cache.rs
+@@ -0,0 +1,54 @@
++use super::{database, storage_prune};
++use base64::{Engine, engine::general_purpose::STANDARD};
++use rusqlite::{Connection, OptionalExtension, params};
++use serde_json::Value;
++
++pub(super) fn family(scope: &str) -> bool {
++    scope.strip_prefix("mem:index:bm25:vec:")
++        .is_some_and(|suffix| suffix.len() == 4 && suffix.bytes().all(|byte| byte.is_ascii_digit()))
++}
++
++pub(super) fn reason(c: &Connection, scope: &str, key: &str, value: &Value) -> anyhow::Result<&'static str> {
++    if !family(scope) { return Ok("legacy_cache_family_unknown"); }
++    let Some(object) = value.as_object() else { return Ok("legacy_cache_format_unknown"); };
++    if object.len() != 3 || value["id"] != key || !["id", "s", "e"].iter().all(|field| value[*field].is_string()) {
++        return Ok("legacy_cache_format_unknown");
++    }
++    let session = value["s"].as_str().unwrap();
++    let encoded = value["e"].as_str().unwrap();
++    if session.is_empty() || session.len() > 4096 || encoded.len() > 131_072 { return Ok("legacy_cache_decode_budget"); }
++    let Ok(bytes) = STANDARD.decode(encoded) else { return Ok("legacy_cache_embedding_invalid"); };
++    if bytes.is_empty() || bytes.len() % 4 != 0 || STANDARD.encode(&bytes) != encoded
++        || bytes.chunks_exact(4).any(|bytes| !f32::from_le_bytes(bytes.try_into().unwrap()).is_finite()) {
++        return Ok("legacy_cache_embedding_invalid");
++    }
++    let identity: Option<(String, i64, String, i64)> = c.query_row(
++        "SELECT model,dimensions,generation,epoch FROM retrieval_semantic_meta WHERE index_id='observations' AND status='ready'",
++        [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional()?;
++    let Some((model, dimensions, generation, epoch)) = identity else { return Ok("legacy_cache_native_identity_not_ready"); };
++    // This retirement is deliberately restricted to the accepted current local corpus.
++    if model != "Xenova/all-MiniLM-L6-v2" || dimensions != 384 || generation != "local-v1" {
++        return Ok("legacy_cache_native_identity_changed");
++    }
++    if bytes.len() / 4 == dimensions as usize { return Ok("legacy_cache_dimension_compatible"); }
++    let rollback: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM compact_rollback) OR EXISTS(SELECT 1 FROM compact_config WHERE mode!=1 OR phase!='compact' OR complete!=1)", [], |row| row.get(0))?;
++    if rollback { return Ok("legacy_cache_compaction_or_rollback_open"); }
++    let source_scope = format!("mem:obs:{session}");
++    let Some(source) = storage_prune::bounded_dependency(c, &source_scope, key)? else { return Ok("legacy_cache_canonical_missing_or_oversized"); };
++    if source["id"] != key || source["sessionId"] != session || storage_prune::row_protected(&source)
++        || storage_prune::protected(&serde_json::to_string(&source)?) {
++        return Ok("legacy_cache_canonical_identity_or_protection");
++    }
++    let version = database::row_version(c, &source_scope, key)?.to_string();
++    let Some(semantic) = storage_prune::bounded_dependency(c, "mem:semantic:observations", key)? else { return Ok("legacy_cache_native_source_missing_or_oversized"); };
++    if semantic["id"] != key || semantic["sessionId"] != session || semantic["sourceScope"] != source_scope
++        || semantic["sourceVersion"] != version || semantic["model"] != model
++        || semantic["dimensions"] != dimensions || semantic["generation"] != generation
++        || storage_prune::row_protected(&semantic) {
++        return Ok("legacy_cache_native_source_stale");
++    }
++    let current: bool = c.query_row(
++        "SELECT EXISTS(SELECT 1 FROM retrieval_source_items s JOIN state_rows r ON r.scope=s.scope AND r.key=s.key AND r.version=s.version JOIN retrieval_vectors v ON v.index_id=s.index_id AND v.id=s.key AND v.epoch=?4 AND v.session_id=?5 WHERE s.index_id='observations' AND s.scope=?1 AND s.key=?2 AND s.version=?3 AND s.dirty=0)",
++        params![source_scope,key,version,epoch,session], |row| row.get(0))?;
++    Ok(if current { "legacy_cache_stale_dimension_canonical_preserved" } else { "legacy_cache_native_coverage_not_current" })
++}
+--- a/engine/src/workers/state/adapters/sqlite/storage.rs
++++ b/engine/src/workers/state/adapters/sqlite/storage.rs
+@@ -13,9 +13,20 @@
+     ProviderBudgetFinish { operation_id: String, window_id: String, claim_id: String, outcome: String },
+     ProviderBudgetStatus { operation_id: String },
+     Physical,
++    BlobMeasure { after_blob: i64, limit: usize },
+     TtlPage { request: super::storage_ttl::Request },
+     TtlRecordContextUse { request: super::storage_ttl::ContextUse },
+     CompactStatus,
++    RepackStatus,
++    RepackProof,
++    RepackReceipt { request: super::storage_repack::Request },
++    RepackApply { request: super::storage_repack::Request },
++    LexicalRepackStatus,
++    LexicalRepackProof,
++    LexicalRepackProofPage { request: super::storage_lexical_repack::proof::PageRequest },
++    LexicalRepackReceipt { request: super::storage_repack::Request },
++    LexicalRepackApply { request: super::storage_repack::Request },
++    CompactReceipt { request: super::compact::Request },
+     CompactApply { request: super::compact::Request },
+     MigrateIncremental { allow_blocking: bool, max_ms: u64 },
+     Diagnostics { cursor: Option<storage_diagnostics::Cursor>, limit: usize, max_bytes: u64, max_ms: u64 },
+@@ -46,7 +57,7 @@
+         })
+     }
+     pub fn maintenance_lease(&self) -> bool { matches!(self, Self::MaintenanceLeaseAcquire { .. } | Self::MaintenanceLeaseRefresh { .. } | Self::MaintenanceLeaseRelease { .. } | Self::MaintenanceStateSave { .. }) }
+-    pub fn read_only(&self) -> bool { matches!(self, Self::Diagnostics { .. } | Self::GraphMetadata | Self::Physical | Self::CompactStatus) }
++    pub fn read_only(&self) -> bool { matches!(self, Self::Diagnostics { .. } | Self::GraphMetadata | Self::Physical | Self::CompactStatus | Self::CompactReceipt { .. } | Self::BlobMeasure { .. } | Self::RepackStatus | Self::RepackProof | Self::RepackReceipt { .. } | Self::LexicalRepackStatus | Self::LexicalRepackProof | Self::LexicalRepackProofPage { .. } | Self::LexicalRepackReceipt { .. }) }
+     pub fn reclamation(&self) -> bool { matches!(self, Self::Reclaim { .. } | Self::MigrateIncremental { .. }) }
+ }
+ pub fn bounded<T>(connection: &Connection, max_ms: u64, job: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+@@ -64,7 +75,18 @@
+ }
+ pub fn execute(connection: &Connection, path: &Path, request: Request) -> anyhow::Result<Value> {
+     match request {
++        Request::LexicalRepackStatus => super::storage_lexical_repack::status(connection),
++        Request::LexicalRepackProof => bounded(connection,3000,||super::storage_lexical_repack::proof(connection)),
++        Request::LexicalRepackReceipt {request} => super::storage_lexical_repack::receipt(connection,&request),
++        Request::LexicalRepackProofPage {..} => Err(error("STATE_TX_INVALID_REQUEST")),
++        Request::LexicalRepackApply {..} => Err(error("STATE_TX_INVALID_REQUEST")),
++        Request::RepackStatus => super::storage_repack::status(connection),
++        Request::RepackProof => bounded(connection,1000,||super::storage_repack::proof(connection)),
++        Request::RepackReceipt {request} => super::storage_repack::receipt(connection,&request),
++        Request::RepackApply {..} => Err(error("STATE_TX_INVALID_REQUEST")),
+         Request::CompactStatus => super::compact::status(connection),
++        Request::BlobMeasure {after_blob,limit} => bounded(connection,3000,||super::storage_blob_measure::page(connection,after_blob,limit)),
++        Request::CompactReceipt {request} => super::compact::receipt(connection,request),
+         Request::CompactApply {request} => bounded(connection,request.max_ms,||super::compact::execute(connection,request)),
+         Request::ProviderBudgetClaim {..} | Request::ProviderBudgetConsume {..} | Request::ProviderBudgetFinish {..} | Request::ProviderBudgetStatus {..} => Err(error("STATE_PROVIDER_BUDGET_TRANSACTION_INVALID")),
+         Request::MaintenanceLeaseAcquire {owner_id, lease_ms} => storage_maintenance_lease::acquire(connection, &owner_id, lease_ms),
+--- a/engine/src/workers/state/adapters/sqlite/compact.rs
++++ b/engine/src/workers/state/adapters/sqlite/compact.rs
+@@ -178,4 +178,4 @@
+     if active { store(c,scope,key,version,text) } else { super::codec::encode(text) }
+ }
+ 
+-pub use maintenance::{Request, Step, execute, status};
++pub use maintenance::{Request, Step, execute, status, receipt};
+--- a/engine/src/workers/state/adapters/sqlite/compact/maintenance.rs
++++ b/engine/src/workers/state/adapters/sqlite/compact/maintenance.rs
+@@ -24,9 +24,26 @@
+ 
+ pub fn status(c: &Connection) -> anyhow::Result<Value> {
+     let vectors_complete:bool=c.query_row("SELECT complete FROM compact_vector_cursor WHERE singleton=1",[],|r|r.get(0))?;
+-    c.query_row("SELECT generation,mode,phase,last_scope,last_key,complete FROM compact_config WHERE singleton=1",[],|r| {
++    let mut result: Value = c.query_row("SELECT generation,mode,phase,last_scope,last_key,complete FROM compact_config WHERE singleton=1",[],|r| {
+         Ok(json!({"format":3,"generation":r.get::<_,String>(0)?,"active":r.get::<_,bool>(1)?,"phase":r.get::<_,String>(2)?,"cursor":{"scope":r.get::<_,String>(3)?,"key":r.get::<_,String>(4)?},"rows_complete":r.get::<_,bool>(5)?,"vectors_complete":vectors_complete,"complete":r.get::<_,bool>(5)? && vectors_complete,"physical_bytes_reclaimed":null}))
+-    }).map_err(Into::into)
++    })?;
++    let progress=super::collector::progress(c)?;
++    result["gc_complete"]=progress["complete"].clone();
++    result["collect_progress"]=progress;
++    Ok(result)
++}
++
++pub fn receipt(c: &Connection, request: Request) -> anyhow::Result<Value> {
++    super::super::protocol::require(!request.operation_id.is_empty() && request.operation_id.len()<=128)?;
++    let digest=Sha256::digest(serde_json::to_vec(&request)?).to_vec();
++    let saved:Option<(Vec<u8>,String)>=c.query_row("SELECT digest,result FROM compact_receipts WHERE operation_id=?1",[&request.operation_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
++    match saved {
++        Some((prior,result)) => {
++            if prior!=digest {return Err(super::super::protocol::error("STATE_TX_REPLAY_CONFLICT"));}
++            Ok(json!({"status":"applied","operation_id":request.operation_id,"result":serde_json::from_str::<Value>(&result)?}))
++        }
++        None => Ok(json!({"status":"not_found","operation_id":request.operation_id,"result":null})),
++    }
+ }
+ 
+ pub fn execute(c: &Connection, request: Request) -> anyhow::Result<Value> {
+--- a/engine/src/workers/state/adapters/sqlite/mod.rs
++++ b/engine/src/workers/state/adapters/sqlite/mod.rs
+@@ -6,7 +6,10 @@
+ mod protocol;
+ mod retention;
+ mod storage;
++mod storage_repack;
++mod storage_lexical_repack;
+ mod storage_ttl;
++mod storage_blob_measure;
+ mod snapshot_read_view;
+ #[cfg(test)]
+ mod snapshot_read_view_tests;
+@@ -17,6 +20,7 @@
+ mod storage_maintenance_lease;
+ mod storage_profile;
+ mod storage_prune;
++mod storage_legacy_cache;
+ mod storage_operations;
+ mod observation;
+ mod retrieval;
+@@ -646,6 +650,43 @@
+         }
+         let request: storage::Request = protocol::decode(input)?;
+         let path = self.path.clone();
++        if let storage::Request::LexicalRepackProofPage {request} = request {
++            let pressure=self.foreground_pending.clone();let generation=self.generation.to_string();
++            let budget=database::PreparationBudget::new("storage_lexical_proof_page",Duration::from_millis(3000));let worker_budget=budget.clone();
++            return self.run_controlled_view(MAX_ENVELOPE_BYTES,true,Some(budget),move |connection,views| {
++                if views.busy(){return Err(protocol::error("STATE_REPACK_ACTIVE_VIEW"));}
++                if pressure.load(Ordering::Acquire)>0{return Err(protocol::error("STATE_REPACK_FOREGROUND_PENDING"));}
++                storage_lexical_repack::proof::page(connection,&path,&generation,&request,&worker_budget)
++            }).await;
++        }
++        if let storage::Request::LexicalRepackApply {request} = request {
++            let pressure=self.foreground_pending.clone();
++            let budget=database::PreparationBudget::new("storage_lexical_repack",Duration::from_millis(request.max_ms));
++            let worker_budget=budget.clone();
++            return self.run_controlled_view(MAX_ENVELOPE_BYTES,true,Some(budget),move |connection,views| {
++                if matches!(request.step,storage_repack::Step::Cut|storage_repack::Step::Rollback) && views.busy() {
++                    return Err(protocol::error("STATE_REPACK_ACTIVE_VIEW"));
++                }
++                if pressure.load(Ordering::Acquire)>0 {return Err(protocol::error("STATE_REPACK_FOREGROUND_PENDING"));}
++                database::run_preparation(connection,&path,&worker_budget,false,
++                    |transaction|storage_lexical_repack::execute(transaction,request))
++            }).await;
++        }
++        if let storage::Request::RepackApply {request} = request {
++            let pressure=self.foreground_pending.clone();
++            let budget=database::PreparationBudget::new("storage_repack",Duration::from_millis(request.max_ms));
++            let worker_budget=budget.clone();
++            return self.run_controlled_view(MAX_ENVELOPE_BYTES,true,Some(budget),move |connection,views| {
++                if matches!(request.step,storage_repack::Step::Cut|storage_repack::Step::Rollback) && views.busy() {
++                    return Err(protocol::error("STATE_REPACK_ACTIVE_VIEW"));
++                }
++                if pressure.load(Ordering::Acquire)>0 {
++                    return Err(protocol::error("STATE_REPACK_FOREGROUND_PENDING"));
++                }
++                database::run_preparation(connection,&path,&worker_budget,false,
++                    |transaction|storage_repack::execute(transaction,request))
++            }).await;
++        }
+         if let storage::Request::CompactApply {request: ref cut}=request {
+             if matches!(cut.step,compact::Step::Checkpoint|compact::Step::EnableIncremental|compact::Step::Rebuild) {
+                 return self.run(bytes.saturating_add(1024*1024),move |connection| {
+@@ -689,7 +730,7 @@
+                 storage::execute(connection, &path, request)
+             }).await
+         } else {
+-            let reserve=match &request {storage::Request::CompactApply {request}=>request.max_bytes.saturating_mul(2).saturating_add(4*1024*1024),_=>4*1024*1024};
++            let reserve=match &request {storage::Request::CompactApply {request}=>request.max_bytes.saturating_mul(2).saturating_add(4*1024*1024),storage::Request::TtlPage{..}=>MAX_ENVELOPE_BYTES.saturating_sub(bytes),_=>4*1024*1024};
+             if storage_profile::enabled() && matches!(&request,storage::Request::CompactApply{..}) {
+                 return self.mutate_profiled(bytes.saturating_add(reserve),move |connection|storage::execute(connection,&path,request)).await;
+             }
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/storage_blob_measure.rs
+@@ -0,0 +1,50 @@
++use super::protocol::require;
++use rusqlite::{Connection,params};
++use serde_json::{Value,json};
++use std::collections::BTreeSet;
++
++fn category(scope:&str)->&'static str {
++    if super::storage_legacy_cache::family(scope){"legacyVectorCache"}
++    else if scope.starts_with("mem:obs:"){"toolBodies"}
++    else if scope.starts_with("mem:graph:prepared:") || scope.starts_with("mem:graph:remaps:"){"graphAuxiliary"}
++    else if scope.starts_with("mem:summary-queue:units:"){"summaryAuxiliary"}
++    else if scope=="mem:recent-searches"{"viewer"}
++    else if ["mem:routine-runs","mem:temporal-graph-work","mem:temporal-graph-pending"].contains(&scope){"completedBodies"}
++    else if scope=="retrieval:vector"{"vectorKnowledge"}
++    else if scope=="retrieval:graph-list"{"graphKnowledge"}
++    else{"otherDurableKnowledge"}
++}
++
++// Only live roots own payload occupancy. Historical roots and shared payloads
++// must not be charged repeatedly to the rows that happen to reference them.
++pub fn page(c:&Connection,after:i64,limit:usize)->anyhow::Result<Value> {
++    require(after>=0 && (1..=128).contains(&limit))?;
++    let started=std::time::Instant::now();
++    let rows=c.prepare_cached("SELECT id,kind,logical_bytes,length(payload) FROM compact_blobs WHERE id>?1 ORDER BY id LIMIT ?2")?
++        .query_map(params![after,limit as i64],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
++    let mut categories=json!({});let mut cursor=after;let mut inspected=0;
++    for(id,kind,logical,stored)in &rows {
++        if inspected>0 && started.elapsed().as_millis()>2200{break;}
++        let mut scopes=c.prepare_cached("SELECT DISTINCT t.scope FROM compact_segments s JOIN compact_roots t ON t.id=s.root JOIN state_rows r ON r.scope=t.scope AND r.key=t.key AND r.version=t.version WHERE s.blob=?1 AND state_compact_root(r.value)=t.id LIMIT 129")?
++            .query_map([id],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
++        let truncated=scopes.len()>128;
++        if *kind==1 {
++            let vectors:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM compact_vector_refs f JOIN retrieval_vectors v ON v.index_id=f.index_id AND v.epoch=f.epoch AND v.id=f.id WHERE f.blob=?1 AND state_compact_vector_root(v.embedding)=f.blob)",[id],|r|r.get(0))?;
++            if vectors{scopes.push("retrieval:vector".to_owned());}
++        }
++        if *kind==2 {
++            let graph:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM compact_graph_lists g JOIN retrieval_identifiers i ON i.epoch=g.epoch AND i.id=g.key JOIN retrieval_nodes n ON n.epoch=i.epoch AND n.key=i.value WHERE g.list=?1)",[id],|r|r.get(0))?;
++            if graph{scopes.push("retrieval:graph-list".to_owned());}
++        }
++        // This is exactly the native collector's incoming-reference predicate.
++        // Absence of live row ownership alone cannot authorize collection.
++        let collectible:bool=c.query_row("SELECT NOT EXISTS(SELECT 1 FROM compact_segments WHERE blob=?1) AND NOT EXISTS(SELECT 1 FROM compact_vector_refs WHERE blob=?1) AND NOT EXISTS(SELECT 1 FROM compact_graph_lists WHERE list=?1)",[id],|r|r.get(0))?;
++        let owners:BTreeSet<_>=scopes.iter().map(|scope|category(scope)).collect();
++        let owner=if truncated || owners.len()>1{"sharedAcrossCategories"}else{owners.first().copied().unwrap_or("unreferenced")};
++        if !categories[owner].is_object(){categories[owner]=json!({"blobs":0,"logicalBytes":0,"compressedPayloadBytes":0,"lists":0,"collectorCandidateBlobs":0,"collectorCandidatePayloadBytes":0});}
++        let slot=&mut categories[owner];
++        for(field,delta)in[("blobs",1),("logicalBytes",*logical),("compressedPayloadBytes",*stored),("lists",i64::from(*kind==2)),("collectorCandidateBlobs",i64::from(collectible)),("collectorCandidatePayloadBytes",if collectible{*stored}else{0})]{slot[field]=json!(slot[field].as_i64().unwrap_or(0)+delta);}
++        cursor=*id;inspected+=1;
++    }
++    Ok(json!({"afterBlob":after,"cursor":cursor,"done":rows.len()<limit && inspected==rows.len(),"inspected":inspected,"categories":categories,"elapsedMs":started.elapsed().as_millis(),"coverage":"unique compact blob payloads; excludes SQLite pages, indexes, root/segment metadata, identifier dictionary and inline rollback images","consistency":"keyset_live"}))
++}
+--- a/engine/src/workers/state/adapters/sqlite/database.rs
++++ b/engine/src/workers/state/adapters/sqlite/database.rs
+@@ -310,11 +310,12 @@
+         (application == 0 || application == APPLICATION_ID)
+             && (version == 0 || version == FORMAT_VERSION)
+     } else {
+-        application == APPLICATION_ID && version == FORMAT_VERSION
++        application == APPLICATION_ID && [FORMAT_VERSION, 3].contains(&version)
+     };
+     if !compatible {
+         anyhow::bail!("Unsupported SQLite state format; explicit migration is required");
+     }
++    super::retrieval::lexical_content::validate_format(&connection)?;
+     if tables == 0 {
+         connection.execute_batch("PRAGMA auto_vacuum=INCREMENTAL")?;
+     }
+@@ -326,8 +327,10 @@
+         CREATE TABLE IF NOT EXISTS graph_storage_metadata(scope TEXT PRIMARY KEY,status TEXT NOT NULL CHECK(status IN ('preparing','scanned','ready','stale')),rows INTEGER NOT NULL CHECK(rows>=0),logical_bytes INTEGER NOT NULL CHECK(logical_bytes>=0),stored_bytes INTEGER NOT NULL CHECK(stored_bytes>=0),revision TEXT NOT NULL,last_key TEXT) WITHOUT ROWID;")?;
+     super::storage_maintenance_lease::initialize(&connection)?;
+     super::compact::schema(&connection)?;
++    super::storage_repack::initialize(&connection)?;
++    super::storage_lexical_repack::initialize(&connection)?;
+     connection.pragma_update(None, "application_id", APPLICATION_ID)?;
+-    connection.pragma_update(None, "user_version", FORMAT_VERSION)?;
++    connection.pragma_update(None, "user_version", version.max(FORMAT_VERSION))?;
+     {
+         let transaction = connection.unchecked_transaction()?;
+         super::retrieval::initialize(&transaction)?;
+@@ -355,6 +358,7 @@
+ }
+ 
+ fn register_value_function(connection: &Connection) -> anyhow::Result<()> {
++    super::retrieval::lexical_content::register(connection)?;
+     connection.create_scalar_function(
+         "state_json",
+         2,
+@@ -745,6 +749,7 @@
+ }
+ 
+ pub(super) fn configure_snapshot_reader(connection: &Connection) -> anyhow::Result<()> {
++    super::retrieval::lexical_content::validate_format(connection)?;
+     register_value_function(connection)?;
+     super::compact::register(connection)?;
+     connection.busy_timeout(Duration::from_millis(100))?;
+--- a/engine/src/workers/state/adapters/sqlite/compact/collector.rs
++++ b/engine/src/workers/state/adapters/sqlite/compact/collector.rs
+@@ -19,6 +19,8 @@
+     c.execute("UPDATE compact_gc_progress SET stage=0,cycle_deleted=0,done=0,invalidated=0,cycles=cycles+1 WHERE singleton=1",[])?;Ok(())
+ }
+ pub fn collect(c:&Connection,request:&super::maintenance::Request)->anyhow::Result<(usize,usize,usize)> {
++    anyhow::ensure!(!super::super::storage_repack::protected(c)?,"STATE_REPACK_ORIGINAL_PROTECTED");
++    anyhow::ensure!(!super::super::storage_lexical_repack::protected(c)?,"STATE_LEXICAL_ORIGINAL_PROTECTED");
+     if c.query_row("SELECT invalidated FROM compact_gc_progress WHERE singleton=1",[],|r|r.get::<_,bool>(0))? {restart(c)?;}
+     let mut b=Budget {units:request.limit,inspected:0,deleted:0,bytes:0,max_bytes:request.max_bytes,yielded:false,started:Instant::now(),max_time:Duration::from_millis(request.max_ms),last:Duration::ZERO};
+     while b.available() {
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/storage_repack.rs
+@@ -0,0 +1,174 @@
++mod schema;
++mod mirror;
++#[cfg(test)]
++mod tests;
++
++use super::{database, protocol::{error, require, Guard}, storage_maintenance_lease};
++use rusqlite::{Connection, OptionalExtension, params};
++use serde::{Deserialize, Serialize};
++use serde_json::{Value, json};
++use sha2::{Digest, Sha256};
++use std::time::{Duration, Instant};
++
++#[derive(Clone, Copy, Deserialize, Serialize, PartialEq)]
++#[serde(rename_all="snake_case")]
++pub enum Step { Begin, Copy, Cut, Rollback, Retire }
++#[derive(Clone, Deserialize, Serialize)]
++#[serde(deny_unknown_fields)]
++pub struct Request {
++    pub operation_id: String, pub job_id: String, pub expected_ordinal: u64,
++    pub step: Step, pub max_ms: u64, pub max_bytes: usize, pub limit: usize,
++    pub owner_id: String, pub fence: u64, pub guard: Guard,
++}
++
++pub fn initialize(c: &Connection) -> anyhow::Result<()> { schema::initialize(c) }
++pub fn protected(c: &Connection) -> anyhow::Result<bool> {
++    Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name IN ('state_repack_stage','state_repack_original'))",[],|r|r.get(0))?)
++}
++pub fn status(c: &Connection) -> anyhow::Result<Value> {
++    let value: Option<String> = c.query_row("SELECT value FROM state_repack_job WHERE singleton=1",[],|r|r.get(0)).optional()?;
++    Ok(value.map(|v|serde_json::from_str(&v)).transpose()?.unwrap_or(json!({"phase":"absent","ordinal":0})))
++}
++pub fn receipt(c: &Connection, request: &Request) -> anyhow::Result<Value> {
++    let saved: Option<(Vec<u8>,String)> = c.query_row("SELECT digest,result FROM state_repack_receipts WHERE operation_id=?1",[&request.operation_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
++    match saved {
++        None => Ok(json!({"status":"not_found","operation_id":request.operation_id})),
++        Some((digest,result)) => {
++            require(digest == Sha256::digest(serde_json::to_vec(request)?).to_vec())?;
++            Ok(json!({"status":"applied","operation_id":request.operation_id,"result":serde_json::from_str::<Value>(&result)?}))
++        }
++    }
++}
++fn equivalent(c:&Connection,target:&str,scope:&str,key:&str)->anyhow::Result<bool> {
++    let columns=["scope","key","value","version","position","value_bytes"];
++    let equality=columns.iter().map(|name|format!("a.{name} IS b.{name} AND typeof(a.{name})=typeof(b.{name})")).collect::<Vec<_>>().join(" AND ");
++    Ok(c.query_row(&format!("SELECT EXISTS(SELECT 1 FROM state_rows a JOIN {target} b ON a.scope=b.scope AND a.key=b.key WHERE a.scope=?1 AND a.key=?2 AND {equality})"),params![scope,key],|r|r.get(0))?)
++}
++pub fn proof(c:&Connection)->anyhow::Result<Value> {
++    let job=status(c)?;let phase=job["phase"].as_str().unwrap_or("");
++    require(["ready","cut"].contains(&phase))?;
++    let target=if phase=="cut"{"state_repack_original"}else{"state_repack_stage"};
++    let names:Vec<String>=c.prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND name IN ('state_repack_insert','state_repack_update','state_repack_delete') ORDER BY name")?.query_map([],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
++    let plan:Vec<String>=c.prepare("EXPLAIN QUERY PLAN SELECT key FROM state_rows INDEXED BY state_rows_order WHERE scope='mem:graph:control' AND value IS NOT NULL ORDER BY position")?.query_map([],|r|r.get(3))?.collect::<rusqlite::Result<_>>()?;
++    Ok(json!({"job_id":job["job_id"],"ordinal":job["ordinal"],"phase":phase,
++        "raw_verified_rows":job["raw_verified_rows"],"copied_rows":job["copied_rows"],
++        "copied_tombstones":job["copied_tombstones"],"copied_null_positions":job["copied_null_positions"],"raw_storage_types":job["raw_storage_types"],
++        "schema_exact":schema::capture(c)?==job["schema"],"preserved_native_triggers":job["schema"]["triggers"].as_array().map(Vec::len),
++        "mirror_triggers":names,"mirror_target":target,"graph_control_raw_types_equal":equivalent(c,target,database::CONTROL_SCOPE,"current")?,
++        "original_protected":protected(c)?,"order_query_plan":plan}))
++}
++pub(super) fn leases(c: &Connection, r: &Request) -> anyhow::Result<()> {
++    storage_maintenance_lease::validate_in_transaction(c,&r.owner_id,r.fence)?;
++    require(r.owner_id == r.guard.owner_id)?;
++    super::commit::read_allowed(c,database::CONTROL_SCOPE,"current",Some(&r.guard))?;
++    let control=database::row(c,database::CONTROL_SCOPE,"current")?.value.ok_or_else(||error("STATE_TX_FAILED"))?;
++    require(control["recovery"].is_null())?;
++    if r.step == Step::Cut {
++        let now=chrono::Utc::now().timestamp_millis();
++        let expiry:i64=c.query_row("SELECT expires_at_ms FROM state_storage_maintenance_lease WHERE singleton=1",[],|r|r.get(0))?;
++        require(expiry-now>=120_000 && control["lease"]["expires_at_ms"].as_i64().is_some_and(|expiry|expiry-now>=120_000))?;
++    }
++    Ok(())
++}
++pub fn execute(c: &Connection, r: Request) -> anyhow::Result<Value> {
++    require(!c.is_autocommit() && !r.operation_id.is_empty() && r.operation_id.len()<=128
++        && !r.job_id.is_empty() && r.job_id.len()<=96 && (1..=4096).contains(&r.limit)
++        && (1024..=4*1024*1024).contains(&r.max_bytes)
++        && (1..=if r.step==Step::Cut {60_000} else {3000}).contains(&r.max_ms))?;
++    leases(c,&r)?;
++    let prior=receipt(c,&r)?;
++    if prior["status"]=="applied" {return Ok(prior["result"].clone());}
++    let mut job=status(c)?;
++    require(job["ordinal"].as_u64()==Some(r.expected_ordinal))?;
++    if r.step==Step::Begin {
++        require(job["phase"]=="absent" && !protected(c)?)?;
++        let saved=schema::capture(c)?;
++        c.execute_batch(schema::STAGE)?;
++        mirror::install(c,"state_rows","state_repack_stage")?;
++        job=json!({"job_id":r.job_id,"owner_id":r.owner_id,"phase":"copy","ordinal":0,
++            "cursor":null,"copied_rows":0,"copied_stored_bytes":0,"raw_verified_rows":0,"copied_tombstones":0,"copied_null_positions":0,"raw_storage_types":{},"schema":saved});
++    } else {
++        require(job["job_id"]==r.job_id && job["owner_id"]==r.owner_id)?;
++    }
++    let mut rows=0usize;let mut bytes=0usize;
++    match r.step {
++        Step::Begin => (),
++        Step::Copy => {
++            require(job["phase"]=="copy")?;
++            (rows,bytes)=copy(c,&r,&mut job)?;
++        }
++        Step::Cut => {
++            require(job["phase"]=="ready")?;
++            schema::cut(c,&job["schema"])?;
++            job["phase"]=json!("cut");
++        }
++        Step::Rollback => {
++            require(job["phase"]=="cut")?;
++            schema::rollback(c,&job["schema"])?;
++            job["phase"]=json!("ready");
++        }
++        Step::Retire => {
++            require(job["phase"]=="cut" || job["phase"]=="retiring")?;
++            if job["phase"]=="cut" {mirror::remove(c)?;job["phase"]=json!("retiring");}
++            (rows,bytes)=retire(c,&r,&mut job)?;
++        }
++    }
++    job["ordinal"]=json!(r.expected_ordinal.checked_add(1).ok_or_else(||error("STATE_TX_LIMIT_EXCEEDED"))?);
++    c.execute("INSERT INTO state_repack_job VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET value=excluded.value",[serde_json::to_string(&job)?])?;
++    let result=json!({"operation_id":r.operation_id,"job":job,"processed_rows":rows,"input_bytes":bytes,"original_protected":protected(c)?});
++    c.execute("INSERT INTO state_repack_receipts VALUES(?1,?2,?3)",params![r.operation_id,Sha256::digest(serde_json::to_vec(&r)?).to_vec(),serde_json::to_string(&result)?])?;
++    Ok(result)
++}
++
++fn copy(c: &Connection,r:&Request,job:&mut Value)->anyhow::Result<(usize,usize)> {
++    let started=Instant::now();let mut rows=0usize;let mut bytes=0usize;
++    let mut cursor=job["cursor"].clone();
++    while rows<r.limit && (rows==0 || started.elapsed()<Duration::from_millis(r.max_ms.saturating_sub(200).min(1500))) {
++        let after_scope=cursor["scope"].as_str().unwrap_or("");let after_key=cursor["key"].as_str().unwrap_or("");
++        let predicate=if cursor.is_null(){"?1 IS NOT NULL AND ?2 IS NOT NULL"}else{"(scope,key)>(?1,?2)"};
++        let batch=c.prepare(&format!("SELECT scope,key,length(CAST(scope AS BLOB))+length(CAST(key AS BLOB))+coalesce(length(CAST(value AS BLOB)),0)+length(CAST(version AS BLOB))+16 FROM state_rows WHERE {predicate} ORDER BY scope,key LIMIT ?3"))?
++            .query_map(params![after_scope,after_key,128.min(r.limit-rows) as i64],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
++        if batch.is_empty() {job["phase"]=json!("ready");break;}
++        let mut advanced=false;
++        for (scope,key,size) in batch {
++            let size=usize::try_from(size)?;
++            if bytes.saturating_add(size)>r.max_bytes {
++                if rows==0 {return Err(error("STATE_REPACK_ROW_EXCEEDS_BUDGET"));}
++                break;
++            }
++            c.execute("INSERT INTO state_repack_stage SELECT * FROM state_rows WHERE scope=?1 AND key=?2 ON CONFLICT(scope,key) DO UPDATE SET value=excluded.value,version=excluded.version,position=excluded.position,value_bytes=excluded.value_bytes",params![scope,key])?;
++            anyhow::ensure!(equivalent(c,"state_repack_stage",&scope,&key)?,"STATE_REPACK_RAW_MISMATCH");
++            let (tombstone,null_position,kind):(bool,bool,String)=c.query_row("SELECT value IS NULL,position IS NULL,typeof(value) FROM state_rows WHERE scope=?1 AND key=?2",params![scope,key],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
++            job["raw_verified_rows"]=json!(job["raw_verified_rows"].as_u64().unwrap_or(0)+1);
++            job["copied_tombstones"]=json!(job["copied_tombstones"].as_u64().unwrap_or(0)+u64::from(tombstone));
++            job["copied_null_positions"]=json!(job["copied_null_positions"].as_u64().unwrap_or(0)+u64::from(null_position));
++            job["raw_storage_types"][&kind]=json!(job["raw_storage_types"][&kind].as_u64().unwrap_or(0)+1);
++            cursor=json!({"scope":scope,"key":key});rows+=1;bytes+=size;advanced=true;
++            if started.elapsed()>=Duration::from_millis(r.max_ms.saturating_sub(200).min(1500)) {break;}
++        }
++        if !advanced || bytes>=r.max_bytes || started.elapsed()>=Duration::from_millis(r.max_ms.saturating_sub(200).min(1500)) {break;}
++        // A full byte budget may leave one row unconsumed in this metadata chunk.
++        let next_size:Option<i64>=c.query_row("SELECT length(CAST(scope AS BLOB))+length(CAST(key AS BLOB))+coalesce(length(CAST(value AS BLOB)),0)+length(CAST(version AS BLOB))+16 FROM state_rows WHERE (scope,key)>(?1,?2) ORDER BY scope,key LIMIT 1",params![cursor["scope"].as_str(),cursor["key"].as_str()],|r|r.get(0)).optional()?;
++        if next_size.is_some_and(|n|usize::try_from(n).map_or(true,|n|bytes.saturating_add(n)>r.max_bytes)) {break;}
++    }
++    job["cursor"]=cursor;
++    job["copied_rows"]=json!(job["copied_rows"].as_u64().unwrap_or(0)+rows as u64);
++    job["copied_stored_bytes"]=json!(job["copied_stored_bytes"].as_u64().unwrap_or(0)+bytes as u64);
++    Ok((rows,bytes))
++}
++
++fn retire(c:&Connection,r:&Request,job:&mut Value)->anyhow::Result<(usize,usize)> {
++    let started=Instant::now();let mut rows=0usize;let mut bytes=0usize;
++    while rows<r.limit && (rows==0 || started.elapsed()<Duration::from_millis(r.max_ms.saturating_sub(200).min(1500))) {
++        let row:Option<(String,String,i64)>=c.query_row("SELECT scope,key,length(CAST(scope AS BLOB))+length(CAST(key AS BLOB))+coalesce(length(CAST(value AS BLOB)),0)+length(CAST(version AS BLOB))+16 FROM state_repack_original ORDER BY scope,key LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
++        let Some((scope,key,size))=row else {
++            c.execute_batch("DROP TABLE state_repack_original; DROP INDEX state_repack_stage_order;")?;
++            job["phase"]=json!("retired");break;
++        };
++        let size=usize::try_from(size)?;
++        if bytes.saturating_add(size)>r.max_bytes {anyhow::ensure!(rows>0,"STATE_REPACK_ROW_EXCEEDS_BUDGET");break;}
++        c.execute("DELETE FROM state_repack_original WHERE scope=?1 AND key=?2",params![scope,key])?;rows+=1;bytes+=size;
++    }
++    job["retired_representation_rows"]=json!(job["retired_representation_rows"].as_u64().unwrap_or(0)+rows as u64);
++    Ok((rows,bytes))
++}
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/storage_repack/schema.rs
+@@ -0,0 +1,49 @@
++use rusqlite::Connection;
++use serde_json::{Value,json};
++use super::super::protocol::require;
++pub(super) const STAGE:&str="CREATE TABLE state_repack_stage(scope TEXT NOT NULL,key TEXT NOT NULL,value BLOB,version TEXT NOT NULL,position INTEGER,value_bytes INTEGER NOT NULL,PRIMARY KEY(scope,key)) WITHOUT ROWID; CREATE INDEX state_repack_stage_order ON state_repack_stage(scope,position) WHERE value IS NOT NULL;";
++pub(super) fn initialize(c:&Connection)->anyhow::Result<()> {
++    c.execute_batch("CREATE TABLE IF NOT EXISTS state_repack_job(singleton INTEGER PRIMARY KEY CHECK(singleton=1),value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS state_repack_receipts(operation_id TEXT PRIMARY KEY,digest BLOB NOT NULL,result TEXT NOT NULL) WITHOUT ROWID;")?;Ok(())
++}
++pub(super) fn capture(c:&Connection)->anyhow::Result<Value> {
++    let view:String=c.query_row("SELECT sql FROM sqlite_schema WHERE type='view' AND name='state_values'",[],|r|r.get(0))?;
++    let index:String=c.query_row("SELECT sql FROM sqlite_schema WHERE type='index' AND name='state_rows_order'",[],|r|r.get(0))?;
++    let triggers=c.prepare("SELECT name,sql FROM sqlite_schema WHERE type='trigger' AND tbl_name='state_rows' AND name NOT IN ('state_repack_insert','state_repack_update','state_repack_delete') ORDER BY name")?.query_map([],|r|Ok(json!({"name":r.get::<_,String>(0)?,"sql":r.get::<_,String>(1)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
++    let names=triggers.iter().map(|t|t["name"].as_str().unwrap_or("")).collect::<Vec<_>>();
++    let expected=vec!["compact_gc_state_rows_DELETE","compact_gc_state_rows_INSERT","compact_gc_state_rows_UPDATE","compact_inline_insert","compact_inline_update","crystal_delete","crystal_insert","crystal_update","lexical_content_before_DELETE","lexical_content_before_UPDATE","viewer_recent_delete","viewer_recent_insert","viewer_recent_update"];
++    let unexpected:Vec<_>=names.iter().filter(|name|!expected.contains(name)).map(|name|name.chars().take(128).collect::<String>()).take(16).collect();
++    let missing:Vec<_>=expected.iter().filter(|name|!names.contains(name)).collect();
++    anyhow::ensure!(unexpected.is_empty() && missing.is_empty(),"STATE_REPACK_SCHEMA_UNSUPPORTED unexpected={unexpected:?} missing={missing:?}");
++    Ok(json!({"view":view,"index":index,"triggers":triggers}))
++}
++fn detach(c:&Connection,saved:&Value)->anyhow::Result<()> {
++    super::mirror::remove(c)?;
++    c.execute_batch("DROP VIEW state_values;")?;
++    for trigger in saved["triggers"].as_array().ok_or_else(||super::error("STATE_TX_FAILED"))? {
++        let name=trigger["name"].as_str().ok_or_else(||super::error("STATE_TX_FAILED"))?;
++        c.execute_batch(&format!("DROP TRIGGER \"{name}\";"))?;
++    }
++    c.execute_batch("DROP INDEX state_rows_order;")?;Ok(())
++}
++fn attach(c:&Connection,saved:&Value)->anyhow::Result<()> {
++    c.execute_batch(saved["index"].as_str().ok_or_else(||super::error("STATE_TX_FAILED"))?)?;
++    c.execute_batch(saved["view"].as_str().ok_or_else(||super::error("STATE_TX_FAILED"))?)?;
++    for trigger in saved["triggers"].as_array().ok_or_else(||super::error("STATE_TX_FAILED"))? {c.execute_batch(trigger["sql"].as_str().ok_or_else(||super::error("STATE_TX_FAILED"))?)?;}
++    Ok(())
++}
++pub(super) fn cut(c:&Connection,saved:&Value)->anyhow::Result<()> {
++    require(capture_without_mirror(c)?==*saved)?;
++    c.flush_prepared_statement_cache();detach(c,saved)?;
++    c.execute_batch("ALTER TABLE state_rows RENAME TO state_repack_original; ALTER TABLE state_repack_stage RENAME TO state_rows;")?;
++    attach(c,saved)?;super::mirror::install(c,"state_rows","state_repack_original")?;
++    c.flush_prepared_statement_cache();Ok(())
++}
++fn capture_without_mirror(c:&Connection)->anyhow::Result<Value> {
++    capture(c)
++}
++pub(super) fn rollback(c:&Connection,saved:&Value)->anyhow::Result<()> {
++    c.flush_prepared_statement_cache();detach(c,saved)?;
++    c.execute_batch("ALTER TABLE state_rows RENAME TO state_repack_stage; ALTER TABLE state_repack_original RENAME TO state_rows;")?;
++    attach(c,saved)?;super::mirror::install(c,"state_rows","state_repack_stage")?;
++    c.flush_prepared_statement_cache();Ok(())
++}
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/storage_repack/mirror.rs
+@@ -0,0 +1,10 @@
++use rusqlite::Connection;
++pub(super) fn remove(c:&Connection)->anyhow::Result<()> {
++    c.execute_batch("DROP TRIGGER IF EXISTS state_repack_insert; DROP TRIGGER IF EXISTS state_repack_update; DROP TRIGGER IF EXISTS state_repack_delete;")?;Ok(())
++}
++pub(super) fn install(c:&Connection,source:&str,target:&str)->anyhow::Result<()> {
++    let insert=format!("INSERT INTO {target}(scope,key,value,version,position,value_bytes) VALUES(NEW.scope,NEW.key,NEW.value,NEW.version,NEW.position,NEW.value_bytes) ON CONFLICT(scope,key) DO UPDATE SET value=excluded.value,version=excluded.version,position=excluded.position,value_bytes=excluded.value_bytes;");
++    c.execute_batch(&format!("CREATE TRIGGER state_repack_insert AFTER INSERT ON {source} BEGIN {insert} END;
++        CREATE TRIGGER state_repack_update AFTER UPDATE ON {source} BEGIN DELETE FROM {target} WHERE scope=OLD.scope AND key=OLD.key AND (OLD.scope IS NOT NEW.scope OR OLD.key IS NOT NEW.key); {insert} END;
++        CREATE TRIGGER state_repack_delete AFTER DELETE ON {source} BEGIN DELETE FROM {target} WHERE scope=OLD.scope AND key=OLD.key; END;"))?;Ok(())
++}
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/storage_repack/tests.rs
+@@ -0,0 +1,97 @@
++use super::*;
++use super::super::{commit,protocol::LeaseRequest};
++use std::sync::{Arc,atomic::{AtomicUsize,Ordering}};
++
++fn open()->(tempfile::TempDir,Connection) {
++    let root=std::env::var("III_SQLITE_TEST_ROOT").expect("isolated test root required");
++    let dir=tempfile::tempdir_in(root).unwrap();
++    let c=database::open(&dir.path().join("repack.sqlite3")).unwrap();(dir,c)
++}
++fn request(c:&Connection,step:Step)->Request {
++    let lease=storage_maintenance_lease::acquire(c,"repack-test",300_000).unwrap();
++    let tx=c.unchecked_transaction().unwrap();
++    let graph=commit::lease(&tx,LeaseRequest::Acquire{owner_id:"repack-test".into(),generation:"1".into(),ttl_ms:300_000}).unwrap();
++    tx.commit().unwrap();
++    Request{operation_id:format!("operation-{}",status(c).unwrap()["ordinal"]),job_id:"pilot".into(),expected_ordinal:status(c).unwrap()["ordinal"].as_u64().unwrap(),step,max_ms:if step==Step::Cut{60_000}else{3000},max_bytes:4*1024*1024,limit:4096,owner_id:"repack-test".into(),fence:lease["fence"].as_u64().unwrap(),guard:Guard{owner_id:"repack-test".into(),generation:"1".into(),fence:graph["fence"].as_str().unwrap().into()}}
++}
++fn apply(c:&Connection,r:Request)->Value {
++    let tx=c.unchecked_transaction().unwrap();let result=execute(&tx,r).unwrap();tx.commit().unwrap();result
++}
++fn ready(c:&Connection) {
++    while status(c).unwrap()["phase"]=="copy" {apply(c,request(c,Step::Copy));}
++    assert_eq!(status(c).unwrap()["phase"],"ready");
++}
++fn rows(c:&Connection,table:&str)->Vec<String> {
++    c.prepare(&format!("SELECT quote(scope)||':'||typeof(scope)||'|'||quote(key)||':'||typeof(key)||'|'||quote(value)||':'||typeof(value)||'|'||quote(version)||':'||typeof(version)||'|'||quote(position)||':'||typeof(position)||'|'||quote(value_bytes)||':'||typeof(value_bytes) FROM {table} ORDER BY scope,key")).unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
++}
++fn seed(c:&Connection,n:usize) {
++    let tx=c.unchecked_transaction().unwrap();
++    for i in 0..n {tx.execute("INSERT INTO state_rows VALUES('test',?1,?2,?3,?4,2)",params![format!("key-{i:08}"),b"{}".as_slice(),format!("{}",i+1),i as i64]).unwrap();}
++    tx.execute_batch("INSERT INTO state_rows VALUES('test','tombstone',NULL,'9007199254740991',NULL,0); INSERT INTO state_rows VALUES('test','text','{}','2',99999,2);").unwrap();tx.commit().unwrap();
++}
++
++#[test]
++fn copy_mirrors_all_mutations_and_cut_preserves_queries_schema_and_rollback() {
++    let (_dir,c)=open();seed(&c,40);let saved=schema::capture(&c).unwrap();
++    apply(&c,request(&c,Step::Begin));let mut first=request(&c,Step::Copy);first.limit=10;apply(&c,first);
++    c.execute_batch("INSERT INTO state_rows VALUES('aaa','behind',X'7B7D','3',42,2); UPDATE state_rows SET scope='aaa',key='moved',version='8',value='{}',position=NULL WHERE scope='test' AND key='key-00000001'; DELETE FROM state_rows WHERE scope='test' AND key='key-00000002'; UPDATE state_rows SET value=NULL,value_bytes=0 WHERE scope='test' AND key='key-00000039';").unwrap();
++    ready(&c);assert_eq!(rows(&c,"state_rows"),rows(&c,"state_repack_stage"));
++    let fidelity=proof(&c).unwrap();assert_eq!(fidelity["raw_verified_rows"],fidelity["copied_rows"]);assert_eq!(fidelity["schema_exact"],true);assert_eq!(fidelity["preserved_native_triggers"],13);
++    let before=rows(&c,"state_rows");let r=request(&c,Step::Cut);apply(&c,r);
++    assert_eq!(rows(&c,"state_rows"),before);assert_eq!(rows(&c,"state_repack_original"),before);
++    assert_eq!(proof(&c).unwrap()["graph_control_raw_types_equal"],true);
++    let view_rows:i64=c.query_row("SELECT count(*) FROM state_values",[],|r|r.get(0)).unwrap();assert_eq!(view_rows,before.len() as i64);
++    let ordered:Vec<String>=c.prepare("SELECT key FROM state_rows INDEXED BY state_rows_order WHERE scope='test' AND value IS NOT NULL ORDER BY position").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();assert!(!ordered.is_empty());
++    mirror::remove(&c).unwrap();assert_eq!(schema::capture(&c).unwrap(),saved);mirror::install(&c,"state_rows","state_repack_original").unwrap();
++    c.execute_batch("INSERT INTO state_rows VALUES('post','cut','{}','1',1,2); UPDATE state_rows SET key='renamed' WHERE scope='post'; DELETE FROM state_rows WHERE scope='aaa';").unwrap();
++    assert_eq!(rows(&c,"state_rows"),rows(&c,"state_repack_original"));
++    let before_rollback=rows(&c,"state_rows");apply(&c,request(&c,Step::Rollback));
++    assert_eq!(rows(&c,"state_rows"),before_rollback);assert_eq!(rows(&c,"state_repack_stage"),before_rollback);
++    apply(&c,request(&c,Step::Cut));apply(&c,request(&c,Step::Retire));
++    assert!(!protected(&c).unwrap());assert_eq!(rows(&c,"state_rows"),before_rollback);
++    assert_eq!(schema::capture(&c).unwrap(),saved);
++}
++
++#[test]
++fn interrupted_copy_rolls_back_cursor_rows_and_receipt_then_resumes() {
++    let (_dir,c)=open();seed(&c,1000);apply(&c,request(&c,Step::Begin));
++    let r=request(&c,Step::Copy);let before=status(&c).unwrap();let stage=rows(&c,"state_repack_stage");
++    let count=Arc::new(AtomicUsize::new(0));let tick=count.clone();
++    let tx=c.unchecked_transaction().unwrap();tx.progress_handler(1,Some(move||tick.fetch_add(1,Ordering::SeqCst)>2000)).unwrap();
++    assert!(execute(&tx,r.clone()).is_err());tx.progress_handler(0,None::<fn()->bool>).unwrap();if !tx.is_autocommit(){tx.rollback().unwrap();}
++    assert_eq!(status(&c).unwrap(),before);assert_eq!(rows(&c,"state_repack_stage"),stage);assert_eq!(receipt(&c,&r).unwrap()["status"],"not_found");
++    apply(&c,r);ready(&c);assert_eq!(rows(&c,"state_rows"),rows(&c,"state_repack_stage"));
++}
++
++#[test]
++fn interrupted_cut_reverts_ddl_keeps_ready_copy_without_recopy() {
++    let (_dir,c)=open();seed(&c,20_000);let saved=schema::capture(&c).unwrap();apply(&c,request(&c,Step::Begin));ready(&c);
++    let before=status(&c).unwrap();let source=rows(&c,"state_rows");let r=request(&c,Step::Cut);
++    let tick=Arc::new(AtomicUsize::new(0));let counter=tick.clone();
++    let tx=c.unchecked_transaction().unwrap();tx.progress_handler(1,Some(move||counter.fetch_add(1,Ordering::SeqCst)>5000)).unwrap();
++    assert!(execute(&tx,r.clone()).is_err());tx.progress_handler(0,None::<fn()->bool>).unwrap();if !tx.is_autocommit(){tx.rollback().unwrap();}
++    assert_eq!(status(&c).unwrap(),before);assert_eq!(rows(&c,"state_rows"),source);assert_eq!(rows(&c,"state_repack_stage"),source);
++    assert_eq!(receipt(&c,&r).unwrap()["status"],"not_found");
++    mirror::remove(&c).unwrap();assert_eq!(schema::capture(&c).unwrap(),saved);mirror::install(&c,"state_rows","state_repack_stage").unwrap();
++    apply(&c,r);assert_eq!(rows(&c,"state_rows"),source);
++}
++
++#[test]
++fn restart_and_lost_ack_use_exact_receipt_across_changed_fence() {
++    let (dir,c)=open();seed(&c,100);apply(&c,request(&c,Step::Begin));let mut r=request(&c,Step::Copy);r.limit=20;let result=apply(&c,r.clone());drop(c);
++    let c=database::open(&dir.path().join("repack.sqlite3")).unwrap();assert_eq!(receipt(&c,&r).unwrap()["result"],result);
++    storage_maintenance_lease::release(&c,&r.owner_id,r.fence).unwrap();let renewed=storage_maintenance_lease::acquire(&c,&r.owner_id,300_000).unwrap();assert_ne!(renewed["fence"],r.fence);
++    assert_eq!(receipt(&c,&r).unwrap()["result"],result);
++    let mut changed=r.clone();changed.fence=renewed["fence"].as_u64().unwrap();assert!(receipt(&c,&changed).is_err());
++    ready(&c);assert_eq!(rows(&c,"state_rows"),rows(&c,"state_repack_stage"));
++}
++
++#[test]
++fn oversized_row_never_skipped_and_original_blocks_gc() {
++    let (_dir,c)=open();c.execute("INSERT INTO state_rows VALUES('large','cell',?1,'1',1,?2)",params![vec![42u8;4*1024*1024],4*1024*1024]).unwrap();
++    apply(&c,request(&c,Step::Begin));let r=request(&c,Step::Copy);let before=status(&c).unwrap();let tx=c.unchecked_transaction().unwrap();
++    let failure=execute(&tx,r).unwrap_err();assert!(failure.to_string().contains("STATE_REPACK_ROW_EXCEEDS_BUDGET"));tx.rollback().unwrap();assert_eq!(status(&c).unwrap(),before);assert!(protected(&c).unwrap());
++    let tx=c.unchecked_transaction().unwrap();let request=super::super::compact::Request{operation_id:"gc-protected".into(),expected_generation:super::super::compact::status(&tx).unwrap()["generation"].as_str().unwrap().into(),step:super::super::compact::Step::Collect,limit:128,max_bytes:4194304,max_ms:3000,lease_owner_id:"repack-test".into(),lease_fence:1};
++    // The native collector guard runs before any candidate or progress mutation.
++    let result=super::super::compact::execute(&tx,request);assert!(result.unwrap_err().to_string().contains("STATE_REPACK_ORIGINAL_PROTECTED"));
++}
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/storage_lexical_repack.rs
+@@ -0,0 +1,150 @@
++#[cfg(test)]
++mod tests;
++mod schema;
++pub mod proof;
++pub use schema::validate as validate_schema;
++use super::{protocol::{require,error},retrieval::lexical_content as content,storage_repack::{Request,Step}};
++use rusqlite::{Connection,OptionalExtension,params};
++use serde_json::{Value,json};
++use sha2::{Digest,Sha256};
++use std::time::{Duration,Instant};
++
++const COPY_FIRST_SQL:&str="SELECT rowid,length(CAST(text AS BLOB)) FROM retrieval_lexical ORDER BY rowid LIMIT 1";
++const COPY_AFTER_SQL:&str="SELECT rowid,length(CAST(text AS BLOB)) FROM retrieval_lexical WHERE rowid>?1 ORDER BY rowid LIMIT 1";
++const COPY_WORK_SQL:&str="SELECT coalesce(max(CASE WHEN v.value_bytes BETWEEN 1 AND 262144 AND v.stored_bytes BETWEEN 1 AND 262144 AND e.value_bytes BETWEEN 1 AND 262144 AND e.stored_bytes BETWEEN 1 AND 262144 THEN 3*(v.value_bytes+v.stored_bytes)+e.value_bytes+e.stored_bytes ELSE 0 END),0) FROM retrieval_lexical_links l CROSS JOIN retrieval_source_items s INDEXED BY retrieval_source_items_id ON s.index_id=l.index_id AND s.key=l.id AND s.dirty=0 CROSS JOIN state_values v ON v.scope=s.scope AND v.key=s.key AND v.version=s.version AND v.live=1 CROSS JOIN state_values e ON e.scope='mem:semantic:'||l.index_id AND e.key=l.id AND e.live=1 WHERE l.rowid=?1";
++
++pub fn initialize(c:&Connection)->anyhow::Result<()> {
++    c.execute_batch("CREATE TABLE IF NOT EXISTS lexical_repack_job(singleton INTEGER PRIMARY KEY CHECK(singleton=1),value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS lexical_repack_receipts(operation_id TEXT PRIMARY KEY,digest BLOB NOT NULL,result TEXT NOT NULL) WITHOUT ROWID;")?;
++    Ok(())
++}
++pub fn status(c:&Connection)->anyhow::Result<Value> {
++    let value:Option<String>=c.query_row("SELECT value FROM lexical_repack_job WHERE singleton=1",[],|r|r.get(0)).optional()?;
++    Ok(value.map(|v|serde_json::from_str(&v)).transpose()?.unwrap_or(json!({"phase":"absent","ordinal":0})))
++}
++pub fn protected(c:&Connection)->anyhow::Result<bool> {
++    Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='lexical_repack_original')",[],|r|r.get(0))?)
++}
++pub fn receipt(c:&Connection,r:&Request)->anyhow::Result<Value> {
++    let saved:Option<(Vec<u8>,String)>=c.query_row("SELECT digest,result FROM lexical_repack_receipts WHERE operation_id=?1",[&r.operation_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
++    match saved {None=>Ok(json!({"status":"not_found","operation_id":r.operation_id})),Some((digest,result))=>{
++        require(digest==Sha256::digest(serde_json::to_vec(r)?).to_vec())?;
++        Ok(json!({"status":"applied","operation_id":r.operation_id,"result":serde_json::from_str::<Value>(&result)?}))
++    }}
++}
++fn mirror(c:&Connection)->anyhow::Result<Option<&'static str>> {
++    Ok(match status(c)?["phase"].as_str(){Some("copy"|"ready")=>Some("lexical_repack_stage"),Some("cut")=>Some("lexical_repack_original"),_=>None})
++}
++pub fn mirror_delete(c:&Connection,rowid:i64)->anyhow::Result<()> {
++    if let Some(target)=mirror(c)? {delete_table(c,target,rowid)?;}
++    Ok(())
++}
++pub fn delete_table(c:&Connection,table:&str,rowid:i64)->anyhow::Result<()> {
++    require(["retrieval_lexical","lexical_repack_stage","lexical_repack_original"].contains(&table))?;
++    let classic=table=="lexical_repack_stage" || (table=="retrieval_lexical" && content::active(c)?);
++    validate_schema(c,table,classic)?;
++    if !classic {c.execute(&format!("DELETE FROM {table} WHERE rowid=?1"),[rowid])?;return Ok(());}
++    let exists:bool=c.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE rowid=?1)"),[rowid],|r|r.get(0))?;
++    if !exists {return Ok(());}
++    let (index,epoch,id):(String,i64,String)=c.query_row("SELECT index_id,epoch,id FROM retrieval_lexical_links WHERE rowid=?1",[rowid],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
++    let text=content::text(c,rowid)?.ok_or_else(||error("STATE_LEXICAL_CONTENT_MISSING"))?;
++    // FTS5 requires the exact OLD indexed values; proof and links remain until all mirrors finish.
++    c.execute(&format!("INSERT INTO {table}({table},rowid,index_id,epoch,id,text) VALUES('delete',?1,?2,?3,?4,?5)"),params![rowid,index,epoch,id,text])?;
++    Ok(())
++}
++pub fn mirror_insert(c:&Connection,rowid:i64,index:&str,epoch:i64,id:&str,text:&str)->anyhow::Result<()> {
++    if let Some(target)=mirror(c)? {
++        delete_table(c,target,rowid)?;
++        c.execute(&format!("INSERT INTO {target}(rowid,index_id,epoch,id,text) VALUES(?1,?2,?3,?4,?5)"),params![rowid,index,epoch,id,text])?;
++    }
++    if content::active(c)? || mirror(c)?.is_some() {content::save(c,rowid,text)?;}
++    Ok(())
++}
++pub fn proof(c:&Connection)->anyhow::Result<Value> {proof::full(c)}
++pub fn execute(c:&Connection,r:Request)->anyhow::Result<Value> {
++    require(!c.is_autocommit() && !r.operation_id.is_empty() && r.operation_id.len()<=128 && !r.job_id.is_empty() && r.job_id.len()<=96
++        && (1..=4096).contains(&r.limit) && (1024..=4*1024*1024).contains(&r.max_bytes)
++        && (1..=if r.step==Step::Cut{60_000}else{3000}).contains(&r.max_ms))?;
++    super::storage_repack::leases(c,&r)?;
++    let prior=receipt(c,&r)?;if prior["status"]=="applied" {return Ok(prior["result"].clone());}
++    let mut job=status(c)?;require(job["ordinal"].as_u64()==Some(r.expected_ordinal))?;
++    if r.step==Step::Begin {
++        require(job["phase"]=="absent" && !content::active(c)? && !super::storage_repack::protected(c)?)?;
++        let original_schema=validate_schema(c,"retrieval_lexical",false)?;
++        schema::create_stage(c)?;
++        let stage_schema=validate_schema(c,"lexical_repack_stage",true)?;
++        job=json!({"job_id":r.job_id,"owner_id":r.owner_id,"phase":"copy","ordinal":0,"cursor":null,"verified_rows":0,"input_text_bytes":0,"canonical_exact_bytes":0,"reasons":{},"original_create_sql":original_schema,"stage_create_sql":stage_schema});
++    } else {
++        require(job["job_id"]==r.job_id && job["owner_id"]==r.owner_id)?;
++        if ["copy","ready"].contains(&job["phase"].as_str().unwrap_or("")) {
++            validate_schema(c,"retrieval_lexical",false)?;validate_schema(c,"lexical_repack_stage",true)?;
++        } else if ["cut","retiring"].contains(&job["phase"].as_str().unwrap_or("")) {
++            validate_schema(c,"retrieval_lexical",true)?;validate_schema(c,"lexical_repack_original",false)?;
++        }
++    }
++    let (mut rows,mut bytes)=(0usize,0usize);let mut cut_proof=None;
++    match r.step {
++        Step::Begin=>(),
++        Step::Copy=>{require(job["phase"]=="copy")?;(rows,bytes)=copy(c,&r,&mut job)?;},
++        Step::Cut=>{
++            require(job["phase"]=="ready")?;let mut verified=proof(c)?;require(verified["rowids_and_metadata_exact"]==true)?;
++            c.flush_prepared_statement_cache();
++            c.execute_batch("ALTER TABLE retrieval_lexical RENAME TO lexical_repack_original; ALTER TABLE lexical_repack_stage RENAME TO retrieval_lexical; PRAGMA user_version=3;")?;
++            job["phase"]=json!("cut");c.flush_prepared_statement_cache();
++            verified["original_create_sql"]=json!(validate_schema(c,"lexical_repack_original",false)?);
++            verified["active_create_sql"]=json!(validate_schema(c,"retrieval_lexical",true)?);content::validate_format(c)?;
++            verified["format"]=json!(3);verified["original_protected"]=json!(protected(c)?);cut_proof=Some(verified);
++        },
++        Step::Rollback=>{
++            require(job["phase"]=="cut")?;c.flush_prepared_statement_cache();
++            c.execute_batch("ALTER TABLE retrieval_lexical RENAME TO lexical_repack_stage; ALTER TABLE lexical_repack_original RENAME TO retrieval_lexical; PRAGMA user_version=2;")?;
++            job["phase"]=json!("ready");c.flush_prepared_statement_cache();
++        },
++        Step::Retire=>{
++            require(job["phase"]=="cut" || job["phase"]=="retiring")?;job["phase"]=json!("retiring");
++            (rows,bytes)=retire(c,&r,&mut job)?;
++        },
++    }
++    job["ordinal"]=json!(r.expected_ordinal.checked_add(1).ok_or_else(||error("STATE_TX_LIMIT_EXCEEDED"))?);
++    c.execute("INSERT INTO lexical_repack_job VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET value=excluded.value",[serde_json::to_string(&job)?])?;
++    if let Some(proof)=cut_proof.as_mut(){proof["job"]=job.clone();}
++    let result=json!({"operation_id":r.operation_id,"job":job,"processed_rows":rows,"work_bytes":bytes,"original_protected":protected(c)?,"cut_proof":cut_proof});
++    c.execute("INSERT INTO lexical_repack_receipts VALUES(?1,?2,?3)",params![r.operation_id,Sha256::digest(serde_json::to_vec(&r)?).to_vec(),serde_json::to_string(&result)?])?;
++    Ok(result)
++}
++fn copy(c:&Connection,r:&Request,job:&mut Value)->anyhow::Result<(usize,usize)> {
++    let started=Instant::now();let (mut rows,mut bytes)=(0usize,0usize);
++    while rows<r.limit && (rows==0 || started.elapsed()<Duration::from_millis(r.max_ms.saturating_sub(300).min(1000))) {
++        let next:Option<(i64,i64)>=match job["cursor"].as_i64() {
++            Some(cursor)=>c.prepare_cached(COPY_AFTER_SQL)?.query_row([cursor],|r|Ok((r.get(0)?,r.get(1)?))).optional()?,
++            None=>c.prepare_cached(COPY_FIRST_SQL)?.query_row([],|r|Ok((r.get(0)?,r.get(1)?))).optional()?,
++        };
++        let Some((rowid,size))=next else {job["phase"]=json!("ready");break;};
++        let size=usize::try_from(size)?;anyhow::ensure!(size<=content::MAX_TEXT,"STATE_LEXICAL_ROW_EXCEEDS_BUDGET");
++        let canonical_work:i64=c.prepare_cached(COPY_WORK_SQL)?.query_row([rowid],|r|r.get(0))?;
++        let work=size.saturating_add(usize::try_from(canonical_work)?).saturating_add(4096);
++        if bytes.saturating_add(work)>r.max_bytes {anyhow::ensure!(rows>0,"STATE_LEXICAL_ROW_EXCEEDS_BUDGET");break;}
++        let (index,epoch,id,text):(String,i64,String,String)=c.prepare_cached("SELECT index_id,epoch,id,text FROM retrieval_lexical WHERE rowid=?1")?.query_row([rowid],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
++        require(content::rowid(c,&index,epoch,&id)?==Some(rowid))?;
++        let staged:bool=c.prepare_cached("SELECT EXISTS(SELECT 1 FROM lexical_repack_stage WHERE rowid=?1)")?.query_row([rowid],|r|r.get(0))?;
++        if staged {delete_table(c,"lexical_repack_stage",rowid)?;}
++        c.prepare_cached("INSERT INTO lexical_repack_stage(rowid,index_id,epoch,id,text) VALUES(?1,?2,?3,?4,?5)")?.execute(params![rowid,index,epoch,id,text])?;
++        let reason=content::save(c,rowid,&text)?;
++        anyhow::ensure!(content::text(c,rowid)?.as_deref()==Some(text.as_str()),"STATE_LEXICAL_COPY_TEXT_MISMATCH");
++        job["reasons"][reason]=json!(job["reasons"][reason].as_u64().unwrap_or(0)+1);
++        job["input_text_bytes"]=json!(job["input_text_bytes"].as_u64().unwrap_or(0)+size as u64);
++        if reason=="canonical_exact" {job["canonical_exact_bytes"]=json!(job["canonical_exact_bytes"].as_u64().unwrap_or(0)+size as u64);}
++        job["cursor"]=json!(rowid);rows+=1;bytes+=work;
++    }
++    job["verified_rows"]=json!(job["verified_rows"].as_u64().unwrap_or(0)+rows as u64);Ok((rows,bytes))
++}
++fn retire(c:&Connection,r:&Request,job:&mut Value)->anyhow::Result<(usize,usize)> {
++    let started=Instant::now();let (mut rows,mut bytes)=(0usize,0usize);
++    while rows<r.limit && (rows==0 || started.elapsed()<Duration::from_millis(r.max_ms.saturating_sub(300).min(1000))) {
++        let next:Option<(i64,i64)>=c.query_row("SELECT rowid,length(CAST(text AS BLOB)) FROM lexical_repack_original ORDER BY rowid LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
++        let Some((rowid,size))=next else {c.execute_batch("DROP TABLE lexical_repack_original;")?;job["phase"]=json!("retired");break;};
++        let size=usize::try_from(size)?.saturating_add(4096);
++        if bytes.saturating_add(size)>r.max_bytes {anyhow::ensure!(rows>0,"STATE_LEXICAL_ROW_EXCEEDS_BUDGET");break;}
++        c.execute("DELETE FROM lexical_repack_original WHERE rowid=?1",[rowid])?;rows+=1;bytes+=size;
++    }
++    job["retired_rows"]=json!(job["retired_rows"].as_u64().unwrap_or(0)+rows as u64);Ok((rows,bytes))
++}
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/storage_lexical_repack/schema.rs
+@@ -0,0 +1,19 @@
++use super::*;
++
++pub(super) fn create_stage(c:&Connection)->anyhow::Result<()> {
++    c.execute_batch(&format!("CREATE VIRTUAL TABLE lexical_repack_stage USING fts5({},content='');",content::DECLARATION))?;
++    Ok(())
++}
++pub fn validate(c:&Connection,table:&str,classic:bool)->anyhow::Result<String> {
++    require(["retrieval_lexical","lexical_repack_stage","lexical_repack_original"].contains(&table))?;
++    let sql:String=c.query_row("SELECT sql FROM sqlite_schema WHERE type='table' AND name=?1",[table],|r|r.get(0))?;
++    let rest=sql.strip_prefix("CREATE VIRTUAL TABLE ").ok_or_else(||error("STATE_LEXICAL_SCHEMA_UNSUPPORTED"))?;
++    let rest=rest.strip_prefix("IF NOT EXISTS ").unwrap_or(rest);
++    let quoted=format!("\"{table}\"");
++    let tail=rest.strip_prefix(quoted.as_str()).or_else(||rest.strip_prefix(table)).ok_or_else(||error("STATE_LEXICAL_SCHEMA_UNSUPPORTED"))?;
++    let expected=format!(" USING fts5({}{})",content::DECLARATION,if classic{",content=''"}else{""});
++    anyhow::ensure!(tail.trim_end_matches(';').trim_end()==expected,"STATE_LEXICAL_SCHEMA_UNSUPPORTED");
++    let columns=c.prepare("SELECT name FROM pragma_table_xinfo(?1) WHERE hidden=0 ORDER BY cid")?.query_map([table],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
++    anyhow::ensure!(columns==["index_id","epoch","id","text"],"STATE_LEXICAL_SCHEMA_UNSUPPORTED");
++    Ok(sql)
++}
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/storage_lexical_repack/proof.rs
+@@ -0,0 +1,93 @@
++use super::{content,status,protected,validate_schema};
++use super::super::{database,protocol::{require,Guard},storage_repack::{self,Request,Step}};
++use rusqlite::{Connection,params};
++use serde::{Deserialize,Serialize};
++use serde_json::{Value,json};
++
++#[derive(Clone,Debug,Deserialize,Serialize,PartialEq)]
++#[serde(deny_unknown_fields)]
++pub struct Anchor {
++    pub generation:String,pub data_version:i64,pub schema_version:i64,pub total_changes:i64,
++    pub job_id:String,pub phase:String,pub ordinal:u64,pub owner_id:String,pub fence:u64,
++    pub guard_generation:String,pub guard_fence:String,pub cursor:Option<i64>,
++}
++#[derive(Clone,Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct PageRequest {
++    pub job_id:String,pub phase:String,pub ordinal:u64,pub owner_id:String,pub fence:u64,pub guard:Guard,
++    pub after_rowid:Option<i64>,pub limit:usize,pub max_bytes:usize,pub anchor:Option<Anchor>,
++}
++fn tables(job:&Value)->anyhow::Result<(&'static str,&'static str)> {
++    require(["ready","cut"].contains(&job["phase"].as_str().unwrap_or("")))?;
++    Ok(if job["phase"]=="cut"{("lexical_repack_original","retrieval_lexical")}else{("retrieval_lexical","lexical_repack_stage")})
++}
++pub(super) fn equality_sql(original:&str,stage:&str)->String {
++    format!("FROM {original} f LEFT JOIN {stage} s ON s.rowid=f.rowid LEFT JOIN retrieval_lexical_links l ON l.rowid=f.rowid LEFT JOIN retrieval_lexical_content_proof p ON p.rowid=f.rowid")
++}
++const MISMATCH:&str="s.rowid IS NULL OR l.rowid IS NULL OR p.rowid IS NULL OR f.index_id IS NOT l.index_id OR f.epoch IS NOT l.epoch OR f.id IS NOT l.id";
++pub(super) fn page_sql(original:&str,stage:&str,after:bool)->String {
++    format!("SELECT f.rowid,coalesce(length(CAST(f.text AS BLOB)),0)+coalesce(length(CAST(f.index_id AS BLOB)),0)+coalesce(length(CAST(f.id AS BLOB)),0)+128,({MISMATCH}) {} {} ORDER BY f.rowid LIMIT ?{}",equality_sql(original,stage),if after{"WHERE f.rowid>?1"}else{""},if after{2}else{1})
++}
++fn summary(c:&Connection,job:Value)->anyhow::Result<Value> {
++    let (original,stage)=tables(&job)?;
++    let original_schema=validate_schema(c,original,false)?;let active_schema=validate_schema(c,stage,true)?;
++    let count=|table:&str|->anyhow::Result<i64>{Ok(c.query_row(&format!("SELECT count(*) FROM {table}"),[],|r|r.get(0))?)};
++    let original_rows=count(original)?;let stage_rows=count(stage)?;let proof_rows=count("retrieval_lexical_content_proof")?;
++    let (lazy,literal,literal_bytes,canonical_bytes):(i64,i64,i64,i64)=c.query_row("SELECT coalesce(sum(literal IS NULL),0),coalesce(sum(literal IS NOT NULL),0),coalesce(sum(length(CAST(literal AS BLOB))),0),coalesce(sum(CASE WHEN literal IS NULL THEN bytes ELSE 0 END),0) FROM retrieval_lexical_content_proof",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
++    Ok(json!({"job":job,"counts_exact":original_rows==stage_rows&&stage_rows==proof_rows,"schema_exact":true,"original_create_sql":original_schema,"active_create_sql":active_schema,"columns":["index_id","epoch","id","text"],"tokenizer":"unicode61 tokenchars '_'","original_rows":original_rows,"stage_rows":stage_rows,"proof_rows":proof_rows,"lazy_rows":lazy,"fallback_rows":literal,"fallback_bytes":literal_bytes,"canonical_text_bytes":canonical_bytes,"total_text_bytes":canonical_bytes+literal_bytes,"original_protected":protected(c)?,"format":c.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0))?}))
++}
++pub fn full(c:&Connection)->anyhow::Result<Value> {
++    let job=status(c)?;let (original,stage)=tables(&job)?;
++    let missing:i64=c.query_row(&format!("SELECT count(*) {} WHERE {MISMATCH}",equality_sql(original,stage)),[],|r|r.get(0))?;
++    let mut result=summary(c,job)?;result["rowids_and_metadata_exact"]=json!(missing==0&&result["counts_exact"]==true);result["mismatched_rows"]=json!(missing);Ok(result)
++}
++fn stamp(c:&Connection,generation:&str,r:&PageRequest)->anyhow::Result<Anchor> {
++    Ok(Anchor{generation:generation.into(),data_version:c.pragma_query_value(None,"data_version",|r|r.get(0))?,schema_version:c.pragma_query_value(None,"schema_version",|r|r.get(0))?,total_changes:c.query_row("SELECT total_changes()",[],|r|r.get(0))?,job_id:r.job_id.clone(),phase:r.phase.clone(),ordinal:r.ordinal,owner_id:r.owner_id.clone(),fence:r.fence,guard_generation:r.guard.generation.clone(),guard_fence:r.guard.fence.clone(),cursor:r.after_rowid})
++}
++fn validate(c:&Connection,r:&PageRequest)->anyhow::Result<Value> {
++    require((1..=4096).contains(&r.limit)&&(1024..=4*1024*1024).contains(&r.max_bytes))?;r.guard.validate()?;
++    storage_repack::leases(c,&Request{operation_id:"lexical-proof-observation".into(),job_id:r.job_id.clone(),expected_ordinal:r.ordinal,step:Step::Copy,max_ms:3000,max_bytes:r.max_bytes,limit:r.limit,owner_id:r.owner_id.clone(),fence:r.fence,guard:r.guard.clone()})?;
++    let job=status(c)?;require(job["job_id"]==r.job_id&&job["owner_id"]==r.owner_id&&job["phase"]==r.phase&&job["ordinal"].as_u64()==Some(r.ordinal))?;
++    let (original,stage)=tables(&job)?;validate_schema(c,original,false)?;validate_schema(c,stage,true)?;Ok(job)
++}
++pub fn inside(c:&Connection,generation:&str,r:&PageRequest)->anyhow::Result<Value> {
++    require(!c.is_autocommit())?;let job=validate(c,r)?;let mut anchor=stamp(c,generation,r)?;
++    if let Some(prior)=&r.anchor {anyhow::ensure!(prior==&anchor,"STATE_LEXICAL_PROOF_CHANGED");}else{require(r.after_rowid.is_none())?;}
++    let (original,stage)=tables(&job)?;let sql=page_sql(original,stage,r.after_rowid.is_some());let mut statement=c.prepare(&sql)?;
++    let mut rows=if let Some(after)=r.after_rowid{statement.query(params![after,r.limit as i64])?}else{statement.query([r.limit as i64])?};
++    let (mut processed,mut bytes,mut mismatched)=(0usize,0usize,0usize);let mut saw_row=false;
++    while let Some(row)=rows.next()? {
++        saw_row=true;let rowid:i64=row.get(0)?;let work=usize::try_from(row.get::<_,i64>(1)?)?;
++        if bytes.saturating_add(work)>r.max_bytes {anyhow::ensure!(processed>0,"STATE_LEXICAL_PROOF_ROW_EXCEEDS_BUDGET");break;}
++        require(anchor.cursor.is_none_or(|cursor|rowid>cursor))?;
++        mismatched+=usize::from(row.get::<_,bool>(2)?);bytes+=work;processed+=1;anchor.cursor=Some(rowid);
++    }
++    drop(rows);drop(statement);
++    let terminal=!saw_row;let summary=if terminal{Some(summary(c,job)?)}else{None};
++    Ok(json!({"anchor":anchor,"processed_rows":processed,"work_bytes":bytes,"mismatched_rows":mismatched,"terminal":terminal,"next_after_rowid":anchor.cursor,"summary":summary}))
++}
++// Revalidate guards in a bounded read transaction, then reject commits during either read.
++pub fn after(c:&Connection,path:&std::path::Path,generation:&str,r:&PageRequest,value:&Value,budget:&database::PreparationBudget)->anyhow::Result<()> {
++    let saved:Anchor=serde_json::from_value(value["anchor"].clone())?;
++    database::run_preparation(c,path,budget,true,|tx| {
++        validate(tx,r)?;let mut current=stamp(tx,generation,r)?;current.cursor=saved.cursor;
++        anyhow::ensure!(current==saved,"STATE_LEXICAL_PROOF_CHANGED");Ok(())
++    })?;
++    bounded_stamps(c,budget,|| {
++        let mut current=stamp(c,generation,r)?;current.cursor=saved.cursor;
++        anyhow::ensure!(current==saved,"STATE_LEXICAL_PROOF_CHANGED");Ok(())
++    })
++}
++fn bounded_stamps<T>(c:&Connection,budget:&database::PreparationBudget,read:impl FnOnce()->anyhow::Result<T>)->anyhow::Result<T> {
++    let result=(||{budget.install(c)?;let value=read()?;budget.check()?;Ok(value)})();
++    database::clear_preparation_budget(c)?;result
++}
++pub fn page(c:&Connection,path:&std::path::Path,generation:&str,r:&PageRequest,budget:&database::PreparationBudget)->anyhow::Result<Value> {
++    let mut before=bounded_stamps(c,budget,||{let stamp=stamp(c,generation,r)?;
++        if let Some(anchor)=&r.anchor {anyhow::ensure!(*anchor==stamp,"STATE_LEXICAL_PROOF_CHANGED");}else{require(r.after_rowid.is_none())?;}Ok(stamp)})?;
++    let value=database::run_preparation(c,path,budget,true,|tx| {
++        let value=inside(tx,generation,r)?;let observed:Anchor=serde_json::from_value(value["anchor"].clone())?;
++        before.cursor=observed.cursor;anyhow::ensure!(before==observed,"STATE_LEXICAL_PROOF_CHANGED");Ok(value)
++    })?;
++    after(c,path,generation,r,&value,budget)?;Ok(value)
++}
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/storage_lexical_repack/proof_tests.rs
+@@ -0,0 +1,97 @@
++use super::*;
++use super::super::proof as pages;
++fn observation(c:&Connection)->pages::PageRequest {
++    let r=request(c,Step::Copy);let job=status(c).unwrap();
++    pages::PageRequest{job_id:r.job_id,phase:job["phase"].as_str().unwrap().into(),ordinal:r.expected_ordinal,owner_id:r.owner_id,fence:r.fence,guard:r.guard,after_rowid:None,limit:7,max_bytes:1024,anchor:None}
++}
++fn page(c:&Connection,r:&pages::PageRequest,generation:&str)->anyhow::Result<Value> {
++    let budget=database::PreparationBudget::new("proof-fixture",Duration::from_secs(3));
++    pages::page(c,std::path::Path::new(c.path().unwrap()),generation,r,&budget)
++}
++fn advance(r:&mut pages::PageRequest,v:&Value){r.after_rowid=v["next_after_rowid"].as_i64();r.anchor=Some(serde_json::from_value(v["anchor"].clone()).unwrap());}
++fn aggregate(c:&Connection)->Value {
++    let mut r=observation(c);let(mut count,mut mismatch)=(0u64,0u64);
++    for _ in 0..1024 {let v=page(c,&r,"fixture-generation").unwrap();assert!(v["processed_rows"].as_u64().unwrap()<=7);assert!(v["work_bytes"].as_u64().unwrap()<=1024);count+=v["processed_rows"].as_u64().unwrap();mismatch+=v["mismatched_rows"].as_u64().unwrap();
++        if v["terminal"]==true{assert_eq!(v["processed_rows"],0);let mut result=v["summary"].clone();result["rowids_and_metadata_exact"]=json!(result["counts_exact"]==true&&result["original_rows"].as_u64()==Some(count)&&mismatch==0);return result;}
++        assert!(v["summary"].is_null());advance(&mut r,&v);
++    }panic!("bounded fixture pages did not terminate");
++}
++#[test]
++fn bounded_observation_matches_full_and_cut_receipt_before_and_after_rename() {
++    let (_dir,c)=open();seed(&c,80);apply(&c,request(&c,Step::Begin));ready(&c);
++    let expired_request=observation(&c);let expired=database::PreparationBudget::new("expired-stamp-fixture",Duration::ZERO);assert!(pages::page(&c,std::path::Path::new(c.path().unwrap()),"fixture-generation",&expired_request,&expired).is_err());assert!(database::check_preparation().is_ok());
++    let observed=aggregate(&c);assert_eq!(observed["rowids_and_metadata_exact"],true);assert_eq!(observed["original_rows"],80);assert_eq!(observed["canonical_text_bytes"],proof(&c).unwrap()["canonical_text_bytes"]);
++    let r=request(&c,Step::Cut);let result=apply(&c,r.clone());let native=&result["cut_proof"];
++    assert_eq!(native["rowids_and_metadata_exact"],true);assert_eq!(native["format"],3);assert_eq!(native["original_protected"],true);assert_eq!(native["job"],result["job"]);
++    assert_eq!(receipt(&c,&r).unwrap()["result"]["cut_proof"],*native);assert_eq!(aggregate(&c)["rowids_and_metadata_exact"],true);
++    let mut invalid=observation(&c);invalid.after_rowid=Some(1);assert!(page(&c,&invalid,"fixture-generation").is_err());
++    let mut cursor=observation(&c);let first=page(&c,&cursor,"fixture-generation").unwrap();advance(&mut cursor,&first);cursor.after_rowid=Some(999);assert!(page(&c,&cursor,"fixture-generation").is_err());
++    let mut fenced=observation(&c);fenced.fence+=1;assert!(page(&c,&fenced,"fixture-generation").is_err());
++}
++#[test]
++fn missing_and_extra_stage_or_proof_rows_never_pass_pages_or_atomic_cut() {
++    for case in ["missing_stage","extra_stage","missing_proof","extra_proof"] {
++        let (_dir,c)=open();seed(&c,4);apply(&c,request(&c,Step::Begin));ready(&c);
++        match case {
++            "missing_stage"=>delete_table(&c,"lexical_repack_stage",1).unwrap(),
++            "extra_stage"=>{c.execute("INSERT INTO lexical_repack_stage(rowid,index_id,epoch,id,text) VALUES(999,'observations',1,'extra','literal')",[]).unwrap();},
++            "missing_proof"=>{c.execute("DELETE FROM retrieval_lexical_content_proof WHERE rowid=1",[]).unwrap();},
++            _=>{c.execute("INSERT INTO retrieval_lexical_content_proof(rowid,recipe,bytes,literal) VALUES(999,0,1,'x')",[]).unwrap();},
++        }
++        assert_eq!(aggregate(&c)["rowids_and_metadata_exact"],false,"{case}");assert_eq!(proof(&c).unwrap()["rowids_and_metadata_exact"],false);
++        let r=request(&c,Step::Cut);let before=status(&c).unwrap();let tx=c.unchecked_transaction().unwrap();assert!(execute(&tx,r.clone()).is_err());tx.rollback().unwrap();
++        assert_eq!(status(&c).unwrap(),before);assert_eq!(receipt(&c,&r).unwrap()["status"],"not_found");assert!(!content::active(&c).unwrap());
++    }
++}
++#[test]
++fn observation_invalidates_same_connection_mirror_write_ddl_rollback_external_commit_and_restart() {
++    for cause in ["mirror","ddl","rollback","external","restart","lease_refresh"] {
++        let (_dir,c)=open();seed(&c,8);apply(&c,request(&c,Step::Begin));ready(&c);c.execute("CREATE TABLE proof_external_fixture(value INTEGER)",[]).unwrap();
++        let mut r=observation(&c);r.limit=2;let first=page(&c,&r,"fixture-generation").unwrap();assert_eq!(first["next_after_rowid"],2);advance(&mut r,&first);let job=status(&c).unwrap();
++        match cause {
++            "mirror"=>{let tx=c.unchecked_transaction().unwrap();mirror_delete(&tx,1).unwrap();delete_table(&tx,"retrieval_lexical",1).unwrap();tx.execute("INSERT INTO retrieval_lexical(rowid,index_id,epoch,id,text) VALUES(1,'observations',1,'row-00000','changed needle')",[]).unwrap();mirror_insert(&tx,1,"observations",1,"row-00000","changed needle").unwrap();tx.commit().unwrap();},
++            "ddl"=>{let before:i64=c.query_row("SELECT total_changes()",[],|r|r.get(0)).unwrap();c.execute("CREATE TABLE proof_ddl_fixture(value INTEGER)",[]).unwrap();assert_eq!(c.query_row("SELECT total_changes()",[],|r|r.get::<_,i64>(0)).unwrap(),before);},
++            "rollback"=>{let tx=c.unchecked_transaction().unwrap();tx.execute("INSERT INTO proof_external_fixture VALUES(1)",[]).unwrap();tx.rollback().unwrap();},
++            "external"=>{let external=Connection::open(c.path().unwrap()).unwrap();external.execute("INSERT INTO proof_external_fixture VALUES(1)",[]).unwrap();},
++            "lease_refresh"=>{super::super::super::storage_maintenance_lease::refresh(&c,&r.owner_id,r.fence,300000).unwrap();},
++            _=>(),
++        }
++        assert_eq!(status(&c).unwrap(),job,"phase/ordinal cannot detect {cause}");let generation=if cause=="restart"{"different-adapter-generation"}else{"fixture-generation"};
++        assert!(page(&c,&r,generation).unwrap_err().to_string().contains("STATE_LEXICAL_PROOF_CHANGED"),"{cause}");
++    }
++}
++#[test]
++fn external_commit_during_or_after_page_snapshot_is_rejected_before_publication() {
++    for while_read_open in [true,false] {
++        let (_dir,c)=open();seed(&c,4);apply(&c,request(&c,Step::Begin));ready(&c);c.execute("CREATE TABLE proof_external_fixture(value INTEGER)",[]).unwrap();
++        let r=observation(&c);let tx=c.unchecked_transaction().unwrap();let value=pages::inside(&tx,"fixture-generation",&r).unwrap();
++        let external=Connection::open(c.path().unwrap()).unwrap();
++        if while_read_open {external.execute("INSERT INTO proof_external_fixture VALUES(1)",[]).unwrap();}
++        tx.commit().unwrap();
++        if !while_read_open {external.execute("INSERT INTO proof_external_fixture VALUES(1)",[]).unwrap();}
++        let budget=database::PreparationBudget::new("post-commit-fixture",Duration::from_secs(3));
++        assert!(pages::after(&c,std::path::Path::new(c.path().unwrap()),"fixture-generation",&r,&value,&budget).unwrap_err().to_string().contains("STATE_LEXICAL_PROOF_CHANGED"),"external commit while_read_open={while_read_open}");
++    }
++}
++#[test]
++fn cut_deadline_after_sql_changes_rolls_back_rename_job_and_receipt_only() {
++    let (_dir,c)=open();seed(&c,6);apply(&c,request(&c,Step::Begin));ready(&c);let before=status(&c).unwrap();let r=request(&c,Step::Cut);
++    let budget=database::PreparationBudget::new("cut-deadline-fixture",Duration::from_secs(1));
++    let result=database::run_preparation(&c,std::path::Path::new(c.path().unwrap()),&budget,false,|tx| {
++        let value=execute(tx,r.clone())?;assert!(content::active(tx)?);assert_eq!(receipt(tx,&r)?["status"],"applied");std::thread::sleep(Duration::from_millis(1100));Ok(value)
++    });
++    assert!(result.is_err());assert_eq!(status(&c).unwrap(),before);assert_eq!(receipt(&c,&r).unwrap()["status"],"not_found");assert!(!content::active(&c).unwrap());assert!(!protected(&c).unwrap());assert_eq!(proof(&c).unwrap()["rowids_and_metadata_exact"],true);
++}
++#[test]
++fn linked_proof_explain_has_rowid_pushdown_and_unique_lookups() {
++    let (_dir,c)=open();seed(&c,4);apply(&c,request(&c,Step::Begin));ready(&c);
++    let sql=pages::page_sql("retrieval_lexical","lexical_repack_stage",true);
++    let plan=c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap().query_map(params![1,2],|r|r.get::<_,String>(3)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
++    assert!(plan.iter().any(|v|v.contains("SCAN f VIRTUAL TABLE INDEX")&&v.contains('>')),"{plan:?}");
++    assert!(plan.iter().any(|v|v.contains("SCAN s VIRTUAL TABLE INDEX")&&v.contains('=')),"{plan:?}");
++    assert!(plan.iter().any(|v|v.contains("SEARCH l ")&&v.contains("rowid=?")),"{plan:?}");assert!(plan.iter().any(|v|v.contains("SEARCH p ")&&v.contains("rowid=?")),"{plan:?}");
++    let full_sql=format!("SELECT count(*) {} WHERE s.rowid IS NULL OR l.rowid IS NULL OR p.rowid IS NULL OR f.index_id IS NOT l.index_id OR f.epoch IS NOT l.epoch OR f.id IS NOT l.id",pages::equality_sql("retrieval_lexical","lexical_repack_stage"));
++    let full=c.prepare(&format!("EXPLAIN QUERY PLAN {full_sql}")).unwrap().query_map([],|r|r.get::<_,String>(3)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
++    let evidence=json!({"sqlite":c.query_row("SELECT sqlite_version()",[],|r|r.get::<_,String>(0)).unwrap(),"paged":plan,"full_cut":full});
++    std::fs::write(std::path::Path::new(&std::env::var("III_SQLITE_TEST_ROOT").unwrap()).join("proof-query-plans-v5.json"),serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
++}
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/storage_lexical_repack/tests.rs
+@@ -0,0 +1,235 @@
++use super::*;
++use super::super::{database,commit,protocol::{Guard,LeaseRequest},storage_maintenance_lease,retrieval};
++use std::sync::{Arc,atomic::{AtomicUsize,Ordering}};
++
++fn open()->(tempfile::TempDir,Connection) {
++    let root=std::env::var("III_SQLITE_TEST_ROOT").expect("isolated test root required");
++    let dir=tempfile::tempdir_in(root).unwrap();let c=database::open(&dir.path().join("lexical.sqlite3")).unwrap();(dir,c)
++}
++fn request(c:&Connection,step:Step)->Request {
++    let lease=storage_maintenance_lease::acquire(c,"lexical-test",300_000).unwrap();
++    let tx=c.unchecked_transaction().unwrap();
++    let graph=commit::lease(&tx,LeaseRequest::Acquire{owner_id:"lexical-test".into(),generation:"1".into(),ttl_ms:300_000}).unwrap();tx.commit().unwrap();
++    Request{operation_id:format!("lexical-{}",status(c).unwrap()["ordinal"]),job_id:"lexical-pilot".into(),expected_ordinal:status(c).unwrap()["ordinal"].as_u64().unwrap(),step,max_ms:if step==Step::Cut{60000}else{3000},max_bytes:4194304,limit:4096,owner_id:"lexical-test".into(),fence:lease["fence"].as_u64().unwrap(),guard:Guard{owner_id:"lexical-test".into(),generation:"1".into(),fence:graph["fence"].as_str().unwrap().into()}}
++}
++fn apply(c:&Connection,r:Request)->Value {let tx=c.unchecked_transaction().unwrap();let v=execute(&tx,r).unwrap();tx.commit().unwrap();v}
++fn ready(c:&Connection) {for _ in 0..1000 {if status(c).unwrap()["phase"]!="copy" {break;}apply(c,request(c,Step::Copy));}assert_eq!(status(c).unwrap()["phase"],"ready");}
++fn seed(c:&Connection,n:usize) {
++    let tx=c.unchecked_transaction().unwrap();
++    tx.execute_batch("INSERT INTO retrieval_semantic_meta VALUES('observations','test-local',4,'local-v1','ready',-1,'0',1,0,0); INSERT INTO retrieval_source_meta VALUES('observations','agentmemory',0,'',-1,'rows','');").unwrap();
++    for i in 0..n {
++        let key=format!("row-{i:05}");let title=format!("needle café 東京 😀 {i} alpha_beta");let text=format!("{title} body");
++        let value=json!({"id":key,"sessionId":"s","title":title,"narrative":"body","facts":[],"concepts":[],"files":[]});let raw=serde_json::to_string(&value).unwrap();
++        tx.execute("INSERT INTO state_rows VALUES('mem:obs:s',?1,?2,'1',?3,?4)",params![key,raw.as_bytes(),i as i64,raw.len() as i64]).unwrap();
++        let embedding=serde_json::to_string(&json!({"id":key,"sourceScope":"mem:obs:s","sourceVersion":"1","model":"test-local","generation":"local-v1","text":"semantic surrogate must never replace lexical"})).unwrap();
++        tx.execute("INSERT INTO state_rows VALUES('mem:semantic:observations',?1,?2,'1',?3,?4)",params![key,embedding.as_bytes(),i as i64,embedding.len() as i64]).unwrap();
++        tx.execute("INSERT INTO retrieval_source_items VALUES('observations','mem:obs:s',?1,'1',0)",[&key]).unwrap();
++        tx.execute("INSERT INTO retrieval_lexical(rowid,index_id,epoch,id,text) VALUES(?1,'observations',1,?2,?3)",params![i as i64+1,key,text]).unwrap();
++        tx.execute("INSERT INTO retrieval_lexical_links VALUES('observations',1,?1,?2)",params![key,i as i64+1]).unwrap();
++    }
++    tx.commit().unwrap();
++}
++fn matches(c:&Connection,table:&str)->Vec<(i64,f64)> {
++    c.prepare(&format!("SELECT rowid,bm25({table}) FROM {table} WHERE {table} MATCH 'needle OR alpha_beta OR café' ORDER BY bm25({table}),rowid")).unwrap().query_map([],|r|Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap()
++}
++fn diagnostics(c:&Connection,table:&str)->Value {
++    c.execute_batch("DROP TABLE IF EXISTS temp.lexical_diagnostic_vocab;").unwrap();
++    c.execute_batch(&format!("CREATE VIRTUAL TABLE temp.lexical_diagnostic_vocab USING fts5vocab(main,'{table}','instance');")).unwrap();
++    let terms=c.prepare("SELECT term,doc,col,offset FROM temp.lexical_diagnostic_vocab ORDER BY term,doc,col,offset").unwrap().query_map([],|r|Ok(json!([r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?]))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
++    let sizes=c.prepare(&format!("SELECT id,hex(sz) FROM {table}_docsize ORDER BY id")).unwrap().query_map([],|r|Ok(json!([r.get::<_,i64>(0)?,r.get::<_,String>(1)?]))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
++    json!({"terms":terms,"docsize":sizes})
++}
++#[test]
++fn exact_projection_contentless_match_bm25_rowids_rename_rollback_and_retirement() {
++    let (_dir,c)=open();seed(&c,40);let before=matches(&c,"retrieval_lexical");
++    apply(&c,request(&c,Step::Begin));ready(&c);let p=proof(&c).unwrap();assert_eq!(p["lazy_rows"],40);assert_eq!(p["fallback_rows"],0);assert_eq!(p["rowids_and_metadata_exact"],true);
++    assert_eq!(matches(&c,"lexical_repack_stage"),before);
++    for id in 1..=40 {let old:String=c.query_row("SELECT text FROM retrieval_lexical WHERE rowid=?1",[id],|r|r.get(0)).unwrap();assert_eq!(content::text(&c,id).unwrap().unwrap(),old);assert_eq!(content::length(&c,id).unwrap(),Some(old.len()));}
++    apply(&c,request(&c,Step::Cut));assert_eq!(matches(&c,"retrieval_lexical"),before);assert!(content::active(&c).unwrap());
++    let null:Option<String>=c.query_row("SELECT text FROM retrieval_lexical WHERE rowid=1",[],|r|r.get(0)).unwrap();assert!(null.is_none());
++    assert_eq!(proof(&c).unwrap()["rowids_and_metadata_exact"],true);content::validate_format(&c).unwrap();
++    apply(&c,request(&c,Step::Rollback));assert_eq!(matches(&c,"retrieval_lexical"),before);assert!(!content::active(&c).unwrap());
++    apply(&c,request(&c,Step::Cut));while status(&c).unwrap()["phase"]!="retired" {let mut r=request(&c,Step::Retire);r.limit=5;apply(&c,r);}
++    assert!(!protected(&c).unwrap());assert_eq!(matches(&c,"retrieval_lexical"),before);assert!(content::text(&c,1).unwrap().unwrap().contains("café 東京 😀"));
++}
++#[test]
++fn direct_mutations_capture_historical_text_atomically_before_update_delete_and_rename() {
++    let (_dir,c)=open();seed(&c,6);apply(&c,request(&c,Step::Begin));ready(&c);apply(&c,request(&c,Step::Cut));
++    let old=(1..=6).map(|id|content::text(&c,id).unwrap().unwrap()).collect::<Vec<_>>();
++    let tx=c.unchecked_transaction().unwrap();tx.execute("UPDATE state_rows SET value='{}',value_bytes=2,version='2' WHERE scope='mem:obs:s' AND key='row-00000'",[]).unwrap();assert_eq!(content::text(&tx,1).unwrap().as_ref(),Some(&old[0]));tx.rollback().unwrap();
++    assert!(c.query_row("SELECT literal IS NULL FROM retrieval_lexical_content_proof WHERE rowid=1",[],|r|r.get::<_,bool>(0)).unwrap());
++    c.execute("UPDATE state_rows SET value='{}',value_bytes=2,version='2' WHERE scope='mem:obs:s' AND key='row-00000'",[]).unwrap();
++    c.execute("DELETE FROM state_rows WHERE scope='mem:obs:s' AND key='row-00001'",[]).unwrap();
++    c.execute("UPDATE state_rows SET scope='mem:obs:other',key='moved' WHERE scope='mem:obs:s' AND key='row-00002'",[]).unwrap();
++    for id in 1..=3 {assert_eq!(content::text(&c,id).unwrap().as_ref(),Some(&old[id as usize-1]));}
++    // The SDK write path is also covered before retrieval maintenance observes the new version.
++    let tx=c.unchecked_transaction().unwrap();database::write(&tx,"mem:obs:s","row-00003",Some(&json!({"id":"row-00003","sessionId":"s","title":"new needle","narrative":"body"}))).unwrap();tx.commit().unwrap();
++    assert_eq!(content::text(&c,4).unwrap().as_ref(),Some(&old[3]));
++    // A broken proof fails the source mutation rather than silently losing historic text.
++    c.execute("UPDATE retrieval_lexical_content_proof SET version='999' WHERE rowid=5",[]).unwrap();assert!(c.execute("DELETE FROM state_rows WHERE scope='mem:obs:s' AND key='row-00004'",[]).is_err());
++    assert!(database::row(&c,"mem:obs:s","row-00004").unwrap().value.is_some());
++}
++#[test]
++fn missing_dirty_stale_wrong_scope_model_epoch_and_oversized_sources_retain_literal() {
++    let (_dir,c)=open();seed(&c,10);
++    c.execute("UPDATE retrieval_source_items SET dirty=1 WHERE key='row-00000'",[]).unwrap();
++    c.execute("DELETE FROM state_rows WHERE scope='mem:obs:s' AND key='row-00001'",[]).unwrap();
++    c.execute("UPDATE retrieval_source_items SET version='99' WHERE key='row-00002'",[]).unwrap();
++    c.execute("UPDATE retrieval_source_items SET scope='mem:obs:foreign' WHERE key='row-00003'",[]).unwrap();
++    for (id,field,value) in [(4,"model","wrong"),(5,"sourceVersion","99"),(6,"sourceScope","mem:obs:foreign"),(9,"generation","wrong-generation")] {
++        c.execute("UPDATE state_rows SET value=json_set(CAST(value AS TEXT),?1,?2),value_bytes=length(CAST(json_set(CAST(value AS TEXT),?1,?2) AS BLOB)) WHERE scope='mem:semantic:observations' AND key=?3",params![format!("$.{field}"),value,format!("row-{id:05}")]).unwrap();
++    }
++    c.execute("UPDATE state_rows SET value_bytes=262145 WHERE scope='mem:obs:s' AND key='row-00007'",[]).unwrap();
++    c.execute("UPDATE retrieval_lexical SET epoch=2 WHERE rowid=9",[]).unwrap();c.execute("UPDATE retrieval_lexical_links SET epoch=2 WHERE rowid=9",[]).unwrap();
++    apply(&c,request(&c,Step::Begin));ready(&c);let p=proof(&c).unwrap();assert_eq!(p["fallback_rows"],10);assert_eq!(p["lazy_rows"],0);
++    apply(&c,request(&c,Step::Cut));for id in 1..=10 {assert!(content::text(&c,id).unwrap().unwrap().contains("café 東京 😀"));}
++}
++#[test]
++fn dual_writes_behind_cursor_and_after_cut_preserve_reverse_representation() {
++    let (_dir,c)=open();seed(&c,10);apply(&c,request(&c,Step::Begin));let mut first=request(&c,Step::Copy);first.limit=5;apply(&c,first);
++    for active in [false,true] {
++        if active {ready(&c);assert_eq!(matches(&c,"lexical_repack_stage"),matches(&c,"retrieval_lexical"),"ready COPY including behind-cursor replacement");apply(&c,request(&c,Step::Cut));}
++        let replacement=if active{"changed needle café delta delta"}else{"changed needle café"};
++        let tx=c.unchecked_transaction().unwrap();mirror_delete(&tx,2).unwrap();delete_table(&tx,"retrieval_lexical",2).unwrap();tx.execute("DELETE FROM retrieval_lexical_content_proof WHERE rowid=2",[]).unwrap();
++        tx.execute("INSERT INTO retrieval_lexical(rowid,index_id,epoch,id,text) VALUES(2,'observations',1,'row-00001',?1)",[replacement]).unwrap();mirror_insert(&tx,2,"observations",1,"row-00001",replacement).unwrap();tx.commit().unwrap();
++        assert_eq!(content::text(&c,2).unwrap().unwrap(),replacement);
++        let target=if active{"lexical_repack_original"}else{"lexical_repack_stage"};
++        assert!(c.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {target} WHERE {target} MATCH 'changed' AND rowid=2)"),[],|r|r.get::<_,bool>(0)).unwrap());
++        if active {
++            assert_eq!(matches(&c,target),matches(&c,"retrieval_lexical"),"immediate replacement parity before merge");
++            let tx=c.unchecked_transaction().unwrap();mirror_delete(&tx,3).unwrap();delete_table(&tx,"retrieval_lexical",3).unwrap();tx.execute("DELETE FROM retrieval_lexical_links WHERE rowid=3",[]).unwrap();tx.execute("DELETE FROM retrieval_lexical_content_proof WHERE rowid=3",[]).unwrap();tx.commit().unwrap();
++            assert_eq!(matches(&c,target),matches(&c,"retrieval_lexical"),"immediate pure-delete parity before merge");
++            let original=diagnostics(&c,target);let current=diagnostics(&c,"retrieval_lexical");assert_eq!(original,current,"live token instances and column sizes");
++            eprintln!("live tokens/docsize identical; before merge original={:?}, active={:?}",matches(&c,target),matches(&c,"retrieval_lexical"));
++            c.execute("INSERT INTO retrieval_lexical(retrieval_lexical,rank) VALUES('merge',4)",[]).unwrap();
++            eprintln!("after supported bounded merge active={:?}",matches(&c,"retrieval_lexical"));
++            assert_eq!(matches(&c,target),matches(&c,"retrieval_lexical"));
++        }
++    }
++    let before_rollback=matches(&c,"retrieval_lexical");apply(&c,request(&c,Step::Rollback));assert_eq!(matches(&c,"retrieval_lexical"),before_rollback);assert_eq!(matches(&c,"lexical_repack_stage"),before_rollback);assert_eq!(content::text(&c,2).unwrap().unwrap(),"changed needle café delta delta");
++}
++#[test]
++fn interrupted_copy_and_cut_revert_only_current_transaction_with_attributable_receipts() {
++    let (_dir,c)=open();seed(&c,200);apply(&c,request(&c,Step::Begin));
++    for step in [Step::Copy,Step::Cut] {
++        if step==Step::Cut {ready(&c);}
++        let before=status(&c).unwrap();let r=request(&c,step);let ticks=Arc::new(AtomicUsize::new(0));let counter=ticks.clone();
++        let tx=c.unchecked_transaction().unwrap();tx.progress_handler(1,Some(move||counter.fetch_add(1,Ordering::SeqCst)>if step==Step::Cut{1000}else{2000})).unwrap();
++        assert!(execute(&tx,r.clone()).is_err());tx.progress_handler(0,None::<fn()->bool>).unwrap();if !tx.is_autocommit(){tx.rollback().unwrap();}
++        assert_eq!(status(&c).unwrap(),before);assert_eq!(receipt(&c,&r).unwrap()["status"],"not_found");
++        apply(&c,r.clone());assert_eq!(receipt(&c,&r).unwrap()["status"],"applied");
++    }
++}
++#[test]
++fn restart_lost_ack_new_fence_format_guard_and_unskippable_oversized_fts() {
++    let (dir,c)=open();seed(&c,10);apply(&c,request(&c,Step::Begin));let mut r=request(&c,Step::Copy);r.limit=3;let result=apply(&c,r.clone());drop(c);
++    let c=database::open(&dir.path().join("lexical.sqlite3")).unwrap();assert_eq!(receipt(&c,&r).unwrap()["result"],result);
++    storage_maintenance_lease::release(&c,&r.owner_id,r.fence).unwrap();let l=storage_maintenance_lease::acquire(&c,&r.owner_id,300000).unwrap();assert_ne!(l["fence"],r.fence);assert_eq!(receipt(&c,&r).unwrap()["result"],result);let mut changed=r.clone();changed.fence=l["fence"].as_u64().unwrap();assert!(receipt(&c,&changed).is_err());
++    ready(&c);apply(&c,request(&c,Step::Cut));drop(c);let c=database::open(&dir.path().join("lexical.sqlite3")).unwrap();assert!(content::active(&c).unwrap());content::validate_format(&c).unwrap();
++    apply(&c,request(&c,Step::Rollback));c.execute("INSERT INTO retrieval_lexical(rowid,index_id,epoch,id,text) VALUES(100,'unknown',1,'huge',?1)",["x".repeat(content::MAX_TEXT+1)]).unwrap();c.execute("INSERT INTO retrieval_lexical_links VALUES('unknown',1,'huge',100)",[]).unwrap();
++    c.execute("UPDATE lexical_repack_job SET value=json_set(value,'$.phase','copy')",[]).unwrap();let before=status(&c).unwrap();let r=request(&c,Step::Copy);let tx=c.unchecked_transaction().unwrap();assert!(execute(&tx,r).is_err());tx.rollback().unwrap();assert_eq!(status(&c).unwrap(),before);assert!(c.query_row("SELECT EXISTS(SELECT 1 FROM retrieval_lexical WHERE rowid=100)",[],|r|r.get::<_,bool>(0)).unwrap());
++}
++
++fn call(c:&Connection,value:Value)->Value {
++    let request=retrieval::request::parse(value.clone()).unwrap_or_else(|e|panic!("{}: {e}",value["action"]));let tx=c.unchecked_transaction().unwrap();let result=retrieval::bounded(&tx,||retrieval::execute(&tx,request)).unwrap();tx.commit().unwrap();result
++}
++fn api(action:&str)->Value {json!({"action":action,"index_id":"observations","model":"test-local","dimensions":4,"generation":"local-v1"})}
++fn write(c:&Connection,scope:&str,key:&str,v:&Value) {let tx=c.unchecked_transaction().unwrap();database::write(&tx,scope,key,Some(v)).unwrap();tx.commit().unwrap();}
++fn prepare_until_ready(c:&Connection,request:Value)->u64 {
++    let mut processed=0;
++    for _ in 0..32 {
++        let value=call(c,request.clone());
++        assert!(["pending","partial","ready"].contains(&value["status"].as_str().unwrap()),"{value}");
++        let rows=value["processed"].as_u64().unwrap();assert!(rows<=16,"{value}");processed+=rows;
++        if let Some(bytes)=value["text_bytes"].as_u64(){assert!(bytes<=65536,"{value}");}
++        if value["status"]=="ready" {return processed;}
++    }
++    panic!("bounded preparation did not reach ready: {request}");
++}
++#[test]
++fn actual_semantic_upsert_search_snippets_unicode_and_delete_still_work_after_cut() {
++    use base64::Engine;
++    let (_dir,c)=open();let mut config=api("semantic_configure");config["source_kind"]=json!("agentmemory");call(&c,config);
++    write(&c,"mem:sessions","s",&json!({"id":"s","project":"p"}));
++    write(&c,"mem:obs:s","obs",&json!({"id":"obs","sessionId":"s","title":"needle café","narrative":format!("{}\0needle_tail {}","😀".repeat(20),"😀".repeat(1200)),"facts":[],"concepts":[],"files":[]}));
++    let embedding=base64::engine::general_purpose::STANDARD.encode([1.0f32,0.0,0.0,0.0].iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>());
++    let mut upsert=api("semantic_upsert");upsert["items"]=json!([{"id":"obs","session_id":"s","embedding":embedding,"text":"surrogate","source_scope":"mem:obs:s","source_version":"1"}]);call(&c,upsert.clone());
++    let mut source_ready=false;
++    for _ in 0..20 {let mut prep=api("source_prepare");prep["max_rows"]=json!(32);if call(&c,prep)["source_prepared"]==true {source_ready=true;break;}}
++    assert!(source_ready,"source preparation must complete before project maintenance");
++    for source in ["sessions","summaries"] {
++        prepare_until_ready(&c,json!({"action":"project_catalog_prepare","source":source,"max_rows":16,"max_bytes":65536}));
++    }
++    prepare_until_ready(&c,json!({"action":"project_vectors_prepare","index_id":"observations","max_rows":16,"max_bytes":65536}));
++    let mut search=api("keyword_search");search["query"]=json!("needle");search["global"]=json!(true);search["include_text"]=json!(true);search["source_scope"]=json!("mem:obs:s");search["session_id"]=json!("s");search["limit"]=json!(1);search["max_candidates"]=json!(1);search["max_bytes"]=json!(65536);
++    let before=call(&c,search.clone());assert_eq!(before["items"][0]["obsId"],"obs");assert!(before["items"][0]["text"].as_str().unwrap().len()<=2048);
++    let mut old_snippet:String=c.query_row("SELECT substr(text,1,2048) FROM retrieval_lexical WHERE id='obs'",[],|r|r.get(0)).unwrap();let mut end=old_snippet.len().min(2048);while !old_snippet.is_char_boundary(end){end-=1;}old_snippet.truncate(end);assert_eq!(before["items"][0]["text"],old_snippet);
++    apply(&c,request(&c,Step::Begin));ready(&c);apply(&c,request(&c,Step::Cut));assert_eq!(call(&c,search.clone()),before);
++    c.execute_batch("DELETE FROM retrieval_scoped_postings; DELETE FROM retrieval_scoped_lexical; DELETE FROM retrieval_scoped_vectors; UPDATE retrieval_scoped_meta SET status='pending',cursor='';").unwrap();
++    let mut small=json!({"action":"project_vectors_prepare","index_id":"observations","project":"p","source_kind":"observation","max_rows":16,"max_bytes":1024});
++    let r=retrieval::request::parse(small.clone()).unwrap();let tx=c.unchecked_transaction().unwrap();let yielded=retrieval::execute(&tx,r).unwrap();assert_eq!(yielded["processed"],0);assert_eq!(yielded["has_more"],true);assert!(yielded["text_bytes"].as_u64().unwrap()<=1024);assert!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM retrieval_scoped_vectors WHERE id='obs')",[],|r|r.get::<_,bool>(0)).unwrap());tx.commit().unwrap();
++    small["max_bytes"]=json!(65536);assert_eq!(prepare_until_ready(&c,small),1,"one source row after committed budget yield; no duplicate or skipped projection");
++    assert_eq!(c.query_row("SELECT count(*) FROM retrieval_scoped_vectors WHERE id='obs' AND document IS NOT NULL",[],|r|r.get::<_,i64>(0)).unwrap(),1);
++    assert_eq!(c.query_row("SELECT count(*) FROM retrieval_scoped_lexical f JOIN retrieval_scoped_vectors v ON v.document=f.rowid WHERE v.id='obs'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
++    let mut scoped=search.clone();scoped.as_object_mut().unwrap().remove("global");scoped["project"]=json!("p");scoped["source_kind"]=json!("observation");let selected=call(&c,scoped.clone());assert_eq!(selected["items"][0]["obsId"],"obs");assert_eq!(selected["items"][0]["text"],before["items"][0]["text"]);
++    let mut tail=scoped.clone();tail["query"]=json!("needle_tail");assert_eq!(call(&c,tail)["items"][0]["obsId"],"obs");
++    scoped["project"]=json!("foreign");assert!(call(&c,scoped)["items"].as_array().unwrap().is_empty());
++    call(&c,upsert);assert_eq!(call(&c,search.clone()),before);
++    assert_eq!(proof(&c).unwrap()["rowids_and_metadata_exact"],true);
++    let tx=c.unchecked_transaction().unwrap();database::write(&tx,"mem:semantic:observations","obs",None).unwrap();tx.commit().unwrap();assert!(matches(&c,"retrieval_lexical").is_empty());assert!(matches(&c,"lexical_repack_original").is_empty());
++}
++
++#[test]
++fn historical_fallback_guard_survives_state_rows_repack_cut_and_rollback() {
++    use super::super::storage_repack as rows;
++    let (_dir,c)=open();seed(&c,3);apply(&c,request(&c,Step::Begin));ready(&c);apply(&c,request(&c,Step::Cut));
++    let old=content::text(&c,1).unwrap().unwrap();
++    let row_step=|step|{
++        let mut r=request(&c,step);r.expected_ordinal=rows::status(&c).unwrap()["ordinal"].as_u64().unwrap();r.operation_id=format!("rows-{}",r.expected_ordinal);r.job_id="rows-pilot".into();
++        let tx=c.unchecked_transaction().unwrap();let v=rows::execute(&tx,r).unwrap();tx.commit().unwrap();v
++    };
++    row_step(Step::Begin);for _ in 0..100 {if rows::status(&c).unwrap()["phase"]!="copy"{break;}row_step(Step::Copy);}
++    row_step(Step::Cut);assert_eq!(rows::proof(&c).unwrap()["preserved_native_triggers"],13);assert_eq!(content::text(&c,1).unwrap().unwrap(),old);
++    c.execute("UPDATE state_rows SET version='2',value='{}',value_bytes=2 WHERE scope='mem:obs:s' AND key='row-00000'",[]).unwrap();assert_eq!(content::text(&c,1).unwrap().unwrap(),old);
++    row_step(Step::Rollback);assert_eq!(rows::proof(&c).unwrap()["preserved_native_triggers"],13);assert_eq!(content::text(&c,1).unwrap().unwrap(),old);
++}
++
++#[test]
++fn complete_columns_and_tokenizer_are_guarded_before_any_migration_effect() {
++    let (_dir,c)=open();let original=validate_schema(&c,"retrieval_lexical",false).unwrap();assert!(original.contains(content::DECLARATION));
++    c.execute_batch("DROP TABLE retrieval_lexical; CREATE VIRTUAL TABLE retrieval_lexical USING fts5(index_id UNINDEXED,epoch UNINDEXED,id UNINDEXED,text,tokenize='porter');").unwrap();
++    let r=request(&c,Step::Begin);let tx=c.unchecked_transaction().unwrap();assert!(execute(&tx,r).unwrap_err().to_string().contains("STATE_LEXICAL_SCHEMA_UNSUPPORTED"));tx.rollback().unwrap();assert_eq!(status(&c).unwrap()["phase"],"absent");assert!(!c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='lexical_repack_stage')",[],|r|r.get::<_,bool>(0)).unwrap());
++}
++
++#[test]
++fn copy_query_plans_push_rowid_and_preserve_duplicate_source_max_and_selection() {
++    let (_dir,c)=open();seed(&c,3);
++    let raw=serde_json::to_string(&json!({"id":"row-00000","title":"different scope", "narrative":"x".repeat(1000)})).unwrap();
++    c.execute("INSERT INTO state_rows VALUES('mem:obs:z','row-00000',?1,'1',0,?2)",params![raw.as_bytes(),raw.len() as i64]).unwrap();
++    c.execute("INSERT INTO retrieval_source_items VALUES('observations','mem:obs:z','row-00000','1',0)",[]).unwrap();
++    let plan=|sql:&str|->Vec<String>{c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap().query_map([1i64],|r|r.get(3)).unwrap().collect::<rusqlite::Result<_>>().unwrap()};
++    let old_range="SELECT rowid,length(CAST(text AS BLOB)) FROM retrieval_lexical WHERE (?1 IS NULL OR rowid>?1) ORDER BY rowid LIMIT 1";
++    let range_plan=plan(COPY_AFTER_SQL);assert!(range_plan.iter().any(|v|v.contains("VIRTUAL TABLE INDEX")&&v.contains('>')),"{range_plan:?}");
++    assert_eq!(c.prepare(COPY_AFTER_SQL).unwrap().query_row([2i64],|r|r.get::<_,i64>(0)).unwrap(),3);
++    let unanchor=|sql:&str|sql.replace(" CROSS JOIN "," JOIN ").replace(" INDEXED BY retrieval_source_items_id","");
++    let old_work=unanchor(COPY_WORK_SQL);let old_candidate=unanchor(content::SOURCE_CANDIDATE_SQL);
++    let work=|sql:&str|c.prepare(sql).unwrap().query_row([1i64],|r|r.get::<_,i64>(0)).unwrap();
++    assert_eq!(work(&old_work),work(COPY_WORK_SQL),"MAX must cover both scopes, not a first-row shortcut");
++    let scope=|sql:&str|c.prepare(sql).unwrap().query_row([1i64],|r|r.get::<_,String>(0)).unwrap();
++    assert_eq!(scope(&old_candidate),scope(content::SOURCE_CANDIDATE_SQL),"same fixture candidate selection");
++    let scopes=|sql:&str|{let mut values=c.prepare(sql.strip_suffix(" LIMIT 1").unwrap()).unwrap().query_map([1i64],|r|r.get::<_,String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();values.sort();values};
++    let candidates=scopes(content::SOURCE_CANDIDATE_SQL);assert_eq!(candidates,vec!["mem:obs:s","mem:obs:z"]);assert_eq!(scopes(&old_candidate),candidates,"no cross-scope multiplicity change");
++    let candidate_plan=plan(content::SOURCE_CANDIDATE_SQL);let work_plan=plan(COPY_WORK_SQL);
++    for entries in [&candidate_plan,&work_plan] {
++        let links=entries.iter().position(|v|v.contains("SEARCH l ")&&v.contains("rowid=?")).expect("UNIQUE links.rowid lookup");
++        let source=entries.iter().position(|v|v.contains("SEARCH s ")&&v.contains("retrieval_source_items_id")&&v.contains("key=?")).expect("source index_id/key lookup");
++        assert!(links<source,"{entries:?}");
++    }
++    assert_eq!(content::save(&c,1,"needle café 東京 😀 0 alpha_beta body").unwrap(),"canonical_exact");assert_eq!(content::text(&c,1).unwrap().unwrap(),"needle café 東京 😀 0 alpha_beta body");
++    let evidence=json!({"sqlite_version":c.query_row("SELECT sqlite_version()",[],|r|r.get::<_,String>(0)).unwrap(),"old_range":plan(old_range),"direct_range":range_plan,"old_work":plan(&old_work),"anchored_work":work_plan,"old_candidate":plan(&old_candidate),"anchored_candidate":candidate_plan,"duplicate_scopes":candidates,"work_bytes_max":work(COPY_WORK_SQL)});
++    eprintln!("copy-query-plans: {evidence}");
++    std::fs::write(std::path::Path::new(&std::env::var("III_SQLITE_TEST_ROOT").unwrap()).join("copy-query-plans-v4.json"),serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
++}
++
++#[path = "proof_tests.rs"]
++mod proof_tests;
+--- /dev/null
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/lexical_content.rs
+@@ -0,0 +1,103 @@
++use super::super::protocol;
++use rusqlite::{Connection, OptionalExtension, params};
++use serde_json::Value;
++
++pub const MAX_TEXT: usize = 1_048_576;
++pub const MAX_SOURCE: i64 = 262_144;
++pub const DECLARATION: &str = "index_id UNINDEXED,epoch UNINDEXED,id UNINDEXED,text,tokenize='unicode61 tokenchars ''_'''";
++pub const SOURCE_CANDIDATE_SQL:&str="SELECT s.scope,s.key,s.version,m.model,m.generation,l.epoch,v.value_bytes,v.stored_bytes,l.index_id,e.value_bytes,e.stored_bytes FROM retrieval_lexical_links l CROSS JOIN retrieval_semantic_meta m ON m.index_id=l.index_id AND m.epoch=l.epoch CROSS JOIN retrieval_source_meta sm ON sm.index_id=m.index_id CROSS JOIN retrieval_source_items s INDEXED BY retrieval_source_items_id ON s.index_id=l.index_id AND s.key=l.id AND s.dirty=0 CROSS JOIN state_values v ON v.scope=s.scope AND v.key=s.key AND v.version=s.version AND v.live=1 CROSS JOIN state_values e ON e.scope='mem:semantic:'||l.index_id AND e.key=l.id AND e.live=1 WHERE l.rowid=?1 LIMIT 1";
++pub fn schema(c: &Connection) -> anyhow::Result<()> {
++    c.execute_batch("CREATE TABLE IF NOT EXISTS retrieval_lexical_content_proof(rowid INTEGER PRIMARY KEY,scope TEXT,key TEXT,version TEXT,recipe INTEGER NOT NULL,model TEXT,generation TEXT,epoch INTEGER,bytes INTEGER NOT NULL,literal TEXT);
++        CREATE INDEX IF NOT EXISTS retrieval_lexical_content_source ON retrieval_lexical_content_proof(scope,key) WHERE literal IS NULL;")?;
++    // Both ordinary SDK writes and direct native deletes reach these BEFORE triggers.
++    for event in ["UPDATE", "DELETE"] {
++        c.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS lexical_content_before_{event} BEFORE {event} ON state_rows
++          WHEN EXISTS(SELECT 1 FROM retrieval_lexical_content_proof WHERE scope=OLD.scope AND key=OLD.key AND literal IS NULL)
++          BEGIN
++            SELECT CASE WHEN EXISTS(SELECT 1 FROM retrieval_lexical_content_proof WHERE scope=OLD.scope AND key=OLD.key AND literal IS NULL AND (version<>OLD.version OR recipe<>1)) THEN RAISE(ABORT,'STATE_LEXICAL_SOURCE_VERSION_MISMATCH') END;
++            UPDATE retrieval_lexical_content_proof SET literal=(SELECT state_lexical_project(state_json(value,value_bytes),OLD.scope) FROM state_values WHERE scope=OLD.scope AND key=OLD.key AND live=1) WHERE scope=OLD.scope AND key=OLD.key AND literal IS NULL;
++            SELECT CASE WHEN EXISTS(SELECT 1 FROM retrieval_lexical_content_proof WHERE scope=OLD.scope AND key=OLD.key AND (literal IS NULL OR length(CAST(literal AS BLOB))<>bytes)) THEN RAISE(ABORT,'STATE_LEXICAL_SOURCE_UNAVAILABLE') END;
++          END;"))?;
++    }
++    Ok(())
++}
++
++pub fn register(c: &Connection) -> anyhow::Result<()> {
++    use rusqlite::functions::FunctionFlags;
++    c.create_scalar_function("state_lexical_project", 2, FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS, |context| {
++        let raw = context.get::<String>(0)?;
++        let scope = context.get::<String>(1)?;
++        let projected = (|| -> anyhow::Result<String> {
++            anyhow::ensure!(raw.len() <= MAX_TEXT, "STATE_LEXICAL_SOURCE_TOO_LARGE");
++            let document: Value = serde_json::from_str(&raw)?;
++            let text = super::source_lexical::project(&document, &scope)?;
++            anyhow::ensure!(text.len() <= MAX_TEXT, "STATE_LEXICAL_SOURCE_TOO_LARGE");
++            Ok(text)
++        })();
++        projected.map_err(|e| rusqlite::Error::UserFunctionError(e.into()))
++    })?;
++    Ok(())
++}
++
++pub fn active(c: &Connection) -> anyhow::Result<bool> {
++    let version: i64 = c.pragma_query_value(None,"user_version",|r|r.get(0))?;
++    Ok(version == 3)
++}
++pub fn validate_format(c:&Connection)->anyhow::Result<()> {
++    if !active(c)? {return Ok(());}
++    super::super::storage_lexical_repack::validate_schema(c,"retrieval_lexical",true)?;
++    let proof:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='retrieval_lexical_content_proof')",[],|r|r.get(0))?;
++    anyhow::ensure!(proof,"STATE_LEXICAL_FORMAT_UNSUPPORTED");Ok(())
++}
++pub fn rowid(c: &Connection, index: &str, epoch: i64, id: &str) -> anyhow::Result<Option<i64>> {
++    Ok(c.query_row("SELECT rowid FROM retrieval_lexical_links WHERE index_id=?1 AND epoch=?2 AND id=?3", params![index,epoch,id], |r|r.get(0)).optional()?)
++}
++pub fn length(c: &Connection, rowid: i64) -> anyhow::Result<Option<usize>> {
++    let bytes: Option<i64> = c.query_row("SELECT bytes FROM retrieval_lexical_content_proof WHERE rowid=?1",[rowid],|r|r.get(0)).optional()?;
++    let bytes = match bytes {
++        Some(bytes) => Some(bytes),
++        None if !active(c)? => c.query_row("SELECT length(CAST(text AS BLOB)) FROM retrieval_lexical WHERE rowid=?1",[rowid],|r|r.get(0)).optional()?.flatten(),
++        None => None,
++    };
++    bytes.map(|b|usize::try_from(b).map_err(Into::into)).transpose()
++}
++pub fn text(c: &Connection, rowid: i64) -> anyhow::Result<Option<String>> {
++    let saved: Option<(Option<String>,Option<String>,Option<String>,i64,i64,Option<String>)> = c.query_row("SELECT scope,key,version,recipe,bytes,literal FROM retrieval_lexical_content_proof WHERE rowid=?1",[rowid],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
++    let Some((scope,key,version,recipe,bytes,literal)) = saved else {
++        if active(c)? {return Err(protocol::error("STATE_LEXICAL_CONTENT_MISSING"));}
++        return Ok(c.query_row("SELECT text FROM retrieval_lexical WHERE rowid=?1",[rowid],|r|r.get(0)).optional()?);
++    };
++    let text = if let Some(text) = literal {text} else {
++        protocol::require(recipe == 1)?;
++        c.query_row("SELECT state_lexical_project(state_json(v.value,v.value_bytes),v.scope) FROM state_values v WHERE v.scope=?1 AND v.key=?2 AND v.version=?3 AND v.live=1 AND v.value_bytes<=1048576 AND v.stored_bytes<=1048576",params![scope,key,version],|r|r.get::<_,String>(0)).optional()?.ok_or_else(||protocol::error("STATE_LEXICAL_SOURCE_UNAVAILABLE"))?
++    };
++    anyhow::ensure!(text.len() == usize::try_from(bytes)? && text.len() <= MAX_TEXT,"STATE_LEXICAL_CONTENT_MISMATCH");
++    Ok(Some(text))
++}
++
++pub fn save(c: &Connection, rowid: i64, text: &str) -> anyhow::Result<&'static str> {
++    protocol::require(text.len() <= MAX_TEXT)?;
++    c.execute("DELETE FROM retrieval_lexical_content_proof WHERE rowid=?1",[rowid])?;
++    let candidate: Option<(String,String,String,String,String,i64,i64,i64,String,i64,i64)> = c.prepare_cached(SOURCE_CANDIDATE_SQL)?.query_row([rowid],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?))).optional()?;
++    let mut reason = "missing_dirty_or_historical";
++    if let Some((scope,key,version,model,generation,epoch,logical,stored,index,embedding_logical,embedding_stored)) = candidate {
++        if super::source::tracked_scope(&scope) && [logical,stored,embedding_logical,embedding_stored].iter().all(|n|(1..=MAX_SOURCE).contains(n)) {
++            let embedding:String=c.query_row("SELECT state_json(value,value_bytes) FROM state_values WHERE scope=?1 AND key=?2",params![format!("mem:semantic:{index}"),key],|r|r.get(0))?;
++            let binding=serde_json::from_str::<Value>(&embedding).ok().is_some_and(|v|v["id"]==key && v["sourceScope"]==scope && v["sourceVersion"]==version && v["model"]==model && v["generation"]==generation);
++            if !binding {
++                c.execute("INSERT INTO retrieval_lexical_content_proof(rowid,recipe,bytes,literal) VALUES(?1,0,?2,?3)",params![rowid,text.len() as i64,text])?;
++                return Ok("semantic_binding_stale");
++            }
++            // Invalid canonical documents retain the literal; cancellation and resource errors propagate.
++            let raw: String = c.query_row("SELECT state_json(value,value_bytes) FROM state_values WHERE scope=?1 AND key=?2",params![scope,key],|r|r.get(0))?;
++            let projected = serde_json::from_str::<Value>(&raw).ok().filter(|v|v["id"].as_str()==Some(key.as_str())).and_then(|v|super::source_lexical::project(&v,&scope).ok());
++            if projected.as_deref() == Some(text) {
++                c.execute("INSERT INTO retrieval_lexical_content_proof VALUES(?1,?2,?3,?4,1,?5,?6,?7,?8,NULL)",params![rowid,scope,key,version,model,generation,epoch,text.len() as i64])?;
++                return Ok("canonical_exact");
++            }
++            reason = "canonical_mismatch_or_invalid";
++        } else {reason = "canonical_oversized_or_unknown_scope";}
++    }
++    c.execute("INSERT INTO retrieval_lexical_content_proof(rowid,recipe,bytes,literal) VALUES(?1,0,?2,?3)",params![rowid,text.len() as i64,text])?;
++    Ok(reason)
++}
+--- a/engine/src/workers/state/adapters/sqlite/retrieval/mod.rs
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/mod.rs
+@@ -10,6 +10,7 @@
+ mod graph_read;
+ mod legacy_work;
+ mod lexical;
++pub(super) mod lexical_content;
+ mod lsh;
+ mod metadata;
+ mod prepare;
+--- a/engine/src/workers/state/adapters/sqlite/retrieval/lexical.rs
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/lexical.rs
+@@ -5,9 +5,9 @@
+ use std::collections::BTreeSet;
+ 
+ pub fn schema(connection: &Connection) -> anyhow::Result<()> {
+-    connection.execute_batch("CREATE VIRTUAL TABLE IF NOT EXISTS retrieval_lexical USING fts5(index_id UNINDEXED,epoch UNINDEXED,id UNINDEXED,text,tokenize='unicode61 tokenchars ''_''');
+-        CREATE TABLE IF NOT EXISTS retrieval_lexical_links(index_id TEXT NOT NULL,epoch INTEGER NOT NULL,id TEXT NOT NULL,rowid INTEGER NOT NULL UNIQUE,PRIMARY KEY(index_id,epoch,id)) WITHOUT ROWID;")?;
+-    Ok(())
++    connection.execute_batch(&format!("CREATE VIRTUAL TABLE IF NOT EXISTS retrieval_lexical USING fts5({});
++        CREATE TABLE IF NOT EXISTS retrieval_lexical_links(index_id TEXT NOT NULL,epoch INTEGER NOT NULL,id TEXT NOT NULL,rowid INTEGER NOT NULL UNIQUE,PRIMARY KEY(index_id,epoch,id)) WITHOUT ROWID;",super::lexical_content::DECLARATION))?;
++    super::lexical_content::schema(connection)
+ }
+ 
+ pub fn replace(
+@@ -24,7 +24,9 @@
+         )
+         .optional()?;
+     if let Some(rowid) = rowid {
+-        connection.execute("DELETE FROM retrieval_lexical WHERE rowid=?1", [rowid])?;
++        super::super::storage_lexical_repack::mirror_delete(connection, rowid)?;
++        super::super::storage_lexical_repack::delete_table(connection,"retrieval_lexical",rowid)?;
++        connection.execute("DELETE FROM retrieval_lexical_content_proof WHERE rowid=?1", [rowid])?;
+         connection.execute(
+             "DELETE FROM retrieval_lexical_links WHERE index_id=?1 AND epoch=?2 AND id=?3",
+             params![meta.index_id, meta.epoch, key],
+@@ -44,15 +46,20 @@
+     if source::kind(connection, &meta.index_id)?.is_none() {
+         protocol::require(text.len() <= 65_536)?;
+     }
+-    connection.execute(
+-        "INSERT INTO retrieval_lexical(index_id,epoch,id,text) VALUES(?1,?2,?3,?4)",
+-        params![meta.index_id, meta.epoch, key, text],
+-    )?;
+-    let rowid = connection.last_insert_rowid();
++    let rowid = if super::lexical_content::active(connection)? {
++        let highest:i64=connection.query_row("SELECT coalesce(max(rowid),0) FROM retrieval_lexical_links",[],|r|r.get(0))?;
++        let rowid=highest.checked_add(1).ok_or_else(||protocol::error("STATE_TX_LIMIT_EXCEEDED"))?;
++        connection.execute("INSERT INTO retrieval_lexical(rowid,index_id,epoch,id,text) VALUES(?1,?2,?3,?4,?5)",params![rowid,meta.index_id,meta.epoch,key,text])?;
++        rowid
++    } else {
++        connection.execute("INSERT INTO retrieval_lexical(index_id,epoch,id,text) VALUES(?1,?2,?3,?4)",params![meta.index_id,meta.epoch,key,text])?;
++        connection.last_insert_rowid()
++    };
+     connection.execute(
+         "INSERT INTO retrieval_lexical_links VALUES(?1,?2,?3,?4)",
+         params![meta.index_id, meta.epoch, key, rowid],
+     )?;
++    super::super::storage_lexical_repack::mirror_insert(connection,rowid,&meta.index_id,meta.epoch,key,&text)?;
+     connection.execute(
+         "UPDATE retrieval_semantic_meta SET lexical_count=lexical_count+1 WHERE index_id=?1",
+         [&meta.index_id],
+@@ -120,7 +127,7 @@
+     }
+     let mut output = Vec::new();
+     if let Some(expression) = expression(query)? {
+-        let global_sql = "SELECT retrieval_lexical.id,v.session_id,bm25(retrieval_lexical) FROM retrieval_lexical CROSS JOIN retrieval_vector_values v ON v.index_id=retrieval_lexical.index_id AND v.epoch=retrieval_lexical.epoch AND v.id=retrieval_lexical.id WHERE retrieval_lexical MATCH ?1 AND retrieval_lexical.index_id=?2 AND retrieval_lexical.epoch=?3 AND (?7 IS NULL OR v.session_id=?7) ORDER BY bm25(retrieval_lexical),retrieval_lexical.id LIMIT ?5";
++        let global_sql = "SELECT l.id,v.session_id,bm25(retrieval_lexical) FROM retrieval_lexical CROSS JOIN retrieval_lexical_links l ON l.rowid=retrieval_lexical.rowid CROSS JOIN retrieval_vector_values v ON v.index_id=l.index_id AND v.epoch=l.epoch AND v.id=l.id WHERE retrieval_lexical MATCH ?1 AND l.index_id=?2 AND l.epoch=?3 AND (?7 IS NULL OR v.session_id=?7) ORDER BY bm25(retrieval_lexical),l.id LIMIT ?5";
+         let source_predicate = super::search_projection::filter("?8", "?9");
+         let global_sql = global_sql.replace(" ORDER BY", &format!("{source_predicate} ORDER BY"));
+         let mut statement = connection.prepare_cached(&global_sql)?;
+--- a/engine/src/workers/state/adapters/sqlite/retrieval/source_lexical.rs
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/source_lexical.rs
+@@ -43,6 +43,11 @@
+     }
+     let raw: String = row.get(1)?;
+     let document: Value = serde_json::from_str(&raw)?;
++    Ok(Some(project(&document, scope)?))
++}
++
++pub fn project(document: &Value, scope: &str) -> anyhow::Result<String> {
++    protocol::require(super::source::tracked_scope(scope))?;
+     let fields: &[&str] = if scope == "mem:memories" {
+         &["title", "content", "concepts", "files"]
+     } else {
+@@ -74,5 +79,5 @@
+     }
+     let text = terms.join(" ");
+     protocol::require(!text.trim().is_empty())?;
+-    Ok(Some(text))
++    Ok(text)
+ }
+--- a/engine/src/workers/state/adapters/sqlite/retrieval/scoped/write.rs
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/scoped/write.rs
+@@ -19,7 +19,7 @@
+         .collect())
+ }
+ pub fn text(c: &Connection, index: &str, epoch: i64, id: &str) -> anyhow::Result<Option<String>> {
+-    let value:Option<String>=c.query_row("SELECT f.text FROM retrieval_lexical_links l JOIN retrieval_lexical f ON f.rowid=l.rowid WHERE l.index_id=?1 AND l.epoch=?2 AND l.id=?3",params![index,epoch,id],|r|r.get(0)).optional()?;
++    let value=super::super::lexical_content::rowid(c,index,epoch,id)?.map(|rowid|super::super::lexical_content::text(c,rowid)).transpose()?.flatten();
+     if let Some(value) = &value {
+         protocol::require(value.len() <= 1_048_576)?;
+     }
+--- a/engine/src/workers/state/adapters/sqlite/retrieval/scoped/projection.rs
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/scoped/projection.rs
+@@ -122,12 +122,8 @@
+     if current && !restored {
+         return Ok(RowResult::Done(source_bytes.saturating_add(authority_bytes)));
+     }
+-    let needed: Option<i64> = c.query_row(
+-        "SELECT length(CAST(f.text AS BLOB)) FROM retrieval_lexical_links l JOIN retrieval_lexical f ON f.rowid=l.rowid WHERE l.index_id=?1 AND l.epoch=?2 AND l.id=?3",
+-        params![meta.index_id, meta.epoch, id],
+-        |row| row.get(0),
+-    ).optional()?;
+-    let needed = needed.unwrap_or(0).try_into().unwrap_or(usize::MAX);
++    let needed = super::super::lexical_content::rowid(c,&meta.index_id,meta.epoch,id)?
++        .map(|rowid|super::super::lexical_content::length(c,rowid)).transpose()?.flatten().unwrap_or(0);
+     if used.saturating_add(needed) > max_bytes {
+         return budget(processed, used.saturating_add(needed));
+     }
+--- a/engine/src/workers/state/adapters/sqlite/retrieval/search_projection.rs
++++ b/engine/src/workers/state/adapters/sqlite/retrieval/search_projection.rs
+@@ -14,14 +14,16 @@
+ 
+ pub fn enrich(connection:&Connection,index:&str,items:&mut Vec<Value>,options:Options<'_>)->anyhow::Result<Option<&'static str>> {
+     if !options.include_text {return Ok(None);}
+-    let mut statement=connection.prepare("SELECT substr(f.text,1,2048),s.scope,s.version FROM retrieval_source_items s INDEXED BY retrieval_source_items_id CROSS JOIN retrieval_lexical_links l ON l.index_id=s.index_id AND l.id=s.key CROSS JOIN retrieval_semantic_meta m ON m.index_id=l.index_id AND m.epoch=l.epoch CROSS JOIN retrieval_lexical f ON f.rowid=l.rowid WHERE s.index_id=?1 AND s.key=?2 AND s.dirty=0 AND (?3 IS NULL OR s.scope=?3) AND (?4 IS NULL OR (s.scope>='mem:obs:' AND s.scope<'mem:obs;')) AND (?5 IS NULL OR s.scope<'mem:obs:' OR s.scope>='mem:obs;' OR s.scope='mem:obs:'||?5) LIMIT 1")?;
++    let mut statement=connection.prepare("SELECT l.rowid,s.scope,s.version FROM retrieval_source_items s INDEXED BY retrieval_source_items_id CROSS JOIN retrieval_lexical_links l ON l.index_id=s.index_id AND l.id=s.key CROSS JOIN retrieval_semantic_meta m ON m.index_id=l.index_id AND m.epoch=l.epoch WHERE s.index_id=?1 AND s.key=?2 AND s.dirty=0 AND (?3 IS NULL OR s.scope=?3) AND (?4 IS NULL OR (s.scope>='mem:obs:' AND s.scope<'mem:obs;')) AND (?5 IS NULL OR s.scope<'mem:obs:' OR s.scope>='mem:obs;' OR s.scope='mem:obs:'||?5) LIMIT 1")?;
+     let mut output=Vec::with_capacity(items.len());let mut bytes=2048usize;let mut partial=None;
+     for mut item in items.drain(..) {
+         let id=item["obsId"].as_str().ok_or_else(||protocol::error("STATE_INDEX_NOT_READY"))?;
+-        let projection:Option<(String,String,String)>=statement.query_row(params![index,id,options.source_scope,options.source_kind,options.session_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+-        let Some((mut text,scope,version))=projection else {partial=Some("projection_source_missing");continue;};
++        let projection:Option<(i64,String,String)>=statement.query_row(params![index,id,options.source_scope,options.source_kind,options.session_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
++        let Some((rowid,scope,version))=projection else {partial=Some("projection_source_missing");continue;};
++        let Some(mut text)=super::lexical_content::text(connection,rowid)? else {partial=Some("projection_source_missing");continue;};
+         protocol::counter(&version)?;
+-        let mut end=text.len().min(2048);while !text.is_char_boundary(end) {end-=1;}text.truncate(end);
++        // Match SQLite substr(TEXT,1,2048), including its NUL termination, before the byte cap.
++        let mut end=text.find('\0').unwrap_or(text.len()).min(2048);while !text.is_char_boundary(end) {end-=1;}text.truncate(end);
+         item["text"]=json!(text);item["source_scope"]=json!(scope);item["source_version"]=json!(version);
+         let needed=protocol::size(&item)?+1;
+         if bytes+needed>options.max_bytes {partial=Some("projection_budget");break;}
+--- a/src/state/native-compaction.ts
++++ b/src/state/native-compaction.ts
+@@ -66,3 +66,15 @@
+     count(value.input_bytes) && value.input_bytes <= request.request.max_bytes &&
+     (request.request.step !== 'collect' || typeof value.gc_complete === 'boolean'));
+ }
++
++export async function lookupNativeCompactionReceipt(sdk: import('iii-sdk').IIIClient, original: NativeCompactionApply): Promise<NativeCompactionStatus | null> {
++  const request: NativeCompactionRequest = { action: 'compact_apply', request: original };
++  validateNativeCompactionRequest(request);
++  const value = await sdk.trigger<unknown, unknown>({ function_id: 'state::storage', payload: {
++    action: 'compact_receipt', request: original,
++  } });
++  if (!record(value) || value.operation_id !== original.operation_id) throw new Error('STATE_STORAGE_INVALID_RESPONSE');
++  if (value.status === 'not_found' && value.result === null) return null;
++  if (value.status !== 'applied' || !validNativeCompactionResponse(request, value.result)) throw new Error('STATE_STORAGE_INVALID_RESPONSE');
++  return value.result;
++}

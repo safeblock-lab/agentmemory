@@ -110,5 +110,3 @@ if (process.argv[1] !== void 0 && resolve(process.argv[1]) === fileURLToPath(imp
 });
 //#endregion
 export { normalizePayload, responseFor, targetsFor };
-
-//# sourceMappingURL=antigravity-bridge.mjs.map

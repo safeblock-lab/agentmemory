@@ -1,7 +1,19 @@
 import type { IIIClient } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
 import type { RecentOperation } from "../types.js";
-import { PROCESSING_OPERATION_NAMES, recordOperation } from "./dashboard-activity.js";
+import { PROCESSING_OPERATION_NAMES, recordOperation, markWorkflowStatisticsGap } from "./dashboard-activity.js";
+import { logger } from "../logger.js";
+
+function failureDiagnostic(value: unknown, depth = 0): Record<string, unknown> {
+  const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const message = value instanceof Error ? value.message : record.error;
+  const code = typeof record.code === "string" ? record.code : typeof message === "string" ? message.match(/\bSTATE_[A-Z0-9_]+\b/)?.[0] : undefined;
+  const identifier = (item: unknown) => typeof item === "string" && /^[A-Za-z0-9_:.-]{1,160}$/.test(item) ? item : undefined;
+  return { code: identifier(code), errorName: value instanceof Error ? value.name : undefined,
+    error: identifier(message), reason: identifier(record.reason),
+    ...(depth < 2 ? { stages: Object.fromEntries(Object.entries(operationResultObject(record.results)).slice(0, 4)
+      .map(([name, result]) => [name.slice(0, 64), failureDiagnostic(operationResultObject(result), depth + 1)])) } : {}) };
+}
 
 function operationResultObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -78,13 +90,20 @@ export function installOperationTracking(sdk: IIIClient, kv: StateKV): void {
         const result = await handler(...args);
         const metadata = operationResultObject(result);
         const { outcome, reason } = operationResultOutcome(metadata);
+        if (outcome === "failed" || outcome === "partial") logger.warn("Processing operation returned a failure", { functionId, phase: "handler_result", ...failureDiagnostic(metadata) });
+        if ((outcome === "completed" || outcome === "partial" || outcome === "failed") &&
+          (functionId === "mem::consolidate-pipeline" && typeof metadata.selectedRunId !== "string" ||
+            functionId === "mem::skill-extract" && !operationResultObject(args[0]).intentId)) {
+          await markWorkflowStatisticsGap(kv, functionId === "mem::skill-extract" ? "skills" : "consolidation");
+        }
         await recordOperation(kv, functionId as RecentOperation["functionId"], outcome,
           operationResultCounts(functionId, metadata), undefined,
-          { durationMs: Date.now() - started, reason, ...(outcome === "failed" ? { errorCode: "operation_failed" } : {}) });
+          { executionLevel: "unit", durationMs: Date.now() - started, reason, ...(outcome === "failed" ? { errorCode: "operation_failed" } : {}) });
         return result;
       } catch (error) {
+        logger.error("Processing operation threw", { functionId, phase: "handler_exception", ...failureDiagnostic(error) });
         await recordOperation(kv, functionId as RecentOperation["functionId"], "failed", { itemsFailed: 1 }, undefined,
-          { durationMs: Date.now() - started, errorCode: "operation_failed" });
+          { executionLevel: "unit", durationMs: Date.now() - started, errorCode: "operation_failed" });
         throw error;
       }
     }, options);

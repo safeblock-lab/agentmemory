@@ -1,5 +1,91 @@
 # Storage retention and maintenance
 
+## Current source integration status (2026-10-17)
+
+The TypeScript final-context emitter is now connected to the native-use candidate's
+`retention_context_delivery` contract. Only version-pinned observation references
+from selected output blocks are admitted; discarded candidates, generic access,
+client telemetry and durable knowledge do not acquire an implicit TTL. The
+native owner reports the admission/monotonic usage and collection recheck in the
+same StateModule transaction. Main must combine that candidate with these
+sources before runtime promotion. No runtime, tests, builds or verification
+were executed for this integration; `native_source_integrated_runtime_pending`
+is a source status, not installed acceptance.
+
+Context results include `retentionUse`: `not_applicable`, `recorded`, `partial`,
+or `unavailable`, plus bounded counts and sanitized error code as applicable.
+Legacy version-lookup failures or changed rows are counted as untracked;
+native errors/cap exhaustion remain visible without blocking context delivery
+or logging source payloads. Request bounds are 128 distinct observation refs,
+4096 UTF-8 bytes per scope/key/task/project, positive canonical u64 versions and
+1 MiB total request JSON. Native metadata caps are 16384 new event receipts and
+16384 resource-use rows. `STATE_RETENTION_METADATA_LIMIT` fails atomically;
+`STATE_RETENTION_EVENT_WINDOW`, `STATE_RETENTION_EVENT_CONFLICT` and
+`STATE_RETENTION_SESSION_INVALID` report their protocol failures. No client
+producer, observed time, category or arbitrary retention duration is accepted.
+Configured fractional-hour maximum ages are floored to integer milliseconds.
+
+Closed-temporary collection removes only the exact UUID temporary and returns
+`manifestRetained: true`. The shared ownership manifest is deliberately retained:
+a prior native lease check cannot atomically fence a later filesystem unlink.
+Repeated collection returns `already_collected_manifest_recovery_required` once
+the temporary is gone. This does not block ordinary storage-maintenance ticks.
+It does block later snapshot creation/restore, which reports
+`STATE_SNAPSHOT_MANIFEST_RECOVERY_REQUIRED`, `deferred: true`, `retryable: false`.
+Recovery requires a separately authorized offline operation with all snapshot
+writers and collectors stopped/fenced, or a genuine atomic owner-qualified
+release primitive. The collector never claims to provide that primitive.
+Active and legacy manifests are preserved; no automatic shared-manifest unlink
+or invisible global maintenance block is introduced.
+
+Earlier dated sections below describe prior source stages. This current status
+supersedes their statements that the producer was unwired or that collection
+unlinks the shared manifest. Viewer-stream ownership/rollback integration and
+usable full-native backup/reference-aware rotation remain required separately;
+this source handoff does not complete all of U13 or establish physical savings.
+
+## Isolated TTL implementation (2026-10-16)
+
+The isolated storage candidate adds native `state::storage` action `ttl_page`.
+Each successful transaction stores the deletion result, cumulative run totals,
+scope/key cursor and receipt under `mem:storage-maintenance`. A resumed caller
+uses the same run ID and ordinal; a lost acknowledgement never creates another
+operation ID. Both the storage-maintenance lease and graph guard are checked
+inside the transaction. The run fixes its clock and policy on its first page.
+
+Pages inspect at most 4,096 rows in chunks of 128, account at most 4 MiB of
+candidate input, and cooperatively yield after 2,400 ms. The enclosing SQL
+deadline is 3,000 ms and rolls back an interrupted transaction. Receipts include
+observed `elapsedMs`; the commit and acknowledgement are outside that cooperative
+slice, so a late successful acknowledgement is not rejected as an invalid result.
+Rows above the existing 128 KiB dependency decoder limit remain retained and are
+reported as `oversizedRetained`; advancing the run cursor does not delete them or
+prove complete tool-body expiry. A future run can revisit retained rows.
+
+Viewer records use 24 hours of inactivity and a 96-hour maximum age. Eligible
+tool-body copies and terminal bodies use seven days of inactivity and a 28-day
+maximum age. The existing maximum-age environment settings remain applicable.
+Selected context output can record server-side use for an existing active task
+session and exact observation version. Client timestamps, generic reads,
+retrieval candidates and maintenance do not renew retention. Unattributed use
+signals remain protected.
+
+Effective deletion categories are eligible recent-search viewer rows, completed
+routine runs, independently proven terminal queue/temporal bodies and disposable
+prepared/remap graph rows. Raw tool bodies are stripped only when a distinct
+canonical observation retains exactly the same original fields and version.
+Unique tool bodies and originals remain retained even when a narrative summary
+exists. Audit/replay receipts, job identities, useful knowledge, protected
+references and monotonic spend remain outside this cleanup. Backups keep the
+fixed 30-day policy, but missing ownership or protected references prevent
+collection; this implementation performs no heuristic filesystem deletion or
+Git garbage collection.
+
+See [the TTL operation record](storage-ttl-cleanup-20261016.md) for installation,
+actual effect receipts, physical reclamation and current operational limits.
+The older maintenance path below is historical context for the preceding runtime;
+its candidate counts are not evidence that the new TTL run deleted those rows.
+
 The local storage-maintenance worker samples the native state store and indexes
 legacy observation identities in bounded pages. Startup and scheduled ticks do
 not delete logical records. Physical page reclamation is a separate bounded
@@ -412,3 +498,73 @@ also hold exclusive maintenance ownership across processes until collection
 finishes. Supplying a closed owner without that serialization is insufficient
 for public operation. This cross-process operator gate is part of the required
 integration, not a guarantee supplied by an exported helper alone.
+
+### Closed-temporary lifecycle tightening (2026-10-17 source)
+
+The collector now requires `assertMaintenanceOwnership`, a callback that refreshes
+and validates the native maintenance owner/fence. It is awaited before inspecting
+ownership and before each unlink. The exact manifest must contain writer-generated
+`phase: "closed"`; a caller-supplied owner ID alone cannot close active work.
+The writer emits this terminal phase only after cleanup fails and never unlinks
+the shared manifest path afterward. Normal cleanup removes the manifest before
+closing its file handle, so a recorded closed owner cannot later remove a
+successor's manifest. Crashed writing/prepared/published manifests still require
+separate recovery; timeout or age alone does not prove owner closure.
+
+The source now connects this collector to the existing SDK function
+`mem::storage-maintenance` with `action: "collect_snapshot_temporary"` and
+`closed_owner_id`. The directory comes only from server snapshot configuration.
+This explicit action requires prior cleanup activation and a fresh native
+maintenance lease, rejects recovered-expired ownership, supplies native fence
+refresh before each unlink, and records an audit after collection. Scheduled
+maintenance never selects this action. Public REST action whitelisting remains
+an integration boundary until added to the existing maintenance endpoint.
+
+### Native context-use transaction contract
+
+The expanded source declares `RetentionContextDeliveryRequest` and
+`RetentionContextDeliveryResult` in `src/state/storage.ts`. The agreed integration
+request is `action: "retention_context_delivery"`, server-generated UUID
+`event_id`, existing caller-session `task_id`, `project`, and at most 128
+`resources` containing exact `scope`, `key`, and `expected_version`. It accepts
+no client producer/category label or timestamp. Current observation blocks carry
+version-pinned references. Legacy observations must exactly match a versioned
+rehydration; candidate blocks discarded by the token budget never emit use.
+
+Required native transaction: validate task/session project, bound and whitelist
+references, compare each canonical row version, derive retention category and
+immutable origin from native state, persist the event's immutable server time
+and request identity, and update usage monotonically by `(scope, key, origin)`.
+Retry of the same event must return its original observed time without renewed
+expiry; a conflicting event payload must fail. Missing/changed resources are
+skipped, never recreated. No raw body or context content belongs in usage state.
+Result fields are `event_id`, ISO `observed_at`, `admitted`, `skipped`, and
+`replayed`. Collection must read that state inside its own deletion transaction,
+apply `min(lastUse + inactivity, origin + maximumAge)`, and recheck all holds,
+references, replay, version and active-job protections. A separate TS read and
+write is insufficient. Event receipts cannot be discarded while their origin
+still requires exact replay.
+
+This contract declaration alone does not enable an absent native action. Native
+implementation and TypeScript caller must be integrated in one source delivery
+before reporting server-use renewal connected.
+
+The existing authenticated `POST /agentmemory/storage/maintenance` now accepts
+`collect_snapshot_temporary` and only forwards its `closed_owner_id` field.
+It reuses the SDK action and fixed server directory; no new endpoint or MCP tool
+is introduced. The operator still needs prior cleanup activation and a genuine
+writer-recorded closed manifest. No runtime cleanup was performed by this source
+change.
+
+The new event protocol uses server-generated UUIDv7 identifiers. Admission and
+exact replay are supported only within 24 hours of their embedded creation time;
+future skew is limited to 60 seconds. Native `observed_at` is authoritative for
+use and cannot be supplied by a client. An event outside this window is rejected
+before any renewal. A repeated event inside the window returns its original
+native observed time; a conflicting resource request for that event fails.
+New event receipts become collectable only after the window plus skew has
+closed. Per-resource monotonic usage survives independently for its origin's
+lifecycle. Existing legacy replay/budget/event receipts are unaffected. These
+bounds apply to the new protocol, not retrospective permission to collect old
+state. Rejection must report a bounded stable error without persisting or logging
+the rejected context/resource payload.

@@ -2,10 +2,20 @@ import { createHash } from "node:crypto";
 import type { StateKV } from "../state/kv.js";
 import type { GraphStorageMetadata } from "../state/storage.js";
 import { KV } from "../state/schema.js";
-import type { StorageMaintenanceState } from "../types.js";
+import type { DashboardWorkflowStatistics, StorageMaintenanceState } from "../types.js";
 import { logger } from "../logger.js";
 import type { EngineMemoryMetric } from "./engine-memory.js";
-import type { DashboardActivity } from "./dashboard-activity.js";
+import { readDataDirectoryStorage, type DataDirectoryStorageMetric } from "./data-directory-storage.js";
+import { readWorkflowStatistics, type DashboardActivity } from "./dashboard-activity.js";
+import { isLayoutAdmissionAccepted, normalizeLayoutCycle, type LayoutAdmission, type LayoutCycle } from "./periodic-layouts.js";
+import { isPeriodicAdmissionReady } from "./periodic-maintenance.js";
+import { normalizePeriodicCompactionProgress, PERIODIC_GROWTH_THRESHOLD_BYTES,
+  type PeriodicCompactionProgress, type PeriodicExecutionAdmission } from "./periodic-maintenance-state.js";
+
+type DashboardMaintenanceState = StorageMaintenanceState & Partial<{
+  layoutCycle: LayoutCycle; layoutAdmission: LayoutAdmission;
+  periodicCompaction: PeriodicCompactionProgress; periodicAdmission: PeriodicExecutionAdmission;
+}>;
 
 export interface Failures24hMetric {
   count: number | null;
@@ -31,16 +41,25 @@ export interface AutomaticCompactionMetric {
   enabled: boolean | null;
   state: "enabled" | "paused" | "requires_migration" | "unsupported_mode" | "unknown";
   autoVacuumMode: 0 | 1 | 2 | null;
+  source?: "admitted_physical_v1";
+  baselineBytes?: number;
+  baselineAt?: string;
+  growthThresholdBytes?: number;
+  triggerBytes?: number;
+  recoveryRequired?: boolean;
+  disposition?: string | null;
 }
 
 export interface DashboardOperationalMetrics {
   asOf: string;
   failures24h: Failures24hMetric;
   graphStorage: GraphStorageMetric;
+  dataDirectoryStorage?: DataDirectoryStorageMetric;
   engineMemory: EngineMemoryMetric;
   lastSuccessfulCompactionAt: string | null;
   automaticCompaction: AutomaticCompactionMetric;
-  maintenance?: { state: "unavailable" | "dependency_failure" | "deferred" | "no_progress" | "progress"; reason: string; physicalBytesReclaimed: number | null };
+  maintenance?: { state: "unavailable" | "dependency_failure" | "deferred" | "pending" | "no_progress" | "progress"; reason: string; physicalBytesReclaimed: number | null; historicalErrorCode?: string | null };
+  workflowStatistics?: DashboardWorkflowStatistics[] | null;
   workflows?: ReturnType<typeof buildWorkflowStatus>;
 }
 
@@ -51,6 +70,7 @@ export interface WorkflowStatusInputs {
   nativeAvailable: boolean;
   slotsAvailable?: boolean;
   activity: DashboardActivity | null;
+  statistics?: DashboardWorkflowStatistics[] | null;
   configured: Record<"graph" | "consolidation" | "compression" | "reflection" | "snapshots" | "maintenance", boolean>;
 }
 
@@ -67,10 +87,12 @@ export function buildWorkflowStatus(input: WorkflowStatusInputs) {
   ];
   return {
     backgroundRecoveryPaused: input.backgroundRecoveryPaused,
-    evidenceCoverage: "Last 30 recorded operations; absence does not prove a workflow has never run.",
+    evidenceCoverage: "Durable logical workflow executions; counters declare coverage and queues use current native state.",
     items: definitions.map(definition => {
-      const observed = input.activity?.items.slice(0, 30).find(item => definition.functions.includes(item.functionId)
-        && (item.outcome === "completed" || item.outcome === "failed" || item.outcome === "partial"));
+      const statistics = input.statistics?.find(item => item.workflow === definition.key);
+      const observed = statistics?.lastRun ?? null;
+      const attempt = statistics?.invocationHistory?.lastAttempt;
+      const latest = attempt && (!observed || Date.parse(attempt.occurredAt) >= Date.parse(observed.occurredAt)) ? attempt : observed;
       let state: "enabled" | "paused" | "disabled" | "unavailable" | "dependency_failure" | "failed" = "enabled";
       let reason = "eligible_execution_not_proven";
       if (!definition.enabled) { state = "disabled"; reason = "configuration_disabled"; }
@@ -79,11 +101,12 @@ export function buildWorkflowStatus(input: WorkflowStatusInputs) {
       else if (definition.provider && input.providerCircuitOpen) { state = "dependency_failure"; reason = "provider_circuit_open"; }
       else if (definition.key === "reflection" && input.slotsAvailable === false) { state = "dependency_failure"; reason = "slots_disabled"; }
       else if (["graph", "maintenance"].includes(definition.key) && !input.nativeAvailable) { state = "dependency_failure"; reason = "native_state_unavailable"; }
-      else if (observed?.outcome === "failed") { state = "failed"; reason = "last_observed_execution_failed"; }
-      else if (!input.activity) { state = "unavailable"; reason = "execution_evidence_unavailable"; }
+      else if (latest?.outcome === "failed") { state = "failed"; reason = latest === attempt ? "last_observed_invocation_failed" : "last_observed_execution_failed"; }
+      else if (!statistics) { state = "unavailable"; reason = "execution_evidence_unavailable"; }
       return {
         key: definition.key, label: definition.label, configured: definition.enabled, state, reason,
-        lastObservedAt: observed?.timestamp ?? null, lastOutcome: observed?.outcome ?? null,
+        lastObservedAt: latest?.occurredAt ?? null, lastOutcome: latest?.outcome ?? null,
+        statistics: statistics ?? null,
       };
     }),
   };
@@ -171,11 +194,40 @@ function lastSuccessfulCompactionAt(state: StorageMaintenanceState | null): stri
   return null;
 }
 
-function maintenanceMetric(value: unknown): NonNullable<DashboardOperationalMetrics["maintenance"]> {
+function maintenanceMetric(value: DashboardMaintenanceState | null): NonNullable<DashboardOperationalMetrics["maintenance"]> {
   if (!isRecord(value) || value.version !== 1 || !isRecord(value.compaction)) {
     return { state: "unavailable", reason: "maintenance_state_unavailable", physicalBytesReclaimed: null };
   }
   const progress = value.compaction;
+  if (automaticCompactionMetric(value, false).source === "admitted_physical_v1") {
+    const cycle = normalizeLayoutCycle(value.layoutCycle);
+    const periodic = normalizePeriodicCompactionProgress(value.periodicCompaction);
+    const historicalErrorCode = typeof progress.lastErrorCode === "string" && /^STATE_[A-Z0-9_]+$/.test(progress.lastErrorCode)
+      ? progress.lastErrorCode : null;
+    if (cycle.recoveryRequired || periodic.recoveryRequired || periodic.lastErrorCode)
+      return { state: "dependency_failure", reason: "storage_error", physicalBytesReclaimed: null, historicalErrorCode };
+    if (cycle.pending && cycle.disposition === "exact_receipt_pending")
+      return { state: "pending", reason: "layout_receipt_pending", physicalBytesReclaimed: null, historicalErrorCode };
+    if (cycle.active || cycle.pending !== null || periodic.pendingRequest !== null)
+      return { state: "pending", reason: "maintenance_in_progress", physicalBytesReclaimed: null, historicalErrorCode };
+    const currentReclaim = value.lastReclaim;
+    if (currentReclaim && validIso(currentReclaim.at) && periodic.growthBaseline
+      && Date.parse(currentReclaim.at) >= Date.parse(periodic.growthBaseline.sampledAt)
+      && safeCount(currentReclaim.physicalBytesReclaimed)) {
+      if (currentReclaim.status === "migration_required")
+        return { state: "dependency_failure", reason: "migration_required", physicalBytesReclaimed: currentReclaim.physicalBytesReclaimed, historicalErrorCode };
+      if (currentReclaim.status === "deferred")
+        return { state: "deferred", reason: currentReclaim.reason === "foreground_pressure" ? "foreground_pressure" : "maintenance_deferred",
+          physicalBytesReclaimed: currentReclaim.physicalBytesReclaimed, historicalErrorCode };
+      const bytes = currentReclaim.physicalBytesReclaimed;
+      return { state: bytes > 0 ? "progress" : "no_progress",
+        reason: bytes > 0 ? "physical_bytes_reclaimed" : "no_physical_reduction", physicalBytesReclaimed: bytes, historicalErrorCode };
+    }
+    if (cycle.disposition === "growth_below_threshold" || periodic.lastDisposition === "growth_below_threshold"
+      || periodic.lastDisposition === "main_post_compact_baseline")
+      return { state: "deferred", reason: "growth_below_threshold", physicalBytesReclaimed: null, historicalErrorCode };
+    return { state: "unavailable", reason: "current_maintenance_measurement_unavailable", physicalBytesReclaimed: null, historicalErrorCode };
+  }
   const last = isRecord(value.lastReclaim) ? value.lastReclaim : null;
   const bytes = safeCount(last?.physicalBytesReclaimed) ? last.physicalBytesReclaimed : null;
   if (progress.lastErrorCode) return { state: "dependency_failure", reason: "storage_error", physicalBytesReclaimed: bytes };
@@ -187,11 +239,27 @@ function maintenanceMetric(value: unknown): NonNullable<DashboardOperationalMetr
 }
 
 function automaticCompactionMetric(
-  state: StorageMaintenanceState | null,
+  state: DashboardMaintenanceState | null,
   automaticMaintenancePaused: boolean,
 ): AutomaticCompactionMetric {
   const mode = state?.diagnostics?.lastComplete?.physical?.auto_vacuum;
   const autoVacuumMode = mode === 0 || mode === 1 || mode === 2 ? mode : null;
+  if (state && isLayoutAdmissionAccepted(state.layoutAdmission) && state.periodicAdmission
+    && isPeriodicAdmissionReady(state.periodicAdmission) && state.periodicAdmission.runtimeCompatible === true) {
+    const cycle = normalizeLayoutCycle(state.layoutCycle);
+    const periodic = normalizePeriodicCompactionProgress(state.periodicCompaction);
+    const baseline = periodic.growthBaseline;
+    if (baseline?.coverage === "physical_sqlite_db_wal_v1" && cycle.baseline?.coverage === baseline.coverage
+      && cycle.baseline.observedBytes === baseline.observedBytes && cycle.baseline.sampledAt === baseline.sampledAt) {
+      const recoveryRequired = cycle.recoveryRequired || periodic.recoveryRequired;
+      return { enabled: !automaticMaintenancePaused && !recoveryRequired,
+        state: automaticMaintenancePaused ? "paused" : recoveryRequired ? "unknown" : "enabled",
+        autoVacuumMode: null, source: "admitted_physical_v1", baselineBytes: baseline.observedBytes,
+        baselineAt: baseline.sampledAt, growthThresholdBytes: PERIODIC_GROWTH_THRESHOLD_BYTES,
+        triggerBytes: baseline.observedBytes + PERIODIC_GROWTH_THRESHOLD_BYTES,
+        recoveryRequired, disposition: periodic.lastDisposition ?? cycle.disposition };
+    }
+  }
   if (automaticMaintenancePaused) return { enabled: false, state: "paused", autoVacuumMode };
   if (mode === 2) return { enabled: true, state: "enabled", autoVacuumMode };
   if (mode === 0) return { enabled: false, state: "requires_migration", autoVacuumMode };
@@ -204,14 +272,15 @@ export function createDashboardOperationalMetrics(
   readEngineMemory: () => Promise<EngineMemoryMetric>,
 ) {
   return {
-    async read(now: Date, automaticMaintenancePaused: boolean, agentId?: string): Promise<DashboardOperationalMetrics> {
+    async read(now: Date, automaticMaintenancePaused: boolean, agentId?: string, workflowAgentId: string | null = agentId ?? null): Promise<DashboardOperationalMetrics> {
       const asOfMs = Math.floor(now.getTime() / MINUTE_MS) * MINUTE_MS;
       const counterRecordKey = counterKey(agentId);
-      const [counterRead, maintenance, engineMemory, graphMetadata] = await Promise.all([
+      const [counterRead, maintenance, engineMemory, graphMetadata, workflowRead] = await Promise.all([
         readOrInitializeFailureCounter(kv, counterRecordKey, now.getTime()),
-        kv.get<StorageMaintenanceState>(KV.storageMaintenance, "current").catch(() => null),
+        kv.get<DashboardMaintenanceState>(KV.storageMaintenance, "current").catch(() => null),
         readEngineMemory().catch(() => ({ residentBytes: null, sampledAt: null, source: "unavailable", reason: "probe_failed" } as const)),
         kv.graphStorageMetadata().catch(() => null),
+        readWorkflowStatistics(kv, workflowAgentId ?? undefined).catch(() => null),
       ]);
       const failures = counterWriteFailures.has(kv)
         ? {
@@ -229,7 +298,9 @@ export function createDashboardOperationalMetrics(
       return {
         asOf: new Date(asOfMs).toISOString(),
         failures24h: failures,
+        workflowStatistics: workflowRead?.workflows ?? null,
         graphStorage: graphStorageMetric(graphMetadata),
+        dataDirectoryStorage: readDataDirectoryStorage(),
         engineMemory,
         lastSuccessfulCompactionAt: lastSuccessfulCompactionAt(maintenance),
         automaticCompaction: automaticCompactionMetric(maintenance, automaticMaintenancePaused),

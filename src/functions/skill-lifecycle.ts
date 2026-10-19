@@ -1,6 +1,7 @@
+import { observeWorkflowTerminal, markWorkflowStatisticsGap } from "./dashboard-activity.js";
 import type { IIIClient } from "iii-sdk";
-import type { CompressedObservation, Session, SessionSummary } from "../types.js";
-import { detectLlmProviderKind, isBackgroundRecoveryPaused, isConsolidationEnabled } from "../config.js";
+import type { CompressedObservation, Session, SessionSummary, WorkflowTerminalReceipt } from "../types.js";
+import { detectLlmProviderKind, isBackgroundRecoveryPaused, isConsolidationEnabled, getAgentId } from "../config.js";
 import { KV, fingerprintId, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { StatePageError } from "../state/state-pages.js";
@@ -37,6 +38,7 @@ export interface SkillLifecycleSession {
 }
 
 export interface SkillLifecycleIntent {
+  workflowTerminal?: WorkflowTerminalReceipt;
   kind: "intent";
   admission?: "selected";
   project?: string;
@@ -221,11 +223,23 @@ function lifecycleSkipReason(session: SkillLifecycleSession): string | undefined
 
 async function readIntent(kv: StateKV, id: string): Promise<SkillLifecycleIntent | null> {
   const intent = await kv.get<SkillLifecycleIntent>(KV.skillLifecycleIntents, id);
-  return intent?.kind === "intent" && intent.id === id ? intent : null;
+  if (intent?.kind !== "intent" || intent.id !== id) return null;
+  if (intent.status === "completed" || intent.status === "failed") {
+    if (!intent.workflowTerminal || intent.workflowTerminal.outcome !== intent.status) await markWorkflowStatisticsGap(kv, "skills");
+    else await observeWorkflowTerminal(kv, { ...intent.workflowTerminal, workflow: "skills", producer: "skill-lifecycle", executionLevel: "workflow" });
+  }
+  return intent;
 }
 
 async function writeIntent(kv: StateKV, intent: SkillLifecycleIntent): Promise<void> {
+  if (intent.status === "completed" || intent.status === "failed") {
+    intent.workflowTerminal ??= { executionId: intent.id, agentId: getAgentId(), occurredAt: intent.updatedAt, outcome: intent.status };
+  }
   await kv.set(KV.skillLifecycleIntents, intent.id, intent);
+  if (intent.workflowTerminal) {
+    if (intent.status !== intent.workflowTerminal.outcome) await markWorkflowStatisticsGap(kv, "skills");
+    else await observeWorkflowTerminal(kv, { ...intent.workflowTerminal, workflow: "skills", producer: "skill-lifecycle", executionLevel: "workflow" });
+  }
 }
 
 async function markTerminal(

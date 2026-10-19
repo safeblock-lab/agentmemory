@@ -1,3 +1,6 @@
+import { observeWorkflowTerminal, markWorkflowStatisticsGap } from "./dashboard-activity.js";
+import { getAgentId } from "../config.js";
+import type { WorkflowTerminalReceipt } from "../types.js";
 import type { StateKV } from "../state/kv.js";
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
@@ -48,6 +51,7 @@ export interface CandidatePage {
   id: string; candidates: PagedCandidate[]; examined: number; rejected: number;
 }
 export interface PagedConsolidation {
+  workflowTerminal?: WorkflowTerminalReceipt;
   schema: 2; id: string; kind: "semantic" | "procedural" | "memory"; project: string;
   refs: PagedSource[]; createdAt: string; deferred: boolean;
   phase: "legacy" | "capture" | "quality" | "extract" | "reduce" | "verify" | "aggregate" | "publish" | "completed" | "retained";
@@ -91,12 +95,23 @@ export async function immutablePage<T>(kv: StateKV, key: string, value: T): Prom
   await kv.set(KV.state, key, value);
 }
 export async function saveRoot(kv: StateKV, root: PagedConsolidation): Promise<void> {
+  if (root.kind === "memory" && root.phase === "completed" && root.result?.skipped !== true) {
+    root.workflowTerminal ??= { executionId: root.id, agentId: getAgentId(), occurredAt: new Date().toISOString(),
+      outcome: root.result?.partial === true ? "partial" : "completed" };
+  }
   boundedBytes(root);
   await kv.set(KV.state, pageKey(root.id, "root", 0), root);
+  if (root.workflowTerminal) await observeWorkflowTerminal(kv, { ...root.workflowTerminal,
+    workflow: "consolidation", producer: "consolidate-memory", executionLevel: "workflow" });
 }
 export async function loadRoot(kv: StateKV, id: string): Promise<PagedConsolidation | null> {
   const root = await kv.get<PagedConsolidation>(KV.state, pageKey(id, "root", 0));
   if (root) {
+    if (root.kind === "memory" && root.phase === "completed" && root.result?.skipped !== true) {
+      if (root.workflowTerminal) await observeWorkflowTerminal(kv, { ...root.workflowTerminal,
+        workflow: "consolidation", producer: "consolidate-memory", executionLevel: "workflow" });
+      else await markWorkflowStatisticsGap(kv, "consolidation");
+    }
     boundedBytes(root);
     if (root.schema !== 2 || root.id !== id || !Array.isArray(root.refs) || root.refs.length > 12) throw new Error("consolidation_root_identity_invalid");
   }

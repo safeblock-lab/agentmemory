@@ -20,6 +20,7 @@ const hookEntries = [
 const shared = {
   format: ["esm"] as const,
   target: "node20" as const,
+  dts: false,
   // Keep these as node_modules imports (deps.neverBundle). We never import
   // onnxruntime-{node,web} or sharp directly; they come in transitively
   // through @huggingface/transformers, which is lazy-loaded from
@@ -37,7 +38,7 @@ const shared = {
     ],
   },
   // Each entry is its own build, so the per-entry dts/deps timing notice
-  // fires ~30 times and drowns the real output. It is informational only.
+  // fires per build and drowns the real output. It is informational only.
   inputOptions: {
     checks: { pluginTimings: false },
   },
@@ -79,13 +80,6 @@ export default defineConfig([
   ...hookEntries.map((entry) => ({
     entry: [entry],
     outDir: "dist/hooks",
-    ...shared,
-    clean: false,
-    sourcemap: false,
-  })),
-  ...hookEntries.map((entry) => ({
-    entry: [entry],
-    outDir: "plugin/scripts",
     ...shared,
     clean: false,
     sourcemap: false,

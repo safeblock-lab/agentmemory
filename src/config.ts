@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 import pc from "picocolors";
 import { summaryCallInputLimit } from "./functions/summary-budget.js";
@@ -17,7 +17,14 @@ import type {
   LlmTask,
   OpenAIReasoningEffort,
   SummaryBudgetConfig,
+  OpenAIHttpProfile,
 } from "./types.js";
+
+export function parseOpenAIHttpProfile(value: string | undefined): OpenAIHttpProfile {
+  if (value === undefined) return "legacy-native";
+  if (value === "legacy-native" || value === "validated-json-text") return value;
+  throw new Error("Invalid OpenAI HTTP profile");
+}
 
 function safeParseInt(value: string | undefined, fallback: number): number {
   if (!value) return fallback;
@@ -26,6 +33,9 @@ function safeParseInt(value: string | undefined, fallback: number): number {
 }
 
 const DATA_DIR = join(homedir(), ".agentmemory");
+export function getGraphAutomaticStateDirectory(): string {
+  return resolve(getEnvVar("AGENTMEMORY_DATA_DIR") ?? join(process.cwd(), "data"));
+}
 const ENV_FILE = join(DATA_DIR, ".env");
 const OPENROUTER_KEYS_FILE = join(DATA_DIR, "openrouter-keys.json");
 
@@ -276,6 +286,7 @@ function parseKeepAlive(raw: string | undefined): string | undefined {
 }
 
 function parseAuxiliaryLlmConfig(env: EnvSource): AuxiliaryLlmConfigResult {
+  const httpProfile = parseOpenAIHttpProfile(env["AGENTMEMORY_AUX_LLM_HTTP_PROFILE"]);
   const warnings: string[] = [];
   const auxKeys = [
     "AGENTMEMORY_AUX_LLM_PROVIDER",
@@ -304,6 +315,9 @@ function parseAuxiliaryLlmConfig(env: EnvSource): AuxiliaryLlmConfigResult {
 
   const providerRaw = env["AGENTMEMORY_AUX_LLM_PROVIDER"]?.trim().toLowerCase();
   const provider = providerRaw || (isLocalOllamaBaseUrl(baseURL) ? "ollama" : "openai");
+  if (provider === "ollama" && httpProfile !== "legacy-native") {
+    throw new Error("OpenAI HTTP profile requires an OpenAI-compatible provider");
+  }
   if (provider !== "openai" && provider !== "ollama") {
     warnings.push("AGENTMEMORY_AUX_LLM_PROVIDER must be openai or ollama; auxiliary configuration ignored.");
     return { warnings };
@@ -374,6 +388,7 @@ function parseAuxiliaryLlmConfig(env: EnvSource): AuxiliaryLlmConfigResult {
     config: {
       provider,
       baseURL,
+      httpProfile,
       apiKey: env["AGENTMEMORY_AUX_LLM_API_KEY"]?.trim() || "",
       model,
       timeoutMs,
@@ -638,6 +653,7 @@ function detectProvider(env: Record<string, string>): ProviderConfig {
     return {
       provider: "openai",
       model: env["OPENAI_MODEL"] || "gpt-5.6-luna",
+      httpProfile: parseOpenAIHttpProfile(env["OPENAI_HTTP_PROFILE"]),
       maxTokens,
       baseURL: env["OPENAI_BASE_URL"],
     };

@@ -16,11 +16,11 @@ export interface ConsolidationStatusInput {
   now: Date;
   enabled: boolean;
   llmConfigured: boolean;
-  summaries: number;
-  recurringPatterns: number;
-  semanticFacts: number;
-  procedures: number;
-  relations: number;
+  summaries: number | null;
+  recurringPatterns: number | null;
+  semanticFacts: number | null;
+  procedures: number | null;
+  relations: number | null;
   lastRun: ConsolidationRunRecord | null;
 }
 
@@ -28,7 +28,7 @@ export interface ConsolidationTier {
   id: "semantic" | "procedural" | "relations";
   label: string;
   from: string;
-  count: number;
+  count: number | null;
   state: TierState;
   detail: string;
 }
@@ -52,7 +52,7 @@ function ago(now: Date, iso: string): string {
 }
 
 function fromLastRun(
-  input: ConsolidationStatusInput,
+  input: Pick<ConsolidationStatusInput, "now" | "lastRun">,
   tier: "semantic" | "procedural",
 ): { state: TierState; detail: string } | null {
   const result = input.lastRun?.results?.[tier];
@@ -73,7 +73,7 @@ export function describeConsolidation(input: ConsolidationStatusInput): Consolid
     ? "Off: add an LLM provider key to ~/.agentmemory/.env and restart; consolidation turns on with it."
     : "Off: CONSOLIDATION_ENABLED is set to false; remove it or set it to true and restart.";
 
-  const semanticWaiting = input.summaries < SEMANTIC_MIN_SUMMARIES;
+  const semanticWaiting = input.summaries === null || input.summaries < SEMANTIC_MIN_SUMMARIES;
   const semantic: ConsolidationTier = {
     id: "semantic",
     label: "Semantic facts",
@@ -90,7 +90,7 @@ export function describeConsolidation(input: ConsolidationStatusInput): Consolid
           : { state: "ready", detail: "Ready: runs when the next session ends." }))
   };
 
-  const proceduralWaiting = input.recurringPatterns < PROCEDURAL_MIN_PATTERNS;
+  const proceduralWaiting = input.recurringPatterns === null || input.recurringPatterns < PROCEDURAL_MIN_PATTERNS;
   const procedural: ConsolidationTier = {
     id: "procedural",
     label: "Procedures",
@@ -115,17 +115,39 @@ export function describeConsolidation(input: ConsolidationStatusInput): Consolid
     label: "Relations",
     from: "Links between memories (supersedes, extends, contradicts)",
     count: input.relations,
-    state: input.relations > 0 ? "ran" : "waiting",
+    state: (input.relations !== null && input.relations > 0) ? "ran" : "waiting",
     detail:
-      input.relations > 0
+      (input.relations !== null && input.relations > 0)
         ? `${input.relations} links saved.`
         : "None yet: links are saved when a memory updates or relates to another.",
   };
 
+  if (!off && input.summaries === null && !fromLastRun(input, "semantic")) semantic.detail = "Summary count is unavailable; readiness is not inferred.";
+  if (!off && input.recurringPatterns === null && !fromLastRun(input, "procedural")) procedural.detail = "Recurring-pattern count is unavailable; readiness is not inferred.";
+  if (input.relations === null) relations.detail = "Relation count is unavailable.";
   return {
     enabled: input.enabled,
     llmConfigured: input.llmConfigured,
     lastRunAt: input.lastRun?.at ?? null,
     tiers: [semantic, procedural, relations],
+  };
+}
+
+export function describeConsolidationPreview(input: Pick<ConsolidationStatusInput, "now" | "enabled" | "llmConfigured" | "lastRun">): ConsolidationStatus {
+  const off = !input.enabled || !input.llmConfigured;
+  const definitions = [
+    { id: "semantic" as const, label: "Semantic facts", from: "Durable facts distilled from session summaries" },
+    { id: "procedural" as const, label: "Procedures", from: "Repeatable workflows from finished sessions and recurring patterns" },
+    { id: "relations" as const, label: "Relations", from: "Links between memories (supersedes, extends, contradicts)" },
+  ];
+  return {
+    enabled: input.enabled, llmConfigured: input.llmConfigured, lastRunAt: input.lastRun?.at ?? null,
+    tiers: definitions.map(definition => {
+      const observed = definition.id === "relations" ? null : fromLastRun(input, definition.id);
+      return { ...definition, count: null,
+        ...(definition.id !== "relations" && off
+          ? { state: "off" as const, detail: !input.llmConfigured ? "LLM provider unavailable." : "Consolidation is disabled." }
+          : observed ?? { state: "waiting" as const, detail: "Global counts are not loaded in the bounded dashboard preview." }) };
+    }),
   };
 }

@@ -160,6 +160,36 @@ export class GraphJobStorage {
     return (await this.kv.getVersioned<T>(scope, key, this.guard)).value;
   }
 
+  beginDelta(delta: GraphDeltaPreparation): Promise<void> {
+    const run = this.serial.then(async () => {
+      this.assertLease();
+      const scope = KV.graphDeltas(this.jobId), key = `manifest:${delta.ordinal}`;
+      const manifest = await this.kv.getVersioned(scope, key, this.guard);
+      const job = await this.kv.getVersioned<Record<string, StateJsonValue>>(KV.graphJobs, this.jobId, this.guard);
+      if (!job.exists || !job.value || job.value.id !== this.jobId || job.value.generation !== this.guard.generation)
+        throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
+      const operations: StateCommitOperation[] = [];
+      const count = job.value.logicalDeltaCount;
+      if (count !== undefined && (!Number.isSafeInteger(count) || Number(count) < delta.ordinal))
+        throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
+      if (count === delta.ordinal) {
+        const previous = await this.kv.getVersioned<StateGraphCheckpoint>(KV.graphCheckpoints, this.jobId, this.guard);
+        if (job.value.state !== "staging" || delta.phase !== "preparing" || manifest.exists
+          || !previous.value || previous.value.visibility !== "complete"
+          || previous.value.generation !== this.guard.generation || previous.value.job_id !== this.jobId
+          || previous.value.delta_ordinal + 1 !== delta.ordinal || previous.version !== this.checkpointVersion)
+          throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
+        // Admit the next delta and its count together; failed commits advance neither.
+        operations.push({ type: "set", scope: KV.graphJobs, key: this.jobId, expected_version: job.version,
+          value: graphJson({ ...job.value, logicalDeltaCount: delta.ordinal + 1 }) });
+      }
+      operations.push({ type: "set", scope, key, expected_version: manifest.version, value: graphJson(delta) });
+      await this.commit(this.prepared(operations, delta, "staging"));
+    });
+    this.serial = run.catch(() => undefined);
+    return run;
+  }
+
   private shadowKey(delta: GraphDeltaPreparation, scope: string, key: string): string {
     return `row:${delta.ordinal}:${delta.attempt}:${encodeKey([scope, key])}`;
   }
@@ -196,6 +226,13 @@ export class GraphJobStorage {
   discardPendingShadows(): void {
     this.shadowBuffer.clear();
     this.shadowBufferBytes = 0;
+  }
+
+  async drainForNativeRecovery(): Promise<void> {
+    await this.accessSerial;
+    await this.serial;
+    this.assertLease();
+    this.discardPendingShadows();
   }
 
   private async flushShadows(delta: GraphDeltaPreparation): Promise<void> {
@@ -362,7 +399,19 @@ export class GraphJobStorage {
       if (graphRecordDigest(payload_json) !== reference.digest) throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
       const prepared: StatePreparedBatch = { payload_json, payload_digest: reference.digest };
       const expected = delta.applyOrdinal + ordinal;
-      if (this.checkpoint?.logical_delta_id === delta.id && this.checkpoint.next_chunk_ordinal > expected) continue;
+      if (this.checkpoint?.logical_delta_id === delta.id && this.checkpoint.next_chunk_ordinal > expected) {
+        const body = JSON.parse(payload_json) as { identity: { generation: string; job_id: string; logical_delta_id: string; chunk_ordinal: number } };
+        const identity = body.identity;
+        const receipt = await this.get<{ identity: typeof identity; payload_digest: string; checkpoint_version: StateCounter }>(
+          KV.graphReceipts, JSON.stringify([identity.generation, identity.job_id, identity.logical_delta_id, identity.chunk_ordinal]));
+        if (!receipt || receipt.payload_digest !== prepared.payload_digest
+          || (["generation", "job_id", "logical_delta_id", "chunk_ordinal"] as const).some(key => receipt.identity?.[key] !== identity[key])) {
+          throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
+        }
+        if (ordinal === delta.templateCount - 1 && this.checkpoint.visibility !== "complete"
+          || BigInt(receipt.checkpoint_version) > BigInt(this.checkpointVersion)) throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
+        continue;
+      }
       const startedAt = Date.now();
       await this.commit(prepared);
       const elapsedMs = Date.now() - startedAt;

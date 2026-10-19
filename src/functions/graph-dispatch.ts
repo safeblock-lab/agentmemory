@@ -9,7 +9,12 @@ import { StateTransactionError } from "../state/state-transactions.js";
 import { StatePageError } from "../state/state-pages.js";
 import { isBackgroundRecoveryPaused } from "../config.js";
 import { graphRecordDigest } from "./graph-job-storage.js";
-import { graphDispatchBlocker, graphResult, withLocalGraphRecovery, withSelectedGraphOrigin } from "./graph-jobs.js";
+import { graphDispatchBlocker, graphFailureDiagnostic, graphResult, recoverGraphStoppedTerminal, withGraphAutomaticRegeneration, withLocalGraphRecovery, withSelectedGraphOrigin, GraphTerminalLocalDeliveryStopped } from "./graph-jobs.js";
+import { graphAutomaticRecoveryView } from "./graph-automatic-workflow.js";
+import { logger } from "../logger.js";
+import { readGraphTerminalRecovery, type GraphTerminalRecoveryLink } from "./graph-automatic-terminal.js";
+import { GRAPH_AUTOMATIC_ADOPTION_REVISION } from "../state/graph-automatic-recovery.js";
+import type { GraphAutomaticRecoveryView } from "./graph-automatic-workflow.js";
 import { readGraphSessionCapture } from "./graph-session-capture.js";
 
 export interface GraphDispatchRequest {
@@ -44,10 +49,12 @@ export async function validateSelectedGraphSources(kv: StateKV, selected: Select
   }
 }
 export interface GraphDispatchIntent {
+  automaticTerminalLink?: GraphTerminalRecoveryLink;
   version: 1; id: string; jobId: string; digest: string; captureParts: number;
   createdAt: string; updatedAt: string; state: "pending" | "completed" | "failed";
   attempts: number; retryAfter?: string; blockingJobId?: string;
   deliveryId?: string; claimedAt?: string; providerRequired?: boolean; sourceRequired?: boolean; failureCode?: string;
+  claimUntil?: string;
   groupedWorkProgress?: { workUnits: number; nodesAdded: number; edgesAdded: number };
   executionOrigin?: "selected";
 }
@@ -104,24 +111,78 @@ function groupedContinuation(value: unknown): { workUnits: number; nodesAdded: n
   return { workUnits: progress.workUnits as number, nodesAdded: progress.nodesAdded as number, edgesAdded: progress.edgesAdded as number };
 }
 
-export function registerGraphDispatch(sdk: IIIClient, kv: StateKV, execute: Execute): (request: GraphDispatchRequest) => Promise<unknown> {
+export function registerGraphDispatch(sdk: IIIClient, kv: StateKV, execute: Execute): (request: GraphDispatchRequest, terminalLink?: GraphTerminalRecoveryLink) => Promise<unknown> {
   const lock = <T>(id: string, run: () => Promise<T>) => withKeyedLock(`graph-dispatch:${id}`, run);
   const read = (id: string) => kv.get<GraphDispatchIntent>(KV.graphDispatchIntents, id);
   const write = (intent: GraphDispatchIntent) => kv.set(KV.graphDispatchIntents, intent.id, intent);
+  async function terminalSnapshot(link: GraphTerminalRecoveryLink) {
+    const native = await kv.graphAutomaticRecovery({ command: "status", slot_id: link.slotId });
+    if (native.anchor.job_id !== link.sourceJobId || native.new_job_id !== link.jobId || native.regeneration_id !== link.regenerationId) {
+      throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
+    }
+    if (link.adoption && (native.adoption_revision !== link.adoption.revision
+      || native.reservation?.epoch !== link.adoption.epoch || link.adoption.regenerationId !== link.regenerationId))
+      throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
+    return native;
+  }
 
   async function reconcile(intent: GraphDispatchIntent): Promise<unknown | undefined> {
-    const job = await kv.get<{ state: string; recoveryStopped?: boolean; failureCode?: string; continuationState?: { version?: unknown }; captureDigest?: string; result?: Parameters<typeof graphResult>[0] }>(KV.graphJobs, intent.jobId);
+    let job = await kv.get<{ state: string; recoveryStopped?: boolean; failureCode?: string; continuationState?: { version?: unknown }; captureDigest?: string; result?: Parameters<typeof graphResult>[0]; automaticRecovery?: GraphAutomaticRecoveryView }>(KV.graphJobs, intent.jobId);
+    if (!job && intent.automaticTerminalLink) {
+      const current = graphAutomaticRecoveryView(await terminalSnapshot(intent.automaticTerminalLink));
+      if (current.action === "none") {
+        if (intent.state === "pending") await write({ ...intent, state: "failed", failureCode: current.reason ?? "GRAPH_AUTOMATIC_TERMINAL", updatedAt: new Date().toISOString() });
+        return { success: false, failed: true, stopped: true, jobId: intent.jobId, automaticRecovery: current };
+      }
+    }
+    if (job?.state === "failed" && job.recoveryStopped === true && !job.automaticRecovery?.replacementJobId) {
+      if (job.captureDigest !== intent.digest) throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
+      const terminal = await recoverGraphStoppedTerminal(kv, intent.jobId);
+      if (terminal) {
+        if (intent.state === "pending") await write({ ...intent, state: "failed", updatedAt: new Date().toISOString() });
+        if (terminal.link) {
+          const linked = await kv.get<typeof job>(KV.graphJobs, terminal.link.jobId);
+          if (linked?.state === "completed") return { ...graphResult<Record<string, unknown>>(linked.result),
+            automaticTerminalRecovery: { ...terminal.outcome, action: "none", nextCheckAt: null } };
+          if (terminal.outcome.action === "none" && !linked) return { success: false, failed: true, stopped: true,
+            jobId: intent.jobId, automaticRecovery: terminal.recovery, automaticTerminalRecovery: terminal.outcome };
+          if (linked?.state === "failed" && linked.recoveryStopped) return { success: false, failed: true, stopped: true,
+            jobId: terminal.link.jobId, automaticRecovery: linked.automaticRecovery ?? terminal.recovery,
+            automaticTerminalRecovery: { ...terminal.outcome, resolution: "terminal", action: "none", nextCheckAt: null,
+              reason: linked.automaticRecovery?.reason ?? linked.failureCode ?? terminal.outcome.reason }, failureCode: linked.failureCode };
+          const childRecovery = linked?.automaticRecovery;
+          return { success: true, queued: true, deferred: true, jobId: terminal.link.jobId,
+            ...(childRecovery || terminal.recovery ? { automaticRecovery: childRecovery ?? terminal.recovery } : {}),
+            automaticTerminalRecovery: childRecovery ? { ...terminal.outcome, action: childRecovery.action === "none" ? "continue" : childRecovery.action,
+              nextCheckAt: childRecovery.nextCheckAt } : terminal.outcome };
+        }
+        return { success: false, stopped: terminal.outcome.action === "none", queued: terminal.outcome.action !== "none",
+          jobId: intent.jobId, ...(terminal.recovery ? { automaticRecovery: terminal.recovery } : {}), automaticTerminalRecovery: terminal.outcome };
+      }
+    }
+    if (job?.automaticRecovery?.replacementJobId) {
+      if (job.captureDigest !== intent.digest) throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
+      const replacement = await kv.get<typeof job>(KV.graphJobs, job.automaticRecovery.replacementJobId);
+      if (!replacement || replacement.state !== "completed" && !(replacement.state === "failed" && replacement.recoveryStopped === true)) return queued(intent, {
+        jobId: job.automaticRecovery.replacementJobId,
+        ...(replacement?.automaticRecovery ? { automaticRecovery: replacement.automaticRecovery } : {}),
+      });
+      job = { ...replacement, captureDigest: intent.digest };
+    }
     const terminalFailure = job?.state === "failed" && job.recoveryStopped === true;
     if (!job || job.state !== "completed" && !terminalFailure) return undefined;
     if (job.captureDigest !== intent.digest) throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
-    await write({ ...intent, state: terminalFailure ? "failed" : "completed", updatedAt: new Date().toISOString() });
+    if (intent.state === "pending") await write({ ...intent, state: terminalFailure ? "failed" : "completed", updatedAt: new Date().toISOString() });
     return terminalFailure ? { success: false, failed: true, stopped: true, jobId: intent.jobId,
       failureCode: job.failureCode ?? "STATE_GRAPH_RECOVERY_REQUIRED", ...graphResult<Record<string, unknown>>(job.result) } : graphResult(job.result);
   }
   async function defer(intent: GraphDispatchIntent, details: Partial<GraphDispatchIntent> = {}) {
     const latest = await read(intent.id);
     if (!latest || latest.state !== "pending" || latest.deliveryId !== intent.deliveryId) return queued(intent);
-    const next: GraphDispatchIntent = { ...latest, ...details, deliveryId: undefined, claimedAt: undefined,
+    const next: GraphDispatchIntent = { ...latest, ...details,
+      deliveryId: latest.automaticTerminalLink ? latest.deliveryId : undefined,
+      claimedAt: latest.automaticTerminalLink ? latest.claimedAt : undefined,
+      claimUntil: latest.automaticTerminalLink ? latest.claimUntil : undefined,
       retryAfter: details.retryAfter ?? new Date(Date.now() + Math.min(RETRY_MS * 2 ** Math.min(latest.attempts, 5), 15 * 60_000)).toISOString(),
       updatedAt: new Date().toISOString() };
     await write(next);
@@ -140,13 +201,15 @@ export function registerGraphDispatch(sdk: IIIClient, kv: StateKV, execute: Exec
     if (graphRecordDigest(text) !== intent.digest) throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
     return JSON.parse(text) as GraphDispatchRequest;
   }
-  async function claim(intent: GraphDispatchIntent, localOnly: boolean): Promise<Delivery | null> {
+  async function claim(intent: GraphDispatchIntent, localOnly: boolean, deadline?: number): Promise<Delivery | null> {
     return lock(intent.id, async () => {
       const latest = await read(intent.id);
       if (!latest || latest.state !== "pending" || latest.retryAfter && Date.parse(latest.retryAfter) > Date.now()
-        || latest.claimedAt && Date.parse(latest.claimedAt) + CLAIM_MS > Date.now()) return null;
+        || latest.claimedAt && (latest.claimUntil ? Date.parse(latest.claimUntil) : Date.parse(latest.claimedAt) + CLAIM_MS) > Date.now()) return null;
+      if (deadline !== undefined && deadline <= Date.now()) return null;
       const deliveryId = randomUUID(), now = new Date().toISOString();
-      await write({ ...latest, deliveryId, claimedAt: now, updatedAt: now });
+      const claimUntil = new Date(Math.min(Date.parse(now) + CLAIM_MS, deadline ?? Infinity)).toISOString();
+      await write({ ...latest, deliveryId, claimedAt: now, claimUntil, updatedAt: now });
       return { intentId: latest.id, deliveryId, localOnly };
     });
   }
@@ -168,14 +231,15 @@ export function registerGraphDispatch(sdk: IIIClient, kv: StateKV, execute: Exec
         || data.selected.sourceFingerprint !== intent.digest || data.selected.deliveryId !== data.deliveryId)) throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
       if (data.selected) await selectedRequest(intent, data.selected);
       if (data.selected && intent.state === "pending" && intent.executionOrigin !== "selected") throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
-      if (intent.state !== "pending") return { success: true, completed: intent.state === "completed", failed: intent.state === "failed", jobId: intent.jobId };
       const completed = await reconcile(intent);
       if (completed !== undefined) return completed;
+      if (intent.state !== "pending") return { success: true, completed: intent.state === "completed", failed: intent.state === "failed", jobId: intent.jobId };
       if (!data.selected && isBackgroundRecoveryPaused()) return defer(intent, { failureCode: "GRAPH_RECOVERY_PAUSED" });
       let groupedWork = false;
       try {
         const blocker = await withSelectedGraphOrigin(data.selected, () => graphDispatchBlocker(kv));
-        if (blocker && blocker.id !== intent.jobId) return defer(intent, { blockingJobId: blocker.id,
+        const original = await kv.get<{ automaticRecovery?: { replacementJobId: string | null } }>(KV.graphJobs, intent.jobId);
+        if (blocker && blocker.id !== intent.jobId && blocker.id !== original?.automaticRecovery?.replacementJobId) return defer(intent, { blockingJobId: blocker.id,
           ...(blocker.recoveryAfter ? { retryAfter: blocker.recoveryAfter } : {}) });
         const request = await load(intent);
         if (data.selected) {
@@ -185,8 +249,28 @@ export function registerGraphDispatch(sdk: IIIClient, kv: StateKV, execute: Exec
         groupedWork = request.graphWorkGroupsVersion === 2;
         const active = { ...intent, attempts: intent.attempts + (groupedWork ? 0 : 1), updatedAt: new Date().toISOString() };
         await write(active);
-        const result = await withSelectedGraphOrigin(data.selected, () => withSelectedGraphGeneration(data.selected,
+        const executeRequest = () => withSelectedGraphOrigin(data.selected, () => withSelectedGraphGeneration(data.selected,
           () => withLocalGraphRecovery(data.localOnly, async () => execute(request, active.jobId))));
+        if (intent.automaticTerminalLink) {
+          const link = intent.automaticTerminalLink;
+          const native = await terminalSnapshot(link);
+          const current = graphAutomaticRecoveryView(native);
+          if (current.action === "none") {
+            await write({ ...active, state: "failed", failureCode: current.reason ?? "GRAPH_AUTOMATIC_TERMINAL", updatedAt: new Date().toISOString() });
+            return { success: false, failed: true, stopped: true, jobId: active.jobId, automaticRecovery: current };
+          }
+          if (link.selection) {
+            const source = await kv.get<{ selectedOrigin?: typeof link.selection; automaticSelectedSource?: typeof link.selection; captureDigest?: string }>(KV.graphJobs, link.sourceJobId);
+            if (canonical(source?.selectedOrigin ?? source?.automaticSelectedSource) !== canonical(link.selection)
+              || source?.selectedOrigin && source.captureDigest !== link.selection.sourceFingerprint) {
+              throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
+            }
+          }
+        }
+        const result = intent.automaticTerminalLink
+          ? await withGraphAutomaticRegeneration(intent.automaticTerminalLink.regenerationId, intent.automaticTerminalLink.sourceJobId, executeRequest,
+            intent.automaticTerminalLink.mode === "local_replay" ? intent.automaticTerminalLink.replayRef : undefined, intent.automaticTerminalLink.selection)
+          : await executeRequest();
         const progress = groupedContinuation(result);
         if (progress) {
           const latest = await read(active.id);
@@ -209,6 +293,10 @@ export function registerGraphDispatch(sdk: IIIClient, kv: StateKV, execute: Exec
         if (await reconcile(active) === undefined) await write({ ...active, state: "completed", updatedAt: new Date().toISOString() });
         return result;
       } catch (error) {
+        if (error instanceof GraphTerminalLocalDeliveryStopped) return queued((await read(intent.id)) ?? intent, {
+          localOnly: true, reason: "captured_local_delivery_already_materialized",
+        });
+        logger.warn("Graph dispatch delivery deferred", { intentId: intent.id, jobId: intent.jobId, ...graphFailureDiagnostic(error) });
         if (data.selected && error instanceof Error && error.name === "GraphProviderRecoveryRequired") {
           const latest = await read(intent.id);
           if (latest?.deliveryId !== data.deliveryId) return { success: true, stale: true };
@@ -236,9 +324,9 @@ export function registerGraphDispatch(sdk: IIIClient, kv: StateKV, execute: Exec
       if (!intent || intent.jobId !== selected.jobId || intent.digest !== selected.sourceFingerprint) throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
       await selectedRequest(intent, selected);
       if (intent.state === "pending" && intent.executionOrigin !== "selected") throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
-      if (intent.state !== "pending") return { success: true, completed: intent.state === "completed", failed: intent.state === "failed", jobId: intent.jobId };
       const completed = await reconcile(intent);
       if (completed !== undefined) return completed;
+      if (intent.state !== "pending") return { success: true, completed: intent.state === "completed", failed: intent.state === "failed", jobId: intent.jobId };
       const delivery = selected.deliveryId ? { intentId: intent.id, deliveryId: selected.deliveryId, localOnly: true } : await claim(intent, true);
       if (!delivery) return queued(intent);
       return deliver({ ...delivery, selected: { ...selected, deliveryId: delivery.deliveryId } });
@@ -287,7 +375,8 @@ export function registerGraphDispatch(sdk: IIIClient, kv: StateKV, execute: Exec
     return { success: true, queued: published, scanned };
   });
 
-  return async (request: GraphDispatchRequest) => {
+  return async (request: GraphDispatchRequest, terminalLink?: GraphTerminalRecoveryLink) => {
+    if (terminalLink && (request.graphJobId !== terminalLink.jobId || request.replacementOf !== terminalLink.sourceJobId)) throw new StateTransactionError("STATE_TX_INVALID_REQUEST");
     if (request?.selected !== undefined) validateSelectedGraphControl(request.selected);
     if (!request || typeof request !== "object" || Array.isArray(request)
       || request.sessionId !== undefined && typeof request.sessionId !== "string"
@@ -301,7 +390,21 @@ export function registerGraphDispatch(sdk: IIIClient, kv: StateKV, execute: Exec
     if (!frozen.graphJobId && !frozen.batchEffectKey) frozen.graphProvenanceVersion = 2;
     const text = canonical(frozen);
     if (Buffer.byteLength(text, "utf8") > MAX_CAPTURE_BYTES || (frozen.observations?.length ?? 0) > 100_000) throw new StateTransactionError("STATE_TX_LIMIT_EXCEEDED");
-    const digest = graphRecordDigest(text), id = `graphintent_${digest}`;
+    const digest = graphRecordDigest(text);
+    const adoption = terminalLink?.adoption;
+    if (adoption) {
+      if (adoption.revision !== GRAPH_AUTOMATIC_ADOPTION_REVISION || !Number.isSafeInteger(adoption.epoch)
+        || adoption.epoch < 1 || adoption.epoch >= Number.MAX_SAFE_INTEGER || adoption.regenerationId !== terminalLink!.regenerationId)
+        throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
+      const confirmed = await readGraphTerminalRecovery(kv, terminalLink!.sourceJobId);
+      const saved = confirmed?.link;
+      if (!saved || saved.sourceJobId !== terminalLink!.sourceJobId || saved.slotId !== terminalLink!.slotId
+        || saved.jobId !== terminalLink!.jobId || saved.regenerationId !== terminalLink!.regenerationId
+        || saved.adoption?.epoch !== adoption.epoch || saved.adoption.revision !== adoption.revision
+        || confirmed.adoptionRevision !== adoption.revision || confirmed.recovery?.reservation?.epoch !== adoption.epoch)
+        throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
+    }
+    const id = adoption ? `graphintent_${graphRecordDigest(`${digest}:native-adoption:${adoption.epoch}`)}` : `graphintent_${digest}`;
     const jobId = frozen.graphJobId ?? (frozen.batchEffectKey ? `graphcallback:${frozen.batchEffectKey}` : `graphjob_${digest}`);
     const selected = request.selected ? { ...request.selected, intentId: id, jobId } : undefined;
     if (selected) {
@@ -318,6 +421,12 @@ export function registerGraphDispatch(sdk: IIIClient, kv: StateKV, execute: Exec
         if (selected && existing.state === "pending" && existing.executionOrigin !== "selected") throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
         return existing;
       }
+      if (adoption) {
+        const native = await terminalSnapshot(terminalLink!);
+        if (!native.reservation || native.reservation.consumed || native.reservation.capture !== null
+          || native.reservation.state !== "prepared" || native.reservation.deadline_ms <= Date.now())
+          throw new StateTransactionError("STATE_TX_REPLAY_CONFLICT");
+      }
       let captureParts = 0;
       for (let start = 0; start < text.length;) {
         let end = Math.min(start + FRAGMENT_CHARS, text.length);
@@ -328,13 +437,29 @@ export function registerGraphDispatch(sdk: IIIClient, kv: StateKV, execute: Exec
       const now = new Date().toISOString();
       return write({ version: 1, id, jobId,
         digest, captureParts, createdAt: now, updatedAt: now, state: "pending", attempts: 0,
+        ...(terminalLink ? { automaticTerminalLink: terminalLink } : {}),
         ...(selected && { executionOrigin: "selected" as const }) });
     });
     if (intent.executionOrigin === "selected" && !selected) return { success: true, reason: "selected_foreground_required" };
-    if (selected && intent.state !== "pending") return { success: true, completed: intent.state === "completed", failed: intent.state === "failed", jobId: intent.jobId };
     const completed = await reconcile(intent);
     if (intent.state !== "pending" || completed !== undefined) return completed ?? { success: true, completed: intent.state === "completed", failed: intent.state === "failed", jobId: intent.jobId };
-    const delivery = await claim(intent, Boolean(selected));
+    let delivery: Delivery | null;
+    if (terminalLink) {
+      const native = await terminalSnapshot(terminalLink);
+      const current = graphAutomaticRecoveryView(native);
+      if (current.action === "none") {
+        if (intent.state === "pending") await write({ ...intent, state: "failed", failureCode: current.reason ?? "GRAPH_AUTOMATIC_TERMINAL", updatedAt: new Date().toISOString() });
+        return { success: false, failed: true, stopped: true, jobId: intent.jobId, intentId: intent.id, automaticRecovery: current };
+      }
+      if (intent.retryAfter && Date.parse(intent.retryAfter) > Date.now()) return queued(intent);
+      const deadline = native.reason === "GRAPH_AUTOMATIC_REGENERATION_READY" ? native.deadline_ms ?? undefined : undefined;
+      delivery = intent.deliveryId ? { intentId: intent.id, deliveryId: intent.deliveryId, localOnly: Boolean(selected) }
+        : await claim(intent, Boolean(selected), deadline);
+    } else delivery = await claim(intent, Boolean(selected));
+    if (delivery && terminalLink) {
+      const delivered = await deliver(delivery);
+      return delivered && typeof delivered === "object" ? { ...delivered, intentId: intent.id } : { result: delivered, intentId: intent.id };
+    }
     return delivery ? deliver({ ...delivery, ...(selected ? { selected: { ...selected, deliveryId: delivery.deliveryId } } : {}) }) : queued(intent);
   };
 }

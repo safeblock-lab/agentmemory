@@ -171,7 +171,7 @@ export async function verifySummaryEvidence(
       version: reference.version, project: job.project, sessionId: job.sessionId, content: JSON.stringify(observation) });
   }
   let count = 0;
-  for await (const page of kv.pages<CompressedObservation>(KV.observations(job.sessionId), { limit: 12, maxBytes: 16_384 })) {
+  for await (const page of kv.pages<Pick<CompressedObservation, "id" | "title">>(KV.observations(job.sessionId), { limit: 12, maxBytes: 16_384, fields: ["id", "title"] })) {
     for (const observation of page.items) if (observation.title) {
       if (++count > root.count || !expected.has(observation.id)) throw new SummaryBudgetError("summary_source_changed");
     }

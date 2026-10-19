@@ -40,7 +40,7 @@ import { HybridSearch } from "./state/hybrid-search.js";
 import { IndexPersistence } from "./state/index-persistence.js";
 import { SHUTDOWN_FLUSH_TIMEOUT_MS, SHUTDOWN_HARD_EXIT_MS, settleWithin } from "./shutdown.js";
 import { registerPrivacyFunction } from "./functions/privacy.js";
-import { registerObserveFunction } from "./functions/observe.js";
+import { registerObserveFunction, extractImage } from "./functions/observe.js";
 import { registerImageQuotaCleanup } from "./functions/image-quota-cleanup.js";
 import { registerVisionSearchFunctions } from "./functions/vision-search.js";
 import { registerSlotsFunctions, isSlotsEnabled, isReflectEnabled } from "./functions/slots.js";
@@ -84,7 +84,9 @@ import { registerClaudeBridgeFunction } from "./functions/claude-bridge.js";
 import { registerGraphFunction } from "./functions/graph.js";
 import { registerGraphJobRecovery } from "./functions/graph-jobs.js";
 import { pruneTerminalGraphWork } from "./functions/graph-retention.js";
-import { registerStorageMaintenance } from "./functions/storage-maintenance.js";
+import { registerIndexedSourceRecovery } from './functions/indexed-source-recovery.js';
+import { registerStorageMaintenance, releaseUnclaimedStorageMaintenanceTurn } from "./functions/storage-maintenance.js";
+import type { StorageForegroundPressure, StorageMaintenanceContinuation } from "./functions/physical-maintenance.js";
 import { registerGraphImportFunction } from "./functions/graph-import.js";
 import { registerConsolidationPipelineFunction } from "./functions/consolidation-pipeline.js";
 import { registerTeamFunction } from "./functions/team.js";
@@ -222,21 +224,175 @@ export function isAutomaticStorageMaintenancePaused(): boolean {
   return isBackgroundRecoveryPaused() && getEnvVar("AGENTMEMORY_STORAGE_MAINTENANCE_WHILE_PAUSED") !== "1";
 }
 
+export function isObservationalDashboardRequest(id: string, request: unknown): boolean {
+  if (!isRecord(request) || Array.isArray(request)) return false;
+  if (request.method !== "GET" || (request.http_method !== undefined && request.http_method !== "GET")) return false;
+  if (request.body != null && request.body !== ""
+    && (!isRecord(request.body) || Array.isArray(request.body) || Object.keys(request.body).length > 0)) return false;
+  const rawQuery = request.query_params;
+  if (rawQuery != null && (!isRecord(rawQuery) || Array.isArray(rawQuery))) return false;
+  const query: Record<string, unknown> = isRecord(rawQuery) ? rawQuery : {};
+  const keys = Object.keys(query);
+  const only = (...allowed: string[]) => keys.every(key => allowed.includes(key));
+  const smallLimit = (value: unknown) => typeof value === "string" && /^(?:[1-9]|1[0-6])$/.test(value);
+  const boundedCursor = (value: unknown) => value === undefined
+    || (typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= 8_192);
+  switch (id) {
+    case "api::health": case "api::status": case "api::liveness": case "api::config-flags":
+      return keys.length === 0;
+    case "api::semantic-list": case "api::procedural-list": case "api::relations-list":
+    case "api::consolidation-status": case "api::lesson-list":
+      return only("preview") && query.preview === "true";
+    case "api::memories":
+      return only("latest", "count") && query.latest === "true" && query.count === "true";
+    case "api::sessions":
+      return only("latest", "limit", "cursor") && query.latest === "true"
+        && smallLimit(query.limit) && boundedCursor(query.cursor);
+    case "api::crystal-list":
+      return only("limit", "cursor") && (query.limit === undefined || smallLimit(query.limit))
+        && boundedCursor(query.cursor);
+    default:
+      return false;
+  }
+}
+
+export function isBackgroundHookCaptureRequest(id: string, request: unknown): boolean {
+  if (id !== "api::observe" || !isRecord(request) || Array.isArray(request) || request.method !== "POST") return false;
+  if (request.query_params != null && (!isRecord(request.query_params) || Array.isArray(request.query_params)
+    || Object.keys(request.query_params).length !== 0)) return false;
+  const body = request.body;
+  if (!isRecord(body) || Array.isArray(body) || body.captureMode !== "background_hook_v1"
+    || body.hookType !== "post_tool_use") return false;
+  const allowed = ["captureMode", "hookType", "sessionId", "project", "cwd", "timestamp", "data"];
+  if (Object.keys(body).some(key => !allowed.includes(key))) return false;
+  const boundedString = (value: unknown, maxBytes: number) => typeof value === "string"
+    && value.trim().length > 0 && Buffer.byteLength(value, "utf8") <= maxBytes;
+  if (!boundedString(body.sessionId, 512) || !boundedString(body.project, 1_024)
+    || !boundedString(body.cwd, 4_096) || typeof body.timestamp !== "string"
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(body.timestamp)
+    || !Number.isFinite(Date.parse(body.timestamp))) return false;
+  const data = body.data;
+  if (!isRecord(data) || Array.isArray(data)
+    || Object.keys(data).some(key => !["tool_name", "tool_input", "tool_output"].includes(key))
+    || typeof data.tool_name !== "string" || !/^[A-Za-z0-9_.:-]{1,256}$/.test(data.tool_name)) return false;
+  try { return Buffer.byteLength(JSON.stringify(body), "utf8") <= 65_536 && extractImage(data) === undefined; }
+  catch { return false; }
+}
+
 export async function runAutomaticStorageMaintenance(
   sdk: Pick<IIIClient, "trigger">,
   log: (message: string) => void,
-): Promise<void> {
-  if (isAutomaticStorageMaintenancePaused()) return;
+): Promise<StorageMaintenanceContinuation> {
+  const hold: StorageMaintenanceContinuation = { version: 1, kind: "hold", reason: "unknown_response",
+    incomplete: true, progressMade: false, retryAfterMs: 300_000 };
+  if (isAutomaticStorageMaintenancePaused()) return { ...hold, kind: "idle", reason: "paused", retryAfterMs: 60_000 };
   try {
-    const result = await sdk.trigger<{ action: string }, { success?: boolean; code?: string }>({
+    const result = await sdk.trigger<{ action: string }, { success?: boolean; code?: string; continuation?: unknown }>({
       function_id: "mem::storage-maintenance", payload: { action: "tick" },
     });
     if (result?.success === false) log(`Storage maintenance paused (${result.code ?? "STATE_STORAGE_FAILED"}).`);
+    const next = result?.continuation;
+    if (!isRecord(next) || next.version !== 1
+      || typeof next.kind !== "string"
+      || !["progress", "graph_queued", "foreground", "busy", "idle", "complete", "hold"].includes(next.kind)
+      || typeof next.reason !== "string" || !/^[a-z_]{1,64}$/.test(next.reason)
+      || typeof next.incomplete !== "boolean" || typeof next.progressMade !== "boolean"
+      || (next.retryAfterMs !== null && (!Number.isSafeInteger(next.retryAfterMs)
+        || Number(next.retryAfterMs) < 1_000 || Number(next.retryAfterMs) > 300_000))) return hold;
+    if (result.success !== true && next.kind !== "hold") return hold;
+    if (next.kind === "progress" && (next.incomplete !== true || next.progressMade !== true)) return hold;
+    if (next.kind === "complete" && next.incomplete !== false) return hold;
+    return { version: 1, kind: next.kind as StorageMaintenanceContinuation["kind"], reason: next.reason,
+      incomplete: next.incomplete, progressMade: next.progressMade,
+      retryAfterMs: next.retryAfterMs === null ? null : Number(next.retryAfterMs) };
   } catch (error) {
     const message = error instanceof Error ? error.message : "";
     const code = message.match(/STATE_[A-Z0-9_]+/)?.[0] ?? "STATE_STORAGE_FAILED";
     log(`Storage maintenance paused (${code}).`);
+    return { ...hold, reason: "invocation_unknown" };
   }
+}
+
+function createStorageMaintenanceScheduler(
+  sdk: Pick<IIIClient, "trigger">,
+  log: (message: string) => void,
+  pressure: () => StorageForegroundPressure,
+  releaseUnclaimedTurn: () => void,
+): { wake: () => void; start: () => void; stop: () => void } {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let running: Promise<void> | null = null;
+  let wakePending = false;
+  let stopped = false;
+  let started = false;
+  let cooldownUntil = 0;
+  let noProgress = 0;
+  const clearTimer = () => { if (timer !== undefined) clearTimeout(timer); timer = undefined; };
+  const arm = (delay: number) => {
+    clearTimer();
+    if (stopped) return;
+    timer = setTimeout(() => { timer = undefined; wake(); }, Math.max(0, Math.ceil(delay)));
+    timer.unref();
+  };
+  const wake = () => {
+    if (stopped) { releaseUnclaimedTurn(); return; }
+    wakePending = true;
+    if (!started) return;
+    if (running) return;
+    clearTimer();
+    if (Date.now() < cooldownUntil) {
+      releaseUnclaimedTurn();
+      arm(cooldownUntil - Date.now());
+      return;
+    }
+    if (isAutomaticStorageMaintenancePaused()) {
+      releaseUnclaimedTurn();
+      wakePending = false;
+      arm(60_000);
+      return;
+    }
+    const foreground = pressure();
+    if (foreground.busy) {
+      releaseUnclaimedTurn();
+      wakePending = false;
+      const delay = Math.max(1_000, Math.min(10_000,
+        foreground.phase === "active" ? 5_000 : foreground.quietWindowRemainingMs + 250));
+      cooldownUntil = Date.now() + delay;
+      arm(delay);
+      return;
+    }
+    wakePending = false;
+    let outcome: StorageMaintenanceContinuation = { version: 1, kind: "hold", reason: "invocation_unknown",
+      incomplete: true, progressMade: false, retryAfterMs: 300_000 };
+    running = runAutomaticStorageMaintenance(sdk, log).then(next => { outcome = next; }).catch(() => {}).finally(() => {
+      running = null;
+      if (stopped) { releaseUnclaimedTurn(); return; }
+      const requested = wakePending;
+      wakePending = false;
+      let delay: number;
+      cooldownUntil = 0;
+      if (outcome.kind === "progress") {
+        noProgress = 0;
+        delay = Math.max(1_000, Math.min(10_000, outcome.retryAfterMs ?? 10_000));
+        cooldownUntil = Date.now() + delay;
+      } else if (outcome.kind === "hold") {
+        delay = Math.max(60_000, outcome.retryAfterMs ?? 300_000);
+        cooldownUntil = Date.now() + delay;
+      } else if (outcome.kind === "foreground") {
+        delay = Math.max(1_000, Math.min(10_000, outcome.retryAfterMs ?? 5_000));
+        cooldownUntil = Date.now() + delay;
+      } else if (outcome.kind === "busy") {
+        delay = outcome.retryAfterMs ?? [5_000, 15_000, 60_000][Math.min(noProgress++, 2)]!;
+        cooldownUntil = Date.now() + delay;
+      } else {
+        if (outcome.kind !== "graph_queued") noProgress = 0;
+        delay = requested ? 0 : 60_000;
+      }
+      if (cooldownUntil > Date.now()) releaseUnclaimedTurn();
+      arm(delay);
+    });
+  };
+  return { wake, start: () => { if (!started && !stopped) { started = true; wake(); } },
+    stop: () => { stopped = true; wakePending = false; clearTimer(); releaseUnclaimedTurn(); } };
 }
 
 export async function runAutomaticTemporalRecovery(sdk: Pick<IIIClient, "trigger">): Promise<void> {
@@ -493,12 +649,14 @@ async function main() {
         (event.failureReason ? ` reason=${event.failureReason}` : ""),
       );
     },
-    onUsage: async (event) => {
+    onUsage: async (event, effectKey) => {
+      if (effectKey && !metricsStore) throw new Error("GRAPH_USAGE_RECORDER_UNAVAILABLE");
       await metricsStore?.recordLlmUsage(
         event.task,
         event.provider,
         event.model,
         event,
+        effectKey,
       );
     },
   });
@@ -570,13 +728,38 @@ async function main() {
   installOperationTracking(sdk, kv);
   let foregroundRequests = 0;
   let lastForegroundAt = 0;
+  let lastForegroundFunctionId: string | null = null;
+  const foregroundFunctions = new Map<string, number>();
+  const foregroundPressureSnapshot = (): StorageForegroundPressure => {
+    const now = Date.now();
+    const age = lastForegroundAt > 0 ? Math.max(0, now - lastForegroundAt) : null;
+    const remaining = age === null ? 0 : Math.max(0, 5_000 - age);
+    return {
+      busy: foregroundRequests > 0 || remaining > 0,
+      phase: foregroundRequests > 0 ? "active" : remaining > 0 ? "cooldown" : "idle",
+      observedAt: new Date(now).toISOString(), activeRequests: foregroundRequests,
+      activeFunctions: [...foregroundFunctions].slice(0, 8).map(([functionId, requests]) => ({ functionId, requests })),
+      activeFunctionsTruncated: foregroundFunctions.size > 8,
+      lastCompletedFunctionId: lastForegroundFunctionId,
+      lastCompletedAt: age === null ? null : new Date(lastForegroundAt).toISOString(),
+      lastCompletedAgeMs: age, quietWindowRemainingMs: remaining,
+    };
+  };
   const registerWithActivity = sdk.registerFunction.bind(sdk);
   sdk.registerFunction = (id, handler, options) => {
     if (!/^(api::|mcp::)/.test(id) || typeof handler !== "function") return registerWithActivity(id, handler, options);
     return registerWithActivity(id, async (...args) => {
+      if (isObservationalDashboardRequest(id, args[0]) || isBackgroundHookCaptureRequest(id, args[0])) return handler(...args);
       foregroundRequests++;
+      foregroundFunctions.set(id, (foregroundFunctions.get(id) ?? 0) + 1);
       try { return await handler(...args); }
-      finally { foregroundRequests--; lastForegroundAt = Date.now(); }
+      finally {
+        foregroundRequests--;
+        const remaining = (foregroundFunctions.get(id) ?? 1) - 1;
+        if (remaining > 0) foregroundFunctions.set(id, remaining);
+        else foregroundFunctions.delete(id);
+        lastForegroundAt = Date.now(); lastForegroundFunctionId = id;
+      }
     }, options);
   };
   metricsStore = new MetricsStore(kv);
@@ -605,6 +788,7 @@ async function main() {
 
   setVectorIndex(vectorIndex);
   setEmbeddingProvider(embeddingProvider);
+  registerIndexedSourceRecovery(sdk, kv, indexedVector, embeddingProvider);
 
   const meterAccessor = hasGetMeter(sdk)
     ? (sdk.getMeter.bind(sdk) as (name: string) => unknown)
@@ -657,7 +841,7 @@ async function main() {
   const localGraphCompactor = isLocalOllamaAuxiliary(config.auxiliaryProvider)
     ? auxiliaryProvider
     : undefined;
-  registerGraphFunction(
+  await registerGraphFunction(
     sdk,
     kv,
     provider,
@@ -822,7 +1006,10 @@ async function main() {
   registerSmartSearchFunction(sdk, kv, hybridRanker);
   setHybridRanker(hybridRanker);
   registerRecentSearchesSweepFunction(sdk, kv);
-  registerStorageMaintenance(sdk, kv);
+  const storageMaintenanceScheduler = createStorageMaintenanceScheduler(sdk, bootLog,
+    foregroundPressureSnapshot, () => releaseUnclaimedStorageMaintenanceTurn(kv));
+  registerStorageMaintenance(sdk, kv, () => foregroundRequests > 0 || Date.now() - lastForegroundAt < 5_000,
+    foregroundPressureSnapshot, storageMaintenanceScheduler.wake);
 
   registerApiTriggers(sdk, kv, secret, metricsStore, provider);
   registerEventTriggers(sdk, kv);
@@ -832,6 +1019,33 @@ async function main() {
 
   const indexPersistence = new IndexPersistence(kv, vectorIndex);
   setIndexPersistence(indexPersistence);
+
+  const backgroundRecoveryPaused = isBackgroundRecoveryPaused();
+  let graphRecoveryRunning = false;
+  const recoverGraphJobs = async () => {
+    if (isBackgroundRecoveryPaused() || graphRecoveryRunning) return;
+    graphRecoveryRunning = true;
+    try {
+      await sdk.trigger({ function_id: "mem::graph-dispatch", payload: { localOnly: false } });
+    } catch {
+      console.warn("[agentmemory] Graph recovery paused; durable inputs retained");
+    } finally {
+      try {
+        await pruneTerminalGraphWork(kv);
+      } catch (error) {
+        console.warn("[agentmemory] Graph terminal retention paused", error instanceof Error ? error.message : "STATE_TX_FAILED");
+      } finally { graphRecoveryRunning = false; }
+    }
+  };
+  if (!backgroundRecoveryPaused) {
+    void recoverGraphJobs();
+    const graphRecoveryTimer = setInterval(() => void recoverGraphJobs(), 30_000);
+    graphRecoveryTimer.unref();
+  } else {
+    bootLog("Graph recovery and terminal retention are paused by AGENTMEMORY_BACKGROUND_RECOVERY_PAUSED=1.");
+  }
+
+  storageMaintenanceScheduler.start();
 
   const loaded = indexedRetrieval ? null : await indexPersistence.load().catch((err) => {
     console.warn(`[agentmemory] Failed to load persisted vector index:`, err);
@@ -902,7 +1116,6 @@ async function main() {
       : loaded.state === "none" || vectorCountShortfall
         ? null
         : loaded.savedAt;
-  const backgroundRecoveryPaused = isBackgroundRecoveryPaused();
   const keywordStart = Date.now();
   let indexedRetrievalReady = false;
   if (indexedRetrieval) {
@@ -982,11 +1195,6 @@ async function main() {
   const autoForgetIntervalMs = parseInt(process.env.AUTO_FORGET_INTERVAL_MS || "3600000", 10);
   const consolidationIntervalMs = parseInt(process.env.CONSOLIDATION_INTERVAL_MS || "7200000", 10);
 
-  const storageMaintenanceTick = () => runAutomaticStorageMaintenance(sdk, bootLog);
-  void storageMaintenanceTick();
-  const storageMaintenanceTimer = setInterval(() => void storageMaintenanceTick(), 60_000);
-  storageMaintenanceTimer.unref();
-
   const projectIndexTick = createProjectIndexMaintenance(kv, isAutomaticStorageMaintenancePaused,
     () => foregroundRequests > 0 || Date.now() - lastForegroundAt < 5_000, bootLog);
   void projectIndexTick().catch(() => bootLog("Project index progress could not be saved."));
@@ -1054,8 +1262,16 @@ async function main() {
             !("success" in result) || result.success !== true) {
           console.warn("[agentmemory] Summary queue recovery reported failure");
         }
-      } catch {
-        console.warn("[agentmemory] Summary queue recovery trigger failed");
+      } catch (error) {
+        const record = error && typeof error === "object" ? error as Record<string, unknown> : {};
+        const message = typeof record.message === "string" ? record.message : "";
+        const identifier = (value: unknown) => typeof value === "string" && /^[A-Za-z0-9_:.-]{1,160}$/.test(value) ? value : undefined;
+        const sourceFrames = error instanceof Error && typeof error.stack === "string"
+          ? [...error.stack.matchAll(/[\\/](index|summary-queue|state-pages|kv|src-[A-Za-z0-9_-]{8})\.(?:m?js|ts):(\d+):(\d+)/g)]
+            .slice(0, 4).map(match => `${match[1]}:${match[2]}:${match[3]}`) : [];
+        console.warn("[agentmemory] Summary queue recovery trigger failed", { functionId, phase: "registered_invocation",
+          code: identifier(record.code), stateCode: message.match(/\bSTATE_[A-Z0-9_]+\b/)?.[0],
+          errorClass: error instanceof Error ? error.name : undefined, category: identifier(message), sourceFrames });
       } finally {
         summaryRecoveryRunning = false;
       }
@@ -1067,30 +1283,6 @@ async function main() {
     summaryReconcileTimer.unref();
   } else {
     bootLog("Summary queue recovery is paused by AGENTMEMORY_BACKGROUND_RECOVERY_PAUSED=1.");
-  }
-
-  let graphRecoveryRunning = false;
-  const recoverGraphJobs = async () => {
-    if (isBackgroundRecoveryPaused() || graphRecoveryRunning) return;
-    graphRecoveryRunning = true;
-    try {
-      await sdk.trigger({ function_id: "mem::graph-dispatch", payload: { localOnly: false } });
-    } catch {
-      console.warn("[agentmemory] Graph recovery paused; durable inputs retained");
-    } finally {
-      try {
-        await pruneTerminalGraphWork(kv);
-      } catch (error) {
-        console.warn("[agentmemory] Graph terminal retention paused", error instanceof Error ? error.message : "STATE_TX_FAILED");
-      } finally { graphRecoveryRunning = false; }
-    }
-  };
-  if (!backgroundRecoveryPaused) {
-    void recoverGraphJobs();
-    const graphRecoveryTimer = setInterval(() => void recoverGraphJobs(), 30_000);
-    graphRecoveryTimer.unref();
-  } else {
-    bootLog("Graph recovery and terminal retention are paused by AGENTMEMORY_BACKGROUND_RECOVERY_PAUSED=1.");
   }
 
   if (process.env.AUTO_FORGET_ENABLED !== "false") {
@@ -1172,6 +1364,7 @@ async function main() {
       process.exit(1);
     }, SHUTDOWN_HARD_EXIT_MS);
     hardExit.unref();
+    storageMaintenanceScheduler.stop();
     healthMonitor.stop();
     dedupMap.stop();
     indexPersistence.stop();

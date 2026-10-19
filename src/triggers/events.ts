@@ -178,6 +178,12 @@ export function registerEventTriggers(sdk: IIIClient, kv: StateKV): void {
   sdk.registerFunction(
     "event::session::ended",
     async (data: { sessionId: string }) => {
+      if (typeof data?.sessionId !== "string" || !data.sessionId.trim()) return { success: false, error: "sessionId is required" };
+      const session = await kv.get<Session>(KV.sessions, data.sessionId);
+      if (!session) return { success: false, error: "session_not_found" };
+      if (session.id !== data.sessionId || typeof session.project !== "string" || !session.project.trim()) {
+        return { success: false, error: "session_identity_invalid" };
+      }
       await kv.update(KV.sessions, data.sessionId, [
         { type: "set", path: "endedAt", value: new Date().toISOString() },
         { type: "set", path: "status", value: "completed" },

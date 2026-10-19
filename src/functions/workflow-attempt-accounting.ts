@@ -2,6 +2,47 @@ import type { StateKV } from "../state/kv.js";
 import { KV, fingerprintId } from "../state/schema.js";
 import { withProviderAttemptBudget, type ProviderAttemptBudgetBinding } from "../providers/provider-attempt-budget.js";
 import { validBudgetId } from "../state/provider-attempt-budget.js";
+import type { DashboardWorkflowInvocation, DashboardWorkflowInvocationHistory } from "../types.js";
+
+const invocationHistoryKey = (agentId?: string) => `workflow-invocations:graph:v1:${agentId ? fingerprintId("agent", agentId) : "all"}`;
+
+export async function recordGraphInvocation(kv: StateKV, attempt: DashboardWorkflowInvocation): Promise<void> {
+  const histories = [invocationHistoryKey(), ...(attempt.agentId ? [invocationHistoryKey(attempt.agentId)] : [])];
+  const keys = [...histories, ...(attempt.outcome === "failed" ? histories.map(key => `${key}:failures`) : [])];
+  await Promise.all(keys.map(async key => {
+    const result = await kv.update<{ errors?: unknown }>(KV.state, key, [
+      { type: "append_bounded", path: "items", value: { item: attempt, limit: 100 } },
+    ]);
+    if (Array.isArray(result?.errors) && result.errors.length) throw new Error("workflow_invocation_record_rejected");
+  }));
+}
+
+export async function readGraphInvocations(kv: StateKV, asOf: string, agentId?: string): Promise<DashboardWorkflowInvocationHistory> {
+  const end = Math.floor(Date.parse(asOf) / 60_000) * 60_000;
+  const start = end - 24 * 60 * 60_000;
+  const window = { intervalStart: new Date(start).toISOString(), intervalEnd: new Date(end).toISOString(),
+    coverageSince: null, complete: false as const };
+  try {
+    const histories = await Promise.all([invocationHistoryKey(agentId), `${invocationHistoryKey(agentId)}:failures`]
+      .map(key => kv.get<{ items?: DashboardWorkflowInvocation[] }>(KV.state, key)));
+    if (histories.some(history => history && !Array.isArray(history.items))) throw new Error("workflow_invocation_read_invalid");
+    const unique = new Map<string, DashboardWorkflowInvocation>();
+    for (const item of histories.flatMap(history => history?.items ?? [])) {
+      if (!item || typeof item.executionId !== "string" || !/^op_[a-z0-9_]{1,80}$/.test(item.executionId)
+        || !Number.isFinite(Date.parse(item.occurredAt)) || !["completed", "partial", "failed", "queued", "skipped"].includes(item.outcome)
+        || item.agentId !== null && typeof item.agentId !== "string" || agentId && item.agentId !== agentId)
+        throw new Error("workflow_invocation_read_invalid");
+      unique.set(item.executionId, item);
+    }
+    const attempts = [...unique.values()].sort((a, b) => Date.parse(b.occurredAt) - Date.parse(a.occurredAt) || b.executionId.localeCompare(a.executionId));
+    return { source: "state-workflow-invocations-v1", state: "retained", lastAttempt: attempts[0] ?? null,
+      failures24h: { ...window, observedCount: attempts.filter(item => item.outcome === "failed" && Date.parse(item.occurredAt) >= start && Date.parse(item.occurredAt) < end).length,
+        state: "partial", reason: "bounded_invocation_history_full_total_unknown" } };
+  } catch {
+    return { source: "state-workflow-invocations-v1", state: "unavailable", lastAttempt: null,
+      failures24h: { ...window, observedCount: null, state: "unavailable", reason: "invocation_history_unavailable" } };
+  }
+}
 
 export interface WorkflowAttemptIdentity {
   workflow: "summary" | "skill" | "consolidation" | "graph";

@@ -6,6 +6,10 @@ import { fingerprintId, KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { StatePageError } from "../state/state-pages.js";
 import { logger } from "../logger.js";
+import type { GraphAutomaticRecoveryView } from "../functions/graph-automatic-workflow.js";
+import { readGraphStoppedTerminal } from "../functions/graph-jobs.js";
+import type { GraphTerminalRecoveryView } from "../functions/graph-automatic-terminal.js";
+import { graphAutomaticAvailability, type GraphAutomaticAvailability } from "../functions/graph-automatic-authority.js";
 
 export const MAX_GRAPH_BUILD_CONTINUATION_BYTES = 16_384;
 export const MAX_GRAPH_BUILD_OBSERVATIONS = 25;
@@ -17,6 +21,7 @@ type GraphBuildError = "invalid_continuation" | "continuation_project_mismatch" 
   | "observation_changed" | "graph_extraction_failed";
 
 export interface GraphBuildResponse {
+  graphAutomaticAvailability: GraphAutomaticAvailability;
   status: GraphBuildStatus;
   project: string;
   sessionsProcessed: number;
@@ -26,6 +31,9 @@ export interface GraphBuildResponse {
   continuation: string | null;
   graphJobId?: string;
   error?: GraphBuildError;
+  automaticRecovery?: GraphAutomaticRecoveryView;
+  automaticTerminalRecovery?: GraphTerminalRecoveryView;
+  action?: { endpoint: "/agentmemory/graph/build"; project: string; continuation: string } | null;
 }
 
 interface GraphBuildCursor {
@@ -97,11 +105,15 @@ function response(
   project: string,
   status: GraphBuildStatus,
   continuation: string | null,
-  fields: Partial<Pick<GraphBuildResponse, "sessionsProcessed" | "observationsProcessed" | "nodesAdded" | "edgesAdded" | "graphJobId" | "error">> = {},
+  fields: Partial<Pick<GraphBuildResponse, "sessionsProcessed" | "observationsProcessed" | "nodesAdded" | "edgesAdded" | "graphJobId" | "error" | "automaticRecovery" | "automaticTerminalRecovery">> = {},
 ): GraphBuildResponse {
   return {
+    graphAutomaticAvailability: graphAutomaticAvailability(),
     status, project, sessionsProcessed: 0, observationsProcessed: 0, nodesAdded: 0, edgesAdded: 0,
     continuation, ...fields,
+    ...(fields.automaticRecovery || fields.automaticTerminalRecovery ? { action: graphAutomaticAvailability().enabled && continuation
+      && (fields.automaticTerminalRecovery?.action ?? fields.automaticRecovery?.action) !== "none"
+      ? { endpoint: "/agentmemory/graph/build" as const, project, continuation } : null } : {}),
   };
 }
 
@@ -283,13 +295,33 @@ export async function buildScopedGraph(
   if (!isRecord(extracted)) {
     return response(project, "failed", replayCursor, { graphJobId, error: "graph_extraction_failed" });
   }
+  let durableJob = await kv.get<{ automaticRecovery?: GraphAutomaticRecoveryView }>(KV.graphJobs, graphJobId);
+  const terminalRecovery = await readGraphStoppedTerminal(kv, graphJobId);
+  if (terminalRecovery?.link) {
+    durableJob = await kv.get<typeof durableJob>(KV.graphJobs, terminalRecovery.link.jobId)
+      ?? (terminalRecovery.recovery ? { automaticRecovery: terminalRecovery.recovery } : null);
+  } else if (!durableJob?.automaticRecovery && terminalRecovery?.recovery) {
+    durableJob = { automaticRecovery: terminalRecovery.recovery };
+  }
+  if (durableJob?.automaticRecovery?.replacementJobId) {
+    durableJob = await kv.get<typeof durableJob>(KV.graphJobs, durableJob.automaticRecovery.replacementJobId) ?? durableJob;
+  }
+  let automaticRecovery = (isRecord(extracted.automaticRecovery) && extracted.automaticRecovery.version === 1
+    ? extracted.automaticRecovery as unknown as GraphAutomaticRecoveryView : durableJob?.automaticRecovery);
+  if (automaticRecovery?.captured && extracted.graphContinuation === true && automaticRecovery.state === "completed") {
+    automaticRecovery = { ...automaticRecovery, action: "continue", nextCheckAt: null };
+  }
   const counts = { sessionsProcessed: 1, observationsProcessed: observations.length,
-    nodesAdded: count(extracted.nodesAdded), edgesAdded: count(extracted.edgesAdded), graphJobId };
+    nodesAdded: count(extracted.nodesAdded), edgesAdded: count(extracted.edgesAdded), graphJobId,
+    ...(isRecord(extracted.automaticTerminalRecovery) && extracted.automaticTerminalRecovery.version === 1
+      ? { automaticTerminalRecovery: extracted.automaticTerminalRecovery as unknown as GraphTerminalRecoveryView }
+      : terminalRecovery ? { automaticTerminalRecovery: terminalRecovery.outcome } : {}),
+    ...(automaticRecovery ? { automaticRecovery } : {}) };
   if (extracted.queued === true || extracted.deferred === true || extracted.graphContinuation === true
     || extracted.paused === true || extracted.reason === "selected_foreground_required") {
     return response(project, "queued", replayCursor, counts);
   }
-  if (extracted.success !== true || extracted.failed === true) {
+  if (extracted.success !== true || extracted.failed === true || extracted.incomplete === true) {
     return response(project, "failed", replayCursor, { ...counts, error: "graph_extraction_failed" });
   }
   return response(project, following || sessions.status !== "ready" ? "partial" : "completed", following, counts);

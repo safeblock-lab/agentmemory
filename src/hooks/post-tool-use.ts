@@ -44,6 +44,7 @@ async function main() {
     method: "POST",
     headers: authHeaders(),
     body: JSON.stringify({
+      captureMode: "background_hook_v1",
       hookType: "post_tool_use",
       sessionId,
       project: resolveProject(cwd),

@@ -1,42 +1,13 @@
-import { InvocationError } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
 import { IndexedRetrievalError, retrievalRequest } from "../state/indexed-retrieval.js";
 
 export const VIEWER_PAGE_ROWS = 16;
 export const VIEWER_PAGE_BYTES = 65_536;
-const VIEWER_RECENT_PREPARATION_TIMEOUT_MS = 70_000;
-const VIEWER_RECENT_PREPARATION_MAX_ROWS = 16_384;
-const VIEWER_RECENT_PREPARATION_MAX_BYTES = 128 * 1024 * 1024;
-const VIEWER_RECENT_PREPARATION_MAX_MS = 300_000;
-const VIEWER_RECENT_SOURCE_MAX_BYTES = 16 * 1024 * 1024;
 type Query = Record<string, unknown>;
 type Row = Record<string, unknown>;
-type RecentPreparationStatus = {
-  target: "viewer_recent";
-  status: "preparing" | "partial" | "ready";
-  checkpoint: string;
-  generation: string;
-  scanned: boolean;
-  dirty: number;
-  issues: number;
-  ready: boolean;
-  has_more: boolean;
-};
-type RecentPreparationResult = {
-  status: "preparing" | "partial" | "ready";
-  processed: number;
-  continue: boolean;
-  cursor: { phase: "sessions" | "observations"; scanned: boolean; generation: string };
-  reason: string | null;
-  source_bytes: number;
-  decoded_bytes: number;
-  required_bytes: number | null;
-  elapsed_ms: number;
-  batch_limits: { rows: number; decoded_bytes: number; safety_ms: number };
-  preparation: RecentPreparationStatus;
-};
 type RecentPageItem = { scope: string; key: string; version: string; value: Row; projection?: unknown };
+type SessionCount = { total: number | null; scope: "all_sessions"; coverage: "complete" | "incomplete"; revision: string; generation: string };
 type RecentPageResult = {
   status: "preparing" | "partial" | "ready";
   items: RecentPageItem[];
@@ -44,17 +15,10 @@ type RecentPageResult = {
   next_cursor: string | null;
   ordering: string;
   reason?: string | null;
+  count?: SessionCount;
 };
-type RecentPreparationReconciliation =
-  | ({ state: "reconciled" } & RecentPreparationStatus)
-  | { state: "unknown"; reason: string };
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isSafeIntegerAtLeast(value: unknown, minimum: number): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= minimum;
 }
 
 function hasBoundedJsonBytes(value: unknown, maxBytes: number): boolean {
@@ -163,53 +127,6 @@ async function viewerProjectMemories(kv: StateKV, project: string, query: Query)
     : { ...base, memories, nextCursor, partial, returnedCount: memories.length, total: partial ? null : memories.length };
 }
 
-function isRecentPreparationStatus(value: unknown): value is RecentPreparationStatus {
-  if (!isRecord(value) || value.target !== "viewer_recent"
-    || !["preparing", "partial", "ready"].includes(String(value.status))
-    || typeof value.checkpoint !== "string" || !/^[a-f\d]{64}$/i.test(value.checkpoint)
-    || typeof value.generation !== "string" || !/^\d+$/.test(value.generation)
-    || typeof value.scanned !== "boolean" || !isSafeIntegerAtLeast(value.dirty, 0)
-    || !isSafeIntegerAtLeast(value.issues, 0) || typeof value.ready !== "boolean"
-    || typeof value.has_more !== "boolean") return false;
-  if (value.status === "ready") return value.ready && value.scanned && value.dirty === 0 && value.issues === 0 && !value.has_more;
-  if (value.status === "partial") return !value.ready && value.issues > 0;
-  return !value.ready && value.has_more;
-}
-
-function isRecentPreparationResult(value: unknown): value is RecentPreparationResult {
-  if (!isRecord(value) || !["preparing", "partial", "ready"].includes(String(value.status))
-    || !isSafeIntegerAtLeast(value.processed, 0) || typeof value.continue !== "boolean"
-    || !isRecord(value.cursor) || !(value.cursor.phase === "sessions" || value.cursor.phase === "observations")
-    || typeof value.cursor.scanned !== "boolean" || typeof value.cursor.generation !== "string"
-    || !/^\d+$/.test(value.cursor.generation) || !(value.reason === null || typeof value.reason === "string")
-    || !isSafeIntegerAtLeast(value.source_bytes, 0) || !isSafeIntegerAtLeast(value.decoded_bytes, 0)
-    || !(value.required_bytes === null || isSafeIntegerAtLeast(value.required_bytes, 1)
-      && value.required_bytes <= VIEWER_RECENT_SOURCE_MAX_BYTES)
-    || !isSafeIntegerAtLeast(value.elapsed_ms, 0) || value.elapsed_ms > VIEWER_RECENT_PREPARATION_MAX_MS
-    || !isRecord(value.batch_limits) || !isSafeIntegerAtLeast(value.batch_limits.rows, 1)
-    || value.batch_limits.rows > VIEWER_RECENT_PREPARATION_MAX_ROWS
-    || !isSafeIntegerAtLeast(value.batch_limits.decoded_bytes, 1024)
-    || value.batch_limits.decoded_bytes > VIEWER_RECENT_PREPARATION_MAX_BYTES
-    || !isSafeIntegerAtLeast(value.batch_limits.safety_ms, 1)
-    || value.batch_limits.safety_ms > VIEWER_RECENT_PREPARATION_MAX_MS
-    || !isRecentPreparationStatus(value.preparation)) return false;
-  const status = value.status;
-  const reason = value.reason;
-  const cursor = value.cursor;
-  const limits = value.batch_limits;
-  const readiness = value.preparation;
-  return value.processed <= limits.rows && value.source_bytes <= limits.decoded_bytes
-    && value.decoded_bytes <= limits.decoded_bytes
-    && cursor.generation === readiness.generation && cursor.scanned === readiness.scanned
-    && (value.continue || cursor.scanned && readiness.dirty === 0)
-    && (!value.continue || !cursor.scanned || readiness.dirty !== 0 || reason === "decode_budget_exceeded")
-    && status === readiness.status
-    && (status !== "partial" || readiness.issues > 0)
-    && (status !== "ready" || readiness.ready && !value.continue)
-    && (value.required_bytes === null || reason === "decode_budget_exceeded")
-    && (reason !== "decode_budget_exceeded" || value.required_bytes !== null);
-}
-
 function isRecentPageItem(value: unknown, entity: "sessions" | "observations", sessionId?: string): value is RecentPageItem {
   if (!isRecord(value) || typeof value.key !== "string" || !value.key
     || typeof value.version !== "string" || !value.version || !isRecord(value.value) || value.value.id !== value.key) return false;
@@ -226,47 +143,16 @@ function isRecentPageResult(value: unknown, entity: "sessions" | "observations",
     && value.has_more === (value.next_cursor !== null)
     && typeof value.ordering === "string" && value.ordering.length <= 128
     && (value.reason === undefined || value.reason === null || typeof value.reason === "string")
+    && (value.count === undefined || entity === "sessions" && isSessionCount(value.count))
     && value.items.every(item => isRecentPageItem(item, entity, sessionId));
 }
 
-async function requestRecentPreparation(kv: StateKV): Promise<RecentPreparationResult> {
-  let response: unknown;
-  try {
-    response = await kv.retrieval<unknown>({ action: "viewer_recent_prepare" }, {
-      timeoutMs: VIEWER_RECENT_PREPARATION_TIMEOUT_MS,
-    });
-  } catch (error) {
-    if (error instanceof InvocationError && ["STATE_RECENT_CURSOR_STALE", "STATE_TX_INVALID_REQUEST"].includes(error.code)) {
-      throw new IndexedRetrievalError(error.code, "Native retrieval cursor or request is no longer valid.");
-    }
-    if (error instanceof InvocationError && error.code === "STATE_RETRIEVAL_RESOURCE_LIMIT") {
-      throw new IndexedRetrievalError("STATE_RETRIEVAL_RESOURCE_LIMIT", "Native indexed retrieval exceeded its response resource limit.");
-    }
-    throw error;
-  }
-  if (response === null || typeof response !== "object") {
-    throw new IndexedRetrievalError("STATE_INDEX_NOT_READY", "Native indexed retrieval is unavailable. Prepare the compatible engine indexes explicitly.");
-  }
-  if (Array.isArray(response)) throw new Error("viewer_invalid_recent_preparation");
-  if (!isRecord(response)) throw new Error("viewer_invalid_recent_preparation");
-  if (typeof response.error === "string" || typeof response.code === "string") {
-    throw new IndexedRetrievalError(String(response.code ?? response.error), "Native indexed retrieval rejected the request.");
-  }
-  if (!hasBoundedJsonBytes(response, VIEWER_PAGE_BYTES) || !isRecentPreparationResult(response)) {
-    throw new Error("viewer_invalid_recent_preparation");
-  }
-  return response;
-}
-
-async function reconcileRecentPreparation(kv: StateKV): Promise<RecentPreparationReconciliation> {
-  try {
-    const response = await retrievalRequest<unknown>(kv, { action: "preparation_status", target: "viewer_recent" });
-    if (!isRecentPreparationStatus(response)) return { state: "unknown", reason: "invalid_status_response" };
-    return { state: "reconciled", ...response };
-  } catch (error) {
-    const reason = error instanceof IndexedRetrievalError || error instanceof InvocationError ? error.code : "status_reconciliation_failed";
-    return { state: "unknown", reason };
-  }
+function isSessionCount(value: unknown): value is SessionCount {
+  return isRecord(value) && value.scope === "all_sessions"
+    && (value.coverage === "complete" ? typeof value.total === "number" && Number.isSafeInteger(value.total) && value.total >= 0
+      : value.coverage === "incomplete" && value.total === null)
+    && typeof value.revision === "string" && /^\d{1,20}$/.test(value.revision)
+    && typeof value.generation === "string" && /^\d{1,20}$/.test(value.generation);
 }
 
 async function requestRecentPage(kv: StateKV, entity: "sessions" | "observations", sessionId: string | undefined,
@@ -289,29 +175,14 @@ export async function viewerRecentPage(kv: StateKV, entity: "sessions" | "observ
   if (query.latest !== "true") throw new Error("viewer_latest_required");
   const fields = entity === "sessions" ? VIEWER_SESSION_FIELDS.filter(field => field !== "metadata")
     : [...VIEWER_OBSERVATION_FIELDS, "compressionMethod"];
-  let result = await requestRecentPage(kv, entity, sessionId, options, fields);
-  let preparation: RecentPreparationResult | undefined;
-  let preparationReconciliation: RecentPreparationReconciliation | undefined;
-  if (result.status === "preparing") {
-    try {
-      preparation = await requestRecentPreparation(kv);
-    } catch (error) {
-      if (!(error instanceof InvocationError) || error.code !== "TIMEOUT") throw error;
-      preparationReconciliation = await reconcileRecentPreparation(kv);
-    }
-    const exhausted = preparation
-      ? !preparation.continue
-      : preparationReconciliation?.state === "reconciled"
-        && preparationReconciliation.scanned && preparationReconciliation.dirty === 0;
-    if (options.cursor === undefined && exhausted) {
-      result = await requestRecentPage(kv, entity, sessionId, options, fields);
-    }
-  }
+  const result = await requestRecentPage(kv, entity, sessionId, options, fields);
   const partial = result.status !== "ready" || result.has_more || options.cursor !== undefined;
   return { items: result.items.map(item => item.value), status: result.status, partial, nextCursor: result.next_cursor,
-    total: partial ? null : result.items.length, ordering: result.ordering, reason: result.reason,
-    projections: result.items.map(item => ({ id: item.key, projection: item.projection })), limit: options.limit,
-    ...(preparation ? { preparation } : {}), ...(preparationReconciliation ? { preparationReconciliation } : {}) };
+    total: entity === "sessions" ? result.count?.total ?? null : partial ? null : result.items.length,
+    countScope: entity === "sessions" ? "all_sessions" : "page", returnedCount: result.items.length,
+    ...(entity === "sessions" ? { countCoverage: result.count?.coverage ?? "unavailable", countRevision: result.count?.revision ?? null,
+      countGeneration: result.count?.generation ?? null } : {}), ordering: result.ordering, reason: result.reason,
+    projections: result.items.map(item => ({ id: item.key, projection: item.projection })), limit: options.limit };
 }
 
 export interface ViewerProjectSessions {

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { execSync } from "node:child_process";
 import { basename } from "node:path";
+import { Buffer } from "node:buffer";
 //#region src/hooks/_project.ts
 function resolveProject(cwd) {
 	const explicit = process.env["AGENTMEMORY_PROJECT_NAME"];
@@ -29,6 +30,25 @@ function hookCwd(data) {
 	}
 	const projectDir = process.env["DEVIN_PROJECT_DIR"] || process.env["CLAUDE_PROJECT_DIR"];
 	if (projectDir && projectDir.trim()) return projectDir;
+}
+//#endregion
+//#region src/hooks/_capture-bounds.ts
+const TOOL_INPUT_BYTES = 16384;
+const TOOL_OUTPUT_BYTES = 8192;
+function utf8Prefix(text, maxBytes) {
+	const bytes = Buffer.from(text, "utf8");
+	if (bytes.length <= maxBytes) return text;
+	let end = Math.max(0, maxBytes);
+	while (end > 0 && (bytes[end] & 192) === 128) end--;
+	return bytes.subarray(0, end).toString("utf8");
+}
+function boundCapture(value, maxBytes) {
+	if (value === void 0) return void 0;
+	const text = typeof value === "string" ? value : JSON.stringify(value) ?? "";
+	const bytes = Buffer.byteLength(text, "utf8");
+	if (bytes <= maxBytes) return value;
+	const marker = `\n[agentmemory truncated: original=${bytes} UTF-8 bytes; cap=${maxBytes}; uncaptured suffix unavailable]`;
+	return utf8Prefix(text, Math.max(0, maxBytes - Buffer.byteLength(marker))) + marker;
 }
 //#endregion
 //#region src/hooks/post-tool-failure.ts
@@ -72,8 +92,8 @@ async function main() {
 			timestamp: (/* @__PURE__ */ new Date()).toISOString(),
 			data: {
 				tool_name: toolName,
-				tool_input: typeof toolInput === "string" ? toolInput.slice(0, 4e3) : JSON.stringify(toolInput ?? "").slice(0, 4e3),
-				error: typeof error === "string" ? error.slice(0, 4e3) : JSON.stringify(error ?? "").slice(0, 4e3)
+				tool_input: boundCapture(toolInput, TOOL_INPUT_BYTES),
+				error: boundCapture(error, TOOL_OUTPUT_BYTES)
 			}
 		}),
 		signal: AbortSignal.timeout(3e3)
@@ -83,5 +103,3 @@ async function main() {
 main().catch(() => process.exit(0));
 //#endregion
 export {};
-
-//# sourceMappingURL=post-tool-failure.mjs.map

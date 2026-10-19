@@ -11,7 +11,7 @@ import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
 import { createHash } from "node:crypto";
 import { stableObservationJson } from "./observation-identity.js";
-import { decideMemoryAdmission, sameMemoryScope, type AdmissionRequest, type AttributedMemory, type MemorySourceKind } from "./memory-admission.js";
+import { decideMemoryAdmission, sameMemoryScope, recordAdmissionSkip, type AdmissionRequest, type AttributedMemory, type MemorySourceKind } from "./memory-admission.js";
 
 // Slicing by UTF-16 code unit can cut an astral character (emoji, some CJK
 // extensions) mid surrogate pair, leaving a lone high surrogate that renders
@@ -39,10 +39,11 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
       sourceKind?: MemorySourceKind;
     }) => {
       if (
-        !data.content ||
+        !data?.content ||
         typeof data.content !== "string" ||
         !data.content.trim()
       ) {
+        if (typeof data?.content === "string") await recordAdmissionSkip(kv, "empty_content", Buffer.byteLength(data.content));
         return { success: false, error: "content is required" };
       }
       for (const field of ["files", "concepts", "sourceObservationIds"] as const) {
@@ -93,6 +94,7 @@ export function registerRememberFunction(sdk: IIIClient, kv: StateKV): void {
         try { decision = decideMemoryAdmission(request, candidates); }
         catch (error) { return { success: false, error: error instanceof Error ? error.message : "memory_admission_failed" }; }
         if (decision.action === "skip" && decision.current) {
+          await recordAdmissionSkip(kv, "exact_duplicate", Buffer.byteLength(request.content));
           return { success: true, memory: decision.current, admission: { action: decision.action, reason: decision.reason }, providerCalls: 0 };
         }
         const supersededMemory = decision.action === "update" || decision.action === "merge" ? decision.current : undefined;

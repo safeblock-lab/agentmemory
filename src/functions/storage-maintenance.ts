@@ -1,5 +1,15 @@
+import { markWorkflowStatisticsGap } from "./dashboard-activity.js";
 import type { IIIClient } from "iii-sdk";
+import { runAdmittedPhysicalMaintenance, type StorageForegroundPressure, type StorageMaintenanceContinuation } from "./physical-maintenance.js";
+import { runPeriodicLayouts, emptyLayoutCycle, normalizeLayoutCycle, isLayoutAdmissionAccepted, bindLayoutGraphTurn, LAYOUT_LEASE_CONTEXT_RECOVERY_VERSION, type LayoutCycle, type LayoutAdmission } from "./periodic-layouts.js";
+import { requestGraphWorkTurn, type GraphWorkTurn } from "../state/graph-work-queue.js";
+import { runPeriodicCompactionCandidate, preservePeriodicLease } from "./periodic-maintenance.js";
+import { emptyPeriodicCompactionProgress, normalizePeriodicCompactionProgress,
+  type PeriodicCompactionProgress, type PeriodicExecutionAdmission } from "./periodic-maintenance-state.js";
 import { logger } from "../logger.js";
+import { loadSnapshotConfig } from "../config.js";
+import { collectClosedSnapshotTemporary } from "./snapshot.js";
+import { recordAudit } from "./audit.js";
 import type {
   StorageCleanupSummary, StorageCompactionProgress, StorageDiagnosticProgress,
   StorageGrowthSample, StorageMaintenanceState,
@@ -21,11 +31,27 @@ const RETENTION_MS = STORAGE_RETENTION.completedBodies.inactivityMs;
 const MAX_CANDIDATES = 24;
 const RECLAIM_PAGE_MS = 25;
 const RECLAIM_MAX_PAGES = 16;
+const RECLAIM_MAINTENANCE_PAGE_MS = 3_000;
+const RECLAIM_MAINTENANCE_MAX_PAGES = 4_096;
 const RECLAIM_MIN_INTERVAL_MS = 5_000;
 const RECLAIM_IDLE_POLL_MS = 60_000;
 const RECLAIM_ERROR_BACKOFF_MS = 15 * 60_000;
-const RECLAIM_OVERLAP_LEASE_MS = 2 * 60_000;
+const RECLAIM_OVERLAP_LEASE_MS = 5 * 60_000;
 const active = new WeakSet<StateKV>();
+type LayoutTurnTicket = { turn?: GraphWorkTurn; waited: boolean; claimed: boolean };
+const layoutTurnTickets = new WeakMap<StateKV, LayoutTurnTicket>();
+function releaseLayoutTurn(kv: StateKV, ticket: LayoutTurnTicket): void {
+  if (ticket.turn?.granted) ticket.turn.release();
+  if (layoutTurnTickets.get(kv) === ticket) layoutTurnTickets.delete(kv);
+}
+export function releaseUnclaimedStorageMaintenanceTurn(kv: StateKV): void {
+  const ticket = layoutTurnTickets.get(kv);
+  if (ticket?.turn?.granted && !ticket.claimed) releaseLayoutTurn(kv, ticket);
+}
+function continuation(kind: StorageMaintenanceContinuation["kind"], reason: string, incomplete = true,
+  progressMade = false, retryAfterMs: number | null = null): StorageMaintenanceContinuation {
+  return { version: 1, kind, reason, incomplete, progressMade, retryAfterMs };
+}
 const stateWriters = new WeakMap<StateKV, { sdk: IIIClient; lease: MaintenanceLease; unavailable?: boolean }>();
 type Row = Record<string, unknown>;
 
@@ -50,6 +76,10 @@ type MaintenanceReview = {
   dueReasons: Array<"growth_20_percent" | "free_pages_24h">;
 };
 type MaintenanceState = StorageMaintenanceState & {
+  layoutCycle: LayoutCycle;
+  layoutAdmission?: LayoutAdmission;
+  periodicCompaction: PeriodicCompactionProgress;
+  periodicAdmission?: PeriodicExecutionAdmission;
   maintenanceHistory: MaintenanceHistoryEntry[];
   maintenanceReview: MaintenanceReview;
 };
@@ -82,6 +112,8 @@ function emptyState(): MaintenanceState {
   return {
     version: 1, updatedAt: new Date().toISOString(),
     compaction: emptyCompaction(),
+    layoutCycle: emptyLayoutCycle(),
+    periodicCompaction: emptyPeriodicCompactionProgress(),
     totals: {
       graphRowsDeleted: 0, technicalRowsDeleted: 0, rawStripped: 0,
       operationRowsDeleted: 0, logicalBytesDeleted: 0, storedBytesDeleted: 0,
@@ -118,6 +150,10 @@ async function readState(kv: StateKV): Promise<MaintenanceState> {
   const savedReview = isRow(saved.maintenanceReview) ? saved.maintenanceReview : defaults.maintenanceReview;
   return {
     ...defaults, ...state,
+    layoutCycle: normalizeLayoutCycle(saved.layoutCycle),
+    layoutAdmission: saved.layoutAdmission,
+    periodicCompaction: normalizePeriodicCompactionProgress(saved.periodicCompaction),
+    periodicAdmission: saved.periodicAdmission,
     compaction: {
       ...defaults.compaction, ...savedCompaction,
       nextMaxPages: Number.isInteger(savedCompaction.nextMaxPages)
@@ -191,13 +227,16 @@ async function triggerMaintenanceLease(
 }
 
 async function triggerFencedReclaim(
-  sdk: IIIClient, lease: MaintenanceLease, maxPages: number,
+  sdk: IIIClient, lease: MaintenanceLease, maxPages: number, mode: "ordinary" | "maintenance",
 ): Promise<StorageReclaimResult> {
   try {
-    return await triggerStateStorage<StorageReclaimResult>(sdk, {
-      action: "reclaim", max_pages: maxPages, max_ms: RECLAIM_PAGE_MS,
-      lease_owner_id: lease.ownerId, lease_fence: lease.fence,
-    });
+    const request = mode === "maintenance"
+      ? { action: "reclaim" as const, maintenance: true as const, checkpoint: "truncate" as const,
+        max_pages: RECLAIM_MAINTENANCE_MAX_PAGES, max_ms: RECLAIM_MAINTENANCE_PAGE_MS,
+        lease_owner_id: lease.ownerId, lease_fence: lease.fence }
+      : { action: "reclaim" as const, max_pages: maxPages, max_ms: RECLAIM_PAGE_MS,
+        lease_owner_id: lease.ownerId, lease_fence: lease.fence };
+    return await triggerStateStorage<StorageReclaimResult>(sdk, request);
   } catch (error) {
     throw new StorageMaintenanceOutcomeUnknown(error);
   }
@@ -634,10 +673,13 @@ function updateReclaimState(
   state: MaintenanceState,
   result: StorageReclaimResult,
   now: number,
+  mode: "ordinary" | "maintenance",
 ): void {
   const progress = state.compaction;
-  progress.nextMaxPages = result.next_max_pages ?? progress.nextMaxPages;
-  progress.minIntervalMs = Math.max(RECLAIM_MIN_INTERVAL_MS, result.min_interval_ms ?? progress.minIntervalMs);
+  if (mode === "ordinary") {
+    progress.nextMaxPages = result.next_max_pages ?? progress.nextMaxPages;
+    progress.minIntervalMs = Math.max(RECLAIM_MIN_INTERVAL_MS, result.min_interval_ms ?? progress.minIntervalMs);
+  }
   progress.lastStatus = result.status;
   progress.lastReason = result.reason;
   progress.lastErrorCode = null;
@@ -673,7 +715,7 @@ function updateReclaimState(
     pagesReclaimed: result.pages_reclaimed,
     physicalBytesReclaimed: result.physical_bytes_reclaimed,
     nextMaxPages: progress.nextMaxPages, minIntervalMs: progress.minIntervalMs,
-    checkpointPerformed: false,
+    checkpointPerformed: result.checkpoint_performed,
   };
   appendHistory(state, {
     at: new Date(now).toISOString(), action: "reclaim", outcome: result.status,
@@ -692,13 +734,14 @@ async function reclaim(
   state: MaintenanceState,
   lease: MaintenanceLease,
   force = false,
+  mode: "ordinary" | "maintenance" = "ordinary",
 ): Promise<{ result: StorageReclaimResult | null; outcomeUnknown: boolean }> {
   const now = Date.now();
   const progress = state.compaction;
   const backoffUntil = progress.backoffUntil ? Date.parse(progress.backoffUntil) : 0;
   if (backoffUntil > now) return { result: null, outcomeUnknown: false };
   const nextEligibleAt = progress.nextEligibleAt ? Date.parse(progress.nextEligibleAt) : 0;
-  if (!force && nextEligibleAt > now) return { result: null, outcomeUnknown: false };
+  if (mode === "ordinary" && !force && nextEligibleAt > now) return { result: null, outcomeUnknown: false };
   progress.attempts++;
   await saveState(kv, state);
 
@@ -712,9 +755,10 @@ async function reclaim(
     }
     lease.expiresAt = renewed.expires_at;
     progress.overlap = { ownerId: lease.ownerId, startedAt: new Date(now).toISOString(), expiresAt: lease.expiresAt };
-    const result = await triggerFencedReclaim(sdk, lease,
-      Math.max(1, Math.min(RECLAIM_MAX_PAGES, progress.nextMaxPages)));
-    updateReclaimState(state, result, Date.now());
+    const maxPages = mode === "maintenance" ? RECLAIM_MAINTENANCE_MAX_PAGES
+      : Math.max(1, Math.min(RECLAIM_MAX_PAGES, progress.nextMaxPages));
+    const result = await triggerFencedReclaim(sdk, lease, maxPages, mode);
+    updateReclaimState(state, result, Date.now(), mode);
     return { result, outcomeUnknown: false };
   } catch (error) {
     const code = errorCode(error);
@@ -844,41 +888,97 @@ function growth(state: MaintenanceState): Record<string, unknown> | null {
   };
 }
 
-export function registerStorageMaintenance(sdk: IIIClient, kv: StateKV): void {
+export function registerStorageMaintenance(sdk: IIIClient, kv: StateKV, isForegroundBusy: () => boolean = () => false,
+  foregroundPressureSnapshot?: () => StorageForegroundPressure, onGraphTurnGranted?: () => void): void {
   sdk.registerFunction("mem::storage-maintenance", async (request?: {
-    action?: unknown; allow_blocking?: unknown; max_ms?: unknown;
+    action?: unknown; allow_blocking?: unknown; max_ms?: unknown; closed_owner_id?: unknown;
   }) => {
     const action = typeof request?.action === "string" ? request.action : "tick";
-    if (!["tick", "status", "diagnostics", "activate", "reclaim", "migrate_incremental"].includes(action)) {
+    let returnedContinuation: StorageMaintenanceContinuation | undefined;
+    const respond = <T extends Record<string, unknown>>(value: T, next: StorageMaintenanceContinuation) => {
+      returnedContinuation = next;
+      return { ...value, continuation: next };
+    };
+    if (!["tick", "status", "diagnostics", "activate", "reclaim", "migrate_incremental", "collect_snapshot_temporary"].includes(action)) {
       return { success: false, code: "STATE_STORAGE_INVALID_ACTION" };
     }
     if (action === "status") {
       const state = await readState(kv);
-      return { success: true, state, retentionPolicy: STORAGE_RETENTION, retentionUseIntegration: RETENTION_USE_INTEGRATION, growth: growth(state), maintenanceReview: state.maintenanceReview };
+      return { success: true, state, layoutLeaseContextRecoveryVersion: LAYOUT_LEASE_CONTEXT_RECOVERY_VERSION,
+        retentionPolicy: STORAGE_RETENTION, retentionUseIntegration: RETENTION_USE_INTEGRATION, growth: growth(state), maintenanceReview: state.maintenanceReview };
     }
     if (action === "migrate_incremental" && (request?.allow_blocking !== true || !Number.isInteger(request.max_ms)
       || Number(request.max_ms) < 1 || Number(request.max_ms) > 86_400_000)) {
       return { success: false, code: "STATE_STORAGE_INVALID_REQUEST" };
     }
-    if (active.has(kv)) return { success: true, busy: true };
+    if (action === "collect_snapshot_temporary" && (typeof request?.closed_owner_id !== "string"
+      || !/^[0-9a-f-]{36}$/.test(request.closed_owner_id))) return { success: false, code: "STATE_STORAGE_INVALID_REQUEST" };
+    if (active.has(kv)) {
+      const waiting = layoutTurnTickets.get(kv);
+      if (waiting?.turn?.granted && !waiting.claimed) releaseLayoutTurn(kv, waiting);
+      return respond({ success: true, busy: true }, continuation("busy", "local_running"));
+    }
+    let layoutTicket: LayoutTurnTicket | undefined;
+    if (action === "tick" || action === "activate" || action === "reclaim") {
+      const observed = await readState(kv);
+      if (isLayoutAdmissionAccepted(observed.layoutAdmission)) {
+        let ticket = layoutTurnTickets.get(kv);
+        if (!ticket) {
+          ticket = { waited: false, claimed: false };
+          const queued = ticket;
+          layoutTurnTickets.set(kv, queued);
+          queued.turn = requestGraphWorkTurn(kv, () => {
+            if (!queued.waited || layoutTurnTickets.get(kv) !== queued || !queued.turn?.granted || queued.claimed) return;
+            if (onGraphTurnGranted) {
+              try { onGraphTurnGranted(); }
+              catch { releaseLayoutTurn(kv, queued); }
+              return;
+            }
+            void sdk.trigger({ function_id: "mem::storage-maintenance", payload: { action: "tick" } }).catch(() => {
+              if (!queued.claimed) releaseLayoutTurn(kv, queued);
+            });
+          });
+          queued.waited = !queued.turn.granted;
+        }
+        if (ticket.claimed) return respond({ success: true, busy: true }, continuation("busy", "local_running"));
+        if (!ticket.turn?.granted) return respond({ success: true, deferred: true, reason: "graph_turn_queued" },
+          continuation("graph_queued", "graph_turn_queued", true, false, 60_000));
+        ticket.claimed = true;
+        layoutTicket = ticket;
+      }
+    }
+    const pendingTurn = layoutTurnTickets.get(kv);
+    if (pendingTurn && pendingTurn !== layoutTicket) return respond({ success: true, deferred: true, reason: "graph_turn_queued" },
+      continuation("graph_queued", "graph_turn_queued", true, false, 60_000));
+    if (active.has(kv)) {
+      if (layoutTicket) releaseLayoutTurn(kv, layoutTicket);
+      return respond({ success: true, busy: true }, continuation("busy", "local_running"));
+    }
     active.add(kv);
     let state: MaintenanceState | null = null;
     let lease: MaintenanceLease | null = null;
     let preserveLeaseUntilExpiry = false;
+    let unbindLayoutTurn: (() => void) | undefined;
     const ownerId = generateId("storage-maintenance");
     const startedAt = new Date().toISOString();
+    const hold = (reason: string) => continuation("hold", reason, true, false,
+      Math.max(60_000, Math.min(RECLAIM_OVERLAP_LEASE_MS,
+        lease ? Date.parse(lease.expiresAt) - Date.now() : RECLAIM_OVERLAP_LEASE_MS)));
     try {
       const admitted = await triggerMaintenanceLease(sdk, {
         action: "maintenance_lease_acquire", owner_id: ownerId, lease_ms: RECLAIM_OVERLAP_LEASE_MS,
       });
       if (admitted.status === "busy") {
         state = await readState(kv);
-        return { success: true, busy: true, reason: "native_lease_busy", leaseExpiresAt: admitted.expires_at, state };
+        return respond({ success: true, busy: true, reason: "native_lease_busy", leaseExpiresAt: admitted.expires_at, state },
+          continuation("busy", "native_lease_busy", true, false,
+            Math.max(5_000, Math.min(RECLAIM_OVERLAP_LEASE_MS, Date.parse(admitted.expires_at) - Date.now()))));
       }
       if (admitted.status !== "acquired") {
         throw new StorageMaintenanceOutcomeUnknown("STATE_STORAGE_MAINTENANCE_LEASE_FENCED");
       }
       lease = { ownerId, fence: admitted.fence, expiresAt: admitted.expires_at };
+      if (layoutTicket?.turn) unbindLayoutTurn = bindLayoutGraphTurn(lease, layoutTicket.turn);
       stateWriters.set(kv, { sdk, lease });
       state = await readState(kv);
       state.compaction.overlap = { ownerId, startedAt, expiresAt: lease.expiresAt };
@@ -902,6 +1002,18 @@ export function registerStorageMaintenance(sdk: IIIClient, kv: StateKV): void {
         lease.expiresAt = refreshed.expires_at;
         state.compaction.overlap = { ownerId: lease.ownerId, startedAt, expiresAt: lease.expiresAt };
       };
+
+      if (action === "collect_snapshot_temporary") {
+        if (!state.cleanupActivatedAt) return { success: false, code: "STATE_STORAGE_CLEANUP_NOT_ACTIVATED" };
+        if (admitted.recovered_expired) return { success: false, deferred: true, code: "STATE_STORAGE_MAINTENANCE_RECOVERY_REQUIRED" };
+        const closedOwner = request?.closed_owner_id;
+        if (typeof closedOwner !== "string") throw new Error("STATE_STORAGE_INVALID_REQUEST");
+        const result = await collectClosedSnapshotTemporary(kv, loadSnapshotConfig().dir, closedOwner, refreshLease);
+        if (result.collected) await recordAudit(kv, "delete", "mem::storage-maintenance", [closedOwner], {
+          resource: "snapshot_temporary", reason: "closed_owned_temporary",
+        });
+        return { success: true, result };
+      }
 
       if (action === "activate") {
         if (!state.diagnostics.lastComplete || !state.observationIndex.complete) {
@@ -931,6 +1043,30 @@ export function registerStorageMaintenance(sdk: IIIClient, kv: StateKV): void {
         await diagnosticsStep(sdk, kv, state);
         return { success: true, state };
       }
+      if (state.layoutAdmission?.acceptedByMain === true && state.periodicAdmission?.executionAuthorized === true) {
+        await refreshLease();
+        const physical = await runAdmittedPhysicalMaintenance({ sdk, kv, layoutCycle: state.layoutCycle,
+          layoutAdmission: state.layoutAdmission, periodicCompaction: state.periodicCompaction,
+          periodicAdmission: state.periodicAdmission, lease: lease!, refresh: refreshLease,
+          persist: () => saveState(kv, state!),
+          reclaimMaintenance: () => reclaim(sdk, kv, state!, lease!, true, "maintenance"), isForegroundBusy,
+          foregroundPressureSnapshot });
+        preserveLeaseUntilExpiry = physical.preserveLease;
+        let next: StorageMaintenanceContinuation;
+        if (physical.preserveLease || state.layoutCycle.recoveryRequired || state.layoutCycle.pending !== null || state.layoutCycle.pendingRaw !== null
+          || state.periodicCompaction.recoveryRequired || state.periodicCompaction.pendingRequest !== null
+          || state.periodicCompaction.pendingRequestRaw !== null) next = hold("native_reconciliation_required");
+        else if (physical.cancellationReason === "foreground_pressure") next = continuation("foreground", "foreground_pressure",
+          physical.incomplete, physical.progressMade, Math.max(1_000,
+            Math.min(10_000, (physical.foregroundPressure?.quietWindowRemainingMs ?? 5_000) + 250)));
+        else if (physical.incomplete && physical.progressMade) next = continuation("progress", "bounded_progress", true, true,
+          Math.max(1_000, Math.min(10_000, Math.ceil(physical.elapsedMs / 4))));
+        else if (physical.incomplete) next = continuation("busy", "no_progress");
+        else next = continuation(state.periodicCompaction.lastDisposition === "automatic_cycle_complete" ? "complete" : "idle",
+          "cycle_idle", false, physical.progressMade, 60_000);
+        return respond({ success: true, physicalOnly: true, physical,
+          retentionCleanupActivated: Boolean(state.cleanupActivatedAt), state }, next);
+      }
       if (!state.diagnostics.lastComplete || state.observationIndex.complete) {
         await refreshLease();
         await diagnosticsStep(sdk, kv, state);
@@ -943,15 +1079,39 @@ export function registerStorageMaintenance(sdk: IIIClient, kv: StateKV): void {
       if (state.cleanupActivatedAt) {
         await refreshLease();
         cleanup = await cleanupStep(sdk, kv, state);
+        const sample = state.diagnostics.lastComplete;
+        if (sample) {
+          const layouts = await runPeriodicLayouts({sdk,cycle:state.layoutCycle,admission:state.layoutAdmission,sample,
+            lease:lease!,refresh:refreshLease,persist:()=>saveState(kv,state!)});
+          if (layouts.preserveLease) {preserveLeaseUntilExpiry=true;return {success:true,deferred:true,layouts,state};}
+          const periodic = await runPeriodicCompactionCandidate({
+            sdk, kv, progress: state.periodicCompaction,
+            layoutComplete: layouts.disposition === "cycle_complete"
+              || (!state.layoutCycle.active && state.layoutCycle.familyIndex === 3
+                && state.layoutCycle.pending === null && !state.layoutCycle.recoveryRequired),
+            sample,
+            admission: state.periodicAdmission ?? {
+              baselineBytes: 5_711_050_488, minimumNetBytes: 285_552_525,
+              aggregateCandidateAccepted: false, executionAuthorized: false,
+              conservativeCombinedNetBytes: 0, runtimeCompatible: false,
+            },
+            lease: lease!, refreshSameLease: refreshLease,
+            persistProgress: () => saveState(kv,state!), isCancelled: () => false,
+          }).catch(async error => { await markWorkflowStatisticsGap(kv, "maintenance"); throw error; });
+          preserveLeaseUntilExpiry = preservePeriodicLease(periodic.disposition)
+            || state.periodicCompaction.pendingRequest !== null || state.periodicCompaction.recoveryRequired;
+          if (preserveLeaseUntilExpiry) return { success: true, deferred: true, periodic, state };
+        }
         await refreshLease();
         const outcome = await reclaim(sdk, kv, state, lease!);
         compaction = outcome.result;
         preserveLeaseUntilExpiry = outcome.outcomeUnknown;
       }
-      return { success: true, baselineComplete: Boolean(state.diagnostics.lastComplete), indexComplete: state.observationIndex.complete,
+      return respond({ success: true, baselineComplete: Boolean(state.diagnostics.lastComplete), indexComplete: state.observationIndex.complete,
         cleanupActivated: Boolean(state.cleanupActivatedAt), cleanup,
         compaction: compaction?.status ?? state.compaction.lastStatus,
-        state, maintenanceReview: state.maintenanceReview };
+        state, maintenanceReview: state.maintenanceReview }, preserveLeaseUntilExpiry
+          ? hold("native_reconciliation_required") : continuation("idle", "ordinary_maintenance", false, false, 60_000));
     } catch (error) {
       const code = errorCode(error);
       preserveLeaseUntilExpiry = lease !== null || error instanceof StorageMaintenanceOutcomeUnknown
@@ -973,13 +1133,16 @@ export function registerStorageMaintenance(sdk: IIIClient, kv: StateKV): void {
         await saveState(kv, state).catch(() => undefined);
       }
       logger.warn("Storage maintenance step paused", { code });
-      return { success: false, code, ...(state ? { state } : {}) };
+      return respond({ success: false, code, ...(state ? { state } : {}) }, hold("storage_error"));
     } finally {
+      if (returnedContinuation && preserveLeaseUntilExpiry)
+        Object.assign(returnedContinuation, hold("native_reconciliation_required"));
       if (lease && state && !preserveLeaseUntilExpiry) {
         try {
           state.compaction.overlap = null;
           await saveState(kv, state, true);
         } catch (error) {
+          if (returnedContinuation) Object.assign(returnedContinuation, hold("lease_release_unknown"));
           const code = errorCode(error);
           state.compaction.overlap = { ownerId, startedAt, expiresAt: lease.expiresAt };
           state.compaction.nextEligibleAt = lease.expiresAt;
@@ -998,6 +1161,8 @@ export function registerStorageMaintenance(sdk: IIIClient, kv: StateKV): void {
       }
       active.delete(kv);
       stateWriters.delete(kv);
+      unbindLayoutTurn?.();
+      if (layoutTicket) releaseLayoutTurn(kv, layoutTicket);
     }
   });
 }

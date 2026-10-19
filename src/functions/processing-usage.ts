@@ -7,19 +7,27 @@ import { priceSolUsage } from "./codex-usage.js";
 import { logger } from "../logger.js";
 
 const key = () => getAgentId() ?? "default";
-export async function recordProcessingUsage(kv: StateKV, usage: LlmUsage, effectKey?: string): Promise<void> {
+export interface ProcessingUsageProvenance { task: string; provider: string; model: string }
+export async function recordProcessingUsage(kv: StateKV, usage: LlmUsage, effectKey?: string,
+  provenance?: ProcessingUsageProvenance): Promise<void> {
   const item: ProcessingUsageEvent = { id: effectKey ?? randomUUID(), timestamp: new Date().toISOString() };
+  for (const field of ["task", "provider", "model"] as const) {
+    const value = provenance?.[field];
+    if (typeof value === "string" && value.length <= 256 && /^[A-Za-z0-9][A-Za-z0-9._:/@+-]*$/.test(value)) item[field] = value;
+  }
   for (const field of ["inputTokens", "cachedInputTokens", "cacheWriteInputTokens", "outputTokens"] as const) {
     const value = usage[field];
     if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) item[field] = value;
   }
   try {
     const result = await kv.update<{ errors?: unknown }>(KV.processingUsage, key(), [
-      { type: "append_bounded", path: "items", value: { item, limit: 1000 } },
+      { type: "append_bounded", path: "items", value: { item, limit: 500 } },
     ]);
     if (Array.isArray(result?.errors) && result.errors.length) throw new Error("Usage append rejected");
-  } catch {
-    logger.warn("Processing usage sample could not be recorded");
+  } catch (error) {
+    const code = error instanceof Error ? error.message.match(/\bSTATE_[A-Z0-9_]+\b/)?.[0] : undefined;
+    logger.warn("Processing usage sample could not be recorded", { stateFunction: "state::update", code,
+      errorName: error instanceof Error ? error.name : undefined, requestedLimit: 500 });
   }
 }
 
@@ -37,5 +45,5 @@ export async function readProcessingUsage(kv: StateKV) {
     minUsd += priceSolUsage(e.inputTokens, e.cachedInputTokens ?? e.inputTokens - writes, writes, e.outputTokens);
     maxUsd += priceSolUsage(e.inputTokens, cached, e.cacheWriteInputTokens ?? e.inputTokens - cached, e.outputTokens);
   }
-  return { limit: 1000, calls: events.length, unreportedCalls, missingCacheCalls, solEquivalentUsdRange: [minUsd, maxUsd] };
+  return { limit: 500, calls: events.length, unreportedCalls, missingCacheCalls, solEquivalentUsdRange: [minUsd, maxUsd] };
 }

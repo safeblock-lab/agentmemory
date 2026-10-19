@@ -1,8 +1,8 @@
 # Native lossless compaction source candidate
 
-This delivery has emitted application bundles without typechecking. Native
-compilation is pending dependency recovery; it has not produced an accepted
-engine artifact. No tests, installation, migration, database access, provider
+This delivery compiled the isolated native release and emitted application bundles
+without typechecking. Both compiler/emitter processes returned exit 0; no runtime
+acceptance is implied. No tests, installation, migration, database access, provider
 call, service action, checksum, health probe or physical measurement was performed.
 It establishes neither a reduction ratio nor runtime acceptance. The installed
 engine remains a separate artifact.
@@ -113,6 +113,29 @@ An authorization to edit this source does not authorize invoking these actions.
 
 ## Physical reclamation
 
+Graph membership conversion removes the expanded memberships for one
+`(epoch,key)` using `DELETE FROM retrieval_membership INDEXED BY
+retrieval_membership_key WHERE epoch=?1 AND key=?2`. The existing index is
+created with `IF NOT EXISTS` by `retrieval::graph::schema` on every successful
+database open; initialization errors propagate, so historical databases missing
+the index are repaired before the hinted statement can run. A native SQLite
+3.51.3 schema/plan fixture exposed the unhinted primary-key search on `epoch`
+alone despite the `(epoch,key)` index. The hint selects both equalities and
+does not change which memberships are deleted. The request time budget is
+cooperative; commit, transport and I/O can make client wall time exceed it.
+
+List construction serializes each identifier token with the existing Rust JSON
+encoder, then inserts the token array in ordinal order and resolves IDs through
+the unique token index. This preserves first-occurrence ID assignment, existing
+IDs, duplicates, and packed list width/order without SQL calls per reference.
+Root list members use a set-based insert plus exact distinct cardinality check.
+During physical copy, membership conversion may reuse that freshly built list
+only when its canonical JSON equals the node's complete source-ID array. The
+packed format is still validated, dictionary and epoch bindings are checked,
+native IDs retain first-occurrence order, and key position is explicitly stored.
+The legacy projection is still removed only after its compact representation
+exists; a ready legacy index alone never permits skipping conversion or repair.
+
 The existing native `reclaim` action remains the physical page mechanism:
 1..16 pages per cut, 1..25 ms, a current maintenance fence checked for every
 page, adaptive cuts, five-second cooldown, and foreground/WAL pressure refusal.
@@ -120,7 +143,21 @@ It executes incremental vacuum through the StateModule owner and preserves all
 private tables. Reusable pages and a smaller freelist do not establish a smaller
 file while WAL still retains page changes.
 
-Two additional `compact_apply` steps run outside the ordinary mutation
+The explicit `reclaim` maintenance request adds `maintenance: true`,
+`max_pages: 1..4096`, `max_ms: 1..3000`, and `checkpoint: "truncate"`.
+The default remains `maintenance: false`; ordinary limits and cooldown stay
+unchanged. Maintenance uses transactions of at most 128 pages, checks the
+current owner/fence and foreground pressure between chunks, yields between
+chunks, and has no five-second cooldown. It drains every row returned by
+`PRAGMA incremental_vacuum(N)` before committing each chunk. WAL pressure
+requires an acknowledged TRUNCATE checkpoint rather than unbounded WAL growth.
+The response records actual before/after physical state, reclaimed pages,
+checkpoint outcome, `max_chunk_pages: 128`, and `min_interval_ms: 0`.
+This action has no operation ID or replay receipt: after an unknown ACK,
+reconcile actual page count, freelist and WAL before issuing a new bounded
+call. Never describe a repeated reclaim request as receipt-idempotent.
+
+Three additional `compact_apply` steps run outside the ordinary mutation
 transaction on the same serialized owner. Both require compact phase, the
 expected format generation and a current maintenance lease/fence. They first
 commit a durable identity/digest intent and generation advance, perform the
@@ -144,6 +181,10 @@ the unresolved intent. No stale database swap or budget restoration occurs.
   state and actual SQLite busy/frame counts are recorded. Committing the result
   itself can create new WAL metadata pages, so this is not a promise of a
   permanently zero-byte WAL or a complete final-tree measurement.
+- `rebuild` is an explicitly authorized atomic VACUUM with a 1..240000 ms
+  cooperative budget. It is a manual maintenance-window option; incremental,
+  interruptible `reclaim` remains the shared primitive for direct and future
+  periodic maintenance. A full rebuild does not provide foreground preemption.
 
 After accepted logical cut/collection, enable incremental mode if required,
 run acknowledged bounded `reclaim` cuts, then an explicitly authorized compact
@@ -179,48 +220,51 @@ dependencies and protections. Captured inputs/provider results, durable replay
 receipts, unknown/failed work and raw originals without an exact retained source
 continue to be preserved. These source changes do not schedule or run cleanup.
 
-## Next explicit authorization
+## Build assets and next explicit authorization
 
-First compile this source and its required dependency edges in a new isolated
-native workspace based on upstream `e7de3820d1e558f3762edf95e4440552444d48d3`.
-Apply `patches/iii-engine/0.22.1-state-pagination.patch` there, preserving existing
-work rather than overwriting an accepted source checkout. The production build
-target remains `iii`, binary `iii`, target `x86_64-pc-windows-msvc`; the existing
-release recipe is `cargo build --locked --release --no-default-features --jobs 1
---package iii --bin iii --target x86_64-pc-windows-msvc`. This command was not run.
-Synchronize artifact/capability manifests only with the artifact actually built.
+The native source-only mirror is `native-candidate/build-workspace`, excluding
+`.git`, `target`, `artifacts`, `node_modules` and generated directories.
+`native-candidate/build-native.cmd` takes that workspace's `Cargo.toml` as
+its first argument. It initializes VS2022 Community `vcvars64.bat` and invokes
+`C:/Users/harus/.cargo/bin/cargo.exe build --offline --locked --release
+--no-default-features --jobs 1 --package iii --bin iii --target
+x86_64-pc-windows-msvc`. `CARGO_HOME` is candidate-local `cargo-home`;
+`CARGO_TARGET_DIR` is the existing
+`D:/agentmemory/.codex-task/bounded-engine/cargo-target`.
+`CARGO_INCREMENTAL=0`, TEMP/TMP are candidate-local `temp`. Accepted source
+was not overwritten and no binary/cache tree was copied wholesale.
 
-Previously used cache paths, read from the accepted build recipes rather than
-probed in this delivery, are
-`D:/agentmemory/.codex-task/bounded-engine/cargo-home` and
-`D:/agentmemory/.codex-task/bounded-engine/cargo-target`; `CARGO_INCREMENTAL=0`.
-The compiler entry is `C:/Users/harus/.cargo/bin/cargo.exe`, with VS2022 Community
-`VC/Auxiliary/Build/vcvars64.bat`. The existing full workspace at the canonical
-source root can be reused after Main preserves before-images and integrates only
-the owned adapter delta; do not apply a full upstream patch over its existing
-changes. No cache or binary trees need copying. Current cache/toolchain readiness
-has not been checked.
+Selective locked registry metadata/archives (172638548 bytes, 1440 files) were
+copied without credential/config files. Authorized `cargo fetch --locked`
+completed with the same candidate-local home and Windows target. Initial missing
+`anyhow`/`fs2`, an intermediate output-directory error and two compiler type
+errors have preserved logs. The final native release invocation returned exit 0
+and emitted `native-candidate/artifacts/win32-x64/iii.exe`; raw build/exit and
+emission logs remain beside the recipe. No tests or native capability probes ran.
 
-`native-candidate/build-native.cmd` is the compilation/emission recipe.
-It requires the actual integrated workspace `Cargo.toml` as its first argument,
-uses the existing target cache and a candidate-local Cargo home, sets TEMP/TMP under the delivery directory, writes
-logs/exit and emits to `native-candidate/artifacts/win32-x64/iii.exe`. It performs
-no tests, typecheck, checksum or capability probe. Necessary compilation and
-emission may precede installation approval. Initial offline invocations failed
-before Rust compilation on missing `anyhow`, then `fs2`; their logs/exit files
-are retained as `initial-offline-build.*` and `selected-cache-build.*`.
+`app-source` starts from the installed
+`agentmemory-source-20261015-provider-stages-20261015T115401Z` source package,
+then applies this task's exact retention/capture mutations recovered as data from
+the two worker rollouts. `task-deltas/composition.json` records the baseline
+and applied paths; the extraction does not execute rollout JavaScript. The new
+snapshot read-view module was recovered from its initial source reading and its
+task edits applied. Only its StateKV/storage transport bridge was added to the
+installed baseline. In particular, installed `completeSession` and unrelated
+extract/provider stages remain in that baseline. Native compaction transport and
+the embedding-reuse recovery guard are narrow additions. The retention-evict
+handler is integrated as the directly required cleanup-authorization/explicit-TTL/
+protection change; no entire workspace retention file is promoted. Its recorded
+type-only adjustments targeting an unpublished handler were superseded by that
+integration. No other root workspace files are copied wholesale.
 
-The owned `build-workspace` is a source-only mirror, excluding `.git`, `target`,
-`artifacts`, `node_modules` and generated build directories; the accepted source
-tree was not overwritten. Selective registry metadata/archives named in its
-Cargo.lock were copied to candidate-local `cargo-home` (172638548 bytes,
-1440 files), without credential/config files. Necessary locked dependency fetch
-uses this owned home and the Windows target; it is not a provider request or a
-version change. Compiler/dependency outcome is recorded in build/fetch logs.
-
-`tsdown.config.mts` emitted current index/CLI/standalone/reranker and hook bundles
-to `app-dist` with `dts:false`, followed by existing runtime asset copies.
-`app-build.exit.txt` records exit 0. No typecheck or runtime acceptance is implied.
+`tsdown.isolated.config.mts` emits this isolated source to
+`native-candidate/app-dist-isolated` (index, CLI, standalone, reranker and hooks),
+using the existing workspace tsdown and `dts:false`; the emitter returned exit 0.
+Runtime assets come from the installed baseline, with their source paths recorded
+in `task-deltas/runtime-assets.json`. The prior `app-dist` built from the whole
+workspace is marked `NOT-INSTALLABLE.txt` and must never be promoted. These are
+candidate assets for a later coherent package/install decision, without a passing
+runtime acceptance receipt or permission to restart services or migrate data.
 
 Later acceptance must cover exact reconstruction, mixed inline/compact writes,
 collision handling, list widening/order/duplicates, both membership directions,
@@ -239,3 +283,28 @@ pending. Capture final full database/tree and peak-space measurements before
 choosing collection or physical reclamation. Existing generic offline migration
 rejects schemas containing triggers/views; use this fenced native format path,
 not a legacy bulk converter or generic application export/import.
+
+The repeatable isolated application emitter is `native-candidate/build-app-isolated.cmd`; it does not run package scripts, tests, declaration emission or runtime checks. Recomposition uses `compose-app.py` (line-anchored source patches), `connect-isolated-app.mjs` and `connect-retention-handler.mjs`; the compiler exposed an initial line-anchor replay error, corrected before the final isolated emission. Retention protections are mirrored at the native transaction boundary, including explicit rollback/replay/recovery flags, active leases/generations and unknown/nonempty dependency references.
+
+The final native emission includes the complete retention protection helper and returned exit 0. `source-delivery.json` records this final compiler outcome alongside the isolated application emission; it is a build receipt, not runtime acceptance or a physical-size measurement.
+
+### Bounded collector candidate (2026-10-16)
+
+The collector now carries one durable phase/pass cursor across graph mappings,
+identifier mappings, roots, blobs and redundant inline rows. A request admits at
+most 4096 inspected candidates and, independently, 4096 physically deleted rows
+across all phases, with internal chunks of at most 128. Copy remains capped at
+128. The existing 4 MiB and cooperative 3000 ms budgets, transaction fencing,
+receipt replay and FULL durability remain in force. The time budget is
+cooperative; client wall time is not a hard three-second guarantee.
+
+A pass that deletes anything starts another complete pass; only a complete pass
+with no deletions reaches `gc_complete`. Actual reference changes invalidate
+completion. Separate cumulative inspected/deleted metrics describe work and
+retirement; inspections do not represent storage savings. Parent retirement
+rechecks references and retains a parent while child chunks remain. Reusing an
+unreferenced list blob reconstructs and validates its complete membership before
+publishing references in the same transaction. Physical reclamation is a later
+operation and must be measured separately. This candidate's runtime acceptance
+and actual C database reduction are recorded in the operational receipts, not
+in its compiler exit status.

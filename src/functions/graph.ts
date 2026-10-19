@@ -5,6 +5,7 @@ import type {
   GraphEdge,
   GraphQueryResult,
   GraphSnapshot,
+  GraphControlState,
   CompressedObservation,
   MemoryProvider,
   BatchEffectMetadata,
@@ -22,8 +23,13 @@ import { isGraphExtractionEnabled } from "../config.js";
 import { recordAudit } from "./audit.js";
 import { recordOperation } from "./dashboard-activity.js";
 import { logger } from "../logger.js";
+import { isExplicitEmptyGraphXml } from "./graph-empty-output.js";
+import { recordGraphEmptyOutputParse, GraphTerminalLocalDeliveryStopped } from "./graph-jobs.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
 import { withStrictGraphResponse } from "../providers/openai.js";
+import { enableGraphAutomaticRecovery, freezeGraphAutomaticResponse, isGraphAutomaticRegeneration, registerGraphProviderUsage, registerGraphTerminalDispatcher, withGraphAutomaticRegeneration } from "./graph-jobs.js";
+import { GraphAutomaticRecoveryRequired } from "./graph-automatic-workflow.js";
+import { graphAutomaticBootstrapDiagnostic, graphAutomaticBootstrapFailure, installGraphAutomaticAuthority, setGraphAutomaticAvailability } from "./graph-automatic-authority.js";
 import type { TypeSafeDecisionProvider, TypeSafeQuestion } from "../providers/typesafe.js";
 import {
   getGraphExtractionInputTargetChars,
@@ -963,6 +969,7 @@ function parseGraphExtractionResponse(
   requireProvenance = false,
 ): ParsedGraphExtraction | null {
   if (typeof response !== "string") return null;
+  if (isExplicitEmptyGraphXml(response)) return { nodes: [], edges: [] };
   try {
     const parsed = parseGraphXml(response, observationIds, requireProvenance);
     return parsed.nodes.length === 0 && parsed.edges.length === 0 ? null : parsed;
@@ -1312,7 +1319,7 @@ async function persistGraphDeltaValues(
   return { newNodeCount, newEdgeCount };
 }
 
-export function registerGraphFunction(
+export async function registerGraphFunction(
   sdk: IIIClient,
   kv: StateKV,
   provider: MemoryProvider,
@@ -1320,9 +1327,40 @@ export function registerGraphFunction(
   batchQueue?: FireworksBatchQueue,
   localCompactor?: LocalGraphCompactor,
   typeSafe?: TypeSafeDecisionProvider,
-): void {
+): Promise<void> {
   kv = graphKV(kv);
-  type ExtractionRequest = GraphDispatchRequest & { graphWorkGroupsVersion?: 2 };
+  const automaticProvider = llmRouter ? llmRouter.graphAutomaticProvider() : provider;
+  let automaticReady = false;
+  if (llmRouter) registerGraphProviderUsage(kv, llmRouter.graphAutomaticRoute(),
+    (route, model, usage, effectKey) => llmRouter.recordGraphAutomaticUsage(route, model, usage, effectKey));
+  if (automaticProvider.prepareGraphAutomaticCall) {
+    try {
+      await installGraphAutomaticAuthority([
+        automaticProvider.prepareGraphAutomaticCall({ systemPrompt: GRAPH_EXTRACTION_SYSTEM, userPrompt: "", grouped: false }).profile,
+        automaticProvider.prepareGraphAutomaticCall({ systemPrompt: GRAPH_EXTRACTION_SYSTEM_WITH_PROVENANCE, userPrompt: "", grouped: false }).profile,
+        automaticProvider.prepareGraphAutomaticCall({ systemPrompt: GRAPH_EXTRACTION_SYSTEM_WITH_PROVENANCE, userPrompt: "", grouped: true }).profile,
+      ]);
+      enableGraphAutomaticRecovery(kv);
+      automaticReady = true;
+      setGraphAutomaticAvailability(true);
+    } catch (error) {
+      const reason = graphAutomaticBootstrapFailure(error);
+      const diagnostic = graphAutomaticBootstrapDiagnostic(error);
+      setGraphAutomaticAvailability(false, reason, diagnostic);
+      logger.warn("Automatic graph recovery authorization is disabled", { reason, ...diagnostic });
+    }
+  } else {
+    setGraphAutomaticAvailability(false, "GRAPH_AUTOMATIC_PROVIDER_UNSUPPORTED");
+  }
+  type AutomaticUnitSource = { systemPrompt: string; userPrompt: string; sourceIds: string[]; completesSource?: boolean; nodesAdded?: number; edgesAdded?: number };
+  type ExtractionRequest = GraphDispatchRequest & { graphWorkGroupsVersion?: 2; automaticUnit?: AutomaticUnitSource };
+  const replacementRequest = (request: ExtractionRequest, oldJobId: string, newJobId: string, source?: AutomaticUnitSource): ExtractionRequest => {
+    const unit = source ?? { systemPrompt: request.graphProvenanceVersion === 2 ? GRAPH_EXTRACTION_SYSTEM_WITH_PROVENANCE : GRAPH_EXTRACTION_SYSTEM,
+      userPrompt: buildGraphExtractionPrompt(request.observations ?? []), sourceIds: (request.observations ?? []).map(observation => observation.id), completesSource: true };
+    return request.graphWorkGroupsVersion === 2
+      ? { ...request, graphJobId: newJobId, replacementOf: oldJobId }
+      : { ...request, graphJobId: newJobId, replacementOf: oldJobId, automaticUnit: unit };
+  };
   const currentExtractionOptions = (): GraphExtractionOptions => ({
     graphEnabled: isGraphExtractionEnabled(), llmEnabled: isGraphExtractionEnabled() && !provider.name.includes("noop"),
     auxiliary: llmRouter?.hasAuxiliaryProvider === true, targetChars: getGraphExtractionInputTargetChars(),
@@ -1387,7 +1425,12 @@ export function registerGraphFunction(
     }
     let parsed: ParsedGraphExtraction;
     try {
-      const response = await freezeGraphHandledValue(kv, `project-work-response:v3:${activeUnit.id}`, async () => {
+      const response = automaticReady && automaticProvider.prepareGraphAutomaticCall
+        ? await freezeGraphAutomaticResponse(kv, `project-work-response:v3:${activeUnit.id}`,
+          automaticProvider.prepareGraphAutomaticCall({ systemPrompt: progress.extractionSystem, userPrompt: prompt, grouped: true, sourceIds,
+            completesSource: next.complete && progress.pageIndex + 1 >= progress.pageCount,
+            nodesAdded: progress.nodesAdded, edgesAdded: progress.edgesAdded }))
+        : await freezeGraphHandledValue(kv, `project-work-response:v3:${activeUnit.id}`, async () => {
         const execute = () => llmRouter
           ? llmRouter.run("graph_extraction",
             selectedProvider => selectedProvider.compress(progress.extractionSystem, prompt),
@@ -1402,9 +1445,10 @@ export function registerGraphFunction(
       if (Buffer.byteLength(response, "utf8") > GRAPH_WORK_LIMITS.maxResponseBytes) {
         throw new Error("Captured graph response exceeds its bounded 16 KiB result budget");
       }
-      parsed = await freezeGraphHandledValue(kv, `project-work-parsed:v3:${activeUnit.id}`, () => {
+      parsed = await freezeGraphHandledValue(kv, `project-work-parsed:v3:${activeUnit.id}`, async () => {
         const result = parseGraphExtractionResponse(response, sourceIds, true);
         if (!result) throw new Error(EMPTY_GRAPH_EXTRACTION_ERROR);
+        if (isExplicitEmptyGraphXml(response)) await recordGraphEmptyOutputParse(kv, response, activeUnit!.id, activeUnit!.resultOrdinal);
         return result;
       });
     } catch (error) {
@@ -1438,8 +1482,21 @@ export function registerGraphFunction(
     };
     return yieldGraphJob({ success: true, queued: true, ...updated });
   };
-  const extract = async (request: ExtractionRequest, durableId?: string) => {
+  const extract = async (request: ExtractionRequest, durableId?: string): Promise<unknown> => {
     const startMs = Date.now();
+    const operationId = generateId("op");
+    const jobId = durableId ?? request?.graphJobId;
+    if (jobId) {
+      const control = (await kv.getVersioned<GraphControlState>(KV.graphControl, "current")).value;
+      if (control?.recovery && control.recovery.job_id !== jobId) throw new StateTransactionError("STATE_GRAPH_RECOVERY_REQUIRED");
+      const previous = control?.recovery ? null : await kv.get<{ automaticRecovery?: { slotId: string; replacementJobId: string | null }; automaticReplacementSource?: AutomaticUnitSource }>(KV.graphJobs, jobId);
+      if (previous?.automaticRecovery?.replacementJobId) {
+        const link = await kv.graphAutomaticRecovery({ command: "status", slot_id: previous.automaticRecovery.slotId });
+        if (!link.new_job_id || !link.regeneration_id) throw new Error("STATE_GRAPH_AUTOMATIC_REGENERATION_MISSING");
+        return withGraphAutomaticRegeneration(link.regeneration_id, jobId,
+          () => extract(replacementRequest(request, jobId, link.new_job_id!, previous.automaticReplacementSource), link.new_job_id!));
+      }
+    }
     try {
     const preflight = request.batchEffectKey === undefined
       ? undefined
@@ -1453,12 +1510,41 @@ export function registerGraphFunction(
       : { ...request, graphProvenanceVersion: 2 as const };
       const executionResult = await runGraphJob(kv, request.batchEffectKey ? "batch_callback" : "extraction", input, async (frozen) => {
     const captured = frozen as ExtractionRequest;
+    if (isGraphAutomaticRegeneration() && !automaticReady) throw new Error("STATE_GRAPH_AUTOMATIC_AUTHORIZATION_DISABLED");
+    if (captured.automaticUnit) {
+      const unit = captured.automaticUnit;
+      if (!isGraphAutomaticRegeneration() || !automaticProvider.prepareGraphAutomaticCall
+        || !unit.sourceIds.length || unit.sourceIds.some(id => typeof id !== "string" || !id)
+        || typeof unit.systemPrompt !== "string" || typeof unit.userPrompt !== "string"
+        || Buffer.byteLength(unit.userPrompt) > GRAPH_WORK_LIMITS.maxInputBytes) throw new Error("STATE_GRAPH_AUTOMATIC_SOURCE_INCOMPLETE");
+      const response = await freezeGraphAutomaticResponse(kv, "provider-response",
+        automaticProvider.prepareGraphAutomaticCall({ ...unit, grouped: false }));
+      const parsed = await freezeGraphValue(kv, "parsed-response", () => parseGraphExtractionResponse(response, unit.sourceIds, captured.graphProvenanceVersion === 2));
+      if (!parsed) throw new Error(EMPTY_GRAPH_EXTRACTION_ERROR);
+      const result = await withGraphDelta(kv, () => persistGraphDelta(kv, parsed.nodes, parsed.edges, []));
+      await recordAudit(kv, "observe", "mem::graph-extract", unit.sourceIds, { regenerated: true }, undefined, undefined, `graph-regeneration:${graphJobId()}`);
+      return { success: true, nodesAdded: (unit.nodesAdded ?? 0) + result.newNodeCount, edgesAdded: (unit.edgesAdded ?? 0) + result.newEdgeCount,
+        regenerated: true, ...(unit.completesSource === false ? { partial: true, incomplete: true, reason: "GRAPH_AUTOMATIC_REMAINING_SOURCE_REQUIRES_NEW_OPERATION" } : {}) };
+    }
     const auditEffectKey = (phase: string): string | undefined => {
       const jobId = graphJobId();
       return jobId ? `graph-extraction:${jobId}:${phase}` : undefined;
     };
     const strictProvenance = captured.graphProvenanceVersion === 2;
     const useProjectWorkGroups = strictProvenance && captured.graphWorkGroupsVersion === 2 && !captured.batchResponse && !captured.deferred;
+    if (useProjectWorkGroups && isGraphAutomaticRegeneration() && captured.replacementOf && !await readGraphJobContinuation(kv)) {
+      const prior = await kv.get<{ continuationState?: ProjectGraphWorkProgress }>(KV.graphJobs, captured.replacementOf);
+      const progress = prior?.continuationState;
+      if (progress?.version === 2) {
+        if (!Number.isSafeInteger(progress.pageCount) || progress.pageCount < 0 || progress.pageCount > 100_000) throw new Error("STATE_GRAPH_AUTOMATIC_SOURCE_INCOMPLETE");
+        for (let pageIndex = progress.pageIndex; pageIndex < progress.pageCount; pageIndex++) {
+          const page = await kv.get<ProjectGraphWorkPage>(KV.graphProviderResults(captured.replacementOf), `project-work-page:v3:${pageIndex}`);
+          if (!page || page.version !== 2) throw new Error("STATE_GRAPH_AUTOMATIC_SOURCE_INCOMPLETE");
+          await withGraphDelta(kv, () => kv.set(KV.graphProviderResults(graphJobId()!), `project-work-page:v3:${pageIndex - progress.pageIndex}`, page));
+        }
+        await writeGraphJobContinuation(kv, { ...progress, pageIndex: 0, pageCount: progress.pageCount - progress.pageIndex, activeUnit: undefined });
+      }
+    }
     const extractionSystem = strictProvenance
       ? GRAPH_EXTRACTION_SYSTEM_WITH_PROVENANCE
       : GRAPH_EXTRACTION_SYSTEM;
@@ -1594,7 +1680,7 @@ export function registerGraphFunction(
 
       let inputUnits: GraphExtractionUnit[] = [];
       if (!useProjectWorkGroups) {
-        inputUnits = await freezeGraphInputUnits(kv, options.localCompactor, async () => data.batchResponse
+        inputUnits = await freezeGraphInputUnits(kv, options.localCompactor || Boolean(data.replacementOf), async () => data.batchResponse
           ? [{
             sourceObservations: observationsForGraph,
             promptObservations: observationsForGraph.map(toGraphPromptObservation),
@@ -1687,7 +1773,11 @@ export function registerGraphFunction(
         }
         for (const [unitOrdinal, unit] of inputUnits.entries()) {
           const prompt = buildGraphExtractionPrompt(unit.promptObservations);
-          const response = await freezeGraphHandledValue(kv, "provider-response", async () => {
+          const response = automaticReady && automaticProvider.prepareGraphAutomaticCall && data.batchResponse === undefined && !graphStrictProviderResponse()
+            ? await freezeGraphAutomaticResponse(kv, "provider-response",
+              automaticProvider.prepareGraphAutomaticCall({ systemPrompt: extractionSystem, userPrompt: prompt, grouped: false, sourceIds: unit.sourceObservations.map(observation => observation.id),
+                completesSource: unitOrdinal + 1 >= inputUnits.length, nodesAdded: totalNodesAdded, edgesAdded: totalEdgesAdded }))
+            : await freezeGraphHandledValue(kv, "provider-response", async () => {
             const strict = graphStrictProviderResponse();
             if (strict) return withStrictGraphResponse(strict.provider, strict.admit, () => provider.compress(extractionSystem, prompt, { task: "graph_extraction" }));
             return data.batchResponse ?? (llmRouter
@@ -1766,23 +1856,47 @@ export function registerGraphFunction(
       else if (outcome.queued === true) status = "queued";
       else if (outcome.skipped === true || outcome.stale === true) status = "skipped";
       await recordOperation(kv, "mem::graph-extract", status, counts, undefined, {
-        durationMs: Date.now() - startMs,
+        operationId, jobId,
+        executionLevel: "unit", durationMs: Date.now() - startMs,
         ...((outcome.success !== true || outcome.llmError) ? { errorCode: "graph_extraction_failed" } : {}),
       });
       return result;
     } catch (error) {
+      if (error instanceof GraphTerminalLocalDeliveryStopped) throw error;
       await recordOperation(kv, "mem::graph-extract", "failed", {}, undefined, {
-        durationMs: Date.now() - startMs, errorCode: "graph_extraction_failed",
+        operationId, jobId,
+        executionLevel: "unit", durationMs: Date.now() - startMs, errorCode: "graph_extraction_failed",
       });
+      if (error instanceof GraphAutomaticRecoveryRequired) {
+        if (error.replacement && jobId) {
+          return withGraphAutomaticRegeneration(error.replacement.regenerationId, jobId,
+            () => extract(replacementRequest(request, jobId, error.replacement!.jobId, error.source), error.replacement!.jobId));
+        }
+        return { success: false, queued: error.recovery.action !== "none", stopped: error.recovery.action === "none",
+          jobId, automaticRecovery: error.recovery };
+      }
       throw error;
     }
   };
   const intake = registerGraphDispatch(sdk, kv, extract);
-  sdk.registerFunction("mem::graph-extract", (input: ExtractionRequest) => {
-    if (input?.graphWorkGroupsVersion !== undefined && input.graphWorkGroupsVersion !== 2) throw new Error("Unsupported graph work-group version");
-    const request = input && !input.graphJobId && !input.batchEffectKey && input.batchResponse === undefined
-      ? { ...input, graphWorkGroupsVersion: 2 as const } : input;
-    return intake(request);
+  registerGraphTerminalDispatcher(kv, (input, link) => {
+    if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("STATE_GRAPH_AUTOMATIC_SOURCE_INCOMPLETE");
+    const source = input as ExtractionRequest;
+    return intake({ ...source, graphJobId: link.jobId, replacementOf: link.sourceJobId }, link);
+  });
+  sdk.registerFunction("mem::graph-extract", async (input: ExtractionRequest) => {
+    const startMs = Date.now();
+    try {
+      if (input?.graphWorkGroupsVersion !== undefined && input.graphWorkGroupsVersion !== 2) throw new Error("Unsupported graph work-group version");
+      const request = input && !input.graphJobId && !input.batchEffectKey && input.batchResponse === undefined
+        ? { ...input, graphWorkGroupsVersion: 2 as const } : input;
+      return await intake(request);
+    } catch (error) {
+      await recordOperation(kv, "mem::graph-extract", "failed", {}, undefined, {
+        executionLevel: "unit", durationMs: Date.now() - startMs, errorCode: "graph_extraction_failed",
+      });
+      throw error;
+    }
   });
   registerGraphJobHandler(kv, "extraction", (data, id) => extract(data as ExtractionRequest, id));
   registerGraphJobHandler(kv, "batch_callback", (data, id) => extract(data as ExtractionRequest, id));

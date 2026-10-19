@@ -3,6 +3,7 @@ import type { EmbeddingProvider } from '../types.js';
 import { IndexedRetrievalError, retrievalRequest, type IndexedStatus } from './indexed-retrieval.js';
 import { KV } from './schema.js';
 import { logger } from '../logger.js';
+import { isStateCounter } from './state-transactions.js';
 
 const sharedVectors = new WeakMap<StateKV, IndexedVector>();
 const MAX_QUERY_READINESS_ATTEMPTS = 3;
@@ -10,6 +11,7 @@ const RECOVERY_MAX_PAGES = 16;
 const RECOVERY_MAX_ROWS = 256;
 const RECOVERY_MAX_EMBEDDINGS = 128;
 const RECOVERY_TIMEOUT_MS = 60_000;
+const RECOVERY_SOURCE_READ_CONCURRENCY = 2;
 let semanticProbes: 128 | 256 = 128;
 let vectorCreated = false;
 export function configureCandidateSemanticProbes(probes: 256): void {
@@ -51,16 +53,22 @@ export class IndexedVector {
     return recovery;
   }
   private async recover(provider: EmbeddingProvider): Promise<number> {
+    let phase = 'identity';
+    try {
     if (provider.name !== this.identity.model || provider.dimensions !== this.identity.dimensions) {
       throw new IndexedRetrievalError('STATE_SEMANTIC_IDENTITY_MISMATCH', 'Indexed recovery provider changed.');
     }
+    phase = 'flush';
     await this.flush();
+    phase = 'status';
     const status = await retrievalRequest<IndexedStatus>(this.kv, { action: 'index_status' });
+    phase = 'marker_read';
     const marker = await this.kv.get<{ status: string; model: string; dimensions: number; generation: string }>(KV.config, 'indexed-corpus');
+    phase = 'readiness';
     const selected = this.validateBaseReadiness(status, marker, true);
     if (selected.source_prepared === true && selected.dirty_count === '0' && selected.coverage_ready === true) {
-      if (marker?.status === 'pending') await this.finishRecovery(marker);
-      return 0;
+      phase = 'finish';
+      if (marker?.status !== 'pending' || await this.finishRecovery()) return 0;
     }
     const initialDirty = Number(selected.dirty_count);
     if (!Number.isSafeInteger(initialDirty) || initialDirty < 0 || initialDirty > RECOVERY_MAX_EMBEDDINGS) {
@@ -71,6 +79,7 @@ export class IndexedVector {
     let embedded = 0;
     for (let pageNumber = 0; pageNumber < RECOVERY_MAX_PAGES; pageNumber++) {
       if (Date.now() >= deadline) throw new IndexedRetrievalError('STATE_INDEX_NOT_READY', 'Incremental semantic recovery timed out.');
+      phase = 'source_prepare';
       const page = await retrievalRequest<{ processed: number; items: Array<{ source_scope: string; id: string; source_version: string }>; coverage_ready: boolean }>(this.kv, {
         action: 'source_prepare', ...this.identity, max_rows: RECOVERY_MAX_ROWS, max_bytes: 1_048_576,
       });
@@ -86,43 +95,72 @@ export class IndexedVector {
       for (let offset = 0; offset < page.items.length; offset += 32) {
         if (Date.now() >= deadline) throw new IndexedRetrievalError('STATE_INDEX_NOT_READY', 'Incremental semantic recovery timed out.');
         const batch = page.items.slice(offset, offset + 32);
-        const sources = await Promise.all(batch.map(async ref => {
-          if (!ref || typeof ref.id !== 'string' || !ref.id || typeof ref.source_version !== 'string' || !/^\d+$/.test(ref.source_version) ||
-            typeof ref.source_scope !== 'string' || (ref.source_scope !== KV.memories && !ref.source_scope.startsWith('mem:obs:'))) {
-            throw new IndexedRetrievalError('STATE_INDEX_NOT_READY', 'Invalid incremental semantic source reference.');
-          }
-          const source = await this.kv.getVersioned<{ title: string; narrative?: string; content?: string; sessionId?: string; sessionIds?: string[]; embeddingReuse?: unknown }>(ref.source_scope, ref.id);
-          if (!source.exists || !source.value || source.version !== ref.source_version || typeof source.value.title !== 'string') {
-            throw new IndexedRetrievalError('STATE_INDEX_NOT_READY', 'Semantic source changed during incremental recovery.');
-          }
-          if (source.value.embeddingReuse !== undefined) {
-            throw new IndexedRetrievalError('STATE_INDEX_NOT_READY', 'Metadata embedding reuse remains pending; automatic embedding is forbidden.');
-          }
-          const memory = ref.source_scope === KV.memories;
-          const content = memory ? source.value.content : source.value.narrative;
-          if (content !== undefined && typeof content !== 'string') throw new IndexedRetrievalError('STATE_INDEX_NOT_READY', 'Invalid incremental semantic source content.');
-          return { ...ref, sessionId: memory ? source.value.sessionIds?.[0] ?? 'memory' : source.value.sessionId ?? ref.source_scope.slice('mem:obs:'.length), text: `${source.value.title} ${content ?? ''}`.slice(0, 16_000) };
-        }));
+        phase = 'source_read';
+        const sources: Array<(typeof batch)[number] & { sessionId: string; text: string }> = [];
+        for (let sourceOffset = 0; sourceOffset < batch.length; sourceOffset += RECOVERY_SOURCE_READ_CONCURRENCY) {
+          if (Date.now() >= deadline) throw new IndexedRetrievalError('STATE_INDEX_NOT_READY', 'Incremental semantic recovery timed out.');
+          let failed = false;
+          let firstFailure: unknown;
+          const reads = batch.slice(sourceOffset, sourceOffset + RECOVERY_SOURCE_READ_CONCURRENCY).map(async ref => {
+            if (!ref || typeof ref.id !== 'string' || !ref.id || Buffer.byteLength(ref.id) > 256
+              || !isStateCounter(ref.source_version) || ref.source_version === '0'
+              || typeof ref.source_scope !== 'string' || Buffer.byteLength(ref.source_scope) > 512
+              || (ref.source_scope !== KV.memories && (!ref.source_scope.startsWith('mem:obs:') || !ref.source_scope.slice('mem:obs:'.length)))) {
+              throw new IndexedRetrievalError('STATE_INDEX_NOT_READY', 'Invalid incremental semantic source reference.');
+            }
+            const source = await this.kv.getVersioned<{ id: string; title: string; narrative?: string; content?: string; sessionId?: string; sessionIds?: string[]; embeddingReuse?: unknown }>(ref.source_scope, ref.id);
+            if (!source.exists || !source.value || source.value.id !== ref.id || source.version !== ref.source_version || typeof source.value.title !== 'string'
+              || ref.source_scope !== KV.memories && source.value.sessionId !== ref.source_scope.slice('mem:obs:'.length)) {
+              throw new IndexedRetrievalError('STATE_INDEX_NOT_READY', 'Semantic source changed during incremental recovery.');
+            }
+            if (source.value.embeddingReuse !== undefined) {
+              throw new IndexedRetrievalError('STATE_INDEX_NOT_READY', 'Metadata embedding reuse remains pending; automatic embedding is forbidden.');
+            }
+            const memory = ref.source_scope === KV.memories;
+            const content = memory ? source.value.content : source.value.narrative;
+            if (content !== undefined && typeof content !== 'string') throw new IndexedRetrievalError('STATE_INDEX_NOT_READY', 'Invalid incremental semantic source content.');
+            return { ...ref, sessionId: memory ? source.value.sessionIds?.[0] ?? 'memory' : source.value.sessionId ?? ref.source_scope.slice('mem:obs:'.length), text: `${source.value.title} ${content ?? ''}`.slice(0, 16_000) };
+          });
+          const settled = await Promise.allSettled(reads.map(read => read.catch(error => {
+            if (!failed) { failed = true; firstFailure = error; }
+            throw error;
+          })));
+          if (failed) throw firstFailure;
+          for (const result of settled) if (result.status === 'fulfilled') sources.push(result.value);
+        }
+        phase = 'local_embedding';
         const embeddings = await provider.embedBatch(sources.map(source => source.text));
-        if (embeddings.length !== sources.length || embeddings.some(value => value.length !== provider.dimensions)) {
+        if (Date.now() >= deadline) throw new IndexedRetrievalError('STATE_INDEX_NOT_READY', 'Incremental semantic recovery timed out.');
+        if (embeddings.length !== sources.length || embeddings.some(value => value.length !== provider.dimensions || value.some(number => !Number.isFinite(number)))) {
           throw new IndexedRetrievalError('STATE_INDEX_NOT_READY', 'Incremental semantic embeddings are incomplete.');
         }
         for (let i = 0; i < sources.length; i++) {
           const source = sources[i];
-          await this.add(source.id, source.sessionId, embeddings[i], source.text, source.source_scope);
+          phase = 'semantic_upsert';
+          await this.add(source.id, source.sessionId, embeddings[i], source.text, source.source_scope, source.source_version);
         }
       }
       if (page.coverage_ready) {
-        await this.finishRecovery(marker);
-        return embedded;
+        phase = 'finish';
+        if (await this.finishRecovery()) return embedded;
       }
     }
     throw new IndexedRetrievalError('STATE_INDEX_NOT_READY', 'Incremental semantic recovery exceeds its page limit.');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown recovery failure';
+      const candidate = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
+      const code = typeof candidate === 'string' && /^STATE_[A-Z0-9_]+$/.test(candidate)
+        ? candidate : message.match(/STATE_[A-Z0-9_]+/)?.[0] ?? 'STATE_INDEX_NOT_READY';
+      logger.warn('Indexed local dirty recovery failed', { phase, code });
+      throw new IndexedRetrievalError(code, `Recovery phase=${phase}; ${message}`);
+    }
   }
-  private async finishRecovery(marker: { status: string; model: string; dimensions: number; generation: string } | null): Promise<void> {
+  private async finishRecovery(): Promise<boolean> {
     await this.flush();
     const status = await retrievalRequest<IndexedStatus>(this.kv, { action: 'index_status' });
+    const marker = await this.kv.get<{ status: string; model: string; dimensions: number; generation: string }>(KV.config, 'indexed-corpus');
     const selected = this.validateBaseReadiness(status, marker, true);
+    if (selected.source_prepared === true && Number(selected.dirty_count) > 0) return false;
     if (selected.source_prepared !== true || selected.dirty_count !== '0' || selected.coverage_ready !== true) {
       throw new IndexedRetrievalError('STATE_INDEX_NOT_READY', 'Incremental semantic source coverage remains incomplete.');
     }
@@ -132,7 +170,16 @@ export class IndexedVector {
       await this.kv.set(KV.config, 'indexed-corpus', { ...this.identity, status: 'ready', count });
     }
     try { await this.ready(); }
-    catch (error) { await this.markIncomplete(); throw error; }
+    catch (error) {
+      await this.markIncomplete();
+      if (!(error instanceof IndexedRetrievalError) || error.code !== 'STATE_INDEX_NOT_READY') throw error;
+      const fresh = await retrievalRequest<IndexedStatus>(this.kv, { action: 'index_status' });
+      const currentMarker = await this.kv.get<{ status: string; model: string; dimensions: number; generation: string }>(KV.config, 'indexed-corpus');
+      const current = this.validateBaseReadiness(fresh, currentMarker, true);
+      if (current.source_prepared === true && Number(current.dirty_count) > 0) return false;
+      throw error;
+    }
+    return true;
   }
   private validateBaseReadiness(status: IndexedStatus, marker: { status: string; model: string; dimensions: number; generation: string } | null, allowPendingMarker = false) {
     const selected = status.semantic?.find(item => item.index_id === this.identity.index_id);
@@ -171,10 +218,10 @@ export class IndexedVector {
   async markIncomplete(): Promise<void> {
     await this.kv.set(KV.config, 'indexed-corpus', { ...this.identity, status: 'pending' });
   }
-  async add(id: string, sessionId: string, embedding: Float32Array, text: string, sourceScope = KV.observations(sessionId)): Promise<void> {
-    const source = await this.kv.getVersioned<{ title: string; narrative?: string; content?: string }>(sourceScope, id);
+  async add(id: string, sessionId: string, embedding: Float32Array, text: string, sourceScope = KV.observations(sessionId), expectedVersion?: string): Promise<void> {
+    const source = await this.kv.getVersioned<{ title: string; narrative?: string; content?: string; embeddingReuse?: unknown }>(sourceScope, id);
     const content = sourceScope === KV.memories ? source.value?.content : source.value?.narrative;
-    if (!source.exists || typeof source.version !== 'string' || !/^\d+$/.test(source.version) ||
+    if (!source.exists || !isStateCounter(source.version) || expectedVersion !== undefined && (source.version !== expectedVersion || source.value?.embeddingReuse !== undefined) ||
       `${source.value?.title} ${content ?? ''}`.slice(0, 16_000) !== text) throw new IndexedRetrievalError('STATE_INDEX_NOT_READY', 'Searchable source changed before indexed upsert.');
     const bytes = Buffer.alloc(embedding.length * 4);
     for (let i = 0; i < embedding.length; i++) bytes.writeFloatLE(embedding[i], i * 4);

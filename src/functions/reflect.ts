@@ -11,7 +11,7 @@ import type { FireworksBatchQueue } from "./fireworks-batch.js";
 import { registerReflectQueue, type SelectedReflectControl } from "./reflect-queue.js";
 import { legacyReflectEvidence, currentLegacyReflectEvidence } from "./reflect-retrieval.js";
 import { evaluatePublicationEvidence, type PublicationEvidenceInput } from "./publication-evidence.js";
-import { publicationCallOptions } from "./publication-call-options.js";
+import { publicationExecutor } from "./publication-call-options.js";
 import { stripPrivateData } from "./privacy.js";
 import { parseReflectionResult } from "./reflect-result.js";
 import { REFLECT_CONTROL, validReflectText, type ConceptCluster, type ReflectRequest } from "./reflect-queue-types.js";
@@ -164,14 +164,8 @@ export function registerReflectFunctions(
                 id: row.key, version: row.version, fingerprint: row.fingerprint })) }),
             sources: evidence.rows.map(row => ({ id: JSON.stringify([row.scope, row.key]), scope: row.scope, key: row.key,
               version: row.version, project: result.project!, content: stripPrivateData(JSON.stringify(row.value)) })) };
-          const verdict = await evaluatePublicationEvidence(kv, input, async (request, captureRaw) => {
-            const options = publicationCallOptions();
-            const call = async (target: MemoryProvider) => {
-              const raw = await target.summarize(request.systemPrompt, request.userPrompt, options);
-              await captureRaw(raw); return raw;
-            };
-            return llmRouter ? llmRouter.run("reflection", call, () => true, undefined, options) : call(provider);
-          });
+          const verdict = await evaluatePublicationEvidence(kv, input,
+            publicationExecutor(provider, llmRouter, "reflection"));
           if (!await currentLegacyReflectEvidence(kv, evidence, result.project!)) return { success: true, stale: true };
           if (verdict.status === "unsupported") return { success: true, rejected: true, reason: "reflect_publication_unsupported" };
           if (verdict.status !== "supported") return { success: false, reason: `reflect_publication_${verdict.status}` };

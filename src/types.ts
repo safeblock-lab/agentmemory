@@ -270,6 +270,69 @@ export interface DashboardFailureMinutesScope {
   };
 }
 
+export type DashboardWorkflowKey = "summaries" | "skills" | "graph" | "reflection"
+  | "consolidation" | "compression" | "snapshots" | "maintenance";
+
+export interface DashboardWorkflowTerminal {
+  workflow: DashboardWorkflowKey;
+  executionId: string;
+  executionLevel: "workflow" | "unit";
+  agentId: string | null;
+  occurredAt: string;
+  outcome: "completed" | "partial" | "failed";
+}
+
+export type WorkflowTerminalReceipt = Pick<DashboardWorkflowTerminal, "executionId" | "agentId" | "occurredAt" | "outcome">;
+
+export interface DashboardWorkflowWindow {
+  observedCount: number | null;
+  intervalStart: string;
+  intervalEnd: string;
+  coverageSince: string | null;
+  complete: boolean;
+  state: "complete" | "partial" | "uninitialized" | "invalid" | "unavailable";
+  reason?: string;
+}
+
+export interface DashboardWorkflowQueue {
+  count: number | null;
+  state: "current" | "unavailable" | "partial" | "stale" | "not_applicable";
+  unit: "logical_jobs";
+  sampledAt: string | null;
+  sourceScopes: string[];
+  revision: string | null;
+  reason?: string;
+}
+
+export interface DashboardWorkflowStatistics {
+  workflow: DashboardWorkflowKey;
+  source: "native-workflow-statistics-v1";
+  agentScope: string | null;
+  asOf: string;
+  lastRun: DashboardWorkflowTerminal | null;
+  lastRunState: "recorded" | "unknown" | "never";
+  runs24h: DashboardWorkflowWindow;
+  failures24h: DashboardWorkflowWindow;
+  queued: DashboardWorkflowQueue;
+  invocationHistory?: DashboardWorkflowInvocationHistory;
+}
+
+export interface DashboardWorkflowInvocation {
+  executionId: string;
+  agentId: string | null;
+  occurredAt: string;
+  outcome: RecentOperation["outcome"];
+  jobId?: string;
+  errorCode?: "graph_extraction_failed";
+}
+
+export interface DashboardWorkflowInvocationHistory {
+  source: "state-workflow-invocations-v1";
+  state: "retained" | "unavailable";
+  lastAttempt: DashboardWorkflowInvocation | null;
+  failures24h: DashboardWorkflowWindow;
+}
+
 export interface StorageMaintenanceScope {
   current: StorageMaintenanceState;
 }
@@ -317,6 +380,7 @@ export interface RawObservation {
 }
 
 export interface CompressedObservation {
+  workflowTerminal?: WorkflowTerminalReceipt;
   id: string;
   sessionId: string;
   timestamp: string;
@@ -471,6 +535,7 @@ export interface HookPayload {
 }
 
 export interface ProviderConfig {
+  httpProfile?: OpenAIHttpProfile;
   provider: ProviderType;
   model: string;
   maxTokens: number;
@@ -485,6 +550,7 @@ export interface ProviderConfig {
 export type ProviderType = "agent-sdk" | "anthropic" | "gemini" | "openrouter" | "minimax" | "openai" | "noop";
 
 export type OpenAIReasoningEffort = "none" | "low" | "medium" | "high";
+export type OpenAIHttpProfile = "legacy-native" | "validated-json-text";
 
 export interface AuxiliaryLlmConfig extends Omit<ProviderConfig, "provider"> {
   provider: "openai" | "ollama";
@@ -545,6 +611,7 @@ export interface FireworksBatchConfig {
 }
 
 export interface FireworksBatchRequest {
+  responseFormat?: LlmResponseFormat;
   replacementOf?: string;
   correlationId: string;
   task: FireworksBatchTask;
@@ -575,6 +642,7 @@ export interface BatchCallbackReceipt {
 }
 
 export interface FireworksBatchWorkItem {
+  responseFormat?: LlmResponseFormat;
   replacementOf?: string;
   callbackProtocolVersion?: 1;
   id: string;
@@ -676,6 +744,8 @@ export type LlmResponseFormat =
     };
 
 export interface LlmCallOptions {
+  /** Structured calls must use prepareStructuredCall to bind a single dispatch. */
+  outputContract?: { version: string };
   task?: LlmTask;
   thinking?: boolean;
   outputTokens?: number;
@@ -709,10 +779,39 @@ export interface LlmRoutingConfig {
 }
 
 export interface MemoryProvider {
+  prepareGraphAutomaticCall?: import("./providers/graph-automatic.js").GraphAutomaticProvider["prepareGraphAutomaticCall"];
+  prepareStructuredCall?(request: StructuredLlmRequest): PreparedStructuredLlmCall;
   name: string;
   compress(systemPrompt: string, userPrompt: string, options?: LlmCallOptions): Promise<string>;
   summarize(systemPrompt: string, userPrompt: string, options?: LlmCallOptions): Promise<string>;
   describeImage?(imageData: string, mimeType: string, prompt: string): Promise<string>;
+}
+
+export interface StructuredLlmRequest {
+  operation: "compress" | "summarize";
+  systemPrompt: string;
+  userPrompt: string;
+  contractVersion: string;
+  options: LlmCallOptions & { responseFormat: Extract<LlmResponseFormat, { type: "json_schema" }> };
+}
+
+export interface StructuredLlmBinding {
+  route?: LlmRouteTarget;
+  provider: string;
+  model: string;
+  endpoint: string;
+  profile: OpenAIHttpProfile;
+  operation: "compress" | "summarize";
+  task?: LlmTask;
+  contractVersion: string;
+  responseFormat: string;
+  requestDigest: string;
+  timeoutMs: number;
+}
+
+export interface PreparedStructuredLlmCall {
+  readonly binding: Readonly<StructuredLlmBinding>;
+  execute(): Promise<string>;
 }
 
 export interface AgentMemoryConfig {
@@ -765,8 +864,16 @@ export interface ContextUsageEvent {
 export interface ContextUsageFeed { items: ContextUsageEvent[] }
 
 export interface ProcessingUsageEvent {
+  nativeAttemptId?: string;
+  nativeCaptureDigest?: string | null;
+  dispatchState?: "potential" | "response_captured";
+  usageState?: "known" | "partial" | "unknown";
+  costUsd?: null;
   id: string;
   timestamp: string;
+  task?: string;
+  provider?: string;
+  model?: string;
   inputTokens?: number;
   cachedInputTokens?: number;
   cacheWriteInputTokens?: number;
@@ -927,7 +1034,7 @@ export interface ExportPagination {
 }
 
 export interface ExportData {
-  version: "0.3.0" | "0.4.0" | "0.5.0" | "0.6.0" | "0.6.1" | "0.7.0" | "0.7.2" | "0.7.3" | "0.7.4" | "0.7.5" | "0.7.6" | "0.7.7" | "0.7.9" | "0.8.0" | "0.8.1" | "0.8.2" | "0.8.3" | "0.8.4" | "0.8.5" | "0.8.6" | "0.8.7" | "0.8.8" | "0.8.9" | "0.8.10" | "0.8.11" | "0.8.12" | "0.8.13" | "0.9.0" | "0.9.1" | "0.9.2" | "0.9.3" | "0.9.4" | "0.9.5" | "0.9.6" | "0.9.7" | "0.9.8" | "0.9.9" | "0.9.10" | "0.9.11" | "0.9.12" | "0.9.13" | "0.9.14" | "0.9.15" | "0.9.16" | "0.9.17" | "0.9.18" | "0.9.19" | "0.9.20" | "0.9.21" | "0.9.22" | "0.9.23" | "0.9.24" | "0.9.25" | "0.9.26" | "0.9.27" | "0.9.28" | "0.9.29" | "0.9.30" | "0.9.31" | "0.9.32" | "0.9.33" | "0.9.34" | "0.9.35" | "0.9.36" | "0.9.37" | "0.9.38" | "0.9.39" | "0.9.40" | "0.9.41" | "0.9.42" | "0.9.43" | "0.9.44" | "0.9.45" | "0.9.46" | "0.9.47" | "0.9.48" | "0.9.49" | "0.9.50" | "0.9.51" | "0.9.52" | "0.9.53" | "0.9.54" | "0.9.55" | "0.9.56" | "0.9.57" | "0.9.58" | "0.9.59" | "0.9.60" | "0.9.61" | "0.9.62" | "0.9.63" | "0.9.64" | "0.9.65" | "0.9.66" | "0.9.67" | "0.9.68" | "0.9.69" | "0.9.70" | "0.9.71" | "0.9.72" | "0.9.73" | "0.9.74" | "0.9.75" | "0.9.76" | "0.9.77" | "0.9.78" | "0.9.79" | "0.9.80" | "0.9.81" | "0.9.82" | "0.9.83" | "0.9.84" | "0.9.85" | "0.9.86" | "0.9.87" | "0.9.88" | "0.9.89";
+  version: "0.3.0" | "0.4.0" | "0.5.0" | "0.6.0" | "0.6.1" | "0.7.0" | "0.7.2" | "0.7.3" | "0.7.4" | "0.7.5" | "0.7.6" | "0.7.7" | "0.7.9" | "0.8.0" | "0.8.1" | "0.8.2" | "0.8.3" | "0.8.4" | "0.8.5" | "0.8.6" | "0.8.7" | "0.8.8" | "0.8.9" | "0.8.10" | "0.8.11" | "0.8.12" | "0.8.13" | "0.9.0" | "0.9.1" | "0.9.2" | "0.9.3" | "0.9.4" | "0.9.5" | "0.9.6" | "0.9.7" | "0.9.8" | "0.9.9" | "0.9.10" | "0.9.11" | "0.9.12" | "0.9.13" | "0.9.14" | "0.9.15" | "0.9.16" | "0.9.17" | "0.9.18" | "0.9.19" | "0.9.20" | "0.9.21" | "0.9.22" | "0.9.23" | "0.9.24" | "0.9.25" | "0.9.26" | "0.9.27" | "0.9.28" | "0.9.29" | "0.9.30" | "0.9.31" | "0.9.32" | "0.9.33" | "0.9.34" | "0.9.35" | "0.9.36" | "0.9.37" | "0.9.38" | "0.9.39" | "0.9.40" | "0.9.41" | "0.9.42" | "0.9.43" | "0.9.44" | "0.9.45" | "0.9.46" | "0.9.47" | "0.9.48" | "0.9.49" | "0.9.50" | "0.9.51" | "0.9.52" | "0.9.53" | "0.9.54" | "0.9.55" | "0.9.56" | "0.9.57" | "0.9.58" | "0.9.59" | "0.9.60" | "0.9.61" | "0.9.62" | "0.9.63" | "0.9.64" | "0.9.65" | "0.9.66" | "0.9.67" | "0.9.68" | "0.9.69" | "0.9.70" | "0.9.71" | "0.9.72" | "0.9.73" | "0.9.74" | "0.9.75" | "0.9.76" | "0.9.77" | "0.9.78" | "0.9.79" | "0.9.80" | "0.9.81" | "0.9.82" | "0.9.83" | "0.9.84" | "0.9.85" | "0.9.86" | "0.9.87" | "0.9.88" | "0.9.89" | "0.9.90";
   exportedAt: string;
   sessions: Session[];
   observations: Record<string, CompressedObservation[]>;

@@ -15,7 +15,7 @@ import { logger } from "../logger.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
 import { stripPrivateData } from "./privacy.js";
 import { evaluatePublicationEvidence, preparePublicationEvidence, type PublicationEvidenceInput } from "./publication-evidence.js";
-import { publicationCallOptions } from "./publication-call-options.js";
+import { publicationExecutor } from "./publication-call-options.js";
 import type { SkillExtractionCapture, SkillLifecycleIntent } from "./skill-lifecycle.js";
 import { consolidationRetrievalCoverage, type ConsolidationRetrievalCoverage } from "./consolidation-selection.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
@@ -732,20 +732,11 @@ export function registerSkillExtractFunctions(
         const replay = await evaluatePublicationEvidence(kv, evidenceInput);
         let verdict = replay;
         if (replay.status === "unavailable" && !("status" in evidenceRequest)) {
-          const options = publicationCallOptions();
-          verdict = await evaluatePublicationEvidence(kv, evidenceInput, async (request, captureRaw) => {
-            const operation = async (selectedProvider: MemoryProvider) => {
-              const raw = await selectedProvider.summarize(request.systemPrompt, request.userPrompt, options);
-              await captureRaw(raw);
-              return raw;
-            };
-            const execute = () => llmRouter ? llmRouter.run("skill_extraction", operation, () => true, undefined,
-              options) : operation(provider);
-            return runWorkflowAttempt(accounting, kv, { workflow: "skill", functionId: "mem::skill-extract",
+          verdict = await evaluatePublicationEvidence(kv, evidenceInput, publicationExecutor(provider, llmRouter, "skill_extraction", {},
+            (request, execute) => runWorkflowAttempt(accounting, kv, { workflow: "skill", functionId: "mem::skill-extract",
               project: session.project, sourceId: session.id, sourceFingerprint: resultCaptureId,
               jobId: lifecycleIntent?.id ?? resultCaptureId, unitId: request.requestId,
-              phase: "publication", continuation: "direct" }, execute);
-          });
+              phase: "publication", continuation: "direct" }, execute)));
         }
         if (verdict.status !== "supported") return { success: true, extracted: false, skipped: true,
           reason: `publication_evidence_${verdict.status}`, evidenceRequestId: verdict.requestId,

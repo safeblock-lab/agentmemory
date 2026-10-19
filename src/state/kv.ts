@@ -1,5 +1,7 @@
 import type { IIIClient } from 'iii-sdk'
 import { CanonicalMemoryIndex } from './canonical-memory.js'
+import { createGraphAutomaticRecoveryTransport, type GraphRecoveryCommand, type GraphAutomaticRecoveryResponse,
+  type GraphTerminalRecoveryCommand, type GraphTerminalRecoveryResponse } from './graph-automatic-recovery.js'
 import {
   triggerStateStorage,
   triggerSnapshotStorage,
@@ -49,6 +51,12 @@ function notifyStateWrite(event: { scope: string; key: string; value: unknown })
 
 export class StateKV {
   constructor(private sdk: IIIClient) {}
+
+  graphAutomaticRecovery(command: GraphTerminalRecoveryCommand): Promise<GraphTerminalRecoveryResponse>
+  graphAutomaticRecovery(command: GraphRecoveryCommand): Promise<GraphAutomaticRecoveryResponse>
+  graphAutomaticRecovery(command: GraphRecoveryCommand | GraphTerminalRecoveryCommand): Promise<GraphAutomaticRecoveryResponse | GraphTerminalRecoveryResponse> {
+    return createGraphAutomaticRecoveryTransport(this.sdk)(command)
+  }
 
   snapshotTransport = (request: import("./snapshot-read-view.js").SnapshotReadRequest, timeoutMs: number): Promise<unknown> =>
     triggerSnapshotStorage(this.sdk, request, timeoutMs)

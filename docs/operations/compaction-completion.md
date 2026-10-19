@@ -1,0 +1,43 @@
+# Compaction completion and bounded continuation
+
+This document describes the admitted physical cycle implemented by `src/functions/physical-maintenance.ts`, `periodic-layouts.ts`, `periodic-maintenance.ts`, and `periodic-maintenance-state.ts`. It distinguishes unfinished native collection from a completed physical cycle.
+
+## Completion gates
+
+`compaction.pending` describes reclaim eligibility and reusable pages. A false value does not prove that layout collection or periodic native collection has finished. Likewise, native `rows_complete` and `vectors_complete` are insufficient while `gc_complete` is false.
+
+The admitted physical path starts reclaim only after all three layout families have completed and the periodic candidate has exact terminal collection evidence. The periodic receipt must match the saved operation and generation, report rows, vectors and GC complete, and report no retained inline copy. Unknown receipts, uncertain leases and recovery states retain their existing fences and pause dispatch.
+
+The growth baseline advances only after complete maintenance reclaim and a newer comparable physical sample. Complete reclaim requires maintenance mode, the expected bounded chunk contract, a complete status, no checkpoint contention, zero remaining free pages and WAL, and coherent frame counters. Neither a successful batch nor a large database size substitutes for those gates.
+
+## Work windows
+
+One physical tick has a cooperative 45-second deadline. Layout work can consume at most four existing subwindows, each bounded to 16 batches and five seconds between batches. A shared 20-second layout deadline reserves the remaining 25 seconds for periodic collection and reclaim. A native request already in flight may finish after the cooperative deadline; no further batch starts after the next cancellation check.
+
+`registerStorageMaintenance` accepts the caller's current foreground-pressure predicate. The admitted physical path checks it while draining layouts, periodic batches and reclaim. Layout work also checks cancellation before dispatch, including after persisting an as-yet undispatched request. This permits yielding without inventing an unknown outcome. An already dispatched request retains normal receipt reconciliation and fence rules.
+
+The API activity wrapper distinguishes exact bounded dashboard observations from foreground work. Health/status/liveness/config reads with no query parameters, exact preview requests, the latest-memory counter, bounded recent-session pages and bounded crystal pages do not extend the five-second foreground cooldown. Full listings, search/context retrieval, mutations, MCP requests, malformed shapes and unknown function IDs retain the foreground counter and cooldown. This classification does not change native pressure checks, storage fences or authorization.
+
+Dashboard lessons use `GET /agentmemory/lessons?preview=true`, which reads only the first native page with at most five projected rows and 64 KiB, excluding deleted entries from that preview. It returns `partial:true`, `total:null` and `returnedCount`; fewer than five entries do not prove that the full collection is empty or complete. The full Lessons view retains its normal foreground request. Previously the dashboard called the full lesson listing, whose implementation materialized the entire lesson scope before slicing its response. Exempting other polls alone would still leave that full request extending the foreground cooldown.
+
+Physical responses include `cancellationReason:foreground_pressure`, `deadline`, or `null`. Cancellation remains effective for the rest of the current tick once observed. A tick cancelled before its first periodic step reports `periodic:foreground_pressure` when that is the cause; an immediate pressure yield is no longer labelled solely as an expired work window. This field describes the caller's cancellation; a native reclaim's separate pressure outcome remains in its own result.
+
+When foreground cancellation is observed, the same physical response includes a bounded `foregroundPressure` snapshot: active versus cooldown phase, at most eight active public function IDs with counters, the last completed function ID and timestamp, its age and remaining quiet-window time. It contains no request body, headers or query values. A missing snapshot from an older caller remains `null`. This is passive attribution of the existing cancellation, not a new endpoint or health probe; it does not exempt additional requests or alter native pressure.
+
+Automatic post-tool captures may explicitly request background scheduling with `captureMode:background_hook_v1`. Only exact bounded non-image post-tool envelopes from `api::observe` qualify; other hooks, manual/unmarked observations, oversized data and unknown shapes remain foreground. The hint is stripped by the existing API field whitelist before observation admission. It changes API-level scheduling only: observation capture, providers and native write/lease/fence behavior remain unchanged. Existing in-flight requests are not retroactively reclassified. The active hook script must be updated along with the application; changing the application's `dist` alone does not update a plugin-cache hook command.
+
+New periodic `collect` requests use the existing native limit of 4096; other periodic steps retain 128. All retain `max_bytes:1048576` and `max_ms:2500`, with at most 1024 steps inside the shared deadline. Native collection still works in chunks of at most 128 and stops at its time, byte or candidate/deletion budget. The larger collection request can reduce SDK calls and durable receipt round trips; it does not establish a processing rate or a number of rows reclaimed. Foreground pressure remains checked between requests. SQLite's progress handler bounds native job execution; queue admission and transaction commit are outside that handler, so the same request deadline does not prove identical lock duration. Existing pending requests and their exact receipts retain their original limits. Layout requests retain `limit:10000`, 4 MiB and 2.5 seconds. Maintenance reclaim retains 4096 pages and three seconds; ordinary reclaim retains 16 pages and 25 milliseconds.
+
+The local scheduler in `src/index.ts` invokes storage maintenance every 60 seconds. A large collection backlog may require many ticks. A newer request generation proves that another request committed; it does not prove that GC resumed beyond its previous cursor. Collector invalidation can restart the cursor. Earlier `foreground_pressure` history does not establish current pressure.
+
+## Collector control-state invalidation
+
+The source diagnosis also found a liveness fault: saving `mem:storage-maintenance/current` through the normal compact encoder invalidated collection, both when encoding a new packed value and when updating its state-row reference. The caller durably saves pending requests before dispatch and exact receipts after dispatch. Those necessary saves could therefore restart the next collection request at its initial cursors, even while generations increased.
+
+The coordinated native correction keeps that exact control record inline and exempts only updates whose old and new control values are both inline from reference invalidation. Copy skips the already inline control record while advancing its cursor; migrating a packed control record preserves its value and version without creating another derived backup. Transitioning an existing packed control value to inline must still invalidate collection once so its former packed references can be collected. Other state writes retain their existing invalidation rules. The application change must be deployed with that native correction; increasing the collection limit alone does not repair this restart loop. Pending persistence, lease fences, receipt reconciliation and all completion gates remain required.
+
+## Scope of the source diagnosis
+
+The reported root layout was retired with collection incomplete, and the periodic candidate had complete rows and vectors with GC incomplete. Those observations explain why reclaim had not started. The source diagnosis found a throughput gap: layout work previously received only one five-second subwindow per tick even when the overall 45-second window had idle capacity. The bounded continuation above reduces that gap while preserving native limits and completion gates.
+
+No runtime inspection, tests, typechecking, build, checksum checks or physical-size verification accompanied this source change. No physical space reduction is claimed. Deployment, runtime completion and a subsequent physical measurement remain separate evidence.

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { execSync } from "node:child_process";
 import { basename } from "node:path";
 //#region src/hooks/_project.ts
@@ -45,46 +46,44 @@ function authHeaders() {
 	if (SECRET) h["Authorization"] = `Bearer ${SECRET}`;
 	return h;
 }
-function extractTranscriptPrompts(data) {
+function transcriptCapture(data) {
 	const path = data.transcript_path;
-	if (typeof path !== "string" || !path.endsWith(".jsonl")) return [];
-	let raw;
+	if (typeof path !== "string" || !path.endsWith(".jsonl")) return void 0;
 	let descriptor;
 	try {
 		descriptor = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
 		const info = fstatSync(descriptor);
-		if (!info.isFile()) return [];
-		const limit = 4 * 1024 * 1024;
+		if (!info.isFile()) return void 0;
+		const limit = 256 * 1024;
 		const start = Math.max(0, info.size - limit);
 		const buffer = Buffer.alloc(Math.min(info.size, limit));
 		const bytesRead = readSync(descriptor, buffer, 0, buffer.length, start);
-		raw = buffer.toString("utf8", 0, bytesRead);
-		if (start > 0) raw = raw.slice(raw.indexOf("\n") + 1);
+		let text = buffer.toString("utf8", 0, bytesRead);
+		let windowStart = start;
+		if (start > 0) {
+			const boundary = buffer.subarray(0, bytesRead).indexOf(10);
+			if (boundary < 0) return void 0;
+			windowStart += boundary + 1;
+			text = buffer.subarray(boundary + 1, bytesRead).toString("utf8");
+		}
+		const complete = text.lastIndexOf("\n");
+		if (complete < 0) return void 0;
+		text = text.slice(0, complete + 1);
+		return {
+			event: "transcript_capture_v1",
+			producer: "session-end-transcript-v1",
+			sourceKey: createHash("sha256").update(path).digest("hex"),
+			revision: `${info.dev}:${info.ino}:${info.birthtimeMs}`,
+			windowStart,
+			windowEnd: windowStart + Buffer.byteLength(text),
+			text,
+			...windowStart > 0 ? { omission: "[transcript prefix outside bounded capture window; unavailable in this delivery]" } : {}
+		};
 	} catch {
-		return [];
+		return;
 	} finally {
 		if (descriptor !== void 0) closeSync(descriptor);
 	}
-	const prompts = [];
-	for (const line of raw.split("\n")) {
-		if (!line.trim()) continue;
-		let msg;
-		try {
-			msg = JSON.parse(line);
-		} catch {
-			continue;
-		}
-		if (!msg || typeof msg !== "object" || msg.role !== "user") continue;
-		if (!Array.isArray(msg.message?.content)) continue;
-		for (const block of msg.message.content) {
-			if (prompts.length >= 50) return prompts;
-			if (!block || block.type !== "text" || typeof block.text !== "string") continue;
-			const m = block.text.match(/<user_query>\n?([\s\S]*?)\n?<\/user_query>/);
-			const text = (m ? m[1] : block.text).trim();
-			if (text) prompts.push(text.slice(0, 8e3));
-		}
-	}
-	return prompts;
 }
 async function main() {
 	let input = "";
@@ -98,21 +97,19 @@ async function main() {
 	if (!data || typeof data !== "object") return;
 	if (isSdkChildContext(data)) return;
 	const sessionId = data.session_id || data.sessionId || data.conversation_id || "unknown";
-	const transcriptPrompts = extractTranscriptPrompts(data);
-	if (transcriptPrompts.length > 0) {
+	const capture = transcriptCapture(data);
+	if (capture) {
 		const cwd = hookCwd(data) || process.cwd();
-		const project = resolveProject(cwd);
-		const timestamp = (/* @__PURE__ */ new Date()).toISOString();
-		for (const prompt of transcriptPrompts) fetch(`${REST_URL}/agentmemory/observe`, {
+		fetch(`${REST_URL}/agentmemory/observe`, {
 			method: "POST",
 			headers: authHeaders(),
 			body: JSON.stringify({
 				hookType: "prompt_submit",
 				sessionId,
-				project,
+				project: resolveProject(cwd),
 				cwd,
-				timestamp,
-				data: { prompt }
+				timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+				data: capture
 			}),
 			signal: AbortSignal.timeout(3e3)
 		}).catch(() => {});
@@ -133,5 +130,3 @@ async function main() {
 main().catch(() => process.exit(0));
 //#endregion
 export {};
-
-//# sourceMappingURL=session-end.mjs.map

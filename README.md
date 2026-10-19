@@ -278,6 +278,8 @@ Native and Docker launches use this same resolved host directory; Docker bind-mo
 
 Latest release notes: [CHANGELOG.md](CHANGELOG.md).
 
+Source release in preparation: [0.9.90 draft and distribution prerequisites](docs/operations/release-0.9.90.md).
+
 > **Internal fork:** See [fork usage](docs/fork-local-usage.md) for its GitHub Release and Windows installer steps.
 
 ---

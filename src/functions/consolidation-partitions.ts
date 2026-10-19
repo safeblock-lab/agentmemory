@@ -1,10 +1,12 @@
 import type { StateKV } from "../state/kv.js";
 import { KV, fingerprintId } from "../state/schema.js";
 import type { FireworksBatchQueue } from "./fireworks-batch.js";
-import type { FireworksBatchWorkItem } from "../types.js";
+import type { PreparedStructuredLlmCall } from "../types.js";
+import type { ProceduralBatchWorkItem as FireworksBatchWorkItem } from "./fireworks-batch.js";
 import { createHash } from "node:crypto";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { boundedBytes, immutablePage, pageKey } from "./consolidation-manifest.js";
+import { canonicalStructuredJson, consolidationRequestId, proceduralOutputContract, sameProceduralContract, sameStructuredJsonValue, validatedProceduralContract, type ProceduralOutputContract } from "./consolidation-procedural-format.js";
 
 export const MAX_CONSOLIDATION_INPUT_BYTES = 8 * 1024;
 const PARTITION_INPUT_BYTES = MAX_CONSOLIDATION_INPUT_BYTES - 128;
@@ -102,6 +104,8 @@ export interface ConsolidationManifest<T = unknown> {
 }
 
 export interface RequestCheckpoint {
+  outputContract?: ProceduralOutputContract;
+  providerFailure?: { httpStatus: number; code?: string; param?: string };
   id: string;
   manifestId: string;
   systemPrompt: string;
@@ -128,7 +132,7 @@ export class ConsolidationRequestBlocked extends Error {
 }
 type RequestLookup = { found: false } | { found: true; response: string | undefined }
 interface ResponsePage { text: string; index: number; count: number; sha256: string; bytes: number }
-async function capturedResponse(kv: StateKV, record: RequestCheckpoint): Promise<string | undefined> {
+export async function capturedResponse(kv: StateKV, record: RequestCheckpoint): Promise<string | undefined> {
   if (record.status === "completed" && typeof record.response === "string") return record.response;
   const first = await kv.get<ResponsePage>(KV.state, pageKey(record.manifestId, `response:${record.id}`, 0));
   if (!first) {
@@ -177,11 +181,25 @@ async function requestWork(kv: StateKV, record: RequestCheckpoint): Promise<{ id
 function exactRequestWork(record: RequestCheckpoint, item: FireworksBatchWorkItem | null, id: string): item is FireworksBatchWorkItem {
   return Boolean(item && item.id === id && item.task === "consolidation" && item.correlationId === record.id && item.customId === record.id
     && item.systemPrompt === record.systemPrompt && item.userPrompt === record.userPrompt && item.metadata?.consolidationManifestId === record.manifestId
-    && item.metadata?.consolidationPartitionId === record.id && item.metadata?.sourceFingerprint === record.id);
+    && item.metadata?.consolidationPartitionId === record.id && item.metadata?.sourceFingerprint === record.id
+    && sameStructuredJsonValue(item.responseFormat, record.outputContract?.options.responseFormat)
+    && (record.outputContract?.version !== "procedural-json-v2" || record.outputContract.transport.kind === "fireworks-batch" && item.model === record.outputContract.transport.model)
+    && sameProceduralContract(item.outputContract, record.outputContract?.version === "procedural-json-v2" ? record.outputContract : undefined));
 }
-function definitiveProviderRejection(error: unknown): boolean {
-  if (typeof error !== "object" || error === null || !("status" in error)) return false;
-  return typeof error.status === "number" && [400, 401, 403, 404, 413, 422, 429].includes(error.status);
+function providerFailureMetadata(error: unknown): RequestCheckpoint["providerFailure"] | undefined {
+  if (typeof error !== "object" || error === null || !("status" in error)) return undefined;
+  const httpStatus = error.status;
+  if (typeof httpStatus !== "number" || ![400, 401, 403, 404, 413, 422, 429].includes(httpStatus)) return undefined;
+  const diagnostic = "diagnostic" in error ? error.diagnostic : undefined;
+  const details = isDiagnosticRecord(diagnostic) ? diagnostic : {};
+  const safeIdentifier = (value: unknown): string | undefined => typeof value === "string"
+    && /^[A-Za-z0-9_.:[\]-]{1,128}$/.test(value) ? value : undefined;
+  const code = safeIdentifier(details.code);
+  const param = safeIdentifier(details.param);
+  return { httpStatus, ...(code ? { code } : {}), ...(param ? { param } : {}) };
+}
+function isDiagnosticRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export class ConsolidationRequests {
@@ -189,11 +207,21 @@ export class ConsolidationRequests {
   constructor(
     private kv: StateKV,
     readonly manifestId: string,
-    private summarize: (system: string, prompt: string, request: Readonly<Pick<RequestCheckpoint, "id" | "manifestId">>) => Promise<string>,
+    private summarize: (system: string, prompt: string, request: Readonly<Pick<RequestCheckpoint, "id" | "manifestId" | "outputContract">>, prepared?: PreparedStructuredLlmCall) => Promise<string>,
     private queue?: FireworksBatchQueue,
     private budget: ConsolidationCallBudget = { used: 0, maximum: 2 },
     private capturedOnly = false,
+    private prepare?: (system: string, prompt: string, contract: ProceduralOutputContract) => PreparedStructuredLlmCall,
+    private supportsStructured?: (prompt: string) => boolean,
   ) {}
+
+  async supportsProceduralOutput(system: string, prompt: string): Promise<boolean> {
+    const historicalId = consolidationRequestId(this.manifestId, system, prompt, proceduralOutputContract());
+    if (await this.kv.get<RequestCheckpoint>(KV.state, historicalId)) return true;
+    const bindingKey = fingerprintId("conbinding", canonicalStructuredJson([this.manifestId, system, prompt, "procedural-json-v2", proceduralOutputContract().options]));
+    if (await this.kv.get<ProceduralOutputContract>(KV.state, bindingKey)) return true;
+    return this.queue ? typeof this.queue.prepareProceduralContract === "function" : this.supportsStructured?.(prompt) === true;
+  }
 
   async checkpointRound(round: number, candidates: readonly unknown[]): Promise<void> {
     const id = fingerprintId("conround", `${this.manifestId}:${round}`);
@@ -223,28 +251,80 @@ export class ConsolidationRequests {
     return false;
   }
 
-  async request(systemPrompt: string, userPrompt: string, compatibleSystemPrompts: readonly string[] = []): Promise<string | undefined> {
+  async request(systemPrompt: string, userPrompt: string, compatibleSystemPrompts: readonly string[] = [], outputContract?: ProceduralOutputContract): Promise<string | undefined> {
     userPrompt = `Consolidation manifest: ${this.manifestId}\n\n${userPrompt}`;
+    if (outputContract?.version === "procedural-json-v2") {
+      const historicalContract = proceduralOutputContract();
+      const historicalId = consolidationRequestId(this.manifestId, systemPrompt, userPrompt, historicalContract);
+      const historical = await this.kv.get<RequestCheckpoint>(KV.state, historicalId);
+      if (historical) {
+        if (historical.id !== historicalId || historical.manifestId !== this.manifestId || historical.systemPrompt !== systemPrompt
+          || historical.userPrompt !== userPrompt || !sameProceduralContract(historical.outputContract, historicalContract)) throw new ConsolidationRequestBlocked(historicalId, historical.workItemId, "request_identity_invalid");
+        const response = await capturedResponse(this.kv, historical);
+        if (response !== undefined) return response;
+        if (historical.providerAttempt?.state !== "rejected") {
+          const retained = await this.requestExact(systemPrompt, userPrompt, false, historicalContract);
+          if (retained.found) return retained.response;
+        }
+      }
+    }
     const visited = new Set([systemPrompt]);
     for (const compatibleSystemPrompt of compatibleSystemPrompts) {
       if (visited.has(compatibleSystemPrompt)) continue;
       visited.add(compatibleSystemPrompt);
       if (requestInputBytes(compatibleSystemPrompt, userPrompt) > MAX_CONSOLIDATION_INPUT_BYTES) continue;
-      const compatible = await this.requestExact(compatibleSystemPrompt, userPrompt, false);
+      const compatible = await this.requestExact(compatibleSystemPrompt, userPrompt, false, outputContract);
       if (compatible.found) return compatible.response;
     }
-    const current = await this.requestExact(systemPrompt, userPrompt, true);
+    const current = await this.requestExact(systemPrompt, userPrompt, true, outputContract);
     if (!current.found) throw new Error("consolidation_request_lookup_invalid");
     return current.response;
   }
 
-  private async requestExact(systemPrompt: string, userPrompt: string, allowDispatch: boolean): Promise<RequestLookup> {
+  private async requestExact(systemPrompt: string, userPrompt: string, allowDispatch: boolean, outputContract?: ProceduralOutputContract): Promise<RequestLookup> {
     if (requestInputBytes(systemPrompt, userPrompt) > MAX_CONSOLIDATION_INPUT_BYTES) throw new Error("Consolidation request exceeds 8 KiB; originals retained locally");
-    const id = fingerprintId("conrequest", JSON.stringify([this.manifestId, systemPrompt, userPrompt]));
+    let prepared: PreparedStructuredLlmCall | undefined;
+    if (outputContract?.version === "procedural-json-v2") {
+      const bindingKey = fingerprintId("conbinding", canonicalStructuredJson([this.manifestId, systemPrompt, userPrompt, outputContract.version, outputContract.options]));
+      const savedContract = await this.kv.get<ProceduralOutputContract>(KV.state, bindingKey);
+      if (savedContract) {
+        validatedProceduralContract(savedContract);
+        const savedId = consolidationRequestId(this.manifestId, systemPrompt, userPrompt, savedContract);
+        const replay = await withKeyedLock(`consolidation-request:${savedId}`, async () => {
+          const saved = await this.kv.get<RequestCheckpoint>(KV.state, savedId);
+          if (!saved) return undefined;
+          if (saved.id !== savedId || saved.manifestId !== this.manifestId || saved.systemPrompt !== systemPrompt
+            || saved.userPrompt !== userPrompt || !sameProceduralContract(saved.outputContract, savedContract)) throw new ConsolidationRequestBlocked(savedId, saved.workItemId, "request_identity_invalid");
+          return capturedResponse(this.kv, saved);
+        });
+        if (replay !== undefined) return { found: true, response: replay };
+      }
+      if (this.queue) {
+        if (!this.queue.prepareProceduralContract) throw new Error("procedural_batch_capability_unavailable");
+        outputContract = this.queue.prepareProceduralContract(outputContract);
+      }
+      else {
+        if (!this.prepare) throw new Error("procedural_output_preparation_unavailable");
+        prepared = this.prepare(systemPrompt, userPrompt, outputContract);
+        if (prepared.binding.contractVersion !== outputContract.version) throw new Error("procedural_output_binding_mismatch");
+        const { task, route, ...binding } = prepared.binding;
+        outputContract = { ...outputContract, transport: { kind: "direct", binding: {
+          ...binding, ...(task === undefined ? {} : { task }), ...(route === undefined ? {} : { route }),
+        } } };
+      }
+      outputContract = validatedProceduralContract(outputContract);
+      const boundContract = outputContract;
+      await withKeyedLock(`consolidation-binding:${bindingKey}`, async () => {
+        const previousBinding = await this.kv.get<ProceduralOutputContract>(KV.state, bindingKey);
+        if (previousBinding && !sameProceduralContract(previousBinding, boundContract)) throw new Error("procedural_output_transport_changed");
+        if (!previousBinding && allowDispatch) { boundedBytes(boundContract); await this.kv.set(KV.state, bindingKey, boundContract); }
+      });
+    }
+    const id = consolidationRequestId(this.manifestId, systemPrompt, userPrompt, outputContract);
     return withKeyedLock(`consolidation-request:${id}`, async () => {
     const previous = await this.kv.get<RequestCheckpoint>(KV.state, id);
     if (!previous && !allowDispatch) return { found: false };
-    if (previous && (previous.id !== id || previous.manifestId !== this.manifestId || previous.systemPrompt !== systemPrompt || previous.userPrompt !== userPrompt)) throw new ConsolidationRequestBlocked(id, previous.workItemId, "request_identity_invalid");
+    if (previous && (previous.id !== id || previous.manifestId !== this.manifestId || previous.systemPrompt !== systemPrompt || previous.userPrompt !== userPrompt || !sameProceduralContract(previous.outputContract, outputContract))) throw new ConsolidationRequestBlocked(id, previous.workItemId, "request_identity_invalid");
     if (previous) { const captured = await capturedResponse(this.kv, previous); if (captured !== undefined) return { found: true, response: captured }; }
     if (this.capturedOnly) throw Object.assign(new Error("consolidation_legacy_completed_response_missing"), { code: "CONSOLIDATION_LEGACY_CAPTURE_MISSING" });
     if (previous?.workItemId) {
@@ -259,17 +339,20 @@ export class ConsolidationRequests {
       this.pending = true; return { found: true, response: undefined };
     }
     if (previous?.providerAttempt?.state === "started") throw new ConsolidationRequestBlocked(id, undefined, "provider_dispatch_uncertain");
+    if (outputContract && previous?.providerAttempt?.state === "rejected") throw new ConsolidationRequestBlocked(id, undefined, "provider_contract_rejected");
     if (previous && previous.dispatchMode !== "queue" && previous.providerAttempt?.state !== "rejected") throw new ConsolidationRequestBlocked(id, undefined, "legacy_provider_dispatch_unknown");
     if (previous?.dispatchMode === "queue" && !this.queue) throw new ConsolidationRequestBlocked(id, undefined, "queue_dispatch_unresolved");
     if (!allowDispatch) throw new ConsolidationRequestBlocked(id, previous?.workItemId, "compatible_request_provider_retry_disabled");
     if (this.budget.used >= this.budget.maximum) throw new ConsolidationPending(this.manifestId);
-    const record: RequestCheckpoint = previous ?? { id, manifestId: this.manifestId, systemPrompt, userPrompt, status: "pending", createdAt: new Date().toISOString() };
+    const record: RequestCheckpoint = previous ?? { id, manifestId: this.manifestId, systemPrompt, userPrompt, ...(outputContract ? { outputContract } : {}), status: "pending", createdAt: new Date().toISOString() };
     if (this.queue) {
       const queuedRecord = { ...record, dispatchMode: "queue" as const };
       await this.kv.set(KV.state, id, queuedRecord);
       this.budget.used++;
       const result = await this.queue.enqueue({
         task: "consolidation", correlationId: id, systemPrompt, userPrompt,
+        ...(outputContract ? { responseFormat: outputContract.options.responseFormat } : {}),
+        ...(outputContract?.version === "procedural-json-v2" ? { outputContract } : {}),
         metadata: { tier: "durable", sourceFingerprint: id, consolidationManifestId: this.manifestId, consolidationPartitionId: id },
       });
       if (!result.queued || !result.workItemId) throw new Error(result.reason ?? "Consolidation queue rejected durable request");
@@ -283,9 +366,10 @@ export class ConsolidationRequests {
     await this.kv.set(KV.state, id, dispatched);
     this.budget.used++;
     let response: string;
-    try { response = await this.summarize(systemPrompt, userPrompt, { id, manifestId: this.manifestId }); }
+    try { response = await this.summarize(systemPrompt, userPrompt, { id, manifestId: this.manifestId, ...(outputContract ? { outputContract } : {}) }, prepared); }
     catch (error) {
-      if (definitiveProviderRejection(error)) await this.kv.set(KV.state, id, { ...dispatched, providerAttempt: { state: "rejected", attempt } });
+      const providerFailure = providerFailureMetadata(error);
+      if (providerFailure) await this.kv.set(KV.state, id, { ...dispatched, providerAttempt: { state: "rejected", attempt }, providerFailure });
       throw error;
     }
     await captureResponse(this.kv, dispatched, response);
@@ -329,12 +413,18 @@ export async function replaceConsolidationRequest(kv: StateKV, queue: FireworksB
     const item = await kv.get<FireworksBatchWorkItem>(KV.fireworksBatchWorkItems, work.id);
     if (!exactRequestWork(request, item, work.id)) throw new Error("consolidation_replacement_work_identity_invalid");
     if (!await canReplace(work.id)) throw new ConsolidationRequestBlocked(request.id, work.id, "replacement_ineligible");
+    const replacementContract = request.outputContract ? validatedProceduralContract(request.outputContract) : undefined;
+    if (request.outputContract && !sameProceduralContract(request.outputContract, replacementContract)) {
+      throw new ConsolidationRequestBlocked(request.id, work.id, "request_identity_invalid");
+    }
     const result = await queue.enqueue({ task: "consolidation", replacementOf: work.id, correlationId: request.id,
-      systemPrompt: request.systemPrompt, userPrompt: request.userPrompt, metadata: { tier: "durable", sourceFingerprint: request.id,
+      systemPrompt: request.systemPrompt, userPrompt: request.userPrompt,
+      ...(replacementContract?.version === "procedural-json-v2" ? { outputContract: replacementContract } : {}),
+      ...(replacementContract ? { responseFormat: replacementContract.options.responseFormat } : {}), metadata: { tier: "durable", sourceFingerprint: request.id,
         consolidationManifestId: request.manifestId, consolidationPartitionId: request.id } });
     if (!result.queued || !result.workItemId || result.workItemId === work.id) throw new Error("consolidation_replacement_enqueue_rejected");
     const latest = await kv.get<RequestCheckpoint>(KV.state, request.id);
-    if (!latest || latest.manifestId !== request.manifestId || latest.systemPrompt !== request.systemPrompt || latest.userPrompt !== request.userPrompt) throw new Error("consolidation_replacement_request_changed");
+    if (!latest || latest.manifestId !== request.manifestId || latest.systemPrompt !== request.systemPrompt || latest.userPrompt !== request.userPrompt || !sameProceduralContract(latest.outputContract, request.outputContract)) throw new Error("consolidation_replacement_request_changed");
     if (await capturedResponse(kv, latest) !== undefined) return { success: true, queued: false, replayed: true, workItemId: result.workItemId };
     await immutablePage(kv, pageKey(request.manifestId, `replacement:${request.id}`, work.id), {
       manifestId: request.manifestId, requestId: request.id, oldWorkItemId: work.id, newWorkItemId: result.workItemId, depth: work.depth + 1 });

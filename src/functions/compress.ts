@@ -1,3 +1,4 @@
+import { getAgentId } from "../config.js";
 import type { IIIClient } from "iii-sdk";
 import { readFileSync } from "node:fs";
 import { isManagedImagePath } from "../utils/image-store.js";
@@ -20,10 +21,10 @@ import { CompressOutputSchema } from "../eval/schemas.js";
 import { validateOutput } from "../eval/validator.js";
 import { scoreCompression } from "../eval/quality.js";
 import { compressWithRetry } from "../eval/self-correct.js";
-import { KV } from "../state/schema.js";
+import { KV, fingerprintId } from "../state/schema.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import { logger } from "../logger.js";
-import { recordOperation } from "./dashboard-activity.js";
+import { recordOperation, observeWorkflowTerminal, markWorkflowStatisticsGap } from "./dashboard-activity.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
 import { replaceObservation } from "./observation-identity.js";
 
@@ -92,6 +93,9 @@ export function registerCompressFunction(
         return { success: false, error: "STATE_OBSERVATION_MISSING" };
       }
       if (!("hookType" in current.value) || typeof current.value.hookType !== "string" || !("raw" in current.value)) {
+        const receipt = "workflowTerminal" in current.value ? current.value.workflowTerminal : undefined;
+        if (receipt && Object.hasOwn(receipt, "agentId")) await observeWorkflowTerminal(kv, { ...receipt, workflow: "compression", producer: "observation-compression", executionLevel: "workflow" });
+        else if ("compressionMethod" in current.value && current.value.compressionMethod === "llm") await markWorkflowStatisticsGap(kv, "compression");
         return { success: true, compressed: current.value, deduplicated: true };
       }
       // Read the durable original, never a caller-supplied excerpt or stale event.
@@ -201,7 +205,8 @@ export function registerCompressFunction(
             obsId: data.observationId,
             retried,
           });
-          await recordOperation(kv, "mem::compress", "failed", { observationsProcessed: 1, observationsCompressed: 0 }, data.raw.agentId, { durationMs: latencyMs, errorCode: "parse_failed" });
+          await markWorkflowStatisticsGap(kv, "compression");
+        await recordOperation(kv, "mem::compress", "failed", { observationsProcessed: 1, observationsCompressed: 0 }, data.raw.agentId, { executionLevel: "unit", durationMs: latencyMs, errorCode: "parse_failed" });
           return { success: false, error: "parse_failed" };
         }
 
@@ -235,7 +240,12 @@ export function registerCompressFunction(
           ...(data.raw.origin ? { origin: data.raw.origin } : {}),
         };
 
-        compressed = await replaceObservation(sdk, compressed, current.version);
+        compressed.workflowTerminal = { executionId: fingerprintId("compression", JSON.stringify([data.sessionId, data.observationId, current.version])),
+          agentId: data.raw.agentId ?? getAgentId() ?? null, occurredAt: new Date().toISOString(), outcome: "completed" };
+        compressed = await replaceObservation(sdk, compressed, current.version, true);
+        if (compressed.workflowTerminal && Object.hasOwn(compressed.workflowTerminal, "agentId")) await observeWorkflowTerminal(kv, { ...compressed.workflowTerminal,
+          workflow: "compression", producer: "observation-compression", executionLevel: "workflow" });
+        else await markWorkflowStatisticsGap(kv, "compression");
 
         try {
           getSearchIndex().add(compressed);
@@ -276,7 +286,7 @@ export function registerCompressFunction(
           retried,
         });
 
-        await recordOperation(kv, "mem::compress", "completed", { observationsProcessed: 1, observationsCompressed: 1 }, data.raw.agentId, { durationMs: latencyMs });
+        await recordOperation(kv, "mem::compress", "completed", { observationsProcessed: 1, observationsCompressed: 1 }, data.raw.agentId, { executionLevel: "unit", durationMs: latencyMs });
         return { success: true, compressed, qualityScore };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -288,7 +298,8 @@ export function registerCompressFunction(
           obsId: data.observationId,
           error: msg,
         });
-        await recordOperation(kv, "mem::compress", "failed", { observationsProcessed: 1 }, data.raw.agentId, { durationMs: latencyMs, errorCode: "compression_failed" });
+        await markWorkflowStatisticsGap(kv, "compression");
+        await recordOperation(kv, "mem::compress", "failed", { observationsProcessed: 1 }, data.raw.agentId, { executionLevel: "unit", durationMs: latencyMs, errorCode: "compression_failed" });
         return { success: false, error: "compression_failed" };
       }
     },

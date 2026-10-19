@@ -8,11 +8,15 @@ import {
 } from "node:child_process";
 import {
   chmodSync,
+  closeSync,
   cpSync,
   copyFileSync,
   constants,
   existsSync,
+  fchmodSync,
+  fstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   readlinkSync,
@@ -504,7 +508,7 @@ function warnIfRelocatedDataDir(): void {
   if (!dataDirResolution.relocatedFrom) return;
 
   try {
-    mkdirSync(dataDirResolution.dataDir, { recursive: true });
+    prepareDedicatedDataDirectory();
     const marker = join(dataDirResolution.dataDir, ".cwd-relocation-warning");
     if (existsSync(marker)) return;
     p.log.warn(
@@ -516,6 +520,33 @@ function warnIfRelocatedDataDir(): void {
       `Default data dir ${dataDirResolution.relocatedFrom} is inside a git worktree; using ${dataDirResolution.dataDir} instead.`,
     );
   }
+}
+
+function prepareDedicatedDataDirectory(): void {
+  const directory = resolve(dataDirResolution.dataDir);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  if (process.platform === "win32" || dataDirResolution.source !== "default" || !process.getuid) return;
+  const home = resolve(homedir());
+  const bases = [join(home, ".local", "share", "agentmemory"), join(home, "Library", "Application Support", "agentmemory")];
+  const xdg = process.env["XDG_DATA_HOME"];
+  if (xdg && isAbsolute(xdg)) bases.push(join(resolve(xdg), "agentmemory"));
+  const allowed = bases.some(base => directory === base || selectedInstance > 0 && directory === join(base, `instance-${selectedInstance}`));
+  if (!allowed || directory === home || directory === resolve(process.cwd()) || dirname(directory) === directory) return;
+  for (let ancestor = directory; ; ancestor = dirname(ancestor)) {
+    if (existsSync(join(ancestor, ".git"))) return;
+    if (dirname(ancestor) === ancestor) break;
+  }
+  let handle: number | undefined;
+  try {
+    const entry = lstatSync(directory);
+    if (!entry.isDirectory() || entry.isSymbolicLink() || entry.uid !== process.getuid() || realpathSync(directory) !== directory) return;
+    handle = openSync(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    const opened = fstatSync(handle);
+    if (!opened.isDirectory() || opened.uid !== process.getuid() || opened.dev !== entry.dev || opened.ino !== entry.ino) return;
+    if ((opened.mode & 0o077) !== 0) fchmodSync(handle, 0o700);
+  } catch {
+    p.log.warn("Private graph recovery authorization is unavailable; normal memory service can continue.");
+  } finally { if (handle !== undefined) closeSync(handle); }
 }
 
 function whichBinary(name: string): string | null {
@@ -1484,7 +1515,8 @@ function prepareEngineLaunch(configPath: string): {
         )
       : renderEngineConfig(rawConfig, options);
     const runtimePath = runtimeConfigPath(dataDirResolution.dataDir);
-    mkdirSync(dirname(runtimePath), { recursive: true });
+    prepareDedicatedDataDirectory();
+    mkdirSync(dirname(runtimePath), { recursive: true, mode: 0o700 });
     if (existsSync(runtimePath)) copyFileSync(runtimePath, `${runtimePath}.before-rendered-config-${Date.now()}`, constants.COPYFILE_EXCL);
     writeFileSync(runtimePath, rewritten, "utf-8");
     try {
@@ -1672,7 +1704,7 @@ async function startEngine(): Promise<boolean> {
     return false;
   }
 
-  mkdirSync(dataDirResolution.dataDir, { recursive: true });
+  prepareDedicatedDataDirectory();
   const interactive = !!process.stdin.isTTY && !process.env["CI"];
 
   type Choice = "install" | "manual";
@@ -1981,7 +2013,7 @@ async function runStateMigrationCmd(): Promise<void> {
   }
   const source = realpathSync(sourceArgument);
   const dataDir = resolve(dataDirResolution.dataDir);
-  if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
+  prepareDedicatedDataDirectory();
   const dataDirEntry = lstatSync(dataDir);
   if (dataDirEntry.isSymbolicLink() || !dataDirEntry.isDirectory()) {
     throw new Error("The resolved AgentMemory data directory must be a real directory.");

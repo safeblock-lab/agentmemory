@@ -1,10 +1,11 @@
+import { observeWorkflowTerminal, markWorkflowStatisticsGap } from "./dashboard-activity.js";
 import type { IIIClient } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
 import { fingerprintId, generateId } from "../state/schema.js";
 import { KV } from "../state/schema.js";
 import { batchEffectKey, runBatchCallback } from "../state/batch-effects.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
-import { isBackgroundRecoveryPaused } from "../config.js";
+import { isBackgroundRecoveryPaused, getAgentId } from "../config.js";
 import { StatePageError } from "../state/state-pages.js";
 import { IndexedRetrievalError } from "../state/indexed-retrieval.js";
 import { retrievalRequest } from "../state/indexed-retrieval.js";
@@ -15,7 +16,7 @@ import { REFLECT_SYSTEM } from "../prompts/reflect.js";
 import { ReflectWaiting, ReflectNoEvidence, freezeReflectSeeds, retrieveReflectManifest, currentReflectManifest, prepareReflectGroup } from "./reflect-retrieval.js";
 import { evaluatePublicationEvidence, observePublicationEvidence, preparePublicationEvidence, supersedePublicationJudge, type PublicationEvidenceInput, type PublicationEvidenceResult } from "./publication-evidence.js";
 import { withProviderAttemptBudget } from "../providers/provider-attempt-budget.js";
-import { publicationCallOptions } from "./publication-call-options.js";
+import { publicationExecutor } from "./publication-call-options.js";
 import { recordAudit } from "./audit.js";
 import { stripPrivateData } from "./privacy.js";
 import { constructReflectRecovery, reflectRecoveryReady, validateReflectRecoveryReplay, ReflectRecoveryError, type ReflectManualOperation } from "./reflect-zero-spend-recovery.js";
@@ -43,9 +44,25 @@ const scopedCoverage = (job: ReflectJob) => ({
 export function registerReflectQueue(sdk: IIIClient, kv: StateKV, provider: MemoryProvider, apply: Apply,
   llmRouter?: LlmTaskRouter, batchQueue?: FireworksBatchQueue, embedding?: EmbeddingProvider) {
   const manualExecutions = new Map<string, string>();
+  const readJob = async (id: string): Promise<ReflectJob | null> => {
+    const job = await kv.get<ReflectJob>(REFLECT_JOBS, id);
+    if (job && ["completed", "partial", "failed"].includes(job.status)) {
+      if (!job.workflowTerminal || job.workflowTerminal.outcome !== job.status) await markWorkflowStatisticsGap(kv, "reflection");
+      else await observeWorkflowTerminal(kv, { ...job.workflowTerminal, workflow: "reflection", producer: "reflect-queue", executionLevel: "workflow" });
+    }
+    return job;
+  };
   const save = async (job: ReflectJob) => {
     job.updatedAt = new Date().toISOString();
+    if (["completed", "partial", "failed"].includes(job.status) && !job.workflowTerminal) {
+      const outcome = job.status === "completed" ? "completed" : job.status === "partial" ? "partial" : "failed";
+      job.workflowTerminal = { executionId: job.id, agentId: getAgentId(), occurredAt: job.updatedAt, outcome };
+    }
     await kv.set(REFLECT_JOBS, job.id, job);
+    if (job.workflowTerminal) {
+      if (job.status !== job.workflowTerminal.outcome) await markWorkflowStatisticsGap(kv, "reflection");
+      else await observeWorkflowTerminal(kv, { ...job.workflowTerminal, workflow: "reflection", producer: "reflect-queue", executionLevel: "workflow" });
+    }
   };
   const admissionKey = (request: ReflectRequest) => `admission:${request.project ?? "unscoped"}`;
   const releaseAdmission = (job: ReflectJob) => withKeyedLock(admissionKey(job.request), async () => {
@@ -91,22 +108,13 @@ export function registerReflectQueue(sdk: IIIClient, kv: StateKV, provider: Memo
     }
     const request = preparePublicationEvidence(input);
     if ("status" in request) return request;
-    const options = publicationCallOptions();
-    const execute: import("./publication-evidence.js").PublicationEvidenceExecutor = async (prepared, captureRaw) => {
-      const call = async (target: MemoryProvider) => {
-        const raw = await target.summarize(prepared.systemPrompt, prepared.userPrompt, options);
-        await captureRaw(raw);
-        return raw;
-      };
-      const execute = () => llmRouter
-        ? llmRouter.run("reflection", target => call(target), () => true)
-        : call(provider);
-      return disposition ? withProviderAttemptBudget({ operationId: prepared.requestId,
-        windowId: disposition.budget.windowId, ceiling: disposition.budget.ceiling }, execute) : execute();
-    };
+    const execute = publicationExecutor(provider, llmRouter, "reflection", {}, (prepared, dispatch) =>
+      disposition ? withProviderAttemptBudget({ operationId: prepared.requestId,
+        windowId: disposition.budget.windowId, ceiling: disposition.budget.ceiling }, dispatch) : dispatch());
     return retain(disposition
       ? await supersedePublicationJudge(kv, input, { dispositionId: disposition.dispositionId,
-        checkpoint: disposition.checkpoint, budget: disposition.budget }, execute, observe)
+        checkpoint: disposition.checkpoint, budget: disposition.budget,
+        ...(disposition.migration ? { migration: disposition.migration } : {}) }, execute, observe)
       : await evaluatePublicationEvidence(kv, input, execute, observe));
   };
   const rejectCandidate = async (job: ReflectJob, manifest: ReflectManifest, reason: string, fingerprint: string) => {
@@ -207,7 +215,7 @@ export function registerReflectQueue(sdk: IIIClient, kv: StateKV, provider: Memo
     if (request.legacyWorkId && (request.project || request.query || request.sessionId || request.summaryId || request.factIds || request.lessonIds || request.crystalIds)) throw new Error("legacy_reflect_ambiguous_request");
     const id = jobIdentity(request, origin);
     return withKeyedLock(`reflect-job:${id}`, async () => {
-      let job = await kv.get<ReflectJob>(REFLECT_JOBS, id);
+      let job = await readJob( id);
       if (job && !await reflectRecoveryReady(kv, job)) return { success: false, error: "reflect_recovery_construction_incomplete" };
       if (job && !terminal(job) && origin !== job.executionOrigin) throw new Error("selected_reflect_origin_conflict");
       if (job?.executionOrigin === "selected" && (!input.selected || input.selected.sessionId !== job.selectedSessionId)) return { success: false, error: "selected_foreground_required" };
@@ -289,7 +297,7 @@ export function registerReflectQueue(sdk: IIIClient, kv: StateKV, provider: Memo
       if (binding && request.recoveryOfJobId) {
         const cached = await kv.get<{ checkpoint: string; response?: Record<string, unknown> }>(REFLECT_CONTROL, `${operation}:cut:${input.continuation?.cut ?? 0}`);
         if (cached?.response) {
-          const job = await kv.get<ReflectJob>(REFLECT_JOBS, binding.jobId);
+          const job = await readJob( binding.jobId);
           if (!job || job.id !== binding.jobId || job.executionOrigin !== "manual" || !job.manual) return { success: false, error: "manual_reflect_origin_mismatch" };
           if (batchEffectKey(JSON.stringify(job.request)) !== identity || job.project !== request.project
             || binding.request && batchEffectKey(JSON.stringify(binding.request)) !== identity) return { success: false, error: "manual_reflect_identity_mismatch" };
@@ -327,7 +335,7 @@ export function registerReflectQueue(sdk: IIIClient, kv: StateKV, provider: Memo
         if ("success" in created) return created;
         admitted = created;
       }
-      let job = await kv.get<ReflectJob>(REFLECT_JOBS, admitted.jobId);
+      let job = await readJob( admitted.jobId);
       if (!job || job.executionOrigin !== "manual" || !job.manual) return { success: false, error: "manual_reflect_origin_mismatch" };
       if (request.sessionId && request.sessionId !== job.request.sessionId) return { success: false, error: "manual_reflect_identity_mismatch" };
       if (request.sessionId && !admitted.sessionId) {
@@ -357,7 +365,7 @@ export function registerReflectQueue(sdk: IIIClient, kv: StateKV, provider: Memo
           ...(request.sessionId && { selected: { sessionId: request.sessionId } }) }); }
         finally { manualExecutions.delete(job.id); }
       }
-      job = (await kv.get<ReflectJob>(REFLECT_JOBS, admitted.jobId))!;
+      job = (await readJob( admitted.jobId))!;
       job.manual!.cuts = cut + 1;
       job.dispatchPending = false;
       if (cut + 1 >= 256 && !manualTerminal(job)) {
@@ -382,7 +390,7 @@ export function registerReflectQueue(sdk: IIIClient, kv: StateKV, provider: Memo
   };
   const acceptBatch = async (data: ReflectRequest, cluster: ConceptCluster) => {
     return withKeyedLock(`reflect-job:${cluster.jobId}`, async () => {
-      const job = await kv.get<ReflectJob>(REFLECT_JOBS, cluster.jobId!);
+      const job = await readJob( cluster.jobId!);
       if (job && !await reflectRecoveryReady(kv, job)) return { success: false, error: "reflect_recovery_construction_incomplete" };
       const manifest = job?.manifest;
       if (job?.executionOrigin === "manual") return { success: true, reason: "manual_foreground_required" };
@@ -435,7 +443,7 @@ export function registerReflectQueue(sdk: IIIClient, kv: StateKV, provider: Memo
     if (foregroundControl !== undefined && (data.selected !== undefined || data.manualToken !== undefined))
       return { success: false, error: "conflicting_reflect_execution_controls" };
     return withKeyedLock(`reflect-job:${data.jobId}`, async () => {
-      const job = await kv.get<ReflectJob>(REFLECT_JOBS, data.jobId);
+      const job = await readJob( data.jobId);
       if (job && !await reflectRecoveryReady(kv, job)) return { success: false, error: "reflect_recovery_construction_incomplete" };
       if (foregroundControl !== undefined) {
         if (!job || job.id !== data.jobId) return { success: false, error: "reflect_foreground_job_not_found" };
@@ -574,7 +582,7 @@ export function registerReflectQueue(sdk: IIIClient, kv: StateKV, provider: Memo
               const responseBytes = Buffer.byteLength(response);
               if (timedOut) {
                 await withKeyedLock(`reflect-job:${job.id}`, async () => {
-                  const current = await kv.get<ReflectJob>(REFLECT_JOBS, job.id);
+                  const current = await readJob( job.id);
                   if (!current || current.manifest?.id !== manifest.id || current.generation?.effectKey !== effectKey) return;
                   if (responseBytes > 16384) current.generation = { state: "overflow", effectKey, responseBytes,
                     responseFingerprint: fingerprintId("reflect-response", response) };
@@ -687,7 +695,7 @@ export function registerReflectQueue(sdk: IIIClient, kv: StateKV, provider: Memo
     config: { topic: REFLECT_TOPIC, queue_config: { type: "fifo", concurrency: 1, maxRetries: 3, backoffDelayMs: 30000 } } });
   sdk.registerFunction("mem::reflect-status", async (data: { jobId: string; publication?: unknown }) => {
     if (!validText(data?.jobId)) return { success: false, error: "invalid_reflect_job" };
-    const job = await kv.get<ReflectJob>(REFLECT_JOBS, data.jobId);
+    const job = await readJob( data.jobId);
     let publication: unknown;
     if (data.publication !== undefined) {
       if (!validReflectPublicationReplay(data.publication) || !job?.manifest || !job.captured
@@ -715,7 +723,7 @@ export function registerReflectQueue(sdk: IIIClient, kv: StateKV, provider: Memo
       for (const pending of page.items) {
         if (pending.executionOrigin) continue;
         if (!validText(pending.id)) continue;
-        const job = await kv.get<ReflectJob>(REFLECT_JOBS, pending.id);
+        const job = await readJob( pending.id);
         if (job?.executionOrigin) continue;
         if (!job && pending.request) { await admit(pending.request); dispatched++; continue; }
         if (!job || terminal(job)) { await kv.delete(REFLECT_PENDING, pending.id); if (job) await releaseAdmission(job); continue; }

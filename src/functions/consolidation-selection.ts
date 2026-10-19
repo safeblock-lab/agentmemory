@@ -6,6 +6,18 @@ import { IndexedRetrievalError, retrievalRequest } from "../state/indexed-retrie
 import { rerank } from "../state/reranker.js";
 import { isStateCounter } from "../state/state-transactions.js";
 import type { CanonicalLookup, CanonicalWriteResult } from "../state/canonical-memory.js";
+const retrievalFailureActions = new WeakMap<object, string>();
+export function consolidationRetrievalFailureAction(error: unknown): string | undefined {
+  return error !== null && typeof error === "object" ? retrievalFailureActions.get(error) : undefined;
+}
+async function selectedRetrieval<T>(kv: StateKV, payload: Record<string, unknown>): Promise<T> {
+  try { return await retrievalRequest<T>(kv, payload); }
+  catch (error) {
+    if (error !== null && typeof error === "object" && typeof payload.action === "string")
+      retrievalFailureActions.set(error, payload.action);
+    throw error;
+  }
+}
 export type { CanonicalWriteResult } from "../state/canonical-memory.js";
 
 export type ConsolidationRetrievalCoverage = "bounded_candidate_budget" | "bounded_query_budget";
@@ -32,11 +44,105 @@ export function consolidationRetrievalCoverage(sources: readonly unknown[]): Con
   return COVERAGE_ORDER.filter(label => labels.has(label));
 }
 
+type ScopedSemanticQueryDiagnostic = { subpath: "scope_resolution" | "small_project" | "small_project_prepare_sql" | "small_project_candidate_read"
+  | "vector_prepare_sql" | "scoring" | "enrichment" | "ann_prepare_sql" | "ann_candidate_read";
+  small_project_ms: number; prepare_sql_ms: number; candidate_read_ms: number; window: number; page: number;
+  visited: number; unique: number; duplicate: number; id_bytes: number;
+  fallback_reason: "small_project_disabled" | "small_project_bound" | "small_project_candidate_invalid"
+    | "small_project_source_invalid" | "small_project_id_bytes" | "small_project_vector_missing" | null };
+type ScopedKeywordQueryDiagnostic = { subpath: "pre_enrichment" | "projection_lookup" | "proof_lookup"
+  | "literal_validation" | "decode_validation" | "complete";
+  pre_enrichment_ms: number; enrichment_ms: number; projection_lookup_ms: number; proof_lookup_ms: number;
+  literal_validation_ms: number; decode_validation_ms: number; hits_started: number; hits_completed: number;
+  literal_started: number; recipe1_started: number; full_bytes_validated: number };
+type ScopedQueryDiagnostic = { action: "keyword_search" | "semantic_search";
+  phase: "candidate_selection" | "scoring" | "enrichment"; elapsedMs: number;
+  queryDiagnostics?: ScopedSemanticQueryDiagnostic; keywordDiagnostics?: ScopedKeywordQueryDiagnostic };
+
+const SEMANTIC_QUERY_DIAGNOSTIC_SUBPATHS = new Set<string>(["scope_resolution", "small_project", "small_project_prepare_sql",
+  "small_project_candidate_read", "vector_prepare_sql", "scoring", "enrichment", "ann_prepare_sql", "ann_candidate_read"]);
+const SEMANTIC_QUERY_DIAGNOSTIC_FALLBACKS = new Set<string>(["small_project_disabled", "small_project_bound", "small_project_candidate_invalid",
+  "small_project_source_invalid", "small_project_id_bytes", "small_project_vector_missing"]);
+const SEMANTIC_QUERY_DIAGNOSTIC_FIELDS = new Set([
+  "subpath", "small_project_ms", "prepare_sql_ms", "candidate_read_ms", "window", "page", "visited", "unique",
+  "duplicate", "id_bytes", "fallback_reason",
+]);
+const KEYWORD_QUERY_DIAGNOSTIC_SUBPATHS = new Set<string>([
+  "pre_enrichment", "projection_lookup", "proof_lookup", "literal_validation", "decode_validation", "complete",
+]);
+const KEYWORD_QUERY_DIAGNOSTIC_FIELDS = new Set([
+  "subpath", "pre_enrichment_ms", "enrichment_ms", "projection_lookup_ms", "proof_lookup_ms",
+  "literal_validation_ms", "decode_validation_ms", "hits_started", "hits_completed", "literal_started",
+  "recipe1_started", "full_bytes_validated",
+]);
+
+function isSemanticQueryDiagnosticSubpath(value: unknown): value is ScopedSemanticQueryDiagnostic["subpath"] {
+  return typeof value === "string" && SEMANTIC_QUERY_DIAGNOSTIC_SUBPATHS.has(value);
+}
+
+function isSemanticQueryDiagnosticFallback(value: unknown): value is Exclude<ScopedSemanticQueryDiagnostic["fallback_reason"], null> {
+  return typeof value === "string" && SEMANTIC_QUERY_DIAGNOSTIC_FALLBACKS.has(value);
+}
+
+function isKeywordQueryDiagnosticSubpath(value: unknown): value is ScopedKeywordQueryDiagnostic["subpath"] {
+  return typeof value === "string" && KEYWORD_QUERY_DIAGNOSTIC_SUBPATHS.has(value);
+}
+
+function isNonnegativeSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function scopedSemanticQueryDiagnostic(value: unknown): ScopedSemanticQueryDiagnostic | undefined {
+  if (!record(value)) return undefined;
+  const fields = Object.keys(value);
+  if (fields.length !== SEMANTIC_QUERY_DIAGNOSTIC_FIELDS.size || fields.some(field => !SEMANTIC_QUERY_DIAGNOSTIC_FIELDS.has(field))) {
+    return undefined;
+  }
+  if (!isSemanticQueryDiagnosticSubpath(value.subpath)
+    || (value.fallback_reason !== null && !isSemanticQueryDiagnosticFallback(value.fallback_reason))
+    || !isNonnegativeSafeInteger(value.small_project_ms) || !isNonnegativeSafeInteger(value.prepare_sql_ms)
+    || !isNonnegativeSafeInteger(value.candidate_read_ms) || !isNonnegativeSafeInteger(value.window)
+    || !isNonnegativeSafeInteger(value.page) || !isNonnegativeSafeInteger(value.visited)
+    || !isNonnegativeSafeInteger(value.unique) || !isNonnegativeSafeInteger(value.duplicate)
+    || !isNonnegativeSafeInteger(value.id_bytes)) {
+    return undefined;
+  }
+  return {
+    subpath: value.subpath, small_project_ms: value.small_project_ms, prepare_sql_ms: value.prepare_sql_ms,
+    candidate_read_ms: value.candidate_read_ms, window: value.window, page: value.page, visited: value.visited,
+    unique: value.unique, duplicate: value.duplicate, id_bytes: value.id_bytes, fallback_reason: value.fallback_reason,
+  };
+}
+
+function scopedKeywordQueryDiagnostic(value: unknown): ScopedKeywordQueryDiagnostic | undefined {
+  if (!record(value)) return undefined;
+  const fields = Object.keys(value);
+  if (fields.length !== KEYWORD_QUERY_DIAGNOSTIC_FIELDS.size || fields.some(field => !KEYWORD_QUERY_DIAGNOSTIC_FIELDS.has(field))) {
+    return undefined;
+  }
+  if (!isKeywordQueryDiagnosticSubpath(value.subpath)
+    || !isNonnegativeSafeInteger(value.pre_enrichment_ms) || !isNonnegativeSafeInteger(value.enrichment_ms)
+    || !isNonnegativeSafeInteger(value.projection_lookup_ms) || !isNonnegativeSafeInteger(value.proof_lookup_ms)
+    || !isNonnegativeSafeInteger(value.literal_validation_ms) || !isNonnegativeSafeInteger(value.decode_validation_ms)
+    || !isNonnegativeSafeInteger(value.hits_started) || !isNonnegativeSafeInteger(value.hits_completed)
+    || !isNonnegativeSafeInteger(value.literal_started) || !isNonnegativeSafeInteger(value.recipe1_started)
+    || !isNonnegativeSafeInteger(value.full_bytes_validated)) {
+    return undefined;
+  }
+  return {
+    subpath: value.subpath, pre_enrichment_ms: value.pre_enrichment_ms, enrichment_ms: value.enrichment_ms,
+    projection_lookup_ms: value.projection_lookup_ms, proof_lookup_ms: value.proof_lookup_ms,
+    literal_validation_ms: value.literal_validation_ms, decode_validation_ms: value.decode_validation_ms,
+    hits_started: value.hits_started, hits_completed: value.hits_completed, literal_started: value.literal_started,
+    recipe1_started: value.recipe1_started, full_bytes_validated: value.full_bytes_validated,
+  };
+}
+
 export class ScopedObservationBudgetError extends IndexedRetrievalError {
-  readonly diagnostics: { reason: "query_work_budget" | "candidate_budget"; project: string; sessionId?: string; sourceKind: "observation"; limit: 12 };
-  constructor(reason: "query_work_budget" | "candidate_budget", project: string, sessionId?: string) {
+  readonly diagnostics: { reason: "query_work_budget" | "candidate_budget"; project: string; sessionId?: string; sourceKind: "observation"; limit: 12; queries?: ScopedQueryDiagnostic[] };
+  constructor(reason: "query_work_budget" | "candidate_budget", project: string, sessionId?: string, queries?: ScopedQueryDiagnostic[]) {
     super("STATE_RETRIEVAL_RESOURCE_LIMIT", "Scoped observation query exhausted its work budget; selected input remains available for retry.");
-    this.diagnostics = { reason, project, ...(sessionId ? { sessionId } : {}), sourceKind: "observation", limit: 12 };
+    this.diagnostics = { reason, project, ...(sessionId ? { sessionId } : {}), sourceKind: "observation", limit: 12, ...(queries?.length ? { queries } : {}) };
   }
 }
 
@@ -208,7 +314,7 @@ function boundedLexicalQuery(query: string): string | undefined {
 async function validateSelectedObservationIndex(kv: StateKV,
   identity: { index_id: string; model: string; dimensions: number; generation: string }): Promise<void> {
   const [status, marker] = await Promise.all([
-    retrievalRequest<unknown>(kv, { action: "index_status", index_id: identity.index_id, metadata_only: true }),
+    selectedRetrieval<unknown>(kv, { action: "index_status", index_id: identity.index_id, metadata_only: true }),
     kv.get<unknown>(KV.config, "indexed-corpus"),
   ]);
   if (!record(status) || status.version !== 1 || status.metadata_only !== true || status.index_id !== identity.index_id
@@ -225,10 +331,16 @@ async function validateSelectedObservationIndex(kv: StateKV,
   }
 }
 
-async function prepareSelectedObservations(kv: StateKV,
+export class SelectedObservationPreparationPending extends IndexedRetrievalError {
+  constructor(readonly diagnostics: { project: string; reason: string; cursor: string; coverageEpoch: string; projectGeneration: string; processed: number }) {
+    super("STATE_INDEX_NOT_READY", "Selected observation preparation awaits its native source dependency.");
+  }
+}
+
+export async function prepareSelectedObservations(kv: StateKV,
   identity: { index_id: string; model: string; dimensions: number; generation: string }, project: string): Promise<void> {
   await validateSelectedObservationIndex(kv, identity);
-  const prepared = await retrievalRequest<unknown>(kv, { action: "project_vectors_prepare", index_id: identity.index_id,
+  const prepared = await selectedRetrieval<unknown>(kv, { action: "project_vectors_prepare", index_id: identity.index_id,
     project, source_kind: "observation", max_rows: 16, max_bytes: 65_536 });
   if (!record(prepared) || !["ready", "pending", "partial"].includes(String(prepared.status)) || prepared.index_id !== identity.index_id
     || prepared.project !== project || prepared.source_kind !== "observation" || typeof prepared.has_more !== "boolean"
@@ -241,7 +353,8 @@ async function prepareSelectedObservations(kv: StateKV,
       : !["catalog_not_ready", "project_source_not_ready", "project_projection_pending"].includes(String(prepared.reason)))) {
     throw new IndexedRetrievalError("STATE_TX_INVALID_RESPONSE", "Invalid selected observation preparation response.");
   }
-  if (prepared.status !== "ready") throw new IndexedRetrievalError("STATE_INDEX_NOT_READY", "Selected observation preparation continues in bounded native cuts.");
+  if (prepared.status !== "ready") throw new SelectedObservationPreparationPending({ project, reason: String(prepared.reason),
+    cursor: prepared.cursor, coverageEpoch: prepared.coverage_epoch, projectGeneration: prepared.project_generation, processed: Number(prepared.processed) });
 }
 
 async function searchIndexedObservations(kv: StateKV, identity: { index_id: string; model: string; dimensions: number; generation: string },
@@ -251,13 +364,16 @@ async function searchIndexedObservations(kv: StateKV, identity: { index_id: stri
     const lexicalQuery = boundedLexicalQuery(query);
     const streams = await Promise.all([
       ...(lexicalQuery ? [{ kind: "lexical" as const,
-        request: retrievalRequest<unknown>(kv, { action: "keyword_search", ...base, query: lexicalQuery }) }] : []),
+        request: selectedRetrieval<unknown>(kv, { action: "keyword_search", ...base, query: lexicalQuery }) }] : []),
       { kind: "semantic" as const,
-        request: retrievalRequest<unknown>(kv, { action: "semantic_search", ...base, embedding, max_candidates: 4096, probes: configuredSemanticProbes() }) },
+        request: selectedRetrieval<unknown>(kv, { action: "semantic_search", ...base, embedding, max_candidates: 4096, probes: configuredSemanticProbes() }) },
     ].map(async stream => ({ kind: stream.kind, response: await stream.request })));
     const hits = new Map<string, { bm25Score: number; vectorScore: number; lexicalRank: number; vectorRank: number;
       text: string; rowVersion: string; sessionId: string }>();
     const coverage = new Set<ConsolidationRetrievalCoverage>();
+    const queryDiagnostics: ScopedQueryDiagnostic[] = [];
+    let queryBudgetAction: string | undefined;
+    let candidateBudgetAction: string | undefined;
     for (const { kind, response } of streams) {
       if (!response || typeof response !== "object") throw new Error("skill_scoped_retrieval_invalid");
       const raw = response as Record<string, unknown>;
@@ -269,6 +385,20 @@ async function searchIndexedObservations(kv: StateKV, identity: { index_id: stri
         if (contextCoverage) contextCoverage.partial = true;
         if ((raw.reason === "query_work_budget" || raw.reason === "candidate_budget") && raw.budget_exhausted === true) {
           coverage.add(raw.reason === "candidate_budget" ? "bounded_candidate_budget" : "bounded_query_budget");
+          const action = kind === "lexical" ? "keyword_search" : "semantic_search";
+          if (raw.reason === "query_work_budget" && raw.query_phase !== undefined) {
+            if (!["candidate_selection", "scoring", "enrichment"].includes(String(raw.query_phase))
+              || !Number.isSafeInteger(raw.query_elapsed_ms) || Number(raw.query_elapsed_ms) < 0
+              || Number(raw.query_elapsed_ms) > 300_000) throw new Error("skill_scoped_retrieval_invalid");
+            const semanticDiagnostic = kind === "semantic" ? scopedSemanticQueryDiagnostic(raw.query_diagnostics) : undefined;
+            const keywordDiagnostic = kind === "lexical" && raw.keyword_diagnostics !== undefined
+              ? scopedKeywordQueryDiagnostic(raw.keyword_diagnostics) : undefined;
+            queryDiagnostics.push({ action, phase: raw.query_phase as ScopedQueryDiagnostic["phase"], elapsedMs: Number(raw.query_elapsed_ms),
+              ...(semanticDiagnostic ? { queryDiagnostics: semanticDiagnostic } : {}),
+              ...(keywordDiagnostic ? { keywordDiagnostics: keywordDiagnostic } : {}) });
+          }
+          if (raw.reason === "query_work_budget") queryBudgetAction = queryBudgetAction ? `${queryBudgetAction},${action}` : action;
+          else candidateBudgetAction = candidateBudgetAction ? `${candidateBudgetAction},${action}` : action;
         } else if (contextCoverage && ["catalog_not_ready", "project_mapping_not_ready", "project_source_not_ready",
           "project_projection_pending", "project_index_not_ready"].includes(String(raw.reason))) {
           // Scoped native hits still validate current source versions while coverage is incomplete.
@@ -291,8 +421,13 @@ async function searchIndexedObservations(kv: StateKV, identity: { index_id: stri
         hits.set(item.obsId, previous);
       }
     }
-    if (!hits.size && coverage.size && !contextCoverage) throw new ScopedObservationBudgetError(
-      coverage.has("bounded_query_budget") ? "query_work_budget" : "candidate_budget", project, sessionId);
+    if (!hits.size && coverage.size && !contextCoverage) {
+      const error = new ScopedObservationBudgetError(
+        coverage.has("bounded_query_budget") ? "query_work_budget" : "candidate_budget", project, sessionId, queryDiagnostics);
+      const action = queryBudgetAction ?? candidateBudgetAction;
+      if (action) retrievalFailureActions.set(error, action);
+      throw error;
+    }
     const candidates: HybridSearchResult[] = [];
     let totalBytes = 0;
     for (const [id, scores] of hits) {

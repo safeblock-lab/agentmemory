@@ -1,14 +1,39 @@
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
+import { randomBytes } from "node:crypto";
+import type { IIIClient } from "iii-sdk";
+import { triggerStateStorage, type RetentionResourceReference, type RetentionContextDeliveryResult } from "../state/storage.js";
 
 const DAY = 86_400_000;
+export function newRetentionContextEventId(): string {
+  const bytes = randomBytes(16);
+  bytes.writeUIntBE(Date.now(), 0, 6);
+  bytes[6] = (bytes[6] & 0x0f) | 0x70;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+export async function recordPublishedContextUse(sdk: IIIClient, taskId: string, project: string,
+  references: RetentionResourceReference[]): Promise<RetentionContextDeliveryResult> {
+  const resources = new Map<string, RetentionResourceReference>();
+  for (const reference of references) {
+    const identity = JSON.stringify([reference.scope, reference.key]);
+    const prior = resources.get(identity);
+    if (prior && prior.expected_version !== reference.expected_version) throw new Error("STATE_RETENTION_RESOURCE_VERSION_CONFLICT");
+    resources.set(identity, reference);
+  }
+  return triggerStateStorage<RetentionContextDeliveryResult>(sdk, {
+    action: "retention_context_delivery", event_id: newRetentionContextEventId(), task_id: taskId,
+    project, resources: [...resources.values()],
+  });
+}
 function renewable(inactivityMs: number, environmentKey: string) {
   const configured = process.env[environmentKey];
   const hours = configured === undefined ? inactivityMs * 4 / 3_600_000 : Number(configured);
   if (!Number.isFinite(hours) || hours * 3_600_000 < inactivityMs || hours > 365 * 24) {
     throw new Error(`RETENTION_INVALID_MAXIMUM_AGE: ${environmentKey}`);
   }
-  return { inactivityMs, maximumAgeMs: hours * 3_600_000 };
+  return { inactivityMs, maximumAgeMs: Math.floor(hours * 3_600_000) };
 }
 export const STORAGE_RETENTION = {
   viewer: renewable(DAY, "AGENTMEMORY_RETENTION_VIEWER_MAX_AGE_HOURS"),
@@ -23,7 +48,7 @@ export interface TrustedRetentionUse {
   occurredAt: string;
 }
 export const RETENTION_USE_INTEGRATION = {
-  status: "integration_needed",
+  status: "native_source_integrated_runtime_pending",
   requiredProducer: "server-confirmed task context delivery or task use",
   rejectedSignals: ["client claims", "generic access", "indexing", "maintenance", "retrieval candidates"],
 } as const;

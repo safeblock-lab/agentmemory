@@ -6,9 +6,9 @@ import type { ContextUsageEvent, ContextUsageFeed } from "../types.js";
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
 
-function validCandidateTokens(value: unknown, emittedTokens: number): value is number {
+function validCandidateTokens(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value)
-    && value >= emittedTokens && value <= 1_000_000;
+    && value >= 0 && value <= 1_000_000;
 }
 
 export async function recordContextUsage(kv: StateKV, sessionId: string, data: Record<string, unknown>): Promise<void> {
@@ -23,7 +23,7 @@ export async function recordContextUsage(kv: StateKV, sessionId: string, data: R
     session: createHash("sha256").update(sessionId).digest("hex"),
     source: data.source as ContextUsageEvent["source"],
     characters: data.text.length, textTokens,
-    ...(validCandidateTokens(data.candidateTokens, textTokens) ? { candidateTokens: data.candidateTokens } : {}),
+    ...(validCandidateTokens(data.candidateTokens) ? { candidateTokens: data.candidateTokens } : {}),
   };
   const key = `context-usage:${getAgentId() ?? "default"}`;
   const result = await kv.update<{ errors?: unknown }>(KV.contextUsage, key, [
@@ -45,7 +45,7 @@ export async function readContextUsage(kv: StateKV) {
   for (const event of events) sessions.set(event.session, (sessions.get(event.session) ?? 0) + event.textTokens);
   const totals = [...sessions.values()].sort((a, b) => a - b);
   const textTokens = events.reduce((sum, e) => sum + e.textTokens, 0);
-  const paired = events.filter((e) => validCandidateTokens(e.candidateTokens, e.textTokens));
+  const paired = events.filter((e) => validCandidateTokens(e.candidateTokens));
   const candidateTokens = paired.reduce((sum, e) => sum + (e.candidateTokens ?? 0), 0);
   const pairedEmittedTokens = paired.reduce((sum, e) => sum + e.textTokens, 0);
   return {

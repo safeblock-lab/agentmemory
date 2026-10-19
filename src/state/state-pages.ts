@@ -6,6 +6,7 @@ export const MAX_STATE_PAGE_LIMIT = 1_024
 export const MAX_STATE_PAGE_BYTES = 1_048_576
 export const MAX_STATE_PAGE_CURSOR_BYTES = 4_096
 export const MAX_STALE_LIST_RESTARTS = 3
+export const STATE_KEYSET_LIVE_CAPABILITY = 'state::list_page_keyset_live_v1'
 
 const MAX_TRACKED_CURSORS = 256
 
@@ -40,6 +41,7 @@ export class StatePageError extends Error {
 export interface StatePage<T> {
   items: T[]
   next_cursor: string | null
+  consistency?: 'keyset_live'
 }
 
 export interface StateScopeRevision {
@@ -52,6 +54,7 @@ export interface StatePageOptions {
   limit?: number
   maxBytes?: number
   fields?: string[]
+  consistency?: 'keyset_live'
 }
 
 export interface StatePageRequest {
@@ -60,6 +63,7 @@ export interface StatePageRequest {
   limit: number
   max_bytes: number
   fields?: string[]
+  consistency?: 'keyset_live'
 }
 
 type StatePageTrigger = (request: StatePageRequest) => Promise<unknown>
@@ -69,6 +73,7 @@ interface NormalizedOptions {
   limit: number
   maxBytes: number
   fields?: string[]
+  consistency?: 'keyset_live'
 }
 
 function invalidRequest(): never {
@@ -97,6 +102,8 @@ function normalizeOptions(options: StatePageOptions): NormalizedOptions {
   const limit = options.limit ?? DEFAULT_STATE_PAGE_LIMIT
   const maxBytes = options.maxBytes ?? DEFAULT_STATE_PAGE_MAX_BYTES
   const cursor = options.cursor
+  const consistency = options.consistency
+  if (consistency !== undefined && consistency !== 'keyset_live') invalidRequest()
 
   if (!Number.isInteger(limit) || limit < 1 || limit > MAX_STATE_PAGE_LIMIT) invalidRequest()
   if (!Number.isInteger(maxBytes) || maxBytes < 1_024 || maxBytes > MAX_STATE_PAGE_BYTES) invalidRequest()
@@ -104,7 +111,7 @@ function normalizeOptions(options: StatePageOptions): NormalizedOptions {
     invalidRequest()
   }
 
-  return { cursor, limit, maxBytes, fields: normalizeFields(options.fields) }
+  return { cursor, limit, maxBytes, fields: normalizeFields(options.fields), consistency }
 }
 
 function getErrorCode(error: unknown): string | undefined {
@@ -151,8 +158,12 @@ function validatePage<T>(value: unknown, request: StatePageRequest): StatePage<T
 
   const page = value as Record<string, unknown>
   const keys = Object.keys(page)
+  const keysetLive = request.consistency === 'keyset_live'
+  if (keysetLive && (!Object.hasOwn(page, 'consistency') || page.consistency !== 'keyset_live')) {
+    throw new StatePageError('STATE_PAGE_UNSUPPORTED')
+  }
   if (
-    keys.length !== 2 ||
+    keys.length !== (keysetLive ? 3 : 2) ||
     !Object.hasOwn(page, 'items') ||
     !Object.hasOwn(page, 'next_cursor') ||
     !Array.isArray(page.items) ||
@@ -188,7 +199,8 @@ function validatePage<T>(value: unknown, request: StatePageRequest): StatePage<T
 
   let responseBytes: number
   try {
-    const serialized = JSON.stringify({ items: page.items, next_cursor: nextCursor })
+    const serialized = JSON.stringify({ items: page.items, next_cursor: nextCursor,
+      ...(keysetLive ? { consistency: 'keyset_live' } : {}) })
     if (serialized === undefined) throw new Error()
     responseBytes = Buffer.byteLength(serialized, 'utf8')
   } catch {
@@ -196,7 +208,8 @@ function validatePage<T>(value: unknown, request: StatePageRequest): StatePage<T
   }
   if (responseBytes > request.max_bytes) throw new StatePageError('STATE_PAGE_INVALID_RESPONSE')
 
-  return { items: page.items as T[], next_cursor: nextCursor as string | null }
+  return { items: page.items as T[], next_cursor: nextCursor as string | null,
+    ...(keysetLive ? { consistency: 'keyset_live' as const } : {}) }
 }
 
 export async function* iterateStatePages<T>(
@@ -221,6 +234,7 @@ export async function* iterateStatePages<T>(
       limit: normalized.limit,
       max_bytes: normalized.maxBytes,
       ...(normalized.fields === undefined ? {} : { fields: normalized.fields }),
+      ...(normalized.consistency === undefined ? {} : { consistency: normalized.consistency }),
     }
     let rawPage: unknown
     try {

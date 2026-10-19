@@ -23,6 +23,17 @@ export interface ObservationAdmission {
   last_seen_at: string;
 }
 
+export async function findObservationReplay(kv: StateKV, identity: ObservationIdentity, sessionId: string,
+  hookType: HookPayload["hookType"], raw: unknown): Promise<RawObservation | CompressedObservation | null> {
+  const event = await kv.get<{ observationId?: unknown; identityDigest?: unknown }>(KV.observationEvents(sessionId), identity.eventId);
+  if (!event || event.identityDigest !== identity.identityDigest || typeof event.observationId !== "string") return null;
+  const observation = await kv.get<RawObservation | CompressedObservation>(KV.observations(sessionId), event.observationId);
+  if (!observation || observation.id !== event.observationId || observation.sessionId !== sessionId || observation.hookType !== hookType
+    || stableObservationJson(observation.raw) !== stableObservationJson(raw)
+    || !Number.isSafeInteger(observation.occurrenceCount) || Number(observation.occurrenceCount) < 1) return null;
+  return observation;
+}
+
 export class ObservationAdmissionError extends Error {
   constructor(readonly releaseImage: boolean, cause: unknown) {
     super(cause instanceof Error ? cause.message : "Observation admission failed", { cause });

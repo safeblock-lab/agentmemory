@@ -1,12 +1,22 @@
-import type { MemoryProvider, CircuitBreakerState, LlmCallOptions } from "../types.js";
+import type { MemoryProvider, CircuitBreakerState, LlmCallOptions, StructuredLlmRequest, PreparedStructuredLlmCall } from "../types.js";
+import { canPrepareStructuredCall, prepareStructuredCall, singleStructuredDispatch } from "./structured-output-contract.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
 
 export class ResilientProvider implements MemoryProvider {
   private breaker = new CircuitBreaker();
   name: string;
+  prepareGraphAutomaticCall?: MemoryProvider["prepareGraphAutomaticCall"];
+  prepareStructuredCall?: (request: StructuredLlmRequest) => PreparedStructuredLlmCall;
 
   constructor(private inner: MemoryProvider) {
     this.name = `resilient(${inner.name})`;
+    this.prepareGraphAutomaticCall = inner.prepareGraphAutomaticCall?.bind(inner);
+    if (canPrepareStructuredCall(inner)) {
+      this.prepareStructuredCall = (request) => {
+        const prepared = prepareStructuredCall(inner, request);
+        return singleStructuredDispatch({ ...prepared.binding }, () => this.call(() => prepared.execute()));
+      };
+    }
   }
 
   private async call(fn: () => Promise<string>): Promise<string> {

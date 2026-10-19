@@ -15,6 +15,7 @@ const VECTOR_META_KEY = "vectors:meta";
 const VECTOR_BUCKET_SCOPE_PREFIX = `${KV.bm25Index}:vec:`;
 const WRITE_CONCURRENCY = 32;
 const LOAD_CONCURRENCY = 8;
+const LEGACY_SHARD_READ_CONCURRENCY = 2;
 
 function auditIndexPersistEnabled(): boolean {
   const raw = process.env.AGENTMEMORY_AUDIT_INDEX_PERSIST;
@@ -571,12 +572,20 @@ export class IndexPersistence {
         return null;
       }
     }
-    const loadedShards = await Promise.all(
-      manifest.shards.map(async (shard) => ({
-        shard,
-        chunk: await this.kv.get<string>(shard.scope, shard.key).catch(() => null),
-      })),
-    );
+    const loadedShards: Array<{ shard: IndexShardManifest["shards"][number]; chunk: string | null }> = [];
+    for (let offset = 0; offset < manifest.shards.length; offset += LEGACY_SHARD_READ_CONCURRENCY) {
+      let failed = false;
+      let firstFailure: unknown;
+      const reads = manifest.shards.slice(offset, offset + LEGACY_SHARD_READ_CONCURRENCY).map(async shard => ({
+        shard, chunk: await this.kv.get<string>(shard.scope, shard.key),
+      }));
+      const settled = await Promise.allSettled(reads.map(read => read.catch(error => {
+        if (!failed) { failed = true; firstFailure = error; }
+        throw error;
+      })));
+      if (failed) throw firstFailure;
+      for (const result of settled) if (result.status === "fulfilled") loadedShards.push(result.value);
+    }
     const chunks: string[] = [];
     let chars = 0;
     for (const { shard, chunk } of loadedShards) {

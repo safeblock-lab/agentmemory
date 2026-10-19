@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { runWorkflowAttempt, type WorkflowAttemptAccounting } from "./workflow-attempt-accounting.js";
 import type { IIIClient } from "iii-sdk";
 import type {
@@ -6,12 +7,14 @@ import type {
 } from "../types.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
 import type { StateKV } from "../state/kv.js";
+import { readSummarySnapshotSource } from "./summary-snapshot-source.js";
 import { KV, fingerprintId, generateId } from "../state/schema.js";
 import { evaluatePublicationEvidence, preparePublicationEvidence, type PublicationEvidenceSource } from "./publication-evidence.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { getSummaryBudgetConfig, isBackgroundRecoveryPaused } from "../config.js";
 import { recordAudit } from "./audit.js";
-import { publicationCallOptions } from "./publication-call-options.js";
+import { publicationExecutor } from "./publication-call-options.js";
+import { registerSummaryPublicationRecovery } from "./summary-jobs.js";
 import { SummaryOutputSchema } from "../eval/schemas.js";
 import { validateOutput } from "../eval/validator.js";
 import { scoreSummary } from "../eval/quality.js";
@@ -32,7 +35,7 @@ import { parseSummaryXml } from "./summary-xml.js";
 import {
   groundSummarySourcePaths, summarySourcePathLiterals,
   captureSummaryEvidence, getSummaryEvidenceRoot, readSummaryEvidenceSource, verifySummaryEvidence,
-  type SummaryEvidenceRoot,
+  type SummaryEvidenceJob, type SummaryEvidenceRoot, type SummarySourceReference,
 } from "./summary-source-grounding.js";
 import { recordOperation } from "./dashboard-activity.js";
 import { prepareFullOriginalSummaryRequest } from "./summary-recovery.js";
@@ -49,13 +52,23 @@ const STALE_DELIVERY_MS = 60_000;
 const RETRY_BACKOFF_MS = 30_000;
 const SUMMARY_CALL_TIMEOUT_MS = 150_000;
 const MAX_UNIT_RUNTIME_MS = SUMMARY_CALL_TIMEOUT_MS + STALE_DELIVERY_MS;
-const MAX_LEGACY_GROUNDING_OBSERVATIONS = 256;
-const MAX_LEGACY_GROUNDING_BYTES = 1_048_576;
 type SummaryQueueJob = StoredSummaryQueueJob & {
   executionOrigin?: "selected" | "manual";
   recoveryGeneration?: "full-originals-v2";
 };
 type SummaryQueueIntent = StoredSummaryQueueIntent & { executionOrigin?: "selected" | "manual" };
+async function summaryRecoveryStep<T>(phase: string, context: { jobId?: string; sessionId?: string }, run: () => Promise<T>): Promise<T> {
+  try { return await run(); }
+  catch (error) {
+    const record = error && typeof error === "object" ? error as { code?: unknown; name?: unknown; message?: unknown } : {};
+    const identifier = (value: unknown) => typeof value === "string" && /^[A-Za-z0-9_:.-]{1,128}$/.test(value) ? value : undefined;
+    const stateCode = String(record.message ?? error).match(/\bSTATE_[A-Z0-9_]+\b/)?.[0];
+    logger.warn("Summary recovery step failed", { phase, ...context,
+      code: identifier(record.code), errorClass: identifier(record.name), stateCode });
+    throw error;
+  }
+}
+
 class ManualCutComplete extends Error {}
 export interface ManualSummaryContinuation {
   operationId: string; step: number; jobId: string; project: string; sessionId: string;
@@ -109,6 +122,7 @@ export interface SummaryQueueUnit {
   deliveryId?: string;
   startedAt?: string;
   lastAttemptAt?: string;
+  outputInputHash?: string;
   output?: SummaryPromptItem;
   summary?: SessionSummary;
   lastError?: string;
@@ -271,6 +285,7 @@ function summaryItems(observations: CompressedObservation[]): SummaryPromptItem[
 }
 
 export interface SummaryPathAuthorityJob {
+  id?: string;
   sessionId: string;
   project: string;
   snapshotFingerprint: string;
@@ -281,6 +296,23 @@ export interface SummaryPathAuthorityUnit {
   stage: "map" | "reduce";
   items: SummaryPromptItem[];
 }
+
+interface SummaryPathAuthorityCheckpoint {
+  version: 1;
+  checkpointId: string;
+  inputHash: string;
+  snapshotFingerprint: string;
+  observationCount: number;
+  root: SummaryEvidenceRoot;
+  sourceGeneration: string;
+  sourceRevision: string;
+  referenceHash: string;
+  nextOrdinal: number;
+  pathPageCount: number;
+}
+
+const SUMMARY_PATH_AUTHORITY_BATCH = 12;
+const SUMMARY_PATH_AUTHORITY_PAGE_BYTES = 16_384;
 
 export async function resolveSummaryUnitPathAuthority(
   kv: StateKV,
@@ -301,34 +333,123 @@ export async function resolveSummaryUnitPathAuthority(
     };
   }
 
-  if (!Number.isInteger(job.observationCount) || job.observationCount < 1 ||
-      job.observationCount > MAX_LEGACY_GROUNDING_OBSERVATIONS) {
-    throw new SummaryBudgetError("summary_source_grounding_snapshot_limit_exceeded");
-  }
-  const source: CompressedObservation[] = [];
-  let bytes = 0;
-  for await (const page of kv.pages<CompressedObservation>(KV.observations(job.sessionId), { limit: 12, maxBytes: 16_384 })) {
-    bytes += Buffer.byteLength(JSON.stringify(page.items), "utf8");
-    source.push(...page.items);
-    if (source.length > MAX_LEGACY_GROUNDING_OBSERVATIONS || bytes > MAX_LEGACY_GROUNDING_BYTES) {
-      throw new SummaryBudgetError("summary_source_grounding_snapshot_limit_exceeded");
+  if (!job.id || !Number.isSafeInteger(job.observationCount) || job.observationCount < 1)
+    throw new SummaryBudgetError("summary_source_grounding_snapshot_unavailable");
+  const evidenceJob: SummaryEvidenceJob = { id: job.id, sessionId: job.sessionId, project: job.project,
+    observationCount: job.observationCount };
+  const root = await getSummaryEvidenceRoot(kv, evidenceJob);
+  if (!root || root.count !== job.observationCount)
+    throw new SummaryBudgetError("summary_source_grounding_snapshot_unavailable");
+  const scope = KV.observations(job.sessionId);
+  const sourceRevision = await kv.scopeRevision(scope);
+  if (typeof sourceRevision?.generation !== "string" || !sourceRevision.generation ||
+      typeof sourceRevision.revision !== "string" || !sourceRevision.revision)
+    throw new SummaryBudgetError("summary_source_grounding_snapshot_unavailable");
+  const referenceHashForRoot = async (): Promise<string> => {
+    const digest = createHash("sha256");
+    for (let pageIndex = 0; pageIndex < root.pages; pageIndex++) {
+      const references = await kv.get<SummarySourceReference[]>(KV.state, `${job.id}:source-page:${pageIndex}`);
+      const expectedLength = Math.min(12, root.count - pageIndex * 12);
+      if (!Array.isArray(references) || references.length !== expectedLength ||
+          references.some((reference, index) => !reference || reference.ordinal !== pageIndex * 12 + index + 1 ||
+            typeof reference.id !== "string" || typeof reference.version !== "string" || typeof reference.hash !== "string"))
+        throw new SummaryBudgetError("summary_source_grounding_snapshot_unavailable");
+      const serialized = JSON.stringify(references);
+      if (serialized === undefined) throw new SummaryBudgetError("summary_source_grounding_snapshot_unavailable");
+      digest.update(serialized);
     }
-  }
-  const observations = source
-    .filter(observation => observation.title)
-    .sort((a, b) => a.timestamp.localeCompare(b.timestamp) || a.id.localeCompare(b.id));
-  if (observations.length !== job.observationCount) {
-    throw new SummaryBudgetError("summary_source_grounding_snapshot_unavailable");
-  }
-  const items = summaryItems(observations);
-  const fingerprintItems = items.map(({ sourcePaths: _sourcePaths, modifiedPaths: _modifiedPaths, ...item }) => item);
-  if (fingerprintId("sq", JSON.stringify([job.sessionId, job.project, fingerprintItems])) !== job.snapshotFingerprint) {
-    throw new SummaryBudgetError("summary_source_grounding_snapshot_unavailable");
-  }
-  return {
-    sourcePaths: summarySourcePathLiterals(observations),
-    modifiedPaths: [...new Set(items.flatMap(item => item.modifiedPaths ?? []))],
+    return digest.digest("hex");
   };
+  const referenceHash = await referenceHashForRoot();
+  const inputHash = fingerprintId("summary-input", JSON.stringify(unit.items));
+  const checkpointKey = `${job.id}:path-authority:${inputHash}`;
+  let checkpoint = await kv.get<SummaryPathAuthorityCheckpoint>(KV.state, checkpointKey);
+  const validCheckpoint = (value: SummaryPathAuthorityCheckpoint | undefined): value is SummaryPathAuthorityCheckpoint =>
+    !!value && value.version === 1 && typeof value.checkpointId === "string" && value.checkpointId.length > 0 &&
+    value.inputHash === inputHash && value.snapshotFingerprint === job.snapshotFingerprint &&
+    value.observationCount === job.observationCount && typeof value.root === "object" && value.root !== null &&
+    value.root.count === root.count &&
+    value.root.pages === root.pages && value.root.mode === root.mode &&
+    value.sourceGeneration === sourceRevision.generation && value.sourceRevision === sourceRevision.revision &&
+    value.referenceHash === referenceHash && Number.isSafeInteger(value.nextOrdinal) &&
+    value.nextOrdinal >= 1 && value.nextOrdinal <= root.count + 1 &&
+    Number.isSafeInteger(value.pathPageCount) && value.pathPageCount >= 0;
+  if (checkpoint && !validCheckpoint(checkpoint)) {
+    await kv.delete(KV.state, checkpointKey);
+    checkpoint = undefined;
+  }
+
+  const pathPagesPrefix = (checkpointId: string) => `${checkpointKey}:${checkpointId}:paths:`;
+  const readCheckpointPaths = async (value: SummaryPathAuthorityCheckpoint): Promise<Set<string>> => {
+    const paths = new Set<string>();
+    for (let page = 0; page < value.pathPageCount; page++) {
+      const items = await kv.get<string[]>(KV.state, `${pathPagesPrefix(value.checkpointId)}${page}`);
+      if (!Array.isArray(items) || items.some(item => typeof item !== "string"))
+        throw new SummaryBudgetError("summary_source_grounding_snapshot_unavailable");
+      for (const item of items) paths.add(item);
+    }
+    return paths;
+  };
+  const pathKey = (path: string) => path.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+
+  if (!checkpoint) {
+    checkpoint = {
+      version: 1, checkpointId: generateId("sap"), inputHash,
+      snapshotFingerprint: job.snapshotFingerprint, observationCount: job.observationCount,
+      root, sourceGeneration: sourceRevision.generation, sourceRevision: sourceRevision.revision,
+      referenceHash, nextOrdinal: 1, pathPageCount: 0,
+    };
+    await kv.set(KV.state, checkpointKey, checkpoint);
+  }
+
+  let paths: Set<string>;
+  try { paths = await readCheckpointPaths(checkpoint); }
+  catch {
+    await kv.delete(KV.state, checkpointKey);
+    throw new SummaryBudgetError("summary_source_grounding_snapshot_unavailable");
+  }
+  const pathKeys = new Set([...paths].map(pathKey));
+  const writePathBatch = async (items: string[], startPage: number): Promise<number> => {
+    let page: string[] = [];
+    let pageIndex = startPage;
+    for (const item of items) {
+      const candidate = [...page, item];
+      if (page.length && Buffer.byteLength(JSON.stringify(candidate), "utf8") > SUMMARY_PATH_AUTHORITY_PAGE_BYTES) {
+        await kv.set(KV.state, `${pathPagesPrefix(checkpoint!.checkpointId)}${pageIndex++}`, page);
+        page = [item];
+      } else {
+        if (!page.length && Buffer.byteLength(JSON.stringify(candidate), "utf8") > SUMMARY_PATH_AUTHORITY_PAGE_BYTES)
+          throw new SummaryBudgetError("summary_source_grounding_snapshot_unavailable");
+        page = candidate;
+      }
+    }
+    if (page.length) await kv.set(KV.state, `${pathPagesPrefix(checkpoint!.checkpointId)}${pageIndex++}`, page);
+    return pageIndex - startPage;
+  };
+
+  while (checkpoint.nextOrdinal <= root.count) {
+    const batchEnd = Math.min(root.count, checkpoint.nextOrdinal + SUMMARY_PATH_AUTHORITY_BATCH - 1);
+    const newPaths = new Map<string, string>();
+    for (let ordinal = checkpoint.nextOrdinal; ordinal <= batchEnd; ordinal++) {
+      const { observation } = await readSummaryEvidenceSource(kv, evidenceJob, ordinal);
+      for (const path of summarySourcePathLiterals([observation])) {
+        const key = pathKey(path);
+        if (!pathKeys.has(key)) {
+          pathKeys.add(key);
+          newPaths.set(key, path);
+        }
+      }
+    }
+    const written = await writePathBatch([...newPaths.values()], checkpoint.pathPageCount);
+    for (const path of newPaths.values()) paths.add(path);
+    checkpoint = { ...checkpoint, nextOrdinal: batchEnd + 1, pathPageCount: checkpoint.pathPageCount + written };
+    await kv.set(KV.state, checkpointKey, checkpoint);
+  }
+  const latestRevision = await kv.scopeRevision(scope);
+  if (latestRevision?.generation !== checkpoint.sourceGeneration || latestRevision?.revision !== checkpoint.sourceRevision ||
+      await referenceHashForRoot() !== checkpoint.referenceHash)
+    throw new SummaryBudgetError("summary_source_changed");
+  return { sourcePaths: [...paths], modifiedPaths: [] };
 }
 
 async function snapshot(kv: StateKV, sessionId: string, project: string, bounded = false): Promise<{
@@ -343,7 +464,8 @@ async function snapshot(kv: StateKV, sessionId: string, project: string, bounded
         throw new SummaryBudgetError("selected_snapshot_limit_exceeded");
       }
     }
-  } else source = await kv.list<CompressedObservation>(KV.observations(sessionId));
+  } else source = await summaryRecoveryStep("snapshot.observations", { sessionId },
+    () => readSummarySnapshotSource(kv, KV.observations(sessionId)));
   const observations = source
     .filter(observation => observation.title)
     .sort((a, b) => a.timestamp.localeCompare(b.timestamp) || a.id.localeCompare(b.id));
@@ -357,18 +479,14 @@ async function normalManualSnapshot(kv: StateKV, sessionId: string, project: str
 }> {
   const scope = KV.observations(sessionId);
   const source: CompressedObservation[] = [];
-  let bytes = 0;
   try {
     const before = await kv.scopeRevision(scope);
     if (typeof before?.generation !== "string" || !before.generation ||
         typeof before.revision !== "string" || !before.revision)
       throw new SummaryBudgetError("summary_source_grounding_snapshot_unavailable");
     for await (const page of kv.pages<CompressedObservation>(scope, { limit: 13, maxBytes: 16_384 })) {
-      const serialized = JSON.stringify(page.items);
-      if (serialized === undefined) throw new SummaryBudgetError("summary_source_grounding_snapshot_unavailable");
-      bytes += Buffer.byteLength(serialized, "utf8");
       source.push(...page.items);
-      if (source.length > MAX_SUMMARY_ITEMS || bytes > MAX_LEGACY_GROUNDING_BYTES) {
+      if (source.length > MAX_SUMMARY_ITEMS) {
         throw new SummaryBudgetError("summary_source_grounding_snapshot_limit_exceeded");
       }
     }
@@ -467,7 +585,8 @@ async function failJobLocked(kv: StateKV, jobId: string, reason: string): Promis
   await releaseSummaryActiveJob(kv, job.sessionId, jobId);
   await recordAudit(kv, "compress", "mem::summary-unit", [job.sessionId],
     { jobId, outcome: "failed", reason }, undefined, undefined, `${jobId}:failed`);
-  await recordOperation(kv, "mem::summary-final", "failed", {}, undefined, { errorCode: "summary_failed" });
+  await recordOperation(kv, "mem::summary-final", "failed", {}, undefined,
+    { errorCode: "summary_failed", executionId: job.id, executionLevel: "workflow", occurredAt: failedAt });
   logger.warn("Summary queue job failed", { sessionId: job.sessionId, jobId, reason });
 }
 
@@ -559,14 +678,15 @@ function deterministicSummary(job: SummaryQueueJob, units: SummaryQueueUnit[]): 
 
 async function completeJob(
   sdk: IIIClient, kv: StateKV, job: SummaryQueueJob, summary: SessionSummary, method: SummaryMethod = "llm",
-  foreground = false,
+  foreground = false, publicationRecovery = false,
 ): Promise<void> {
   const fields = summaryFields(summary);
   validateSummary(summary);
   const qualityScore = scoreSummary(fields);
   const receiptKey = `${job.id}:publication-effect`;
   const latest = await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, job.id);
-  if (!latest || latest.status !== "pending" || latest.sessionId !== job.sessionId ||
+  if (!latest || !(latest.status === "pending" || publicationRecovery && latest.status === "failed"
+      && latest.failure === "summary_publication_pending") || latest.sessionId !== job.sessionId ||
       latest.project !== job.project || latest.snapshotFingerprint !== job.snapshotFingerprint)
     throw new SummaryBudgetError("summary_publication_effect_mismatch");
   const effect = await withKeyedLock(`summary-canonical:${job.sessionId}`, async () => {
@@ -629,6 +749,7 @@ async function completeJob(
   await recordOperation(kv, "mem::summary-final", "completed",
     { observationsProcessed: job.observationCount, summariesCreated: 1 }, undefined,
     { durationMs: Math.max(0, Date.now() - Date.parse(job.createdAt)),
+      executionId: job.id, executionLevel: "workflow", occurredAt: completedAt,
       ...(method === "deterministic_fallback" ? { reason: "deterministic_fallback" } : {}) });
   logger.info("Session summarized from queue", {
     sessionId: job.sessionId, observationCount: job.observationCount, qualityScore, method,
@@ -640,6 +761,8 @@ export function registerSummaryQueueFunctions(
   accounting?: WorkflowAttemptAccounting,
 ): void {
   const activeUnits = new Map<string, number>();
+  registerSummaryPublicationRecovery(sdk, kv, provider, llmRouter, summaryFields,
+    (job, summary) => completeJob(sdk, kv, job, summary, "llm", true, true));
   const recoverAppliedPublication = async (job: SummaryQueueJob, foreground: boolean): Promise<SummaryMethod | undefined> => {
     const effect = await kv.get<SummaryPublicationEffect>(KV.state, `${job.id}:publication-effect`);
     if (!effect) return undefined;
@@ -780,20 +903,14 @@ export function registerSummaryQueueFunctions(
     if (result.status === "unavailable") {
       const request = preparePublicationEvidence(input);
       if ("status" in request) throw new SummaryBudgetError(`summary_publication_${request.status}`);
-      const options = publicationCallOptions({ task: "summary" as const, outputTokens: 1024 });
-      result = await evaluatePublicationEvidence(kv, input, async (prepared, captureRaw) => {
-        const call = async (selected: MemoryProvider) => {
-          const raw = await selected.summarize(prepared.systemPrompt, prepared.userPrompt, options);
-          await captureRaw(raw);
-          return raw;
-        };
-        const run = () => llmRouter ? llmRouter.run("summary", call, () => true) : call(provider);
-        const execute = () => selection?.manual ? withSummaryCallTimeout(run, SUMMARY_CALL_TIMEOUT_MS) : run();
-        return runWorkflowAttempt(accounting, kv, { workflow: "summary", functionId: "mem::summary-unit",
-          project: job.project, sourceId: job.sessionId, sourceFingerprint: job.snapshotFingerprint,
-          jobId: job.id, unitId: request.requestId, phase: "publication",
-          continuation: JSON.stringify([job.round, job.stage, unitId, operationId]) }, execute);
-      });
+      result = await evaluatePublicationEvidence(kv, input, publicationExecutor(provider, llmRouter, "summary",
+        { task: "summary", outputTokens: 1024 }, (prepared, dispatch) => {
+          const execute = () => selection?.manual ? withSummaryCallTimeout(dispatch, SUMMARY_CALL_TIMEOUT_MS) : dispatch();
+          return runWorkflowAttempt(accounting, kv, { workflow: "summary", functionId: "mem::summary-unit",
+            project: job.project, sourceId: job.sessionId, sourceFingerprint: job.snapshotFingerprint,
+            jobId: job.id, unitId: prepared.requestId, phase: "publication",
+            continuation: JSON.stringify([job.round, job.stage, unitId, operationId]) }, execute);
+        }));
     }
     if (result.status === "pending" && selection?.manual) throw new ManualCutComplete();
     if (result.status !== "supported") throw new SummaryBudgetError(`summary_publication_${result.status}`);
@@ -805,7 +922,8 @@ export function registerSummaryQueueFunctions(
     const originals = await verifyJobEvidence(job, root);
     if (root.mode === "complete") await judge(job, summary, originals, job.id, foreground, selection);
     else if (units.length === 1 && JSON.stringify(summaryFields(summary)) === JSON.stringify(summaryFields(units[0].summary!))) {
-      await validateUnit(job, units[0], foreground, selection);
+      if (!await validateUnit(job, units[0], foreground, selection))
+        throw new SummaryBudgetError("summary_legacy_lineage_unavailable");
     } else {
       const sources = await validatedChildren(job, units);
       await judge(job, summary, sources, `${job.id}:fallback:${job.round}`, foreground, selection);
@@ -830,6 +948,8 @@ export function registerSummaryQueueFunctions(
     return sources;
   };
   const storeLineage = async (job: SummaryQueueJob, unit: SummaryQueueUnit, parents?: SummaryQueueUnit[], offsets?: Map<string | number, number>): Promise<void> => {
+    const previous = unit.stage === "map"
+      ? await kv.get<SummaryUnitLineage>(KV.state, lineageKey(job.id, unit.id)) : null;
     const children = new Set<string>();
     const sources: PublicationEvidenceSource[] = [];
     for (let index = 0; index < unit.items.length; index++) {
@@ -859,6 +979,19 @@ export function registerSummaryQueueFunctions(
         version: fingerprintId("summary-input-item", JSON.stringify(item)), project: job.project,
         sessionId: job.sessionId, content: JSON.stringify({ text: item.text, provenance }) });
     }
+    if (previous) {
+      if (previous.children.length !== 0 || previous.sources.length !== sources.length)
+        throw new SummaryBudgetError("summary_input_lineage_mismatch");
+      for (let index = 0; index < sources.length; index++) {
+        const old = previous.sources[index], source = sources[index];
+        if (old.id !== source.id || old.scope !== source.scope || old.key !== source.key ||
+            old.project !== source.project || old.sessionId !== source.sessionId ||
+            old.content !== source.content || typeof old.version !== "string" || !old.version)
+          throw new SummaryBudgetError("summary_input_lineage_mismatch");
+        // Keep publication checkpoint identity when the exact source proof is unchanged.
+        sources[index] = old;
+      }
+    }
     await kv.set(KV.state, lineageKey(job.id, unit.id), { inputHash: inputHash(unit), sources,
       children: [...children] } satisfies SummaryUnitLineage);
   };
@@ -871,20 +1004,30 @@ export function registerSummaryQueueFunctions(
         throw new SummaryBudgetError("summary_input_lineage_mismatch");
     }
   };
+  const restoreMapLineage = async (job: SummaryQueueJob, unit: SummaryQueueUnit): Promise<void> =>
+    withKeyedLock(`summary-map-lineage:${job.id}`, async () => {
+      const existing = await kv.get<SummaryUnitLineage>(KV.state, lineageKey(job.id, unit.id));
+      if (existing?.inputHash === inputHash(unit)) return;
+      const units = await loadJobUnits(kv, job);
+      if (job.stage !== "map" || units.some(value => !value || value.jobId !== job.id ||
+          value.stage !== "map" || value.round !== job.round) ||
+          !units.some(value => value?.id === unit.id && inputHash(value) === inputHash(unit)))
+        throw new SummaryBudgetError("summary_input_lineage_mismatch");
+      // Fragment offsets belong to the whole ordered map, including preceding units.
+      await initializeMapLineage(job, units as SummaryQueueUnit[]);
+    });
   const validateUnit = async (job: SummaryQueueJob, unit: SummaryQueueUnit, foreground: boolean,
-    selection?: SelectedSummary): Promise<void> => {
-    if (!unit.summary || !unit.output) return;
+    selection?: SelectedSummary): Promise<boolean> => {
+    if (!unit.summary || !unit.output) return true;
     const existing = await kv.get<ValidatedSummaryUnit>(KV.state, validationKey(job.id, unit.id));
     if (existing) {
       if (existing.inputHash !== inputHash(unit) || existing.outputHash !== outputHash(unit))
         throw new SummaryBudgetError("summary_validation_capture_mismatch");
-      return;
+      return true;
     }
     let lineage = await kv.get<SummaryUnitLineage>(KV.state, lineageKey(job.id, unit.id));
-    if (!lineage && unit.stage === "map") {
-      const units = await loadJobUnits(kv, job);
-      if (units.some(item => !item || item.stage !== "map")) throw new SummaryBudgetError("summary_legacy_lineage_unavailable");
-      await initializeMapLineage(job, units as SummaryQueueUnit[]);
+    if (unit.stage === "map" && (!lineage || lineage.inputHash !== inputHash(unit))) {
+      await restoreMapLineage(job, unit);
       lineage = await kv.get<SummaryUnitLineage>(KV.state, lineageKey(job.id, unit.id));
     }
     if (!lineage && unit.stage === "reduce") {
@@ -924,9 +1067,20 @@ export function registerSummaryQueueFunctions(
     }
     if (!lineage || lineage.inputHash !== inputHash(unit)) throw new SummaryBudgetError("summary_legacy_lineage_unavailable");
     await verifyLineage(job, lineage);
+    // Legacy lineage proves the inputs, but only the generation receipt binds a cached output to them.
+    if (unit.outputInputHash !== inputHash(unit)) {
+      await kv.delete(KV.state, `${job.id}:raw:${unit.id}`);
+      await kv.set(KV.summaryQueueUnits(job.id), unit.id, {
+        ...unit, outputInputHash: undefined, output: undefined, summary: undefined, attempts: 0,
+        dispatchedAt: undefined, deliveryId: undefined, startedAt: undefined,
+        lastAttemptAt: undefined, lastError: undefined,
+      });
+      return false;
+    }
     const requestId = await judge(job, unit.summary, lineage.sources, `${job.id}:unit:${unit.id}`, foreground, selection, unit.id);
     await kv.set(KV.state, validationKey(job.id, unit.id), { inputHash: inputHash(unit), outputHash: outputHash(unit),
       requestId, output: unit.output, summary: unit.summary } satisfies ValidatedSummaryUnit);
+    return true;
   };
   const verifyLineage = async (job: SummaryQueueJob, lineage: SummaryUnitLineage, visited = new Set<string>()): Promise<void> => {
     const session = await kv.get<Session>(KV.sessions, job.sessionId);
@@ -1117,7 +1271,8 @@ export function registerSummaryQueueFunctions(
       await recordAudit(kv, "compress", "mem::summary-enqueue", [sessionId],
         { jobId, unitCount: units.length, outcome: "queued" }, undefined, undefined, `${jobId}:queued`);
       if (!foreground) await enqueue(sdk, "mem::summary-dispatch", { jobId, round: 0, offset: 0 });
-      await recordOperation(kv, "mem::summary-enqueue", "queued", { unitsQueued: units.length });
+      await recordOperation(kv, "mem::summary-enqueue", "queued", { unitsQueued: units.length }, undefined,
+        { executionId: job.id, executionLevel: "workflow", occurredAt: job.createdAt });
       return { success: true, queued: true, jobId,
         ...(foreground && { continuation: { jobId, round: 0, unitIds: job.unitIds } }) };
     });
@@ -1466,14 +1621,16 @@ export function registerSummaryQueueFunctions(
         if (unresolvedPrevious) {
           const [unit, capture] = await Promise.all([
             kv.get<SummaryQueueUnit>(KV.summaryQueueUnits(job.id), supplied.unitId),
-            kv.get<{ state: "intended" | "captured"; raw?: string; overflow?: true }>(KV.state,
+            kv.get<{ state: "intended" | "captured"; inputHash?: string; raw?: string; overflow?: true }>(KV.state,
               `${job.id}:raw:${supplied.unitId}`),
           ]);
-          const capturedRaw = capture?.state === "captured" &&
+          const staleCapture = !!unit && !!capture && capture.inputHash !== inputHash(unit);
+          if (staleCapture) await kv.delete(KV.state, `${job.id}:raw:${supplied.unitId}`);
+          const capturedRaw = !!unit && capture?.state === "captured" && capture.inputHash === inputHash(unit) &&
             (typeof capture.raw === "string" || capture.overflow === true);
           const identifiedUnit = !!unit && unit.id === supplied.unitId && unit.jobId === job.id &&
             unit.round === supplied.round && job.unitIds.includes(unit.id);
-          if (!identifiedUnit || unit.output === undefined && !capturedRaw)
+          if (!identifiedUnit || unit.output === undefined && !capturedRaw && !staleCapture)
             return { success: false, completed: false, error: "summary_dispatch_outcome_unknown" };
         }
         if (!previous && operation.step === supplied.step) {
@@ -1630,13 +1787,19 @@ export function registerSummaryQueueFunctions(
       const job = await kv.get<SummaryQueueJob>(KV.summaryQueueJobs, jobId);
       if (!job || job.status !== "pending") return { completed: false };
       if (!await summaryRecoveryReady(kv, job)) throw new SummaryBudgetError("summary_recovery_construction_pending");
-      const applied = await recoverAppliedPublication(job, foreground);
+      const applied = await summaryRecoveryStep("advance.publication_effect", { jobId: job.id, sessionId: job.sessionId },
+        () => recoverAppliedPublication(job, foreground));
       if (applied) return { completed: true, method: applied };
       const units = await loadJobUnits(kv, job);
       if (units.some(unit => !unit?.output || !unit.summary)) return { completed: false };
       const complete = units as SummaryQueueUnit[];
-      const root = await evidenceRoot(job);
-      if (root.mode === "hierarchical") for (const unit of complete) await validateUnit(job, unit, foreground, selection);
+      const root = await summaryRecoveryStep("advance.evidence_root", { jobId: job.id, sessionId: job.sessionId },
+        () => evidenceRoot(job));
+      if (root.mode === "hierarchical") {
+        for (const unit of complete) {
+          if (!await validateUnit(job, unit, foreground, selection)) return { completed: false };
+        }
+      }
       const outputs = complete.map(unit => unit.output!);
       const continueReduction = async (groups: SummaryPromptItem[][]) => {
         if (job.round >= MAX_SUMMARY_DEPTH) throw new SummaryBudgetError("summary_depth_limit_exceeded");
@@ -1765,6 +1928,7 @@ export function registerSummaryQueueFunctions(
       if (!unit.output && !retryEligible(unit, Date.now())) {
         return { success: true, skipped: true };
       }
+      const requestInputHash = inputHash(unit);
       let pathAuthority: Awaited<ReturnType<typeof resolveSummaryUnitPathAuthority>> | undefined;
       let recoveryMaterial: FullOriginalRecovery | undefined;
       if (!unit.output) {
@@ -1776,7 +1940,8 @@ export function registerSummaryQueueFunctions(
         } catch (error) {
           const attempts = unit.attempts + 1;
           const reason = failureCode(error);
-          await recordOperation(kv, "mem::summary-unit", "failed", {}, undefined, { errorCode: "summary_failed" });
+          await recordOperation(kv, "mem::summary-unit", "failed", {}, undefined,
+            { errorCode: "summary_failed", executionId: `${job.id}:${unit.id}`, executionLevel: "unit" });
           await kv.set(KV.summaryQueueUnits(job.id), unit.id, {
             ...unit, attempts, startedAt: undefined,
             lastError: reason, lastAttemptAt: new Date().toISOString(),
@@ -1793,7 +1958,11 @@ export function registerSummaryQueueFunctions(
       }
       const captureKey = `${job.id}:raw:${unit.id}`;
       let generatedThisDelivery = false;
-      let capture = await kv.get<{ state: "intended" | "captured"; raw?: string; overflow?: true }>(KV.state, captureKey);
+      let capture = await kv.get<{ state: "intended" | "captured"; inputHash?: string; raw?: string; overflow?: true }>(KV.state, captureKey);
+      if (capture && capture.inputHash !== requestInputHash) {
+        await kv.delete(KV.state, captureKey);
+        capture = undefined;
+      }
       if (!unit.output && capture?.state === "intended") return { success: false, completed: false,
         error: "summary_dispatch_outcome_unknown" };
       if (foreground && unit.output && (!unit.summary || unit.summary.sessionId !== job.sessionId ||
@@ -1816,7 +1985,7 @@ export function registerSummaryQueueFunctions(
           const call = async (selected: MemoryProvider) => {
             generatedThisDelivery = true;
             const raw = await selected.summarize(system, prompt, { task: "summary", outputTokens });
-            const captured: typeof capture = { state: "captured",
+            const captured: typeof capture = { state: "captured", inputHash: requestInputHash,
               ...(Buffer.byteLength(raw, "utf8") > 65_536 ? { overflow: true as const } : { raw }) };
             await withKeyedLock(`summary-job:${job.id}`, async () => {
               const [latest, currentUnit, previous] = await Promise.all([
@@ -1830,7 +1999,8 @@ export function registerSummaryQueueFunctions(
                   currentUnit.round !== unit.round || currentUnit.stage !== unit.stage)
                 throw new SummaryBudgetError("summary_capture_identity_mismatch");
               if (previous?.state === "captured") {
-                if (previous.raw !== captured.raw || previous.overflow !== captured.overflow)
+                if (previous.inputHash !== captured.inputHash || previous.raw !== captured.raw ||
+                    previous.overflow !== captured.overflow)
                   throw new SummaryBudgetError("summary_capture_identity_mismatch");
                 capture = previous;
                 return;
@@ -1846,7 +2016,7 @@ export function registerSummaryQueueFunctions(
             () => llmRouter ? llmRouter.run("summary", call, () => true) : call(provider),
             SUMMARY_CALL_TIMEOUT_MS,
           );
-          if (!capture) await kv.set(KV.state, captureKey, { state: "intended" });
+          if (!capture) await kv.set(KV.state, captureKey, { state: "intended", inputHash: requestInputHash });
           if (capture?.overflow) throw new SummaryBudgetError("summary_response_limit_exceeded");
           const response = capture?.raw ?? await runWorkflowAttempt(accounting, kv,
             { workflow: "summary", functionId: "mem::summary-unit", project: job.project,
@@ -1865,24 +2035,28 @@ export function registerSummaryQueueFunctions(
             ]);
             if (!latest || latest.status !== "pending" || latest.round !== unit.round || latest.stage !== unit.stage ||
                 !latest.unitIds.includes(unit.id) || !currentUnit || currentUnit.jobId !== job.id ||
-                currentUnit.round !== unit.round || currentUnit.stage !== unit.stage) return false;
+                currentUnit.round !== unit.round || currentUnit.stage !== unit.stage ||
+                inputHash(currentUnit) !== requestInputHash) return false;
             if (currentUnit.output || currentUnit.summary) {
               if (currentUnit.summary && JSON.stringify(summaryFields(currentUnit.summary)) === JSON.stringify(summaryFields(summary)) &&
-                  JSON.stringify(currentUnit.output) === JSON.stringify(unitOutput(summary, unit.items))) return true;
+                  JSON.stringify(currentUnit.output) === JSON.stringify(unitOutput(summary, unit.items)) &&
+                  currentUnit.outputInputHash === requestInputHash) return true;
               throw new SummaryBudgetError("summary_capture_identity_mismatch");
             }
             await kv.set(KV.summaryQueueUnits(job.id), unit.id, {
-              ...currentUnit, summary, output: unitOutput(summary, unit.items),
+              ...currentUnit, summary, output: unitOutput(summary, unit.items), outputInputHash: requestInputHash,
               startedAt: undefined, lastError: undefined,
             });
             return true;
           });
           if (!admitted) return { success: true, skipped: true };
-          await recordOperation(kv, "mem::summary-unit", "completed", { unitsCompleted: 1 });
+          await recordOperation(kv, "mem::summary-unit", "completed", { unitsCompleted: 1 }, undefined,
+            { executionId: `${job.id}:${unit.id}`, executionLevel: "unit" });
         } catch (error) {
           const attempts = unit.attempts + 1;
           const reason = failureCode(error);
-          await recordOperation(kv, "mem::summary-unit", "failed", {}, undefined, { errorCode: "summary_failed" });
+          await recordOperation(kv, "mem::summary-unit", "failed", {}, undefined,
+            { errorCode: "summary_failed", executionId: `${job.id}:${unit.id}`, executionLevel: "unit" });
           await kv.set(KV.summaryQueueUnits(job.id), unit.id, {
             ...unit, attempts, startedAt: undefined,
             lastError: reason, lastAttemptAt: new Date().toISOString(),
@@ -1986,10 +2160,11 @@ export function registerSummaryQueueFunctions(
         }
       });
       try {
-        const progress = await advance(candidate.id);
+        const progress = await summaryRecoveryStep("reconcile.advance", { jobId: candidate.id, sessionId: candidate.sessionId },
+          () => advance(candidate.id));
         if (progress.completed) {
-          await sdk.trigger({ function_id: "mem::summary-enqueue",
-            payload: { sessionId: candidate.sessionId } });
+          await summaryRecoveryStep("reconcile.completed_enqueue", { jobId: candidate.id, sessionId: candidate.sessionId },
+            () => sdk.trigger({ function_id: "mem::summary-enqueue", payload: { sessionId: candidate.sessionId } }));
           recovered++;
           continue;
         }
@@ -2012,21 +2187,22 @@ export function registerSummaryQueueFunctions(
 
   sdk.registerFunction("mem::summary-recover", async () => {
     if (isBackgroundRecoveryPaused()) return { success: true, recovered: 0, cleaned: 0, paused: true };
-    let { recovered } = await reconcilePendingJobs();
+    let { recovered } = await summaryRecoveryStep("recover.reconcile", {}, reconcilePendingJobs);
     let cleaned = 0;
-    const jobs = await kv.list<SummaryQueueJob>(KV.summaryQueueJobs);
+    const jobs = await summaryRecoveryStep("recover.jobs", {}, () => kv.list<SummaryQueueJob>(KV.summaryQueueJobs));
     const coveredSessions = new Set<string>();
     for (const job of jobs) {
       if (job.executionOrigin) { coveredSessions.add(job.sessionId); continue; }
       if (job.status === "pending") {
         coveredSessions.add(job.sessionId);
       } else if (job.status === "completed") {
-        await sdk.trigger({ function_id: "mem::summary-enqueue", payload: { sessionId: job.sessionId } });
-        await cleanupUnits(kv, job.id);
+        await summaryRecoveryStep("recover.completed_enqueue", { jobId: job.id, sessionId: job.sessionId },
+          () => sdk.trigger({ function_id: "mem::summary-enqueue", payload: { sessionId: job.sessionId } }));
+        await summaryRecoveryStep("recover.cleanup_units", { jobId: job.id, sessionId: job.sessionId }, () => cleanupUnits(kv, job.id));
         await kv.delete(KV.summaryQueueJobs, job.id);
         cleaned++;
       } else if (job.failedAt && Date.now() - Date.parse(job.failedAt) >= FAILED_RETENTION_MS) {
-        await cleanupUnits(kv, job.id);
+        await summaryRecoveryStep("recover.cleanup_units", { jobId: job.id, sessionId: job.sessionId }, () => cleanupUnits(kv, job.id));
         await kv.delete(KV.summaryQueueJobs, job.id);
         const active = await kv.get<ActiveJob>(KV.summaryQueueActive, job.sessionId);
         const intent = await kv.get<SummaryQueueIntent>(KV.summaryQueueIntents, job.sessionId);
@@ -2040,16 +2216,18 @@ export function registerSummaryQueueFunctions(
         coveredSessions.add(job.sessionId);
       }
     }
-    const intents = await kv.list<SummaryQueueIntent>(KV.summaryQueueIntents);
+    const intents = await summaryRecoveryStep("recover.intents", {}, () => kv.list<SummaryQueueIntent>(KV.summaryQueueIntents));
     const uncovered = intents.filter(intent => !intent.executionOrigin && !coveredSessions.has(intent.sessionId))
       .sort((a, b) => (a.lastAttemptAt ?? a.createdAt).localeCompare(b.lastAttemptAt ?? b.createdAt))
       .slice(0, MAX_RECOVERY_INTENTS);
     for (const intent of uncovered) {
-      const session = await kv.get<Session>(KV.sessions, intent.sessionId);
+      const session = await summaryRecoveryStep("recover.intent_session", { sessionId: intent.sessionId },
+        () => kv.get<Session>(KV.sessions, intent.sessionId));
       if (session?.status !== "completed") continue;
-      const result = await sdk.trigger<{ sessionId: string }, { success: boolean; queued?: boolean; skipped?: string; retained?: boolean }>({
-        function_id: "mem::summary-enqueue", payload: { sessionId: intent.sessionId },
-      });
+      const result = await summaryRecoveryStep("recover.intent_enqueue", { sessionId: intent.sessionId },
+        () => sdk.trigger<{ sessionId: string }, { success: boolean; queued?: boolean; skipped?: string; retained?: boolean }>({
+          function_id: "mem::summary-enqueue", payload: { sessionId: intent.sessionId },
+        }));
       if (!result.success && !result.retained) throw new Error("summary_recovery_enqueue_failed");
       if (result.skipped === "no_provider") {
         await kv.set(KV.summaryQueueIntents, intent.sessionId, {

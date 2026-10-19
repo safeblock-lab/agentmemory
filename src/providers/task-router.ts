@@ -1,4 +1,5 @@
-import type { LlmRouteTarget, LlmRoutingConfig, LlmTask, LlmUsage, MemoryProvider } from "../types.js";
+import type { LlmRouteTarget, LlmRoutingConfig, LlmTask, LlmUsage, MemoryProvider, StructuredLlmRequest, PreparedStructuredLlmCall } from "../types.js";
+import { canPrepareStructuredCall as hasStructuredCallCapability, prepareStructuredCall, singleStructuredDispatch } from "./structured-output-contract.js";
 import { logger } from "../logger.js";
 
 export type LlmFallbackReason =
@@ -32,7 +33,7 @@ export interface LlmTaskRouterOptions {
   auxiliary?: LlmProviderTarget;
   routing: LlmRoutingConfig;
   onEvent?: (event: LlmRoutingEvent) => void;
-  onUsage?: (event: LlmUsageEvent) => Promise<void>;
+  onUsage?: (event: LlmUsageEvent, effectKey?: string) => Promise<void>;
 }
 
 export class LlmTaskRouter {
@@ -40,7 +41,7 @@ export class LlmTaskRouter {
   private readonly auxiliary?: LlmProviderTarget;
   private readonly routing: LlmRoutingConfig;
   private readonly onEvent?: (event: LlmRoutingEvent) => void;
-  private readonly onUsage?: (event: LlmUsageEvent) => Promise<void>;
+  private readonly onUsage?: (event: LlmUsageEvent, effectKey?: string) => Promise<void>;
 
   constructor(options: LlmTaskRouterOptions) {
     this.primary = options.primary;
@@ -54,8 +55,48 @@ export class LlmTaskRouter {
     return this.auxiliary !== undefined;
   }
 
+  graphAutomaticProvider(): MemoryProvider {
+    const route = this.routing.routes.graph_extraction ?? "primary";
+    const target = route === "primary" ? this.primary : route === "aux" ? this.auxiliary : undefined;
+    if (!target || this.routing.thinking?.graph_extraction !== undefined) throw new Error("GRAPH_AUTOMATIC_ROUTE_UNSUPPORTED");
+    return target.provider;
+  }
+  graphAutomaticRoute(): LlmRouteTarget { return this.routing.routes.graph_extraction ?? "primary"; }
+  async recordGraphAutomaticUsage(route: LlmRouteTarget, model: string, usage: LlmUsage, effectKey: string): Promise<void> {
+    if (!this.onUsage) throw new Error("GRAPH_USAGE_RECORDER_UNAVAILABLE");
+    await this.onUsage({ ...usage, task: "graph_extraction", provider: route, model }, effectKey);
+  }
+
   hasExplicitRoute(task: LlmTask): boolean {
     return this.routing.explicitRoutes[task] !== undefined;
+  }
+
+  canPrepareStructuredCall(task: LlmTask, routeOverride?: LlmRouteTarget): boolean {
+    const route = this.resolveStructuredRoute(task, routeOverride);
+    if (!route) return false;
+    const target = this.getStructuredTarget(route);
+    return target !== undefined && hasStructuredCallCapability(target.provider);
+  }
+
+  prepareStructuredCall(task: LlmTask, request: StructuredLlmRequest, routeOverride?: LlmRouteTarget): PreparedStructuredLlmCall {
+    const route = this.resolveStructuredRoute(task, routeOverride);
+    if (!route) throw new Error("structured_output_route_invalid");
+    const target = this.getStructuredTarget(route);
+    if (!target) throw new Error("structured_output_route_unavailable");
+    const usage: LlmUsage[] = [];
+    const provider = this.withTask(target, task, usage);
+    const prepared = prepareStructuredCall(provider, request);
+    if (prepared.binding.model !== target.model) throw new Error("structured_output_target_mismatch");
+    return singleStructuredDispatch({ ...prepared.binding, route }, async () => {
+      const startedAt = Date.now();
+      try {
+        const result = await prepared.execute();
+        this.emit({ task, selectedProvider: route, model: target.model, durationMs: Date.now() - startedAt, fallbackUsed: false });
+        return result;
+      } finally {
+        await this.emitUsage(task, route, target.model, usage);
+      }
+    });
   }
 
   async run<T>(
@@ -75,10 +116,11 @@ export class LlmTaskRouter {
 
     const startedAt = Date.now();
     const usage: LlmUsage[] = [];
+    let contracted = false;
     try {
       let candidate: T;
       try {
-        candidate = await operation(this.withTask(this.auxiliary, task, usage));
+        candidate = await operation(this.withTask(this.auxiliary, task, usage, () => { contracted = true; }));
       } finally {
         await this.emitUsage(task, "aux", this.auxiliary.model, usage);
       }
@@ -93,8 +135,10 @@ export class LlmTaskRouter {
         });
         return candidate;
       }
+      if (contracted) throw new Error("structured_output_validation_failed");
       return this.runPrimary(task, operation, validate, true, failureReason);
-    } catch {
+    } catch (error) {
+      if (contracted) throw error;
       return this.runPrimary(task, operation, validate, true, "auxiliary_error");
     }
   }
@@ -164,6 +208,7 @@ export class LlmTaskRouter {
     target: LlmProviderTarget,
     task: LlmTask,
     usage: LlmUsage[],
+    onContract?: () => void,
   ): MemoryProvider {
     const thinking = this.routing.thinking?.[task];
     const options = {
@@ -174,11 +219,39 @@ export class LlmTaskRouter {
     const provider = target.provider;
     return {
       name: provider.name,
-      compress: (systemPrompt, userPrompt, callOptions) => provider.compress(systemPrompt, userPrompt, { ...callOptions, ...options }),
-      summarize: (systemPrompt, userPrompt, callOptions) => provider.summarize(systemPrompt, userPrompt, { ...callOptions, ...options }),
+      ...(hasStructuredCallCapability(provider) ? {
+        prepareStructuredCall: (request: StructuredLlmRequest) => {
+          onContract?.();
+          const onUsage = request.options.onUsage;
+          return prepareStructuredCall(provider, {
+            ...request,
+            options: {
+              ...request.options, ...options,
+              onUsage: (item: LlmUsage) => { options.onUsage(item); onUsage?.(item); },
+            },
+          });
+        },
+      } : {}),
+      compress: (systemPrompt, userPrompt, callOptions) => {
+        if (callOptions?.responseFormat || callOptions?.outputContract) onContract?.();
+        return provider.compress(systemPrompt, userPrompt, { ...callOptions, ...options });
+      },
+      summarize: (systemPrompt, userPrompt, callOptions) => {
+        if (callOptions?.responseFormat || callOptions?.outputContract) onContract?.();
+        return provider.summarize(systemPrompt, userPrompt, { ...callOptions, ...options });
+      },
       ...(provider.describeImage
         ? { describeImage: provider.describeImage.bind(provider) }
         : {}),
     };
+  }
+
+  private resolveStructuredRoute(task: LlmTask, routeOverride?: LlmRouteTarget): LlmRouteTarget | undefined {
+    const route: unknown = routeOverride ?? this.routing.routes[task] ?? "primary";
+    return route === "primary" || route === "aux" ? route : undefined;
+  }
+
+  private getStructuredTarget(route: LlmRouteTarget): LlmProviderTarget | undefined {
+    return route === "primary" ? this.primary : this.auxiliary;
   }
 }

@@ -1,0 +1,336 @@
+diff --git "a/D:\\agentmemory\\.codex-task\\storage-priority-20261015\\runtime-activation\\ttl-cleanup\\app-patch-baseline\\src\\index.ts" "b/D:\\agentmemory\\.codex-task\\storage-priority-20261015\\native-candidate\\app-source\\src\\index.ts"
+index bf58fa5..e518548 100644
+--- "a/D:\\agentmemory\\.codex-task\\storage-priority-20261015\\runtime-activation\\ttl-cleanup\\app-patch-baseline\\src\\index.ts"
++++ "b/D:\\agentmemory\\.codex-task\\storage-priority-20261015\\native-candidate\\app-source\\src\\index.ts"
+@@ -28,8 +28,6 @@ import {
+ import { TypeSafeDecisionProvider } from "./providers/typesafe.js";
+ import { LlmTaskRouter } from "./providers/task-router.js";
+ import { StateKV } from "./state/kv.js";
+-import { createProviderAttemptBudgetTransport } from "./state/provider-attempt-budget.js";
+-import { installProviderAttemptBudgetTransport } from "./providers/provider-attempt-budget.js";
+ import { batchEffectKey } from "./state/batch-effects.js";
+ import { KV } from "./state/schema.js";
+ import { VectorIndex } from "./state/vector-index.js";
+@@ -61,7 +59,6 @@ import {
+ import { registerContextFunction } from "./functions/context.js";
+ import { registerSummarizeFunction } from "./functions/summarize.js";
+ import { registerSummaryQueueFunctions } from "./functions/summary-queue.js";
+-import { loadWorkflowAttemptAccounting } from "./functions/workflow-attempt-accounting.js";
+ import { installOperationTracking } from "./functions/operation-tracking.js";
+ import { registerMigrateFunction } from "./functions/migrate.js";
+ import { registerFileIndexFunction } from "./functions/file-index.js";
+@@ -76,6 +73,7 @@ import { registerRelationsFunction } from "./functions/relations.js";
+ import { registerTimelineFunction } from "./functions/timeline.js";
+ import { registerSmartSearchFunction } from "./functions/smart-search.js";
+ import { registerRecentSearchesSweepFunction } from "./functions/recent-searches-sweep.js";
++import { registerOperationErrorEvidenceSweepFunction } from "./functions/operation-error-evidence.js";
+ import { registerProfileFunction } from "./functions/profile.js";
+ import { registerAutoForgetFunction } from "./functions/auto-forget.js";
+ import { registerExportImportFunction } from "./functions/export-import.js";
+@@ -83,7 +81,6 @@ import { registerEnrichFunction } from "./functions/enrich.js";
+ import { registerClaudeBridgeFunction } from "./functions/claude-bridge.js";
+ import { registerGraphFunction } from "./functions/graph.js";
+ import { registerGraphJobRecovery } from "./functions/graph-jobs.js";
+-import { pruneTerminalGraphWork } from "./functions/graph-retention.js";
+ import { registerStorageMaintenance } from "./functions/storage-maintenance.js";
+ import { registerGraphImportFunction } from "./functions/graph-import.js";
+ import { registerConsolidationPipelineFunction } from "./functions/consolidation-pipeline.js";
+@@ -130,7 +127,7 @@ import { DedupMap } from "./functions/dedup.js";
+ import { registerHealthMonitor } from "./health/monitor.js";
+ import { initMetrics, OTEL_CONFIG } from "./telemetry/setup.js";
+ import { VERSION } from "./version.js";
+-import { bootLog } from "./logger.js";
++import { bootLog, logger } from "./logger.js";
+ import type { AuxiliaryLlmConfig, CompressedObservation, FireworksBatchWorkItem } from "./types.js";
+ import { runtimeMetadataPath } from "./runtime-paths.js";
+ import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
+@@ -565,8 +562,6 @@ async function main() {
+   writeWorkerPidfile();
+ 
+   const kv = new StateKV(sdk);
+-  installProviderAttemptBudgetTransport(createProviderAttemptBudgetTransport(sdk));
+-  const workflowAttemptAccounting = loadWorkflowAttemptAccounting(getEnvVar("AGENTMEMORY_WORKFLOW_ATTEMPT_ACCOUNTING"));
+   installOperationTracking(sdk, kv);
+   let foregroundRequests = 0;
+   let lastForegroundAt = 0;
+@@ -626,15 +621,15 @@ async function main() {
+   registerCompressFunction(sdk, kv, provider, metricsStore, taskRouter);
+   registerSearchFunction(sdk, kv);
+   registerContextFunction(sdk, kv, config.tokenBudget);
+-  registerSummarizeFunction(sdk, kv, provider, metricsStore, taskRouter, workflowAttemptAccounting);
+-  registerSummaryQueueFunctions(sdk, kv, provider, taskRouter, workflowAttemptAccounting);
++  registerSummarizeFunction(sdk, kv, provider, metricsStore, taskRouter);
++  registerSummaryQueueFunctions(sdk, kv, provider, taskRouter);
+   registerMigrateFunction(sdk, kv);
+   registerFileIndexFunction(sdk, kv);
+   registerConsolidateFunction(sdk, kv, provider, {
+     select: selectConsolidation,
+     lookup: (project, title) => canonical.memoryLookup(project, title),
+     commit: (project, title, match, next, effect) => canonical.evolve(project, title, match.token, next, effect),
+-  }, workflowAttemptAccounting);
++  });
+   registerPatternsFunction(sdk, kv);
+   registerRememberFunction(sdk, kv);
+   registerEvictFunction(sdk, kv);
+@@ -688,7 +683,6 @@ async function main() {
+       if (!match.token) throw new Error("consolidation_canonical_token_missing");
+       return canonical.upsert(scope, key, match.token, id, effect, update);
+     },
+-    workflowAttemptAccounting,
+   );
+   bootLog(`Consolidation pipeline: registered (CONSOLIDATION_ENABLED=${isConsolidationEnabled() ? "true" : "false"})`);
+ 
+@@ -756,7 +750,7 @@ async function main() {
+   );
+   registerWorkingMemoryFunctions(sdk, kv, config.tokenBudget);
+   registerSkillExtractFunctions(sdk, kv, provider, taskRouter, typeSafeDecisionProvider,
+-    createSkillObservationSelector(kv, embeddingProvider), workflowAttemptAccounting);
++    createSkillObservationSelector(kv, embeddingProvider));
+   registerSkillLifecycleFunctions(sdk, kv);
+   registerCascadeFunction(sdk, kv);
+ 
+@@ -822,6 +816,7 @@ async function main() {
+   registerSmartSearchFunction(sdk, kv, hybridRanker);
+   setHybridRanker(hybridRanker);
+   registerRecentSearchesSweepFunction(sdk, kv);
++  registerOperationErrorEvidenceSweepFunction(sdk, kv);
+   registerStorageMaintenance(sdk, kv);
+ 
+   registerApiTriggers(sdk, kv, secret, metricsStore, provider);
+@@ -1079,7 +1074,6 @@ async function main() {
+       console.warn("[agentmemory] Graph recovery paused; durable inputs retained");
+     } finally {
+       try {
+-        await pruneTerminalGraphWork(kv);
+       } catch (error) {
+         console.warn("[agentmemory] Graph terminal retention paused", error instanceof Error ? error.message : "STATE_TX_FAILED");
+       } finally { graphRecoveryRunning = false; }
+@@ -1122,19 +1116,20 @@ async function main() {
+     insightDecayTimer.unref();
+   }
+ 
+-  // #771: hourly TTL sweep for the followup-rate diagnostic. The
+-  // recent-searches scope only needs the last entry per session;
+-  // sweeping anything older than the retention window keeps the scope
+-  // from growing unbounded across long-lived deployments.
++  // Hourly TTL sweeps keep small diagnostic scopes bounded across long-lived deployments.
++  if (!isBackgroundRecoveryPaused()) {
+   const recentSearchesSweepTimer = setInterval(async () => {
+-    try {
+-      await sdk.trigger({
+-        function_id: "mem::diagnostic::recent-searches-sweep",
+-        payload: {},
+-      });
+-    } catch {}
++    if (isBackgroundRecoveryPaused()) return;
++    const results = await Promise.allSettled([
++      sdk.trigger({ function_id: "mem::diagnostic::recent-searches-sweep", payload: {} }),
++      sdk.trigger({ function_id: "mem::diagnostic::operation-error-evidence-sweep", payload: {} }),
++    ]);
++    if (results.some(result => result.status === "rejected")) {
++      logger.warn("Hourly diagnostic sweep dispatch failed");
++    }
+   }, 60 * 60 * 1000);
+   recentSearchesSweepTimer.unref();
++  }
+ 
+   if (isConsolidationEnabled()) {
+     const consolidationTimer = setInterval(async () => {
+diff --git "a/D:\\agentmemory\\.codex-task\\storage-priority-20261015\\runtime-activation\\ttl-cleanup\\app-patch-baseline\\src\\functions\\context.ts" "b/D:\\agentmemory\\.codex-task\\storage-priority-20261015\\native-candidate\\app-source\\src\\functions\\context.ts"
+index 44ecf61..982ed20 100644
+--- "a/D:\\agentmemory\\.codex-task\\storage-priority-20261015\\runtime-activation\\ttl-cleanup\\app-patch-baseline\\src\\functions\\context.ts"
++++ "b/D:\\agentmemory\\.codex-task\\storage-priority-20261015\\native-candidate\\app-source\\src\\functions\\context.ts"
+@@ -11,6 +11,7 @@ import type {
+ import { KV } from "../state/schema.js";
+ import { StateKV } from "../state/kv.js";
+ import { recordAccessBatch } from "./access-tracker.js";
++import { recordContextRetentionUse } from "../state/storage-ttl.js";
+ import { logger } from "../logger.js";
+ import {
+   isSlotsEnabled,
+@@ -380,6 +381,11 @@ export function registerContextFunction(
+       }
+ 
+       const result = render(selected);
++      const delivered = new Set(accessedIds);
++      await recordContextRetentionUse(sdk, data.sessionId, data.project,
++        (indexedObservations ?? []).filter(({ ref }) => delivered.has(ref.id)).map(({ ref }) => ({
++          scope: KV.observations(ref.sessionId), key: ref.id, expected_version: ref.rowVersion,
++        })));
+       logger.info("Context generated", {
+         blocks: selected.length,
+         tokens: usedTokens,
+diff --git "a/D:\\agentmemory\\.codex-task\\storage-priority-20261015\\runtime-activation\\ttl-cleanup\\app-patch-baseline\\src\\functions\\storage-maintenance.ts" "b/D:\\agentmemory\\.codex-task\\storage-priority-20261015\\native-candidate\\app-source\\src\\functions\\storage-maintenance.ts"
+index f94e31d..cb4c2ed 100644
+--- "a/D:\\agentmemory\\.codex-task\\storage-priority-20261015\\runtime-activation\\ttl-cleanup\\app-patch-baseline\\src\\functions\\storage-maintenance.ts"
++++ "b/D:\\agentmemory\\.codex-task\\storage-priority-20261015\\native-candidate\\app-source\\src\\functions\\storage-maintenance.ts"
+@@ -10,6 +10,9 @@ import { STORAGE_RETENTION, RETENTION_USE_INTEGRATION, hasRetentionProtection, r
+ import { generateId, KV } from "../state/schema.js";
+ import type { StateKV } from "../state/kv.js";
+ import { StatePageError } from "../state/state-pages.js";
++import { storageTtlPage, type StorageTtlReceipt } from "../state/storage-ttl.js";
++import type { GraphControlState } from "../types.js";
++import type { StateGraphGuard } from "../state/state-transactions.js";
+ import {
+   triggerStateStorage, type ObservationIndexResult, type StorageCandidate,
+   type StorageDiagnostics, type StorageMigrationResult, type StorageReclaimResult,
+@@ -50,10 +53,40 @@ type MaintenanceReview = {
+   dueReasons: Array<"growth_20_percent" | "free_pages_24h">;
+ };
+ type MaintenanceState = StorageMaintenanceState & {
++  ttlRunId?: string;
++  ttlReceipt?: StorageTtlReceipt;
+   maintenanceHistory: MaintenanceHistoryEntry[];
+   maintenanceReview: MaintenanceReview;
+ };
+ 
++async function ttlStep(sdk: IIIClient, kv: StateKV, state: MaintenanceState, lease: MaintenanceLease): Promise<StorageTtlReceipt> {
++  const control = await kv.get<GraphControlState>(KV.graphControl, "current");
++  if (!control || control.recovery) throw new Error("STATE_GRAPH_RECOVERY_REQUIRED");
++  const graphLease = await kv.lease({ action: "acquire", owner_id: generateId("ttl"), generation: control.generation, ttl_ms: 120_000 });
++  if ("released" in graphLease) throw new Error("STATE_TX_INVALID_RESPONSE");
++  const guard: StateGraphGuard = { owner_id: graphLease.owner_id, generation: graphLease.generation, fence: graphLease.fence };
++  try {
++    if (!state.ttlRunId) {
++      state.ttlRunId = generateId("ttl-run");
++      await saveState(kv,state);
++    }
++    const run = await kv.get<{ ordinal: number; done: boolean }>(KV.storageMaintenance, `ttl:${state.ttlRunId}`);
++    const ordinal = run?.ordinal ?? 0;
++    if (run?.done) {
++      const last = await kv.get<StorageTtlReceipt>(KV.storageMaintenance, `ttl:${state.ttlRunId}:${ordinal - 1}`);
++      if (!last) throw new Error("STATE_TX_INVALID_RESPONSE");
++      state.ttlReceipt = last;
++      return last;
++    }
++    const receipt = await storageTtlPage(sdk,{ runId: state.ttlRunId, ordinal, ownerId: lease.ownerId, fence: lease.fence, guard });
++    state.ttlReceipt = receipt;
++    await saveState(kv,state);
++    return receipt;
++  } finally {
++    await kv.lease({ action: "release", ...guard });
++  }
++}
++
+ type MaintenanceLease = { ownerId: string; fence: number; expiresAt: string };
+ 
+ class StorageMaintenanceOutcomeUnknown extends Error {
+@@ -849,7 +882,7 @@ export function registerStorageMaintenance(sdk: IIIClient, kv: StateKV): void {
+     action?: unknown; allow_blocking?: unknown; max_ms?: unknown;
+   }) => {
+     const action = typeof request?.action === "string" ? request.action : "tick";
+-    if (!["tick", "status", "diagnostics", "activate", "reclaim", "migrate_incremental"].includes(action)) {
++    if (!["tick", "ttl", "status", "diagnostics", "activate", "reclaim", "migrate_incremental"].includes(action)) {
+       return { success: false, code: "STATE_STORAGE_INVALID_ACTION" };
+     }
+     if (action === "status") {
+@@ -912,6 +945,12 @@ export function registerStorageMaintenance(sdk: IIIClient, kv: StateKV): void {
+         await saveState(kv, state);
+         return { success: true, activatedAt: state.cleanupActivatedAt, state };
+       }
++      if (action === "ttl") {
++        await refreshLease();
++        state.cleanupActivatedAt ??= new Date().toISOString();
++        const receipt = await ttlStep(sdk,kv,state,lease);
++        return { success: true, receipt, state };
++      }
+       if (action === "reclaim") {
+         if (!state.cleanupActivatedAt) return { success: false, code: "STATE_STORAGE_CLEANUP_NOT_ACTIVATED" };
+         await refreshLease();
+@@ -942,7 +981,21 @@ export function registerStorageMaintenance(sdk: IIIClient, kv: StateKV): void {
+       let compaction: StorageReclaimResult | null = null;
+       if (state.cleanupActivatedAt) {
+         await refreshLease();
+-        cleanup = await cleanupStep(sdk, kv, state);
++        if (state.ttlReceipt?.done) {
++          state.ttlRunId = undefined;
++          state.ttlReceipt = undefined;
++        }
++        const receipt = await ttlStep(sdk, kv, state, lease!);
++        cleanup = {
++          startedAt, completedAt: new Date().toISOString(), graphRowsDeleted: 0,
++          technicalCandidatesProcessed: receipt.inspected, technicalDeleted: receipt.deleted,
++          rawStripped: receipt.rawStripped, deletedLogicalBytes: receipt.logicalBytesDeleted,
++          deletedStoredBytes: receipt.storedBytesDeleted, operationRowsDeleted: 0,
++          skipped: receipt.excluded, excludedUnresolved: receipt.excluded, excludedUnknownAge: 0,
++          pending: !receipt.done,
++          exclusions: ["Unknown ownership or dates, protected references, original bodies, backups, receipts and replay remain retained."],
++        };
++        state.lastCleanup = cleanup;
+         await refreshLease();
+         const outcome = await reclaim(sdk, kv, state, lease!);
+         compaction = outcome.result;
+diff --git "a/D:\\agentmemory\\.codex-task\\storage-priority-20261015\\runtime-activation\\ttl-cleanup\\app-patch-baseline\\src\\functions\\storage-retention.ts" "b/D:\\agentmemory\\.codex-task\\storage-priority-20261015\\native-candidate\\app-source\\src\\functions\\storage-retention.ts"
+index c4a204d..6bae3ad 100644
+--- "a/D:\\agentmemory\\.codex-task\\storage-priority-20261015\\runtime-activation\\ttl-cleanup\\app-patch-baseline\\src\\functions\\storage-retention.ts"
++++ "b/D:\\agentmemory\\.codex-task\\storage-priority-20261015\\native-candidate\\app-source\\src\\functions\\storage-retention.ts"
+@@ -23,7 +23,7 @@ export interface TrustedRetentionUse {
+   occurredAt: string;
+ }
+ export const RETENTION_USE_INTEGRATION = {
+-  status: "integration_needed",
++  status: "server_context_delivery_integrated",
+   requiredProducer: "server-confirmed task context delivery or task use",
+   rejectedSignals: ["client claims", "generic access", "indexing", "maintenance", "retrieval candidates"],
+ } as const;
+diff --git a/src/state/storage-ttl.ts b/src/state/storage-ttl.ts
+new file mode 100644
+--- /dev/null
++++ b/src/state/storage-ttl.ts
+@@ -0,0 +1,56 @@
++import type { IIIClient } from "iii-sdk";
++import type { StateGraphGuard } from "./state-transactions.js";
++import { STORAGE_RETENTION } from "../functions/storage-retention.js";
++
++export interface StorageTtlReceipt {
++  runId: string;
++  ordinal: number;
++  scope: string;
++  inspected: number;
++  deleted: number;
++  rawStripped: number;
++  logicalBytesDeleted: number;
++  storedBytesDeleted: number;
++  excluded: number;
++  inputBytes: number;
++  elapsedMs: number;
++  done: boolean;
++  progress: { ordinal: number; done: boolean };
++}
++
++export async function storageTtlPage(sdk: IIIClient, request: {
++  runId: string; ordinal: number; ownerId: string; fence: number; guard: StateGraphGuard;
++}): Promise<StorageTtlReceipt> {
++  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(request.runId) || !Number.isSafeInteger(request.ordinal)
++    || request.ordinal < 0 || request.ordinal >= 1_000_000) throw new Error("STATE_STORAGE_INVALID_REQUEST");
++  const value = await sdk.trigger<unknown, unknown>({ function_id: "state::storage", payload: {
++    action: "ttl_page", request: {
++      run_id: request.runId, ordinal: request.ordinal, owner_id: request.ownerId,
++      fence: request.fence, guard: request.guard,
++      viewer_max_age_ms: STORAGE_RETENTION.viewer.maximumAgeMs,
++      bodies_max_age_ms: STORAGE_RETENTION.completedBodies.maximumAgeMs,
++      tools_max_age_ms: STORAGE_RETENTION.tools.maximumAgeMs,
++    },
++  } });
++  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("STATE_STORAGE_INVALID_RESPONSE");
++  const receipt = value as StorageTtlReceipt;
++  if (receipt.runId !== request.runId || receipt.ordinal !== request.ordinal || typeof receipt.done !== "boolean"
++    || typeof receipt.scope !== "string" || !receipt.progress || receipt.progress.ordinal !== request.ordinal + 1
++    || receipt.progress.done !== receipt.done
++    || ![receipt.inspected, receipt.deleted, receipt.rawStripped, receipt.logicalBytesDeleted,
++      receipt.storedBytesDeleted, receipt.excluded, receipt.inputBytes].every(n => Number.isSafeInteger(n) && n >= 0)
++    || receipt.inspected > 4096 || receipt.inputBytes > 4_194_304 || !Number.isFinite(receipt.elapsedMs) || receipt.elapsedMs < 0
++    || receipt.deleted + receipt.rawStripped + receipt.excluded !== receipt.inspected) throw new Error("STATE_STORAGE_INVALID_RESPONSE");
++  return receipt;
++}
++
++export async function recordContextRetentionUse(sdk: IIIClient, sessionId: string, project: string,
++  targets: Array<{ scope: string; key: string; expected_version: string }>): Promise<void> {
++  if (!targets.length) return;
++  const result = await sdk.trigger<unknown, { recorded?: unknown }>({ function_id: "state::storage", payload: {
++    action: "ttl_record_context_use", request: { session_id: sessionId, project, targets: targets.slice(0, 50) },
++  } });
++  if (!Number.isSafeInteger(result?.recorded) || Number(result.recorded) < 0 || Number(result.recorded) > targets.length) {
++    throw new Error("STATE_STORAGE_INVALID_RESPONSE");
++  }
++}

@@ -1,6 +1,6 @@
 import { runWorkflowAttempt, type WorkflowAttemptAccounting } from "./workflow-attempt-accounting.js";
 import type { IIIClient } from "iii-sdk";
-import type { CompressedObservation, SessionSummary, MemoryProvider, Session } from "../types.js";
+import type { CompressedObservation, SessionSummary, MemoryProvider, Session, WorkflowTerminalReceipt } from "../types.js";
 import { KV, fingerprintId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
@@ -9,9 +9,9 @@ import { validateOutput } from "../eval/validator.js";
 import { scoreSummary } from "../eval/quality.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import { recordAudit } from "./audit.js";
-import { recordOperation } from "./dashboard-activity.js";
+import { recordOperation, observeWorkflowTerminal, markWorkflowStatisticsGap } from "./dashboard-activity.js";
 import type { LlmTaskRouter } from "../providers/task-router.js";
-import { getSummaryBudgetConfig } from "../config.js";
+import { getAgentId, getSummaryBudgetConfig } from "../config.js";
 import { parseSummaryXml } from "./summary-xml.js";
 import { captureSummaryEvidence, getSummaryEvidenceRoot, verifySummaryEvidence,
   groundSummarySourcePaths, summarySourcePathLiterals } from "./summary-source-grounding.js";
@@ -20,10 +20,10 @@ import { SUMMARY_SYSTEM, buildSummaryItemsPrompt } from "./summary-queue-prompts
 import { validManualSummaryContinuation, type ManualSummaryContinuation } from "./summary-queue.js";
 import { packSummaryItems, summaryChunkInputLimit, summaryOutputTokenBudget } from "./summary-budget.js";
 import { evaluatePublicationEvidence, preparePublicationEvidence } from "./publication-evidence.js";
-import { publicationCallOptions } from "./publication-call-options.js";
+import { publicationExecutor } from "./publication-call-options.js";
 
 interface Selection { project: string; sessionId: string; sourceFingerprint: string }
-interface DirectAttempt { id: string; sessionId: string; project: string; sourceFingerprint: string;
+interface DirectAttempt { workflowTerminal?: WorkflowTerminalReceipt; id: string; sessionId: string; project: string; sourceFingerprint: string;
   observationCount: number; raw?: string; intended?: boolean; overflow?: boolean;
   summary?: SessionSummary; effect?: SessionSummary; completed?: boolean; lastError?: string }
 const fields = (summary: SessionSummary) => ({ title: summary.title, narrative: summary.narrative,
@@ -34,7 +34,7 @@ export function registerSummarizeFunction(sdk: IIIClient, kv: StateKV, provider:
   sdk.registerFunction("mem::summarize", async (data: { sessionId: string; selected?: Selection; manual?: true;
     continuation?: ManualSummaryContinuation; zeroSpendRecoveryOfJobId?: string } | undefined) => {
     if (!data || typeof data.sessionId !== "string" || !data.sessionId.trim()) {
-      await recordOperation(kv, "mem::summarize", "failed", {}, undefined, { durationMs: 0, errorCode: "invalid_input" });
+      await recordOperation(kv, "mem::summarize", "failed", {}, undefined, { executionLevel: "unit", durationMs: 0, errorCode: "invalid_input" });
       return { success: false, error: "sessionId is required" };
     }
     const sessionId = data.sessionId.trim();
@@ -57,7 +57,7 @@ export function registerSummarizeFunction(sdk: IIIClient, kv: StateKV, provider:
       let observationCount = 0;
       const record = (outcome: "failed" | "skipped" | "partial", errorCode: string, summariesCreated = 0) => recordOperation(kv,
         "mem::summarize", outcome, { observationsProcessed: observationCount, summariesCreated }, agentId,
-        { durationMs: Date.now() - started, errorCode });
+        { executionLevel: "unit", durationMs: Date.now() - started, errorCode });
       try {
         const selected = data.selected;
         if (selected && (selected.sessionId !== sessionId || typeof selected.project !== "string" ||
@@ -65,8 +65,12 @@ export function registerSummarizeFunction(sdk: IIIClient, kv: StateKV, provider:
           return { success: false, error: "selection_source_mismatch" };
         const pointerKey = `direct-summary:${sessionId}`;
         let attempt = await kv.get<DirectAttempt>(KV.state, pointerKey);
-        const success = (summary: SessionSummary) => ({ success: true, summary, qualityScore: scoreSummary(fields(summary)),
-          ...(selected && { completed: true }) });
+        const success = async (summary: SessionSummary) => {
+          if (attempt?.workflowTerminal?.outcome === "completed") await observeWorkflowTerminal(kv, { ...attempt.workflowTerminal,
+            workflow: "summaries", producer: "direct-summary", executionLevel: "workflow" });
+          else await markWorkflowStatisticsGap(kv, "summaries");
+          return { success: true, summary, qualityScore: scoreSummary(fields(summary)), ...(selected && { completed: true }) };
+        };
         // Only an exact applied effect permits ACK recovery without re-reading mutable sources.
         if (attempt?.effect && (!attempt.completed || selected?.sourceFingerprint === attempt.sourceFingerprint) &&
             attempt.effect.sessionId === sessionId && attempt.effect.project === attempt.project &&
@@ -168,18 +172,11 @@ export function registerSummarizeFunction(sdk: IIIClient, kv: StateKV, provider:
         if (verdict.status === "unavailable") {
           const request = preparePublicationEvidence(input);
           if ("status" in request) throw new Error(`summary_publication_${request.status}`);
-          const options = publicationCallOptions({ task: "summary" as const, outputTokens: 1024 });
-          verdict = await evaluatePublicationEvidence(kv, input, async (prepared, captureRaw) => {
-            const call = async (chosen: MemoryProvider) => {
-              const raw = await chosen.summarize(prepared.systemPrompt, prepared.userPrompt, options);
-              await captureRaw(raw);
-              return raw;
-            };
-            return runWorkflowAttempt(accounting, kv, { workflow: "summary", functionId: "mem::summarize",
-              project: session.project, sourceId: sessionId, sourceFingerprint: fingerprint, jobId: attempt!.id,
-              unitId: request.requestId, phase: "publication", continuation: "direct" },
-              () => llmRouter ? llmRouter.run("summary", call, () => true) : call(provider));
-          });
+          verdict = await evaluatePublicationEvidence(kv, input, publicationExecutor(provider, llmRouter, "summary",
+            { task: "summary", outputTokens: 1024 }, (prepared, execute) =>
+              runWorkflowAttempt(accounting, kv, { workflow: "summary", functionId: "mem::summarize",
+                project: session.project, sourceId: sessionId, sourceFingerprint: fingerprint, jobId: attempt!.id,
+                unitId: prepared.requestId, phase: "publication", continuation: "direct" }, execute)));
         }
         if (verdict.status !== "supported") throw new Error(`summary_publication_${verdict.status}`);
         await verifySummaryEvidence(kv, attempt, root);
@@ -195,9 +192,11 @@ export function registerSummarizeFunction(sdk: IIIClient, kv: StateKV, provider:
         });
         await recordAudit(kv, "compress", "mem::summarize", [sessionId], { title: summary.title,
           observationCount: observations.length }, undefined, undefined, `${attempt.id}:completed`);
-        await kv.set(KV.state, pointerKey, { ...attempt, completed: true });
+        attempt = { ...attempt, completed: true, workflowTerminal: attempt.workflowTerminal ?? {
+          executionId: attempt.id, agentId: session.agentId ?? getAgentId(), occurredAt: new Date().toISOString(), outcome: "completed" } };
+        await kv.set(KV.state, pointerKey, attempt);
         await metricsStore?.record("mem::summarize", Date.now() - started, true, scoreSummary(fields(summary)));
-        await recordOperation(kv, "mem::summarize", "completed", { observationsProcessed: observations.length, summariesCreated: 1 }, session.agentId, { durationMs: Date.now() - started });
+        await recordOperation(kv, "mem::summarize", "completed", { observationsProcessed: observations.length, summariesCreated: 1 }, session.agentId, { executionLevel: "unit", durationMs: Date.now() - started });
         return success(summary);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -205,7 +204,14 @@ export function registerSummarizeFunction(sdk: IIIClient, kv: StateKV, provider:
         if (!retained || retained.lastError !== message) {
           const applied = retained?.effect && JSON.stringify(await kv.get(KV.summaries, sessionId)) === JSON.stringify(retained.effect);
           await record(applied ? "partial" : "failed", "summary_failed", applied ? 1 : 0);
-          if (retained) await kv.set(KV.state, `direct-summary:${sessionId}`, { ...retained, lastError: message });
+          if (retained) {
+            const outcome = applied ? "partial" : "failed";
+            const workflowTerminal = retained.workflowTerminal ?? { executionId: retained.id,
+              agentId: agentId ?? getAgentId(), occurredAt: new Date().toISOString(), outcome };
+            await kv.set(KV.state, `direct-summary:${sessionId}`, { ...retained, lastError: message, workflowTerminal });
+            if (workflowTerminal.outcome !== outcome) await markWorkflowStatisticsGap(kv, "summaries");
+            else await observeWorkflowTerminal(kv, { ...workflowTerminal, workflow: "summaries", producer: "direct-summary", executionLevel: "workflow" });
+          } else await markWorkflowStatisticsGap(kv, "summaries");
           await metricsStore?.record("mem::summarize", Date.now() - started, false);
         }
         return { success: false, error: error instanceof Error ? error.message : String(error),

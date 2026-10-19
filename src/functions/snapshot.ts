@@ -1,3 +1,5 @@
+import { observeWorkflowTerminal, markWorkflowStatisticsGap } from "./dashboard-activity.js";
+import { getAgentId } from "../config.js";
 import type { IIIClient } from "iii-sdk";
 import { BatchMaintenanceBusyError, withBatchMutationLocks, preserveBatchProvenance } from "../state/batch-effects.js";
 import { execFile, spawn } from "node:child_process";
@@ -10,7 +12,7 @@ import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createGzip } from "node:zlib";
 import { join } from "node:path";
-import type { SnapshotMeta } from "../types.js";
+import type { SnapshotMeta, WorkflowTerminalReceipt } from "../types.js";
 import { KV, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
@@ -61,11 +63,16 @@ function byteLimit(limit: number): Transform {
 }
 
 // The exclusive manifest is also the cross-process writer lock. Unknown prior jobs require explicit recovery.
-async function withSnapshotTemporary<T>(dir: string, purpose: "publish" | "restore", run: (path: string, manifest: (phase: string) => Promise<void>) => Promise<T>): Promise<T> {
+async function withSnapshotTemporary<T>(dir: string, purpose: "publish" | "restore", run: (path: string, manifest: (phase: string) => Promise<void>, execution: { id: string; startedAt: string }) => Promise<T>): Promise<T> {
   const owner = randomUUID();
   const temporary = `.state-${owner}.tmp`;
   const manifestPath = join(dir, ".state-snapshot.manifest.json");
-  const manifest = await open(manifestPath, "wx");
+  let manifest: FileHandle;
+  try { manifest = await open(manifestPath, "wx"); }
+  catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "EEXIST") throw new Error("STATE_SNAPSHOT_MANIFEST_RECOVERY_REQUIRED");
+    throw error;
+  }
   const path = join(dir, temporary);
   let phase = "opened";
   const update = async (next: string) => {
@@ -90,18 +97,20 @@ async function withSnapshotTemporary<T>(dir: string, purpose: "publish" | "resto
     const temporaryHandle = await open(path, "wx");
     ownsTemporary = true;
     await temporaryHandle.close();
-    return await run(path, update);
+    return await run(path, update, { id: owner, startedAt: createdAt });
   } catch (error) { failure = error; throw error; }
   finally {
     try {
       if (ownsTemporary) await rm(path, { force: true });
-      await update("closed");
-      await manifest.close();
       await rm(manifestPath);
+      await manifest.close();
     } catch (cleanup) {
-      await manifest.close().catch(() => undefined);
-      if (failure !== undefined) throw new AggregateError([failure, cleanup], "STATE_SNAPSHOT_CLEANUP_PENDING");
-      throw cleanup;
+      const causes = failure === undefined ? [cleanup] : [failure, cleanup];
+      // After publishing closed, this owner must never unlink the shared manifest path again.
+      // A successor can then safely collect the exact closed owner's temporary.
+      try { await update("closed"); } catch (closureError) { causes.push(closureError); }
+      try { await manifest.close(); } catch (closeError) { causes.push(closeError); }
+      throw new AggregateError(causes, "STATE_SNAPSHOT_CLEANUP_PENDING");
     }
   }
 }
@@ -157,6 +166,16 @@ export function registerSnapshotFunction(sdk: IIIClient, kv: StateKV, snapshotDi
   sdk.registerFunction("mem::snapshot-create", async (data?: { message?: string }) => {
     if (snapshotInFlight) return { success: true, message: "Snapshot already in progress" };
     snapshotInFlight = true;
+    let snapshotExecution: { id: string; startedAt: string } | undefined;
+    let snapshotTerminal: WorkflowTerminalReceipt | undefined;
+    const recordSnapshotTerminal = async (outcome: "completed" | "failed") => {
+      if (!snapshotExecution) { await markWorkflowStatisticsGap(kv, "snapshots"); return; }
+      snapshotTerminal ??= { executionId: snapshotExecution.id, agentId: getAgentId(), occurredAt: new Date().toISOString(), outcome };
+      try {
+        await kv.set(KV.state, `workflow-snapshot:${snapshotExecution.id}`, snapshotTerminal);
+        await observeWorkflowTerminal(kv, { ...snapshotTerminal, workflow: "snapshots", producer: "snapshot-publication", executionLevel: "workflow" });
+      } catch { await markWorkflowStatisticsGap(kv, "snapshots"); }
+    };
     try {
       mkdirSync(snapshotDir, { recursive: true });
       await ensureGitRepo(snapshotDir);
@@ -164,7 +183,8 @@ export function registerSnapshotFunction(sdk: IIIClient, kv: StateKV, snapshotDi
         throw new Error("STATE_SNAPSHOT_PRIOR_PUBLICATION_RECOVERY_REQUIRED");
       }
       const stats: SnapshotStats = { sessions: 0, memories: 0, observations: 0, graphNodes: 0 };
-      return await withSnapshotTemporary(snapshotDir, "publish", async (path, manifest) => {
+      return await withSnapshotTemporary(snapshotDir, "publish", async (path, manifest, execution) => {
+      snapshotExecution = execution;
       const ts = await publishSnapshot(kv, snapshotDir, stats, path, manifest);
       await gitExec(snapshotDir, ["add", "--", "state.json"]);
       const message = data?.message || `Snapshot ${ts}`;
@@ -174,9 +194,10 @@ export function registerSnapshotFunction(sdk: IIIClient, kv: StateKV, snapshotDi
       const meta: SnapshotMeta = { id: generateId("snap"), commitHash, createdAt: ts, message, stats };
       await recordAudit(kv, "export", "mem::snapshot-create", [meta.id], { commitHash, stats });
       await manifest("committed");
+      await recordSnapshotTerminal("completed");
       return { success: true, snapshot: meta };
       });
-    } catch (error) { return snapshotFailure(error); }
+    } catch (error) { await recordSnapshotTerminal("failed"); return snapshotFailure(error); }
     finally { snapshotInFlight = false; }
   });
   sdk.registerFunction("mem::snapshot-list", async () => {
@@ -195,6 +216,16 @@ export function registerSnapshotFunction(sdk: IIIClient, kv: StateKV, snapshotDi
     if (!data || typeof data.commitHash !== "string" || !COMMIT_HASH_RE.test(data.commitHash)) return { success: false, error: "Invalid commitHash format" };
     if (snapshotInFlight) return { success: false, deferred: true, error: "Snapshot already in progress" };
     snapshotInFlight = true;
+    let snapshotExecution: { id: string; startedAt: string } | undefined;
+    let snapshotTerminal: WorkflowTerminalReceipt | undefined;
+    const recordSnapshotTerminal = async (outcome: "completed" | "failed") => {
+      if (!snapshotExecution) { await markWorkflowStatisticsGap(kv, "snapshots"); return; }
+      snapshotTerminal ??= { executionId: snapshotExecution.id, agentId: getAgentId(), occurredAt: new Date().toISOString(), outcome };
+      try {
+        await kv.set(KV.state, `workflow-snapshot:${snapshotExecution.id}`, snapshotTerminal);
+        await observeWorkflowTerminal(kv, { ...snapshotTerminal, workflow: "snapshots", producer: "snapshot-publication", executionLevel: "workflow" });
+      } catch { await markWorkflowStatisticsGap(kv, "snapshots"); }
+    };
     try {
       return await withSnapshotTemporary(snapshotDir, "restore", async (path, manifest) => {
         await extractCommit(snapshotDir, data.commitHash, path);
@@ -218,11 +249,14 @@ export function registerSnapshotFunction(sdk: IIIClient, kv: StateKV, snapshotDi
           return { success: true, commitHash: data.commitHash };
         });
       });
-    } catch (error) { return snapshotFailure(error); }
+    } catch (error) { await recordSnapshotTerminal("failed"); return snapshotFailure(error); }
     finally { snapshotInFlight = false; }
   });
 }
 function snapshotFailure(error: unknown) {
+  if (error instanceof Error && error.message === "STATE_SNAPSHOT_MANIFEST_RECOVERY_REQUIRED") {
+    return { success: false, deferred: true, retryable: false, code: error.message, error: "Snapshot ownership manifest requires explicit recovery" };
+  }
   if (error instanceof BatchMaintenanceBusyError) {
     return { success: false, deferred: true, retryable: true, code: error.code, error: error.message, details: error.details };
   }
@@ -231,10 +265,14 @@ function snapshotFailure(error: unknown) {
   return { success: false, error: message };
 }
 
-export async function collectClosedSnapshotTemporary(kv: StateKV, dir: string, closedOwner: string): Promise<{ collected: boolean; reason: string }> {
-  return withKeyedLock(join(dir, ".state-snapshot.manifest.json"), () => collectOwnedTemporary(kv, dir, closedOwner));
+export async function collectClosedSnapshotTemporary(kv: StateKV, dir: string, closedOwner: string,
+  assertMaintenanceOwnership: () => Promise<void>): Promise<{ collected: boolean; reason: string; manifestRetained?: boolean }> {
+  if (typeof assertMaintenanceOwnership !== "function") throw new Error("STATE_SNAPSHOT_MAINTENANCE_OWNER_REQUIRED");
+  return withKeyedLock(join(dir, ".state-snapshot.manifest.json"), () => collectOwnedTemporary(kv, dir, closedOwner, assertMaintenanceOwnership));
 }
-async function collectOwnedTemporary(kv: StateKV, dir: string, closedOwner: string): Promise<{ collected: boolean; reason: string }> {
+async function collectOwnedTemporary(kv: StateKV, dir: string, closedOwner: string,
+  assertMaintenanceOwnership: () => Promise<void>): Promise<{ collected: boolean; reason: string; manifestRetained?: boolean }> {
+  await assertMaintenanceOwnership();
   if (!/^[0-9a-f-]{36}$/.test(closedOwner)) throw new Error("STATE_SNAPSHOT_INVALID_OWNER");
   if (!await cleanupAuthorized(kv)) return { collected: false, reason: "cleanup_not_authorized" };
   const manifestPath = join(dir, ".state-snapshot.manifest.json");
@@ -253,11 +291,17 @@ async function collectOwnedTemporary(kv: StateKV, dir: string, closedOwner: stri
   const row = manifest as Record<string, unknown>;
   if (row.version !== 1 || row.owner !== closedOwner || row.temporary !== `.state-${closedOwner}.tmp`
     || !["publish", "restore"].includes(String(row.purpose))) throw new Error("STATE_SNAPSHOT_INVALID_MANIFEST");
-  // closedOwner must be supplied only after the owner has been stopped/fenced by the authorized operator.
+  if (row.phase !== "closed") return { collected: false, reason: "owner_closure_not_recorded", manifestRetained: true };
   const decision = retentionEligibility("viewer", { origin: row.createdAt, dependenciesClosed: true });
-  if (!decision.eligible) return { collected: false, reason: decision.reason };
+  if (!decision.eligible) return { collected: false, reason: decision.reason, manifestRetained: true };
   const temporaryPath = join(dir, row.temporary as string);
-  await rm(temporaryPath, { force: true });
-  await rm(manifestPath);
-  return { collected: true, reason: "closed_owned_temporary" };
+  await assertMaintenanceOwnership();
+  try { await rm(temporaryPath); }
+  catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return { collected: false, reason: "already_collected_manifest_recovery_required", manifestRetained: true };
+    }
+    throw error;
+  }
+  return { collected: true, reason: "closed_owned_temporary_manifest_recovery_required", manifestRetained: true };
 }

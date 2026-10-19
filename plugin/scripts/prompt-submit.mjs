@@ -75,5 +75,3 @@ async function main() {
 main().catch(() => process.exit(0));
 //#endregion
 export {};
-
-//# sourceMappingURL=prompt-submit.mjs.map

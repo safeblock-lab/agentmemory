@@ -12,7 +12,7 @@ import { getLatestHealth } from "../health/monitor.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import type { ResilientProvider } from "../providers/resilient.js";
 import { III_PINNED_VERSION, VERSION } from "../version.js";
-import { CONSOLIDATION_COUNTS_REUSE_MS, CONSOLIDATION_LAST_RUN_KEY, describeConsolidation, type ConsolidationRunRecord } from "../functions/consolidation-status.js";
+import { CONSOLIDATION_COUNTS_REUSE_MS, CONSOLIDATION_LAST_RUN_KEY, describeConsolidation, describeConsolidationPreview, type ConsolidationRunRecord } from "../functions/consolidation-status.js";
 import { readConsolidationCounts } from "./consolidation-counts.js";
 import { UNINDEXED_SCAN_REUSE_MS, evaluateStatus, prefersHtml, renderStatusHtml, singleFlight, type GraphStatsInput } from "../functions/status.js";
 import { IndexedRetrievalError, readNativeIndexStatus } from "../state/indexed-retrieval.js";
@@ -40,6 +40,7 @@ import { buildScopedGraph, graphBuildHttpStatus, MAX_GRAPH_BUILD_CONTINUATION_BY
 import { collectProjectedRecords } from "../functions/projected-record-reader.js";
 import { viewerMemories, viewerPage, viewerRecentPage, viewerPageOptions, VIEWER_SESSION_FIELDS, VIEWER_OBSERVATION_FIELDS } from "../functions/viewer-memory-page.js";
 import { StatePageError } from "../state/state-pages.js";
+import { graphAutomaticAvailability } from "../functions/graph-automatic-authority.js";
 import {
   isGraphExtractionEnabled,
   isConsolidationEnabled,
@@ -314,6 +315,7 @@ export function registerApiTriggers(
           version: VERSION,
           provider: providerKind,
           embeddingProvider,
+          graphAutomaticAvailability: graphAutomaticAvailability(),
           flags,
         },
       };
@@ -399,6 +401,19 @@ export function registerApiTriggers(
     }
   }
 
+  const pendingStatusReads = new Map<string, Promise<unknown>>();
+  function coalescePendingStatusRead<T>(key: string, run: () => Promise<T>): Promise<T> {
+    const pending = pendingStatusReads.get(key);
+    if (pending) return pending as Promise<T>;
+    const work = Promise.resolve().then(run);
+    pendingStatusReads.set(key, work);
+    const clear = () => {
+      if (pendingStatusReads.get(key) === work) pendingStatusReads.delete(key);
+    };
+    void work.then(clear, clear);
+    return work;
+  }
+
   const activity = createDashboardActivity(kv);
   const engineMemory = createEngineMemoryReader({ getEngineUrl: () => loadConfig().engineUrl });
   const operationalMetrics = createDashboardOperationalMetrics(kv, engineMemory);
@@ -409,24 +424,69 @@ export function registerApiTriggers(
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
       const checkedAt = new Date();
+      const config = loadConfig();
+      const isolatedAgentScope = isAgentScopeIsolated();
+      const activityAgentId = isolatedAgentScope ? getAgentId() : undefined;
+      const statusScopeKey = JSON.stringify({
+        engineUrl: config.engineUrl,
+        dataDir: config.dataDir,
+        isolatedAgentId: isolatedAgentScope ? activityAgentId ?? null : null,
+        graphExtractionEnabled: isGraphExtractionEnabled(),
+        contextInjectionEnabled: isContextInjectionEnabled(),
+      });
+      const nativeProvider = kv.indexedRetrieval ? getEmbeddingProvider() : null;
       const idx = kv.indexedRetrieval ? null : getSearchIndex();
       const automaticMaintenancePaused = isBackgroundRecoveryPaused()
         && getEnvVar("AGENTMEMORY_STORAGE_MAINTENANCE_WHILE_PAUSED") !== "1";
-      const [health, functionMetrics, graph, native, unindexed, recentActivity, operational] = await Promise.all([
-        valueWithin(getLatestHealth(kv), STATUS_CHECK_TIMEOUT_MS),
-        metricsStore ? valueWithin(metricsStore.getAll(), STATUS_CHECK_TIMEOUT_MS) : Promise.resolve([]),
+      const functionMetricsWork = metricsStore
+        ? valueWithin(coalescePendingStatusRead(
+            JSON.stringify(["functions", statusScopeKey]),
+            () => metricsStore.getAll(),
+          ), STATUS_CHECK_TIMEOUT_MS)
+        : Promise.resolve([]);
+      const savingsWork = valueWithin(functionMetricsWork.then(metrics => {
+        const savingsMetrics = metrics ?? [];
+        return coalescePendingStatusRead(
+          JSON.stringify(["savings", statusScopeKey, JSON.stringify(savingsMetrics)]),
+          () => readSavingsReport(kv, savingsMetrics),
+        );
+      }), 6000);
+      const [health, functionMetrics, graph, native, unindexed, recentActivity, operational, savings] = await Promise.all([
+        valueWithin(coalescePendingStatusRead(
+          JSON.stringify(["health", statusScopeKey]),
+          () => getLatestHealth(kv),
+        ), STATUS_CHECK_TIMEOUT_MS),
+        functionMetricsWork,
         valueWithin(
-          sdk.trigger({ function_id: "mem::graph-stats", payload: {} }) as Promise<GraphStatsInput>,
+          coalescePendingStatusRead(
+            JSON.stringify(["graph", statusScopeKey]),
+            () => sdk.trigger({ function_id: "mem::graph-stats", payload: {} }) as Promise<GraphStatsInput>,
+          ),
           STATUS_CHECK_TIMEOUT_MS,
         ),
-        kv.indexedRetrieval ? valueWithin(readNativeIndexStatus(kv, getEmbeddingProvider()), STATUS_CHECK_TIMEOUT_MS) : Promise.resolve(null),
+        kv.indexedRetrieval ? valueWithin(coalescePendingStatusRead(
+          JSON.stringify(["index", statusScopeKey, nativeProvider?.name ?? null, nativeProvider?.dimensions ?? null]),
+          () => readNativeIndexStatus(kv, nativeProvider),
+        ), STATUS_CHECK_TIMEOUT_MS) : Promise.resolve(null),
         kv.indexedRetrieval ? Promise.resolve(null) : valueWithin(sharedUnindexedScan(), STATUS_CHECK_TIMEOUT_MS),
-        valueWithin(activity.snapshot(isAgentScopeIsolated() ? getAgentId() : undefined), STATUS_CHECK_TIMEOUT_MS),
-        valueWithin(operationalMetrics.read(
-          checkedAt, automaticMaintenancePaused, getAgentId(),
+        valueWithin(coalescePendingStatusRead(
+          JSON.stringify(["activity", statusScopeKey, activityAgentId ?? null]),
+          () => activity.snapshot(activityAgentId),
         ), STATUS_CHECK_TIMEOUT_MS),
+        valueWithin(operationalMetrics.read(
+          checkedAt, automaticMaintenancePaused, getAgentId(), activityAgentId ?? null,
+        ), STATUS_CHECK_TIMEOUT_MS),
+        savingsWork,
       ]);
-      const savings = await valueWithin(readSavingsReport(kv, functionMetrics ?? []), 6000);
+      const unavailableComponents = [
+        ...(health === null ? ["health"] : []),
+        ...(functionMetrics === null ? ["functions"] : []),
+        ...(graph === null ? ["graph"] : []),
+        ...((kv.indexedRetrieval ? native : unindexed) === null ? ["index"] : []),
+        ...(recentActivity === null ? ["activity"] : []),
+        ...(operational === null ? ["operationalMetrics"] : []),
+        ...(savings === null ? ["savings"] : []),
+      ];
       const observationsIndexed = idx ? [...idx.observationCountsBySession().values()].reduce((a, n) => a + n, 0) : null;
       const circuit =
         provider && "circuitState" in provider
@@ -437,7 +497,7 @@ export function registerApiTriggers(
         providerAvailable: Boolean(provider), providerCircuitOpen: circuit?.state === "open",
         nativeAvailable: kv.indexedRetrieval ? native !== null && native !== undefined : false,
         slotsAvailable: isSlotsEnabled(),
-        activity: recentActivity,
+        activity: recentActivity, statistics: operational.workflowStatistics,
         configured: {
           graph: isGraphExtractionEnabled(), consolidation: isConsolidationEnabled(), compression: isAutoCompressEnabled(),
           reflection: isReflectEnabled(), snapshots: loadSnapshotConfig().enabled, maintenance: !automaticMaintenancePaused,
@@ -498,7 +558,7 @@ export function registerApiTriggers(
           body: renderStatusHtml(report, nonce),
         };
       }
-      return { status_code: 200, headers: { "Cache-Control": "no-store" }, body: report };
+        return { status_code: 200, headers: { "Cache-Control": "no-store" }, body: { ...report, unavailableComponents } };
     },
   );
   sdk.registerTrigger({
@@ -882,6 +942,11 @@ export function registerApiTriggers(
           body: { error: "sessionId is required and must be a non-empty string" },
         };
       }
+      const existingSession = await kv.get<Session>(KV.sessions, sessionId);
+      if (!existingSession) return { status_code: 404, body: { success: false, error: "session_not_found" } };
+      if (existingSession.id !== sessionId || typeof existingSession.project !== "string" || !existingSession.project.trim()) {
+        return { status_code: 409, body: { success: false, error: "session_identity_invalid" } };
+      }
       const endedAt = new Date().toISOString();
       try {
         const existingIntent = await kv.get<{
@@ -1133,7 +1198,8 @@ export function registerApiTriggers(
           return { status_code: 200, body: { sessions: items, ...metadata } };
         }
         const page = await viewerPage(kv, KV.sessions, query, VIEWER_SESSION_FIELDS);
-        return { status_code: 200, body: { sessions: page.items, partial: page.partial, nextCursor: page.nextCursor, total: page.partial ? null : page.items.length } };
+        return { status_code: 200, body: { sessions: page.items, partial: page.partial, nextCursor: page.nextCursor,
+          total: null, returnedCount: page.items.length, countScope: "all_sessions", countCoverage: "unavailable", countRevision: null, countGeneration: null } };
       } catch (error) {
         if (error instanceof StatePageError && error.code === "STATE_PAGE_CURSOR_STALE" || error instanceof IndexedRetrievalError && error.code === "STATE_RECENT_CURSOR_STALE") {
           return { status_code: 409, body: { error: "viewer_cursor_stale", restartRequired: true } };
@@ -1929,7 +1995,7 @@ export function registerApiTriggers(
         };
       }
       try {
-        const result = await sdk.trigger({ function_id: "mem::graph-extract", payload: req.body });
+        const result = await sdk.trigger({ function_id: "mem::graph-extract", payload: { observations: req.body.observations } });
         return { status_code: 200, body: result };
       } catch {
         return graphDisabledResponse();
@@ -2289,6 +2355,13 @@ export function registerApiTriggers(
     async (req: HttpRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
+      const preview = req.query_params?.preview;
+      if (preview !== undefined && preview !== "true" && preview !== "false") return { status_code: 400, body: { error: "invalid preview" } };
+      if (preview === "true") {
+        const items: unknown[] = [];
+        for await (const page of kv.pages(KV.semantic, { limit: 5, maxBytes: 65_536, fields: ["id", "fact", "category", "confidence", "createdAt", "updatedAt"] })) { items.push(...page.items); break; }
+        return { status_code: 200, body: { semantic: items, preview: true, partial: true, total: null } };
+      }
       const semantic = await kv.list<import("../types.js").SemanticMemory>(KV.semantic);
       return { status_code: 200, body: { semantic } };
     },
@@ -2303,6 +2376,13 @@ export function registerApiTriggers(
     async (req: HttpRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
+      const preview = req.query_params?.preview;
+      if (preview !== undefined && preview !== "true" && preview !== "false") return { status_code: 400, body: { error: "invalid preview" } };
+      if (preview === "true") {
+        const items: unknown[] = [];
+        for await (const page of kv.pages(KV.procedural, { limit: 5, maxBytes: 65_536, fields: ["id", "name", "title", "steps", "updatedAt"] })) { items.push(...page.items); break; }
+        return { status_code: 200, body: { procedural: items, preview: true, partial: true, total: null } };
+      }
       const procedural = await kv.list<import("../types.js").ProceduralMemory>(KV.procedural);
       return { status_code: 200, body: { procedural } };
     },
@@ -2322,6 +2402,13 @@ export function registerApiTriggers(
     async (req: HttpRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
+      const preview = req.query_params?.preview;
+      if (preview !== undefined && preview !== "true" && preview !== "false") return { status_code: 400, body: { error: "invalid preview" } };
+      if (preview === "true") {
+        const lastRun = await kv.get<ConsolidationRunRecord>(KV.config, CONSOLIDATION_LAST_RUN_KEY).catch(() => null);
+        return { status_code: 200, body: describeConsolidationPreview({ now: new Date(), enabled: isConsolidationEnabled(),
+          llmConfigured: detectLlmProviderKind() === "llm", lastRun }) };
+      }
       const [counts, lastRun] = await Promise.all([
         sharedConsolidationCounts(),
         kv.get<ConsolidationRunRecord>(KV.config, CONSOLIDATION_LAST_RUN_KEY).catch(() => null),
@@ -2348,6 +2435,13 @@ export function registerApiTriggers(
     async (req: HttpRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
+      const preview = req.query_params?.preview;
+      if (preview !== undefined && preview !== "true" && preview !== "false") return { status_code: 400, body: { error: "invalid preview" } };
+      if (preview === "true") {
+        const items: unknown[] = [];
+        for await (const page of kv.pages(KV.relations, { limit: 5, maxBytes: 65_536, fields: ["id", "sourceId", "targetId", "type"] })) { items.push(...page.items); break; }
+        return { status_code: 200, body: { relations: items, preview: true, partial: true, total: null } };
+      }
       const relations = await kv.list<import("../types.js").MemoryRelation>(KV.relations);
       return { status_code: 200, body: { relations } };
     },
@@ -3494,6 +3588,25 @@ export function registerApiTriggers(
     const denied = checkAuth(req, secret);
     if (denied) return denied;
     const params = req.query_params || {};
+    if (params.preview !== undefined && params.preview !== "true" && params.preview !== "false") {
+      return { status_code: 400, body: { error: "invalid preview" } };
+    }
+    if (params.preview === "true") {
+      if (Object.keys(params).some(key => key !== "preview")) {
+        return { status_code: 400, body: { error: "invalid lesson preview parameter" } };
+      }
+      const lessons: Array<{ id: string; content?: string; confidence?: number; project?: string;
+        source?: string; createdAt?: string; updatedAt?: string; deleted?: boolean }> = [];
+      for await (const page of kv.pages<(typeof lessons)[number]>(KV.lessons, {
+        limit: 5, maxBytes: 65_536,
+        fields: ["id", "content", "confidence", "project", "source", "createdAt", "updatedAt", "deleted"],
+      })) {
+        lessons.push(...page.items.filter(lesson => lesson.deleted !== true));
+        break;
+      }
+      return { status_code: 200, body: { success: true, lessons, returnedCount: lessons.length,
+        preview: true, partial: true, total: null } };
+    }
     const minConfidence = parseOptionalFiniteNumber(params.minConfidence);
     if (minConfidence === null) {
       return {
@@ -3637,8 +3750,15 @@ export function registerApiTriggers(
     const body = req.body && typeof req.body === "object" && !Array.isArray(req.body)
       ? req.body as Record<string, unknown> : {};
     const action = typeof body.action === "string" ? body.action : "status";
-    if (!["status", "diagnostics", "activate", "run", "reclaim", "migrate_incremental", "graph_metadata_prepare"].includes(action)) {
-      return { status_code: 400, body: { error: "action must be status, diagnostics, activate, run, reclaim, migrate_incremental, or graph_metadata_prepare" } };
+    if (!["status", "diagnostics", "activate", "run", "reclaim", "migrate_incremental", "graph_metadata_prepare", "collect_snapshot_temporary"].includes(action)) {
+      return { status_code: 400, body: { error: "action must be status, diagnostics, activate, run, reclaim, migrate_incremental, graph_metadata_prepare, or collect_snapshot_temporary" } };
+    }
+    if (action === "collect_snapshot_temporary") {
+      if (typeof body.closed_owner_id !== "string" || !/^[0-9a-f-]{36}$/.test(body.closed_owner_id)) {
+        return { status_code: 400, body: { error: "collect_snapshot_temporary requires closed_owner_id" } };
+      }
+      const result = await sdk.trigger({ function_id: "mem::storage-maintenance", payload: { action, closed_owner_id: body.closed_owner_id } });
+      return { status_code: 200, body: result };
     }
     if (action === "graph_metadata_prepare") {
       const limit = body.limit === undefined ? 256 : body.limit;

@@ -1,3 +1,4 @@
+import type { WorkflowTerminalReceipt } from "../types.js";
 import type { CompressedObservation } from "../types.js";
 import type { GraphWorkCursor } from "./graph-work-groups.js";
 import { parseReflectionResult } from "./reflect-result.js";
@@ -24,9 +25,11 @@ export interface ReflectJudgeDisposition extends PublicationJudgeDisposition {
 export function validReflectJudgeDisposition(value: unknown): value is ReflectJudgeDisposition {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const row = value as Record<string, unknown>;
-  return Object.keys(row).length === 5 && validReflectPublicationReplay(row.unit)
+  const hasMigration = Object.hasOwn(row, "migration");
+  return Object.keys(row).length === (hasMigration ? 6 : 5) && validReflectPublicationReplay(row.unit)
     && validReflectText(row.dispositionId) && validReflectText(row.captureFingerprint)
-    && validPublicationJudgeDisposition({ dispositionId: row.dispositionId, checkpoint: row.checkpoint, budget: row.budget });
+    && validPublicationJudgeDisposition({ dispositionId: row.dispositionId, checkpoint: row.checkpoint, budget: row.budget,
+      ...(hasMigration ? { migration: row.migration } : {}) });
 }
 export function validReflectPublicationReplay(value: unknown): value is ReflectPublicationReplay {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -85,6 +88,7 @@ export interface ReflectEmptyEvidence {
 export type ReflectStatus = "pending" | "blocked" | "waiting_index" | "waiting_graph" | "waiting_scope" |
   "waiting_budget" | "waiting_batch" | "completed" | "partial" | "failed";
 export interface ReflectJob {
+  workflowTerminal?: WorkflowTerminalReceipt;
   id: string; request: ReflectRequest; project?: string; seeds: string[];
   executionOrigin?: "selected" | "manual"; selectedSessionId?: string;
   manual?: { cuts: number; startedAt: number };

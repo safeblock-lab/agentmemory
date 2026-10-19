@@ -1390,6 +1390,9 @@
     }
 
     async function api(path, opts) {
+      var readTimer = null;
+      var callerSignal = opts && opts.signal;
+      var cancelRead = null;
       try {
         var url = REST + '/agentmemory/' + path;
         var headers = Object.assign({ 'Cache-Control': 'no-cache' }, (opts && opts.headers) || {});
@@ -1400,7 +1403,24 @@
         var fetchOpts = Object.assign({}, opts || {}, { headers: headers });
         var readErrorBody = fetchOpts.readErrorBody;
         delete fetchOpts.readErrorBody;
-        var res = await fetch(url, fetchOpts);
+        var isRead = /^(GET|HEAD)$/i.test(fetchOpts.method || 'GET');
+        var readController = isRead ? new AbortController() : null;
+        var deadline = isRead ? new Promise(function(_, reject) {
+          cancelRead = function() {
+            readController.abort();
+            reject(new Error('Read cancelled'));
+          };
+          readTimer = setTimeout(function() {
+            readController.abort();
+            reject(new Error('Read timed out after 12 seconds'));
+          }, 12000);
+          if (callerSignal) {
+            callerSignal.addEventListener('abort', cancelRead, { once: true });
+            if (callerSignal.aborted) cancelRead();
+          }
+        }) : null;
+        if (readController) fetchOpts.signal = readController.signal;
+        var res = await (deadline ? Promise.race([fetch(url, fetchOpts), deadline]) : fetch(url, fetchOpts));
         if (!res.ok) {
           if (res.status === 401) showViewerAuthPrompt();
           console.warn('[viewer] API ' + (fetchOpts.method || 'GET') + ' ' + path + ' returned ' + res.status);
@@ -1411,17 +1431,21 @@
           // (see #1019), and the dashboard badge needs that body.
           if (!readErrorBody) return null;
           try {
-            return await res.json();
+            return await (deadline ? Promise.race([res.json(), deadline]) : res.json());
           } catch (parseErr) {
             console.debug('[viewer] API ' + path + ' non-2xx body was not JSON:', parseErr);
             return null;
           }
         }
+        var body = await (deadline ? Promise.race([res.json(), deadline]) : res.json());
         hideViewerAuthPrompt();
-        return await res.json();
+        return body;
       } catch (err) {
         console.warn('[viewer] API error on ' + path + ':', err);
         return null;
+      } finally {
+        if (readTimer !== null) clearTimeout(readTimer);
+        if (callerSignal && cancelRead) callerSignal.removeEventListener('abort', cancelRead);
       }
     }
     async function apiGet(path) { return api(path); }
@@ -1552,29 +1576,85 @@
     }
 
     var viewerStatusPending = null;
+    var statusSections = {};
+    var STATUS_SECTION_LABELS = { service: 'Service', health: 'Health', provider: 'Provider', index: 'Search index', graph: 'Graph', functions: 'Functions', activity: 'Recent operations', operationalMetrics: 'Workflows and processing', savings: 'Savings' };
+
+    function statusSectionError(key) {
+      return statusSections[key] && statusSections[key].error;
+    }
+
+    function statusSectionNotice(key) {
+      var section = statusSections[key];
+      if (!section || !section.error) return '';
+      var age = section.receivedAt ? Math.max(0, Math.floor((Date.now() - section.receivedAt) / 1000)) : null;
+      var text = STATUS_SECTION_LABELS[key] + ': ';
+      text += section.error + (age !== null ? ' Showing retained data.' : ' No valid sample yet.');
+      if (age !== null) text += ' ' + age + 's since receipt; sampled ' + (section.checkedAt || 'at unknown time') + '.';
+      return '<p role="status" style="font-size:12px;color:var(--ink-muted);overflow-wrap:anywhere;">' + esc(text) + '</p>';
+    }
+
+    function statusSectionNotices() {
+      return Object.keys(STATUS_SECTION_LABELS).map(statusSectionNotice).join('');
+    }
+
+    function retainStatusSections(report) {
+      var previous = state.health.report || {};
+      var merged = Object.assign({}, previous, report || {});
+      var unavailable = report && Array.isArray(report.unavailableComponents) ? report.unavailableComponents : [];
+      Object.keys(STATUS_SECTION_LABELS).forEach(function(key) {
+        var value = report && report[key];
+        var valid = key === 'functions' ? Array.isArray(value) : value && typeof value === 'object' && !Array.isArray(value);
+        if (key === 'activity') valid = valid && value.source === 'native-operation-feed' && Array.isArray(value.items);
+        if (key === 'health') valid = valid && typeof value.status === 'string';
+        if (key === 'graph') valid = valid && (graphCountAvailable(value.totalNodes) || graphCountAvailable(value.totalEdges) || value.coverage);
+        var section = statusSections[key] || { receivedAt: null, checkedAt: null };
+        var partial = false;
+        if (valid && (key === 'index' || key === 'graph')) {
+          value = Object.assign({}, value);
+          Object.keys(previous[key] || {}).forEach(function(field) {
+            if ((value[field] === null || value[field] === undefined) && previous[key][field] !== null && previous[key][field] !== undefined) {
+              value[field] = previous[key][field];
+              partial = true;
+            }
+          });
+        }
+        if (valid && unavailable.indexOf(key) < 0 && !partial) {
+          merged[key] = value;
+          section = { receivedAt: Date.now(), checkedAt: typeof report.checkedAt === 'string' ? report.checkedAt : null, error: null };
+        } else {
+          merged[key] = partial ? value : previous[key] || null;
+          section.error = report ? 'Current section could not fully refresh.' : 'Current status request failed or timed out.';
+        }
+        statusSections[key] = section;
+      });
+      return merged;
+    }
     var viewerStatusRefreshTimer = null;
     function scheduleViewerStatusRefresh() {
       if (viewerStatusRefreshTimer) return;
+      var delay = state.dashboard.statusPartial || state.health.error ? STALE_RETRY_MS : DASHBOARD_RELOAD_COALESCE_MS;
       viewerStatusRefreshTimer = setTimeout(async function() {
         viewerStatusRefreshTimer = null;
         if (state.activeTab !== 'dashboard' && state.activeTab !== 'health') return;
         await loadViewerStatus();
         if (state.activeTab === 'dashboard' && state.dashboard.loaded) renderDashboard();
         if (state.activeTab === 'health') renderHealth();
-      }, DASHBOARD_RELOAD_COALESCE_MS);
+      }, delay);
     }
 
     function loadViewerStatus() {
       if (viewerStatusPending) return viewerStatusPending;
       viewerStatusPending = api('status', { headers: { Accept: 'application/json' } }).then(function(report) {
-        var valid = report && Array.isArray(report.problems) && report.service && report.index;
+        var valid = report && Array.isArray(report.problems);
         var error = valid ? null : 'The status check did not answer. The server may be restarting.';
+        var merged = retainStatusSections(valid ? report : null);
         state.health.error = error;
         state.dashboard.statusError = error;
-        if (valid) {
-          state.health.report = report;
-          state.dashboard.status = report;
+        if (valid || state.health.report) {
+          state.health.report = merged;
+          state.dashboard.status = merged;
         }
+        state.dashboard.statusPartial = Object.keys(STATUS_SECTION_LABELS).some(statusSectionError);
         return valid ? report : null;
       }).finally(function() { viewerStatusPending = null; });
       return viewerStatusPending;
@@ -1633,26 +1713,35 @@
           recentViewerPage('sessions'),
           apiGet('memories?latest=true&count=true'),
           loadViewerStatus(),
-          apiGet('semantic'),
-          apiGet('procedural'),
-          apiGet('relations'),
-          apiGet('lessons'),
+          apiGet('semantic?preview=true'),
+          apiGet('procedural?preview=true'),
+          apiGet('relations?preview=true'),
+          apiGet('lessons?preview=true'),
           apiGet('crystals'),
-          apiGet('consolidation/status')
+          apiGet('consolidation/status?preview=true')
         ]);
         var sessionsOk = !!(results[1] && Array.isArray(results[1].sessions));
         d.sessionsUnavailable = !sessionsOk;
         d.sessionsNotice = sessionsOk ? '' : dashboardRecentNotice(results[0], recentHistoryStates.sessions);
-        d.stale = !sessionsOk || results.some(function(r) { return r === null; });
+        d.stale = !sessionsOk || d.statusPartial || results.some(function(r) { return r === null; });
         if (d.stale) scheduleStaleRetry();
-        if (!sessionsOk && !d.loaded) {
-          el.innerHTML =
-            '<div class="loading" role="status" style="color:var(--accent);">' + esc(d.sessionsNotice) + '<br><br>' +
-            '<button class="btn btn-primary" data-action="refresh-dashboard">Retry</button></div>';
-          return;
+        d.sessionsKnown = d.sessionsKnown || sessionsOk;
+        var lessonsOk = !!(results[7] && Array.isArray(results[7].lessons));
+        d.lessonsKnown = d.lessonsKnown || lessonsOk;
+        d.lessonsUnavailable = !lessonsOk;
+        if (lessonsOk) {
+          d.lessonsTotal = Number.isSafeInteger(results[7].total) && results[7].total >= 0 ? results[7].total : null;
+          d.lessonsPreview = results[7].preview === true || results[7].partial === true;
         }
+        d.crystalsKnown = d.crystalsKnown || !!(results[8] && Array.isArray(results[8].crystals));
+        d.semanticKnown = d.semanticKnown || !!(results[4] && (Array.isArray(results[4].facts) || Array.isArray(results[4].semantic)));
+        d.proceduralKnown = d.proceduralKnown || !!(results[5] && (Array.isArray(results[5].procedures) || Array.isArray(results[5].procedural)));
+        d.healthError = !results[0];
         if (results[0]) d.health = results[0];
-        if (sessionsOk) d.sessions = replaySessionEvents(results[1].sessions, seqAtStart);
+        if (sessionsOk) {
+          d.sessions = replaySessionEvents(results[1].sessions, seqAtStart);
+          d.sessionCount = results[1];
+        }
         if (countToken === memoryCountRequest && results[2]) {
           d.memoryTotal = results[2].total;
         }
@@ -1709,21 +1798,21 @@
       return '<ul class="layer-preview">' + items.map(function(t) { return '<li>' + esc(truncate(t, 140)) + '</li>'; }).join('') + '</ul>';
     }
 
-    function renderMemoryLayers(status, semFacts, procItems) {
+    function renderMemoryLayers(status, semFacts, procItems, availability) {
       var html = '<div class="card" style="margin-top:16px;"><div class="card-title">Memory layers';
       if (status && status.lastRunAt) {
         html += '<span style="float:right;font-size:10px;color:var(--ink-faint);font-family:var(--font-mono);">consolidated ' + esc(formatTime(status.lastRunAt)) + '</span>';
       }
       html += '</div>';
       if (!status || !status.tiers) {
-        html += '<div style="font-size:13px;color:var(--ink-faint);">Consolidation status did not load. Semantic facts: ' + semFacts.length + ', procedures: ' + procItems.length + '.</div></div>';
+        html += '<div style="font-size:13px;color:var(--ink-faint);">Consolidation status did not load. Semantic facts: ' + (availability.semanticKnown ? 'up to ' + semFacts.length + ' previewed' : 'unavailable') + ', procedures: ' + (availability.proceduralKnown ? 'up to ' + procItems.length + ' previewed' : 'unavailable') + '.</div></div>';
         return html;
       }
       html += '<div style="font-size:12px;color:var(--ink-muted);margin-bottom:8px;line-height:1.5;">Raw observations stay searchable as they are. Consolidation turns them into these longer-lived layers.</div>';
       status.tiers.forEach(function(t) {
         html += '<div class="layer-row">' +
           '<div class="layer-head"><span class="layer-name">' + esc(t.label) + '</span>' +
-          '<span class="layer-count">' + esc(String(t.count)) + '</span>' +
+          '<span class="layer-count">' + esc(t.count === null ? 'Unavailable' : String(t.count)) + '</span>' +
           '<span class="badge ' + (LAYER_STATE_BADGES[t.state] || 'badge-muted') + '">' + esc(LAYER_STATE_LABELS[t.state] || t.state) + '</span></div>' +
           '<div class="layer-from">' + esc(t.from) + '</div>' +
           '<div class="layer-detail">' + esc(t.detail) + '</div>' +
@@ -1740,6 +1829,15 @@
 
     function measuredNumber(value) {
       return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+    }
+
+    function finiteSignedNumber(value) {
+      return typeof value === 'number' && Number.isFinite(value);
+    }
+
+    function savingsRange(value, percent) {
+      if (!Array.isArray(value) || value.length !== 2 || !value.every(finiteSignedNumber)) return 'Unavailable';
+      return value.map(function(number) { return percent ? number.toLocaleString(undefined, { maximumSignificantDigits: 6 }) + '%' : savingsNumber(number); }).join(' to ');
     }
 
     function metricDate(value) {
@@ -1759,11 +1857,54 @@
         ' · last 7 days' + (u.partial ? ' · partial sample' : '') + (u.unavailable ? ' · source unavailable' : ''));
     }
 
+    function renderNetSavings(net) {
+      if (!net || net.metric !== 'tokens') return metricRow('Net token savings', 'Unavailable', 'Comparable net savings evidence has not loaded.');
+      var identified = net.identified || {}, observed = net.observed || {}, period = net.period || {};
+      var sensitivity = net.scenarioSensitivity || {}, coverage = observed.coverage || {}, clients = coverage.agentClients || {};
+      var feed = coverage.processing || {}, contextCoverage = coverage.context || {};
+      var periodDetail = metricDate(period.since) + ' through ' + metricDate(period.until) + ' · ' + (typeof net.scope === 'string' ? net.scope : 'Scope unavailable');
+      periodDetail += ' · ' + (observed.agentPartial === true ? 'partial local agent sample' : observed.agentPartial === false ? 'local agent sample' : 'agent coverage unavailable');
+      if (clients.codex && clients.codex.partial === true) periodDetail += ' · Codex coverage partial';
+      if (clients.codex && clients.codex.unavailable === true) periodDetail += ' · Codex usage unavailable';
+      if (clients.claude && clients.claude.partial === true) periodDetail += ' · Claude coverage partial';
+      if (clients.claude && clients.claude.unavailable === true) periodDetail += ' · Claude usage unavailable';
+      var actual = net.status === 'identified' && finiteSignedNumber(identified.percent) && finiteSignedNumber(identified.netTokens) && measuredNumber(identified.denominatorTokens) && identified.denominatorTokens > 0;
+      var html = actual ? metricRow('Net token savings', identified.percent.toFixed(3) + '%',
+        savingsNumber(identified.netTokens) + ' net tokens / ' + savingsNumber(identified.denominatorTokens) + ' total spent tokens · ' + periodDetail)
+        : '';
+      var scenarios = sensitivity.kind === 'zero-credited-avoided-benefit-contribution' && Array.isArray(sensitivity.contextExposureScenarios) ? sensitivity.contextExposureScenarios : [];
+      [1, 0].forEach(function(exposures) {
+        var scenario = scenarios.find(function(item) { return item && item.exposures === exposures; });
+        if (!scenario) return;
+        html += metricRow('Net token contribution · scenario (' + exposures + ' context exposure' + (exposures === 1 ? '' : 's') + ')', savingsRange(scenario.percentRange, true),
+          savingsNumber(scenario.netTokens) + ' contribution tokens / ' + savingsRange(sensitivity.denominatorRange, false) + ' observed spent tokens · ' + savingsNumber(scenario.contextTokensApplied) + ' context + ' + savingsNumber(observed.processingTokens) + ' processing tokens charged · zero avoided-read benefit credited; actual benefit unknown · context exposure assumed, consumption unconfirmed · ' + periodDetail +
+          ' · sensitivity to processing overlap; not actual net savings, causal attribution or a confidence interval');
+      });
+      if (!actual) html += metricRow('Actual net token savings', 'Unidentified',
+        Array.isArray(identified.reasons) && identified.reasons.length ? identified.reasons.filter(function(reason) { return typeof reason === 'string'; }).join(' ') : 'Comparable without-memory baseline or matching evidence unavailable.');
+      html += metricRow('Net evidence · token components',
+        savingsNumber(observed.contextHookTokens) + ' hook + ' + savingsNumber(observed.mcpTextTokens) + ' MCP text; ' + savingsNumber(observed.processingTokens) + ' processing',
+        'Observed text estimates; emission does not prove consumption · processing: ' + savingsNumber(observed.processingInputTokens) + ' input + ' + savingsNumber(observed.processingOutputTokens) + ' output · overlap with agent usage: ' + (typeof observed.processingOverlap === 'string' ? observed.processingOverlap : 'unknown') +
+        ' · avoided reads: ' + savingsNumber(identified.avoidedReadTokens) + ' · checked ' + metricDate(period.checkedAt));
+      html += metricRow('Observed spend · token denominator', savingsNumber(observed.agentTotalTokens) + ' agent tokens',
+        savingsNumber(observed.agentInputTokens) + ' input + ' + savingsNumber(observed.agentOutputTokens) + ' output · sensitivity denominator: ' + savingsRange(sensitivity.denominatorRange, false) + ' tokens · ' + periodDetail);
+      var share = net.processingShareOfObservedSpend || {};
+      html += metricRow('Processing share of observed spend', savingsRange(share.percentRange, true),
+        savingsNumber(observed.processingTokens) + ' processing / ' + savingsRange(share.denominatorRange, false) + ' spent tokens · observed cost share, not savings · retained feed: ' + savingsNumber(feed.retainedEvents) + ' events; ' + savingsNumber(feed.inPeriodEvents) + ' in period');
+      html += metricRow('Net evidence · coverage',
+        'Context: ' + (typeof contextCoverage.coverage === 'string' ? contextCoverage.coverage : 'unknown') + ' · processing: ' + (typeof feed.coverage === 'string' ? feed.coverage : 'unknown'),
+        'Context status: ' + (typeof contextCoverage.status === 'string' ? contextCoverage.status : 'unknown') + ' · processing status: ' + (typeof feed.status === 'string' ? feed.status : 'unknown') +
+        ' · context sample: ' + savingsNumber(contextCoverage.inPeriodEvents) + ' in-period / ' + savingsNumber(contextCoverage.retainedEvents) + ' retained events' +
+        (Array.isArray(contextCoverage.limits) ? ' · context limits: ' + contextCoverage.limits.join('; ') : '') +
+        (Array.isArray(feed.limits) ? ' · processing limits: ' + feed.limits.join('; ') : ''));
+      return html;
+    }
+
     function renderSavingsStats(report) {
-      if (!report) return metricRow('Memory context emitted', 'Unavailable', 'Usage data could not load. Refresh to retry.');
+      if (!report) return renderNetSavings(null) + metricRow('Memory context emitted', 'Unavailable', 'Usage data could not load. Refresh to retry.');
       var c = report.context || {}, u = report.agentUsage || {}, clients = u.clients || {};
       var hasEmissions = c.emissions > 0 && measuredNumber(c.meanTokensPerObservedSession);
-      var html = metricRow('Memory context emitted', hasEmissions ? '~' + savingsNumber(c.meanTokensPerObservedSession) : 'No hook telemetry',
+      var html = renderNetSavings(report.netSavings) + metricRow('Memory context emitted', hasEmissions ? '~' + savingsNumber(c.meanTokensPerObservedSession) : 'No hook telemetry',
         hasEmissions ? 'text tokens per observed session · ' + savingsNumber(c.emissions) + ' hook emissions' : 'No measured hook emissions in this sample; stored memories are separate.');
       html += cacheMetric('Codex input cache hits', clients.codex || report.codex);
       html += cacheMetric('Claude input cache hits', clients.claude);
@@ -1775,29 +1916,49 @@
     }
 
     function renderOperationalStats(metrics) {
-      var m = metrics || {}, failures = m.failures24h || {}, graph = m.graphStorage || {}, ram = m.engineMemory || {}, automatic = m.automaticCompaction || {};
+      var m = metrics || {}, failures = m.failures24h || {}, storage = m.dataDirectoryStorage || {}, ram = m.engineMemory || {}, automatic = m.automaticCompaction || {};
       var html = metricRow('Failures · last 24 hours', failures.complete === true && Number.isSafeInteger(failures.count) && failures.count >= 0 ? savingsNumber(failures.count) : 'Unavailable',
         'Completed minutes: ' + metricDate(failures.intervalStart) + ' → ' + metricDate(failures.intervalEnd) +
         (failures.complete ? '' : ' · incomplete coverage' + (failures.coverageSince ? ' since ' + metricDate(failures.coverageSince) : '')));
-      var graphMeasured = graph.source === 'native_scoped_metadata' && graph.complete === true && measuredNumber(graph.storedBytes);
-      html += metricRow('Graph stored size · GB', graphMeasured ? (graph.storedBytes / 1e9).toFixed(3) + ' GB' : 'Unavailable',
-        graphMeasured ? 'Stored durable graph payload · sample ' + metricDate(graph.sampleAt) + ' · ' + (typeof graph.coverage === 'string' ? graph.coverage : 'coverage unavailable')
-          : graph.reason === 'scoped_metadata_unavailable' ? 'Native metadata for graph scopes is unavailable; total state storage is not graph size.' : 'No complete native measurement for graph scopes.');
+      var storageMeasured = storage.source === 'local_file_metadata' && storage.complete === true && measuredNumber(storage.fileLengthBytes);
+      var storageAttempt = storage.lastAttempt || {};
+      var storageReasons = { directory_unconfigured: 'Data directory configuration unavailable', directory_not_absolute: 'Configured data directory must be absolute', time_budget: 'Scan time budget reached', entry_limit: 'Scan entry limit reached', depth_limit: 'Scan depth limit reached', links_excluded: 'Links excluded from traversal', unsupported_entry: 'Non-regular entries excluded', unsafe_path: 'Directory path could not be safely traversed', read_failed: 'File metadata could not be read', size_overflow: 'File sizes exceed safe numeric range' };
+      var storageValue = storageMeasured ? (storage.fileLengthBytes / 1e9).toFixed(3) + ' GB' + (storage.state === 'stale' ? ' · stale' : '')
+        : storage.state === 'measuring' ? 'Measuring' : storage.state === 'partial' ? 'Incomplete' : 'Unavailable';
+      var storageDetail = 'All data files, including SQLite, WAL, SHM and indexes · file lengths; allocated disk space unmeasured · decimal GB';
+      if (storageMeasured) storageDetail += ' · ' + savingsNumber(storage.fileLengthBytes) + ' bytes · ' + savingsNumber(storage.files) + ' files · complete traversal sample ' + metricDate(storage.sampleAt);
+      if (storageAttempt.complete === false) storageDetail += ' · latest incomplete attempt ' + metricDate(storageAttempt.finishedAt) + ' · ' + savingsNumber(storageAttempt.observedBytes) + ' bytes observed in ' + savingsNumber(storageAttempt.files) + ' files; full total unknown';
+      if (Object.prototype.hasOwnProperty.call(storageReasons, storage.reason)) storageDetail += ' · ' + storageReasons[storage.reason];
+      if (storage.refreshing) storageDetail += ' · refresh in progress';
+      if (!storageMeasured && !storage.reason && !storage.refreshing) storageDetail += ' · no complete file metadata sample';
+      html += metricRow('Data directory size · GB', storageValue, storageDetail);
       html += metricRow('Engine RAM · iii.exe', ram.source === 'iii.exe' && measuredNumber(ram.residentBytes) ? (ram.residentBytes / 1048576).toFixed(1) + ' MiB' : 'Unavailable',
         'Resident working set · sampled ' + metricDate(ram.sampledAt));
-      html += metricRow('Last successful graph compaction', metricDate(m.lastSuccessfulCompactionAt),
+      html += metricRow('Last recorded incremental compaction', metricDate(m.lastSuccessfulCompactionAt),
         m.lastSuccessfulCompactionAt ? 'Last effective page reclamation' : 'No successful compaction recorded');
       var states = { enabled: 'Enabled', paused: 'Paused', requires_migration: 'Requires migration', unsupported_mode: 'Unsupported mode', unknown: 'Unavailable' };
-      html += metricRow('Automatic graph compaction', Object.prototype.hasOwnProperty.call(states, automatic.state) ? states[automatic.state] : 'Unavailable',
+      html += metricRow(automatic.source === 'admitted_physical_v1' ? 'Automatic storage maintenance' : 'Automatic graph compaction', Object.prototype.hasOwnProperty.call(states, automatic.state) ? states[automatic.state] : 'Unavailable',
         'Configured: ' + (automatic.enabled === true ? 'enabled' : automatic.enabled === false ? 'disabled' : 'unavailable') +
-        (Number.isInteger(automatic.autoVacuumMode) && automatic.autoVacuumMode >= 0 && automatic.autoVacuumMode <= 2 ? ' · auto_vacuum ' + automatic.autoVacuumMode : ''));
+        (automatic.source === 'admitted_physical_v1' ? ' · DB + WAL baseline ' + savingsNumber(automatic.baselineBytes) + ' B · sampled ' + metricDate(automatic.baselineAt) + ' · next growth trigger ' + savingsNumber(automatic.triggerBytes) + ' B' + (automatic.recoveryRequired ? ' · recovery required' : '')
+          : Number.isInteger(automatic.autoVacuumMode) && automatic.autoVacuumMode >= 0 && automatic.autoVacuumMode <= 2 ? ' · auto_vacuum ' + automatic.autoVacuumMode : ''));
       var maintenance = m.maintenance || {};
-      var maintenanceStates = { progress: 'Physical reduction measured', no_progress: 'No physical reduction', deferred: 'Deferred', dependency_failure: 'Dependency failure', unavailable: 'Unavailable' };
-      var maintenanceReasons = { storage_error: 'Storage operation failed or its result is unknown', migration_required: 'Storage mode requires migration', foreground_pressure: 'Waiting for foreground workload to settle', maintenance_deferred: 'Waiting for the next eligible maintenance cycle', physical_measurement_unavailable: 'No physical measurement available', physical_bytes_reclaimed: 'Storage file reduction measured', no_physical_reduction: 'This cycle did not shrink the storage file', maintenance_state_unavailable: 'Maintenance state unavailable' };
+      var maintenanceStates = { progress: 'Physical reduction measured', no_progress: 'No physical reduction', deferred: 'Deferred', pending: 'In progress', dependency_failure: 'Dependency failure', unavailable: 'Unavailable' };
+      var maintenanceReasons = { storage_error: 'Storage operation failed or its result is unknown', migration_required: 'Storage mode requires migration', foreground_pressure: 'Waiting for foreground workload to settle', growth_below_threshold: 'Waiting for 1 GB of DB + WAL growth from the saved baseline', maintenance_in_progress: 'An admitted maintenance cycle or native request is in progress', layout_receipt_pending: 'A saved native layout request has no confirmed receipt; physical compaction is paused', current_maintenance_measurement_unavailable: 'The admitted cycle has no current physical reclamation measurement', maintenance_deferred: 'Waiting for the next eligible maintenance cycle', physical_measurement_unavailable: 'No physical measurement available', physical_bytes_reclaimed: 'Storage file reduction measured', no_physical_reduction: 'This cycle did not shrink the storage file', maintenance_state_unavailable: 'Maintenance state unavailable' };
       html += metricRow('Latest storage maintenance', Object.prototype.hasOwnProperty.call(maintenanceStates, maintenance.state) ? maintenanceStates[maintenance.state] : 'Unavailable',
         (Object.prototype.hasOwnProperty.call(maintenanceReasons, maintenance.reason) ? maintenanceReasons[maintenance.reason] : 'No maintenance evidence') +
-        (measuredNumber(maintenance.physicalBytesReclaimed) ? ' · ' + savingsNumber(maintenance.physicalBytesReclaimed) + ' physical bytes reclaimed' : ''));
+        (measuredNumber(maintenance.physicalBytesReclaimed) ? ' · ' + savingsNumber(maintenance.physicalBytesReclaimed) + ' physical bytes reclaimed' : '') +
+        (maintenance.historicalErrorCode ? ' · historical incremental diagnostic: ' + esc(maintenance.historicalErrorCode) : ''));
       return html;
+    }
+
+    function workflowWindowText(window) {
+      if (!window || typeof window !== 'object') return 'Unavailable';
+      var complete = window.complete === true && window.state === 'complete';
+      return (measuredNumber(window.observedCount) ? savingsNumber(window.observedCount) + (complete ? ' · complete total' : ' · recorded subtotal; full total unknown') : 'Unknown') + ' · ' +
+        (complete ? 'complete coverage' : window.state === 'invalid' ? 'incomplete coverage' : window.state === 'partial' ? 'partial coverage' : esc(window.state || 'unavailable')) +
+        (window.coverageSince ? ' · collecting since ' + metricDate(window.coverageSince) : ' · collection not established') +
+        (window.intervalStart && window.intervalEnd ? ' · interval ' + metricDate(window.intervalStart) + ' to ' + metricDate(window.intervalEnd) + ' (end excluded)' : '') +
+        (typeof window.reason === 'string' ? ' · ' + esc(window.reason.replace(/_/g, ' ')) : '');
     }
 
     function renderWorkflowStatus(metrics) {
@@ -1805,15 +1966,36 @@
       var html = '<div class="card"><div class="card-title">Automatic workflows</div>';
       if (!workflows || !Array.isArray(workflows.items)) return html + '<p class="metric-note">Workflow status unavailable.</p></div>';
       html += '<p class="metric-note">Background recovery: ' + (workflows.backgroundRecoveryPaused === true ? 'Paused' : workflows.backgroundRecoveryPaused === false ? 'Enabled' : 'Unavailable') +
-        '. Enabled means eligible; successful execution requires recorded results. Last 30 operations only.</p><dl class="metric-rows">';
+        '. Enabled means eligible; successful execution requires recorded results. Durable logical executions; counters exclude the active minute. A recorded zero with incomplete coverage does not prove no executions. Queue budget limits describe incomplete measurement, not failed jobs.</p><dl class="metric-rows">';
       var labels = { enabled: 'Enabled', paused: 'Paused', disabled: 'Disabled', unavailable: 'Unavailable', dependency_failure: 'Dependency failure', failed: 'Failed' };
-      var reasons = { eligible_execution_not_proven: 'Eligible to run; no success inferred', configuration_disabled: 'Disabled in configuration', background_recovery_paused: 'Background recovery is paused', provider_unavailable: 'No LLM provider is available', provider_circuit_open: 'Provider circuit is open after failures', slots_disabled: 'Memory slots are disabled', native_state_unavailable: 'Native state measurement is unavailable', last_observed_execution_failed: 'Latest recorded execution failed', execution_evidence_unavailable: 'Execution evidence is unavailable' };
+      var reasons = { eligible_execution_not_proven: 'Eligible to run; no success inferred', configuration_disabled: 'Disabled in configuration', background_recovery_paused: 'Background recovery is paused', provider_unavailable: 'No LLM provider is available', provider_circuit_open: 'Provider circuit is open after failures', slots_disabled: 'Memory slots are disabled', native_state_unavailable: 'Native state measurement is unavailable', last_observed_execution_failed: 'Latest recorded execution failed', last_observed_invocation_failed: 'Latest recorded invocation failed; logical job outcome is separate', execution_evidence_unavailable: 'Execution evidence is unavailable' };
       workflows.items.slice(0, 8).forEach(function(item) {
         if (!item || typeof item.label !== 'string') return;
         var status = Object.prototype.hasOwnProperty.call(labels, item.state) ? labels[item.state] : 'Unavailable';
         html += metricRow(item.label, status, 'Configured: ' + (item.configured === true ? 'enabled' : item.configured === false ? 'disabled' : 'unavailable') +
           ' · ' + (Object.prototype.hasOwnProperty.call(reasons, item.reason) ? reasons[item.reason] : 'Evidence unavailable') +
-          (item.lastObservedAt ? ' · Last result: ' + (typeof item.lastOutcome === 'string' ? item.lastOutcome : 'unavailable') + ' · ' + metricDate(item.lastObservedAt) : ' · No execution recorded in this sample'));
+          (item.lastObservedAt ? ' · Last result: ' + esc(item.lastOutcome || 'unavailable') + ' · ' + metricDate(item.lastObservedAt) : ' · Execution history unknown'));
+        var statistics = item.statistics, last = statistics && statistics.lastRun;
+        var invocations = statistics && statistics.invocationHistory, attempt = invocations && invocations.lastAttempt;
+        if (item.key === 'graph') {
+          html += metricRow(item.label + ' · Last invocation', attempt ? metricDate(attempt.occurredAt) : 'Unknown',
+            attempt ? 'Recorded result: ' + esc(attempt.outcome) + ' · operation ' + esc(attempt.executionId) +
+              (attempt.jobId ? ' · job ' + esc(attempt.jobId) : ' · job association unavailable') +
+              (attempt.errorCode ? ' · ' + esc(attempt.errorCode.replace(/_/g, ' ')) : '') +
+              ' · Invocation result does not establish a logical job terminal state' : 'No retained invocation evidence; earlier history unknown');
+          html += metricRow(item.label + ' · Invocation failures / 24h', workflowWindowText(invocations && invocations.failures24h));
+        }
+        html += metricRow(item.label + (item.key === 'graph' ? ' · Last terminal job' : ' · Last run'), last ? metricDate(last.occurredAt) : statistics && statistics.lastRunState === 'never' ? 'Never' : 'Unknown',
+          last ? 'Historical result: ' + esc(last.outcome) + (statistics.lastRunState !== 'recorded' ? ' · coverage invalid; retained history only' : '') : 'No complete historical execution evidence');
+        html += metricRow(item.label + (item.key === 'graph' ? ' · Terminal jobs / 24h' : ' · Runs / 24h'), workflowWindowText(statistics && statistics.runs24h));
+        html += metricRow(item.label + (item.key === 'graph' ? ' · Failed terminal jobs / 24h' : ' · Failures / 24h'), workflowWindowText(statistics && statistics.failures24h));
+        var queue = statistics && statistics.queued;
+        html += metricRow(item.label + ' · Queued', queue && queue.state === 'not_applicable' ? 'N/A' : queue && measuredNumber(queue.count) && (queue.state === 'current' || queue.state === 'partial') ? (queue.state === 'partial' ? 'At least ' : '') + savingsNumber(queue.count) : 'Unknown',
+          queue ? esc(queue.state || 'unavailable') + ' · logical jobs' + (queue.sampledAt ? ' · sampled ' + metricDate(queue.sampledAt) : '') +
+            (queue.state === 'current' && queue.count === 0 ? ' · measured empty queue' : queue.state === 'partial' ? ' · total unknown; measurement incomplete' : '') +
+            (typeof queue.reason === 'string' ? ' · ' + esc(queue.reason === 'queue_budget_exceeded' ? 'measurement budget reached; job execution unaffected' : queue.reason.replace(/_/g, ' ')) : '') : 'Authoritative queue unavailable');
+        html += metricRow(item.label + ' · Scope', statistics ? statistics.agentScope === null ? 'All agents' : esc(statistics.agentScope) : 'Unknown',
+          statistics && statistics.asOf ? 'Statistics as of ' + metricDate(statistics.asOf) : 'No current statistics sample');
       });
       return html + '</dl></div>';
     }
@@ -1860,6 +2042,14 @@
       return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
     }
 
+    function sessionTotalAvailable(count) {
+      return !!count && count.countScope === 'all_sessions' && count.countCoverage === 'complete' && graphCountAvailable(count.total);
+    }
+
+    function sessionCountNotice(count) {
+      return sessionTotalAvailable(count) ? 'All sessions · snapshot revision ' + count.countRevision : 'Total unavailable · source coverage incomplete or unavailable';
+    }
+
     function renderGraphSampleStats(gs) {
       if (!gs.coverage) return '';
       var nodes = graphCountAvailable(gs.sampleNodes) ? String(gs.sampleNodes) : 'Unavailable';
@@ -1880,7 +2070,7 @@
       var gs = graph || {};
       var hasNodes = typeof gs.totalNodes === 'number' && Number.isSafeInteger(gs.totalNodes) && gs.totalNodes >= 0;
       var hasEdges = typeof gs.totalEdges === 'number' && Number.isSafeInteger(gs.totalEdges) && gs.totalEdges >= 0;
-      var historical = (hasNodes || hasEdges) && (gs.countsAreCurrent === false || (gs.fromSnapshot && gs.countsAreCurrent !== true));
+      var historical = (hasNodes || hasEdges) && (error || gs.countsAreCurrent === false || (gs.fromSnapshot && gs.countsAreCurrent !== true));
       var label = historical ? 'Graph snapshot nodes' : 'Graph nodes';
       var detail = hasEdges ? String(gs.totalEdges) + (historical ? ' snapshot edges' : ' edges') : 'Edge count unavailable';
       if (!hasNodes && !hasEdges) detail = 'Graph counts unavailable';
@@ -1893,19 +2083,23 @@
     function renderDashboard() {
       var el = document.getElementById('view-dashboard');
       var d = state.dashboard;
+      var report = d.status;
       var h = d.health || {};
-      var snap = h.health || {};
-      var healthStatus = h.status || 'unknown';
+      var snap = (!d.healthError && h.health) || (report && report.health) || h.health || {};
+      var healthStatus = d.healthError && statusSectionError('health') ? 'unknown' : snap.status || h.status || 'unknown';
+      var legacyMetricsKnown = !d.healthError && Array.isArray(h.functionMetrics) && (!h.unavailableComponents || h.unavailableComponents.indexOf('functionMetrics') < 0);
+      var statusMetricsKnown = !!(report && Array.isArray(report.functions));
+      var metricsKnown = legacyMetricsKnown || statusMetricsKnown;
       var dotClass = healthStatus === 'healthy' ? 'healthy' : healthStatus === 'degraded' ? 'degraded' : healthStatus === 'critical' ? 'critical' : '';
       var activeSessions = d.sessions.filter(function(s) { return s.status === 'active'; }).length;
       var gs = (d.status && d.status.graph) || {};
-      var fMetrics = h.functionMetrics || [];
-      var cb = h.circuitBreaker || null;
+      var fMetrics = legacyMetricsKnown ? h.functionMetrics : statusMetricsKnown ? report.functions : [];
+      var cb = (!d.healthError && h.circuitBreaker) || (report && report.provider && report.provider.circuitBreaker) || null;
       var workers = snap.workers || [];
 
       var html = '';
       // First-run hero: empty dashboard = guided next step
-      if (d.sessions.length === 0 && !d.sessionsUnavailable) {
+      if (sessionTotalAvailable(d.sessionCount) && d.sessionCount.total === 0 && !d.sessionsUnavailable) {
         html += '<div class="card" style="margin-bottom:14px;padding:24px 28px;background:var(--bg-subtle);border-left:3px solid var(--accent);">' +
           '<div style="font-family:var(--font-ui);font-size:11px;letter-spacing:0.15em;text-transform:uppercase;color:var(--accent);font-weight:700;margin-bottom:8px;">First run &rarr; magical moment in 10 seconds</div>' +
           '<div style="font-family:var(--font-display,Lora,Georgia,serif);font-size:22px;font-weight:700;color:var(--ink);margin-bottom:8px;">Seed sample data + prove semantic recall works</div>' +
@@ -1917,19 +2111,23 @@
       if (d.stale) {
         html += '<div class="card" role="status" style="margin-bottom:14px;padding:10px 16px;font-size:12px;color:var(--ink-muted);border-left:3px solid var(--yellow);">' +
           esc(d.sessionsNotice || 'Some panels could not refresh; showing the last data that loaded. Retrying automatically.') +
-          (d.sessionsUnavailable ? ' Showing retained session data.' : '') + '</div>';
+          (d.sessionsUnavailable ? (d.sessionsKnown ? ' Showing retained session data.' : ' Session counts are unavailable.') : '') + '</div>';
       }
+      var sectionNotices = statusSectionNotices();
+      if (sectionNotices) html += '<div style="margin-bottom:14px;">' + sectionNotices + '</div>';
       html += '<div class="stats-grid">';
-      html += '<div class="stat-card" data-action="goto-tab" data-tab="sessions" role="link" tabindex="0"><div class="label">Sessions</div><div class="value">' + d.sessions.length + '</div><div class="sub">' + activeSessions + ' active</div></div>';
+      html += '<div class="stat-card" data-action="goto-tab" data-tab="sessions" role="link" tabindex="0"><div class="label">Sessions</div><div class="value">' + (sessionTotalAvailable(d.sessionCount) ? d.sessionCount.total : 'Unavailable') + '</div><div class="sub">' + esc(sessionCountNotice(d.sessionCount)) + (d.sessionsUnavailable ? ' · refresh unavailable; retained snapshot' : '') + (d.sessionsKnown ? ' · ' + d.sessions.length + ' recent loaded · ' + activeSessions + ' active in loaded history' : '') + '</div></div>';
       html += '<div class="stat-card" data-action="goto-tab" data-tab="memories" role="link" tabindex="0"><div class="label">Memories</div><div class="value">' + (typeof d.memoryTotal === 'number' ? d.memoryTotal : '—') + '</div><div class="sub">latest versions; total unavailable for partial results</div></div>';
-      var lessonCount = (d.lessons || []).length;
-      html += '<div class="stat-card" data-action="goto-tab" data-tab="lessons" role="link" tabindex="0"><div class="label">Lessons</div><div class="value">' + lessonCount + '</div><div class="sub">confidence-scored</div></div>';
-      html += renderGraphStat(gs, d.statusError);
-      html += '<div class="stat-card" data-action="goto-tab" data-tab="crystals" role="link" tabindex="0"><div class="label">Crystals</div><div class="value">' + (d.crystals || []).length + '</div><div class="sub">frozen work snapshots</div></div>';
+      var lessonCount = d.lessonsKnown && Number.isSafeInteger(d.lessonsTotal) && d.lessonsTotal >= 0 ? d.lessonsTotal : 'Unknown';
+      var lessonNotice = d.lessonsKnown ? (d.lessons || []).length + ' shown' + (lessonCount === 'Unknown' ? ' · total unknown' : '') + (d.lessonsPreview ? ' · bounded preview' : '') : 'Preview unavailable · total unknown';
+      if (d.lessonsUnavailable && d.lessonsKnown) lessonNotice += ' · refresh unavailable; retained snapshot';
+      html += '<div class="stat-card" data-action="goto-tab" data-tab="lessons" role="link" tabindex="0"><div class="label">Lessons</div><div class="value">' + lessonCount + '</div><div class="sub">' + esc(lessonNotice) + '</div></div>';
+      html += renderGraphStat(gs, statusSectionError('graph'));
+      html += '<div class="stat-card" data-action="goto-tab" data-tab="crystals" role="link" tabindex="0"><div class="label">Crystals</div><div class="value">' + (d.crystalsKnown ? (d.crystals || []).length : 'Unavailable') + '</div><div class="sub">frozen work snapshots</div></div>';
       html += '<div class="stat-card"><div class="label">Health</div><div class="value"><div class="health-bar"><span class="health-dot ' + dotClass + '"></span> ' + esc(healthStatus) + '</div></div>';
-      html += '<div class="sub">' + esc(snap.connectionState || 'unknown') + '</div></div>';
+      html += '<div class="sub">' + esc(snap.connectionState || 'unknown') + (d.healthError ? ' · health endpoint refresh failed' : '') + '</div></div>';
       var totalCalls = fMetrics.reduce(function(a, m) { return a + (m.totalCalls || 0); }, 0);
-      html += '<div class="stat-card"><div class="label">Function Calls</div><div class="value">' + totalCalls + '</div><div class="sub">' + fMetrics.length + ' functions tracked</div></div>';
+      html += '<div class="stat-card"><div class="label">Function Calls</div><div class="value">' + (metricsKnown ? totalCalls : 'Unavailable') + '</div><div class="sub">' + (metricsKnown ? fMetrics.length + ' functions tracked' : 'Function metrics did not load') + '</div></div>';
       if (cb) {
         var cbClass = cb.state === 'closed' ? 'cb-closed' : cb.state === 'open' ? 'cb-open' : 'cb-half-open';
         html += '<div class="stat-card"><div class="label">Circuit Breaker</div><div class="value"><span class="cb-indicator ' + cbClass + '">' + esc(cb.state) + '</span></div>';
@@ -1997,7 +2195,9 @@
 
       html += '<div class="card"><div class="card-title">Recent Sessions</div>';
       if (d.sessions.length === 0) {
-        html += '<div class="empty-state"><p>No sessions yet. Start a coding session with agentmemory hooks enabled.</p></div>';
+        html += '<div class="empty-state"><p>' + (d.sessionsUnavailable
+          ? 'Recent session history is unavailable or still preparing. Retrying automatically.'
+          : 'No sessions yet. Start a coding session with agentmemory hooks enabled.') + '</p></div>';
       } else {
         var recent = d.sessions.slice().sort(function(a, b) { return (b.startedAt || '').localeCompare(a.startedAt || ''); }).slice(0, 5);
         html += '<table><tr><th>Project</th><th>Status</th><th>Obs</th><th>Started</th></tr>';
@@ -2012,7 +2212,7 @@
       }
       html += '</div>';
 
-      html += renderRecentActivity(d.status, d.statusError, 10);
+      html += renderRecentActivity(d.status, statusSectionError('activity'), 10);
 
       html += '</div>';
 
@@ -2062,7 +2262,7 @@
       var relItems = d.relations || [];
 
       html += '<hr class="section-rule">';
-      html += renderMemoryLayers(d.consolidation, semFacts, procItems);
+      html += renderMemoryLayers(d.consolidation, semFacts, procItems, d);
 
       if (relItems.length > 0) {
         html += '<div class="card" style="margin-top:16px;"><div class="card-title">Memory Relations</div>';
@@ -2313,6 +2513,8 @@
       state.graph.queryError = null;
       state.graph.disabledInfo = null;
       state.graph.rebuildResult = null;
+      state.graph.rebuildInvocationError = null;
+      clearTimeout(graphRecoveryTimer);
       state.graph.totalNodes = null;
       state.graph.totalEdges = null;
       graphSearchTerm = '';
@@ -2366,7 +2568,7 @@
         html += '<button class="btn" data-action="cancel-graph-browse">Cancel preparation</button>';
       }
       if (!ready) {
-        html += '<button class="btn" data-action="rebuild-graph"' + (graphRebuilding || !state.graph.selectedProject ? ' disabled' : '') + '>Rebuild project graph</button>';
+        html += '<button class="btn" data-action="rebuild-graph"' + (graphRebuilding || graphRecoveryPending() || !state.graph.selectedProject ? ' disabled' : '') + '>Rebuild project graph</button>';
         sb.innerHTML = html;
         return;
       }
@@ -2398,7 +2600,7 @@
       });
       html += '</div>';
 
-      html += '<button class="btn" style="margin-top:14px;width:100%;font-size:11px;padding:8px;" data-action="rebuild-graph"' + (graphRebuilding || !state.graph.selectedProject ? ' disabled' : '') + '>↻ Rebuild project graph</button>';
+      html += '<button class="btn" style="margin-top:14px;width:100%;font-size:11px;padding:8px;" data-action="rebuild-graph"' + (graphRebuilding || graphRecoveryPending() || !state.graph.selectedProject ? ' disabled' : '') + '>↻ Rebuild project graph</button>';
       html += '<div id="selected-node-panel"></div>';
       var __focus = captureSearchFocus(['graph-search']);
       sb.innerHTML = html;
@@ -2725,39 +2927,165 @@
     }
 
     var graphRebuilding = false;
+    var graphRecoveryTimer = null;
+
+    function graphRecoveryView(result) {
+      return result && (result.automaticTerminalRecovery || result.automaticRecovery);
+    }
+
+    function graphAutomaticAvailability(result) {
+      return state.graph.automaticAvailability || (result && result.graphAutomaticAvailability) || (state.flagsConfig && state.flagsConfig.graphAutomaticAvailability);
+    }
+
+    function updateGraphAutomaticAvailability(source) {
+      var availability = source && source.graphAutomaticAvailability;
+      if (!availability || typeof availability.enabled !== 'boolean') return;
+      state.graph.automaticAvailability = { enabled: availability.enabled, reason: typeof availability.reason === 'string' && /^[A-Z][A-Z0-9_]{0,127}$/.test(availability.reason) ? availability.reason : null };
+      if (!availability.enabled) clearTimeout(graphRecoveryTimer);
+    }
+
+    function graphAutomaticAvailabilityHtml(result) {
+      var availability = graphAutomaticAvailability(result);
+      if (!availability || typeof availability.enabled !== 'boolean') return '<p role="status">Automatic graph recovery availability has not been reported.</p>';
+      return '<p role="status">Automatic graph recovery is ' + (availability.enabled ? 'available.' : 'disabled. Automatic recovery requests are paused; the retained job and continuation are preserved.')
+        + (availability.reason && /^[A-Z][A-Z0-9_]{0,127}$/.test(availability.reason) ? ' Reason: ' + esc(availability.reason) : '') + '</p>';
+    }
+
+    function graphRecoveryPending() {
+      var recovery = graphRecoveryView(state.graph.rebuildResult);
+      return !!(recovery && recovery.action !== 'none');
+    }
+
+    function graphRecoveryAction(result) {
+      var recovery = graphRecoveryView(result);
+      var availability = graphAutomaticAvailability(result);
+      if (!availability || availability.enabled !== true) return null;
+      var action = result && result.action;
+      if (!recovery || recovery.version !== 1 || ['continue', 'wait'].indexOf(recovery.action) < 0 || !action
+        || action.endpoint !== '/agentmemory/graph/build' || action.project !== result.project
+        || typeof result.continuation !== 'string' || !result.continuation || action.continuation !== result.continuation) return null;
+      return action;
+    }
+
+    function scheduleGraphRecovery(result) {
+      clearTimeout(graphRecoveryTimer);
+      var action = graphRecoveryAction(result);
+      if (!action) return;
+      var recovery = graphRecoveryView(result);
+      var nextCheckAt = recovery.nextCheckAt;
+      if ((recovery.action === 'wait' || recovery.state === 'unknown') && (typeof nextCheckAt !== 'number' || !Number.isFinite(nextCheckAt))) return;
+      graphRecoveryTimer = setTimeout(function() {
+        if (state.graph.rebuildResult !== result || state.graph.selectedProject !== action.project) return;
+        if (typeof nextCheckAt === 'number' && nextCheckAt > Date.now()) { scheduleGraphRecovery(result); return; }
+        rebuildGraph(action.continuation, true);
+      }, Math.min(2147483647, Math.max(1000, typeof nextCheckAt === 'number' && Number.isFinite(nextCheckAt) ? nextCheckAt - Date.now() : 1000)));
+    }
+
+    function graphAutomaticRecoveryHtml(recovery, paused) {
+      if (!recovery || recovery.version !== 1) return '';
+      var labels = {
+        prepared: 'Automatic recovery prepared.', intended: 'Waiting for the provider result; dispatch has been recorded.',
+        captured: 'Complete provider response captured. Recovery reuses this response.',
+        completed: 'Automatic recovery completed.', unknown: 'Provider outcome unknown. Automatic recovery is checking the retained job.',
+        expired: 'Automatic recovery expired.', failed: 'Automatic recovery failed.', terminal: 'Automatic recovery stopped at a terminal result.'
+      };
+      var html = '<div><strong>' + esc(labels[recovery.state] || 'Automatic recovery status unavailable.') + '</strong></div>';
+      if (recovery.state === 'terminal' && recovery.action !== 'none') html = '<div><strong>A replacement recovery is linked; automatic recovery continues.</strong></div>';
+      if (recovery.reason) html += '<div>Recovery reason: ' + esc(recovery.reason) + '</div>';
+      if (recovery.captured) html += '<div>A complete captured response is available for reuse.</div>';
+      if (recovery.potentiallySpent) html += '<div>Provider tokens may already have been spent. An unknown outcome does not make a new provider attempt safe.</div>';
+      html += '<div>' + (recovery.retryAdmitted ? 'The backend has admitted a bounded retry.' : 'No new provider retry has been admitted.') + '</div>';
+      if (typeof recovery.deadline === 'number' && Number.isFinite(recovery.deadline)) {
+        var deadline = new Date(recovery.deadline);
+        if (!Number.isNaN(deadline.getTime())) html += '<div>Recovery deadline: ' + esc(deadline.toLocaleString()) + '</div>';
+      }
+      if (recovery.replacementJobId) html += '<div>Replacement job: ' + esc(recovery.replacementJobId) + '</div>';
+      if (paused) html += '<div>' + esc(paused) + '</div>';
+      else if (recovery.action === 'wait') html += '<div>Waiting before the next automatic status check.</div>';
+      else if (recovery.action === 'continue') html += '<div>Continuing through the server-provided continuation.</div>';
+      else html += '<div>No further automatic recovery action is available.</div>';
+      if ((recovery.action === 'wait' || recovery.state === 'unknown') && (typeof recovery.nextCheckAt !== 'number' || !Number.isFinite(recovery.nextCheckAt))) html += '<div>The server has not provided the next check time. No recovery request is scheduled.</div>';
+      return html;
+    }
+
+    function graphTerminalRecoveryHtml(recovery, paused) {
+      if (!recovery || recovery.version !== 1) return '';
+      var labels = { local_replay: 'Legacy stopped job: local replay selected.', regeneration: 'Legacy stopped job: bounded regeneration selected.', terminal: 'Legacy stopped job: recovery ended with a terminal decision.' };
+      var html = '<div><strong>' + esc(labels[recovery.resolution] || 'Legacy job recovery decision unavailable.') + '</strong></div>';
+      if (recovery.sourceJobId) html += '<div>Original stopped job: ' + esc(recovery.sourceJobId) + '</div>';
+      var reasons = { GRAPH_AUTOMATIC_HISTORY_UNBOUND: 'The retained job history could not establish recovery lineage.', GRAPH_AUTOMATIC_SCOPE_UNPROVEN: 'The recovery source selection could not be established.',
+        GRAPH_AUTOMATIC_SOURCE_INCOMPLETE: 'The retained source is incomplete.', GRAPH_AUTOMATIC_SOURCE_MISSING: 'The retained source is unavailable.', GRAPH_AUTOMATIC_SOURCE_LIMIT: 'The retained source exceeds the admitted recovery limit.',
+        GRAPH_AUTOMATIC_SOURCE_UNIT_UNPROVEN: 'The retained source unit could not be established; no new provider call is admitted.', GRAPH_AUTOMATIC_SLOT_EXHAUSTED: 'The recovery admission budget is exhausted.',
+        GRAPH_AUTOMATIC_COOLDOWN: 'Recovery is waiting for its admission cooldown.', GRAPH_AUTOMATIC_GLOBAL_LIMIT: 'Recovery is waiting for the global admission limit.',
+        GRAPH_AUTOMATIC_LOCAL_FAILED: 'Local response replay failed.', GRAPH_AUTOMATIC_REGENERATION_DEADLINE: 'The regeneration deadline was reached.' };
+      if (reasons[recovery.reason]) html += '<div>' + esc(reasons[recovery.reason]) + '</div>';
+      if (recovery.reason) html += '<div>Recovery decision reason: ' + esc(recovery.reason) + '</div>';
+      if (recovery.resolution === 'local_replay') html += '<div>Recovery uses the retained response for local replay.</div>';
+      if (recovery.replacementJobId) html += '<div>Replacement job: ' + esc(recovery.replacementJobId) + '</div>';
+      if (paused) html += '<div>' + esc(paused) + '</div>';
+      else if (recovery.action === 'wait') html += '<div>Waiting for the server-provided next recovery check.</div>';
+      else if (recovery.action === 'continue') html += '<div>Continuing the recovery decision through the server-provided continuation.</div>';
+      else html += '<div>No further automatic recovery action is available. The original stopped job retains its recorded status.</div>';
+      if (recovery.action === 'wait' && (typeof recovery.nextCheckAt !== 'number' || !Number.isFinite(recovery.nextCheckAt))) html += '<div>The server has not provided the next check time. No recovery request is scheduled.</div>';
+      return html;
+    }
 
     function graphBuildStatusHtml() {
-      if (graphRebuilding) return '<p role="status">Processing one project graph rebuild unit...</p>';
       var result = state.graph.rebuildResult;
-      if (!result) return '';
+      var recovery = graphRecoveryView(result);
+      var invocationError = state.graph.rebuildInvocationError;
+      var availability = graphAutomaticAvailability(result);
+      var availabilityHtml = graphAutomaticAvailabilityHtml(result);
+      var recoveryPaused = invocationError ? 'Automatic requests are paused because the latest request outcome is unavailable.' : availability && availability.enabled === false ? 'Automatic recovery is disabled. The retained recovery state and continuation are preserved.' : null;
+      var activity = graphRebuilding ? '<p role="status">' + (recovery ? 'Processing automatic graph recovery...' : 'Processing one project graph rebuild unit...') + '</p>' : '';
+      if (!result) return availabilityHtml + activity + (invocationError ? '<p role="status">' + esc(invocationError) + '</p>' : '');
       var labels = { completed: 'Project rebuild completed.', partial: 'This rebuild unit completed; more work remains.',
         queued: 'Graph extraction queued; completion has not been confirmed.', failed: 'Graph rebuild unit failed.' };
-      var html = '<div role="status" style="margin:8px 0;font-size:12px;overflow-wrap:anywhere;">' + esc(labels[result.status] || 'Graph rebuild status unavailable.');
+      var html = availabilityHtml + activity + '<div role="status" aria-live="polite" style="margin:8px 0;font-size:12px;overflow-wrap:anywhere;">Last confirmed build result: ' + esc(labels[result.status] || 'Graph rebuild status unavailable.');
+      if (invocationError) html += '<div>Latest request: ' + esc(invocationError) + '</div>';
+      html += result.automaticTerminalRecovery ? graphTerminalRecoveryHtml(result.automaticTerminalRecovery, recoveryPaused) : graphAutomaticRecoveryHtml(result.automaticRecovery, recoveryPaused);
       if (result.error) html += ' ' + esc(result.error);
       if (result.graphJobId) html += '<div>Job: ' + esc(result.graphJobId) + '</div>';
       var countLabels = { sessionsProcessed: 'Sessions processed', observationsProcessed: 'Observations processed', nodesAdded: 'Nodes added', edgesAdded: 'Edges added' };
       Object.keys(countLabels).forEach(function(key) {
         if (typeof result[key] === 'number') html += '<div>' + esc(countLabels[key]) + ': ' + esc(result[key]) + '</div>';
       });
-      if (result.continuation) html += '<button class="btn" data-action="continue-graph-build"' + (graphRebuilding ? ' disabled' : '') + '>' + (result.status === 'failed' ? 'Retry rebuild unit' : result.status === 'queued' ? 'Resume queued unit' : 'Continue project rebuild') + '</button>';
+      if (result.continuation && !recovery) html += '<button class="btn" data-action="continue-graph-build"' + (graphRebuilding ? ' disabled' : '') + '>' + (result.status === 'failed' ? 'Retry rebuild unit' : result.status === 'queued' ? 'Resume queued unit' : 'Continue project rebuild') + '</button>';
+      if (recovery && recovery.action === 'none' && result.status === 'partial' && result.continuation) html += '<button class="btn" data-action="continue-graph-build"' + (graphRebuilding ? ' disabled' : '') + '>Continue project rebuild</button>';
+      if (recovery && recovery.action !== 'none' && !(availability && availability.enabled === false) && !graphRecoveryAction(result)) html += '<div>The server did not return a usable recovery continuation. Recovery status is retained.</div>';
       return html + '</div>';
     }
 
-    async function rebuildGraph(continuation) {
+    async function rebuildGraph(continuation, automatic) {
       var project = state.graph.selectedProject;
       var requestId = state.graph.requestId;
       if (graphRebuilding || !project) return;
-      if (!window.confirm('Process one bounded graph rebuild unit for project "' + project + '"?\n\nWith an LLM provider configured this spends provider tokens. Additional units require another click.')) return;
+      if (automatic) {
+        var action = graphRecoveryAction(state.graph.rebuildResult);
+        if (!action || action.project !== project || action.continuation !== continuation) return;
+      } else {
+        if (graphRecoveryPending()) return;
+        if (!window.confirm('Process one bounded graph rebuild unit for project "' + project + '"?\n\nWith an LLM provider configured this spends provider tokens. Automatic recovery follows the retained job; additional source units require another click.')) return;
+      }
+      clearTimeout(graphRecoveryTimer);
       graphRebuilding = true;
+      state.graph.rebuildInvocationError = null;
       renderGraphSidebar();
       var body = { project: project };
       if (continuation) body.continuation = continuation;
       try {
         var result = await api('graph/build', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), readErrorBody: true });
         if (requestId !== state.graph.requestId || project !== state.graph.selectedProject) return;
-        state.graph.rebuildResult = result && result.project === project && ['completed', 'partial', 'queued', 'failed'].indexOf(result.status) >= 0
-          ? result : { status: 'failed', error: 'The rebuild request failed or returned an invalid result.', continuation: continuation || null };
+        if (!result || result.project !== project || ['completed', 'partial', 'queued', 'failed'].indexOf(result.status) < 0) {
+          state.graph.rebuildInvocationError = 'The request outcome could not be confirmed. The last known job state is retained; no further recovery request has been sent.';
+          return;
+        }
+        state.graph.rebuildResult = result;
+        updateGraphAutomaticAvailability(result);
+        scheduleGraphRecovery(result);
         await loadGraph();
+      } catch (error) {
+        if (requestId === state.graph.requestId && project === state.graph.selectedProject) state.graph.rebuildInvocationError = 'The request outcome could not be confirmed. The last known job state is retained; no further recovery request has been sent.';
       } finally {
         graphRebuilding = false;
         renderGraphSidebar();
@@ -3644,6 +3972,7 @@
         state.sessions.items = [];
       }
       state.sessions.items = state.sessions.items.slice(0, LIVE_BUFFER_MAX);
+      state.sessions.count = result;
       state.sessions.detailStale = true;
       state.sessions.loaded = true;
       renderSessions();
@@ -3655,9 +3984,10 @@
         return (b.startedAt || '').localeCompare(a.startedAt || '');
       });
 
-      var html = '<div class="sessions-layout"><div class="session-list">';
+      var count = state.sessions.count;
+      var html = '<p class="metric-note" role="status">' + (sessionTotalAvailable(count) ? 'Total sessions: ' + count.total + ' · ' : '') + esc(sessionCountNotice(count)) + ' · ' + items.length + ' recent loaded</p><div class="sessions-layout"><div class="session-list">';
       if (items.length === 0) {
-        html += '<div class="empty-state"><div class="empty-icon">&#128466;</div><p>No sessions</p></div>';
+        html += '<div class="empty-state"><div class="empty-icon">&#128466;</div><p>' + (sessionTotalAvailable(count) && count.total === 0 ? 'No sessions' : 'No recent sessions loaded') + '</p></div>';
       } else {
         items.forEach(function(s) {
           var statusBadge = s.status === 'active' ? 'badge-green' : s.status === 'completed' ? 'badge-blue' : 'badge-muted';
@@ -4640,9 +4970,10 @@
         el.innerHTML = html + renderUpdateCard() + '<div style="text-align:center;"><button class="btn btn-primary" data-action="refresh-health">Retry</button></div>';
         return;
       }
-      html += '<div class="card" style="margin-bottom:16px;"><div class="card-title">Status <span class="badge ' + (HEALTH_LEVEL_BADGES[r.status] || 'badge-muted') + '">' + esc(r.status) + '</span>' +
+      var currentStatus = state.health.error || state.dashboard.statusPartial ? 'unknown' : r.status;
+      html += '<div class="card" style="margin-bottom:16px;"><div class="card-title">Status <span class="badge ' + (HEALTH_LEVEL_BADGES[currentStatus] || 'badge-muted') + '">' + esc(currentStatus) + '</span>' +
         '<span style="float:right;font-size:10px;color:var(--ink-faint);font-family:var(--font-mono);">checked ' + esc(shortTime(r.checkedAt)) + '</span></div>';
-      if (!r.problems.length) {
+      if (!r.problems.length && currentStatus !== 'unknown') {
         html += '<p style="font-size:13px;color:var(--ink-muted);">No problems found.</p>';
       }
       r.problems.forEach(function(p) {
@@ -4652,21 +4983,23 @@
         if (p.fix) html += '<div style="font-size:12px;color:var(--ink-muted);margin-top:4px;">' + esc(p.fix) + '</div>';
         html += '</div>';
       });
-      html += '</div>';
+      html += '</div>' + statusSectionNotices();
 
-      var ports = r.service.ports || {};
+      var service = r.service || {};
+      var provider = r.provider || {};
+      var ports = service.ports || {};
       var idx = r.index || {};
-      var cb = r.provider.circuitBreaker;
+      var cb = provider.circuitBreaker;
       html += '<div class="two-col">';
       html += '<div class="card"><div class="card-title">Service</div>' +
-        healthRow('Version', 'v' + r.service.version) +
-        healthRow('Engine', r.service.engineVersion) +
-        healthRow('Uptime', formatSeconds(r.service.uptimeSeconds)) +
+        healthRow('Version', service.version ? 'v' + service.version : 'Unavailable') +
+        healthRow('Engine', service.engineVersion || 'Unavailable') +
+        healthRow('Uptime', typeof service.uptimeSeconds === 'number' ? formatSeconds(service.uptimeSeconds) : 'Unavailable') +
         healthRow('Ports', 'REST ' + (ports.rest || '?') + ' · streams ' + (ports.streams || '?') + ' · viewer ' + (ports.viewer || 'off')) +
         healthRow('Engine connection', (r.health && r.health.connectionState) || 'unknown') +
-        healthRow('LLM provider', r.provider.llm) +
-        healthRow('Embeddings', r.provider.embeddings) +
-        healthRow('Circuit breaker', cb ? (cb.state + ' (' + (cb.failures || 0) + ' failures)') : 'not in use') +
+        healthRow('LLM provider', provider.llm || 'Unavailable') +
+        healthRow('Embeddings', provider.embeddings || 'Unavailable') +
+        healthRow('Circuit breaker', cb ? (cb.state + ' (' + knownCount(cb.failures) + ' failures)') : statusSectionError('provider') ? 'Unavailable' : 'not in use') +
         '</div>';
       html += '<div class="card"><div class="card-title">Search index &amp; graph</div>' + renderSearchIndexRows(idx);
       if (r.graph) {
@@ -4678,13 +5011,13 @@
       }
       html += '</div></div>';
 
-      html += renderRecentActivity(r, state.health.error, 30);
+      html += renderRecentActivity(r, statusSectionError('activity'), 30);
       html += renderUpdateCard();
 
       var fns = (r.functions || []).slice().sort(function(a, b) { return b.totalCalls - a.totalCalls; });
       html += '<div class="card" style="margin-top:16px;overflow-x:auto"><div class="card-title">Functions</div><p>Recorded functions across projects. Call counters are telemetry, not a complete function catalog or proof of successful output.</p>';
       if (!fns.length) {
-        html += '<p style="font-size:13px;color:var(--ink-faint);">No function calls recorded yet.</p>';
+        html += '<p style="font-size:13px;color:var(--ink-faint);">' + (Array.isArray(r.functions) ? 'No function calls recorded in the last successful sample.' : 'Function calls are unavailable.') + '</p>';
       } else {
         html += '<table class="metric-table"><tr><th>Function</th><th style="text-align:right">Calls</th><th style="text-align:right">Failed</th><th style="text-align:right">Failure rate</th><th style="text-align:right">Avg latency</th></tr>';
         fns.forEach(function(f) {
@@ -5082,7 +5415,8 @@
         envelope[entity] = rows;
         envelope.nextCursor = cursor;
         envelope.partial = !!cursor || !!initialCursor;
-        envelope.total = envelope.partial ? null : rows.length;
+        if (entity !== 'sessions') envelope.total = envelope.partial ? null : rows.length;
+        envelope.returnedCount = rows.length;
         delete recentHistoryReasons[entity];
         delete recentHistoryStates[entity];
         return envelope;
@@ -5374,6 +5708,8 @@
       var res = await apiGet('config/flags');
       if (!res) return;
       state.flagsConfig = res;
+      updateGraphAutomaticAvailability(res);
+      if (state.activeTab === 'graph' && document.getElementById('graph-sidebar')) renderGraphSidebar();
       renderFlagBanners(res);
       updateFooter(res);
     }

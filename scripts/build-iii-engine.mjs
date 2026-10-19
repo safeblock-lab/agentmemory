@@ -40,6 +40,10 @@ const REQUIRED_CAPABILITIES = [
   "state::graph_concept_seeds_v1",
   "state::crystal_page_v1",
   "state::provider_attempt_budget_v1",
+  "state::graph_automatic_recovery_v1",
+  "state::list_page_keyset_live_v1",
+  "state::graph_automatic_unspent_reservation_adoption_v1",
+  "state::compact_copy_chunked_window_v1",
 ];
 const BUILD_TIMEOUT_MS = 30 * 60 * 1000;
 const TARGETS = {

@@ -39,13 +39,16 @@ export function combineAgentUsage(codex: UsageSnapshot, claude: UsageSnapshot) {
 export type AgentUsageSnapshot = ReturnType<typeof combineAgentUsage>;
 let cached: AgentUsageSnapshot | undefined;
 let pending: Promise<AgentUsageSnapshot> | undefined;
+// The measured local seven-day profile exceeds the collectors' interactive defaults.
+const profileLimits = { bytes: 2 * 1024 ** 3, lineBytes: 4 * 1024 ** 2,
+  records: 1_000_000, milliseconds: 30_000, files: 2048, entries: 16384, directories: 1024 };
 export async function readAgentUsage(): Promise<AgentUsageSnapshot> {
   if (cached && Date.now() - Date.parse(cached.checkedAt) < 5 * 60_000) return cached;
   return pending ??= (async () => {
     const now = new Date();
     // Sequential collectors share a window and keep disk parsing single-flight.
-    const codex = await collectCodexUsage({ now });
-    const claude = await collectClaudeUsage({ now });
+    const codex = await collectCodexUsage({ now, limits: profileLimits });
+    const claude = await collectClaudeUsage({ now, limits: profileLimits });
     return cached = combineAgentUsage(codex, claude);
   })().finally(() => { pending = undefined; });
 }

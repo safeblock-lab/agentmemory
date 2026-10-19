@@ -22,6 +22,8 @@ import { countContextTokens } from "../utils/context-tokens.js";
 import { getEmbeddingProvider } from "./search.js";
 import { selectIndexedContextObservations } from "./consolidation-selection.js";
 import { selectContextLessons } from "./lessons.js";
+import type { RetentionResourceReference } from "../state/storage.js";
+import { recordPublishedContextUse } from "./storage-retention.js";
 
 function estimateTokens(text: string): number {
   return countContextTokens(text);
@@ -36,6 +38,7 @@ function escapeXmlAttr(s: string): string {
 }
 
 type IndexedObservationSelection = Awaited<ReturnType<typeof selectIndexedContextObservations>>["observations"];
+type RetentionContextBlock = ContextBlock & { retentionReferences?: RetentionResourceReference[]; retentionUntrackedReferences?: number };
 
 async function addIndexedContextSources(
   kv: StateKV,
@@ -43,7 +46,7 @@ async function addIndexedContextSources(
   project: string,
   callerSessionId: string,
   filterAgentId: string | undefined,
-  blocks: ContextBlock[],
+  blocks: RetentionContextBlock[],
 ): Promise<void> {
   const sessionIds = [...new Set(selected.map(({ ref }) => ref.sessionId))].slice(0, 12);
   const sessionsById = new Map<string, Session>();
@@ -109,6 +112,10 @@ async function addIndexedContextSources(
       tokens: estimateTokens(content),
       recency: new Date(session.startedAt).getTime(),
       sourceIds: top.map((observation) => observation.id),
+      retentionReferences: top.flatMap((observation) => {
+        const reference = referencesBySession.get(session.id)?.find(item => item.id === observation.id);
+        return reference ? [{ scope: KV.observations(session.id), key: observation.id, expected_version: reference.rowVersion }] : [];
+      }),
     });
   }
 }
@@ -129,7 +136,7 @@ export function registerContextFunction(
       if (!Number.isSafeInteger(budget) || budget < 1 || budget > 1_000_000) {
         throw new Error("mem::context: budget must be an integer between 1 and 1000000");
       }
-      const blocks: ContextBlock[] = [];
+      const blocks: RetentionContextBlock[] = [];
 
       // Cross-agent isolation for the injected-context path. Mirrors the
       // filter mem::search / mem::smart-search already apply so /context
@@ -339,12 +346,23 @@ export function registerContextFunction(
               .map((o) => `- [${o.type}] ${o.title}: ${o.narrative}`)
               .join("\n");
             const content = `## Session ${sessions[i].id.slice(0, 8)} (${sessions[i].startedAt})\n${items}`;
+            const references = await Promise.all(top.map(async observation => {
+              const scope = KV.observations(sessions[i].id);
+              const row = await kv.getVersioned<CompressedObservation>(scope, observation.id).catch(() => {
+                logger.warn("Context retention source version unavailable", { code: "STATE_RETENTION_SOURCE_VERSION_UNAVAILABLE" });
+                return null;
+              });
+              return row?.value && JSON.stringify(row.value) === JSON.stringify(observation)
+                ? { scope, key: observation.id, expected_version: row.version } : null;
+            }));
             blocks.push({
               type: "observation",
               content,
               tokens: estimateTokens(content),
               recency: new Date(sessions[i].startedAt).getTime(),
               sourceIds: top.map((o) => o.id),
+              retentionReferences: references.filter((reference): reference is RetentionResourceReference => reference !== null),
+              retentionUntrackedReferences: references.filter(reference => reference === null).length,
             });
           }
         }
@@ -355,6 +373,8 @@ export function registerContextFunction(
       let usedTokens = 0;
       const selected: string[] = [];
       const accessedIds: string[] = [];
+      const publishedReferences: RetentionResourceReference[] = [];
+      let untrackedReferences = 0;
       const header = `<agentmemory-context project="${escapeXmlAttr(data.project)}">`;
       const footer = `</agentmemory-context>`;
       const render = (contents: string[]) => `${header}\n${contents.join("\n\n")}\n${footer}`;
@@ -365,6 +385,8 @@ export function registerContextFunction(
         if (nextTokens > budget) continue;
         selected.push(block.content);
         usedTokens = nextTokens;
+        publishedReferences.push(...(block.retentionReferences ?? []));
+        untrackedReferences += block.retentionUntrackedReferences ?? 0;
         if (block.sourceIds && block.sourceIds.length > 0) {
           accessedIds.push(...block.sourceIds);
         }
@@ -380,12 +402,24 @@ export function registerContextFunction(
       }
 
       const result = render(selected);
+      let retentionUse: { status: "not_applicable" | "recorded" | "partial" | "unavailable"; admitted?: number; skipped?: number; untracked?: number; code?: string } = untrackedReferences
+        ? { status: "unavailable", untracked: untrackedReferences, code: "STATE_RETENTION_SOURCE_VERSION_UNAVAILABLE" } : { status: "not_applicable" };
+      if (publishedReferences.length) {
+        try {
+          const receipt = await recordPublishedContextUse(sdk, data.sessionId, data.project, publishedReferences);
+          retentionUse = { status: untrackedReferences ? "partial" : "recorded", admitted: receipt.admitted, skipped: receipt.skipped, untracked: untrackedReferences };
+        } catch (error) {
+          const code = error instanceof Error ? error.message.match(/\bSTATE_[A-Z0-9_]{1,80}\b/)?.[0] : undefined;
+          retentionUse = { status: "unavailable", untracked: untrackedReferences, code: code ?? "STATE_RETENTION_UNAVAILABLE" };
+          logger.warn("Context retention evidence unavailable", { code: retentionUse.code });
+        }
+      }
       logger.info("Context generated", {
         blocks: selected.length,
         tokens: usedTokens,
         partial: indexedRetrievalPartial,
       });
-      return { context: result, blocks: selected.length, tokens: usedTokens, candidateTokens, tokenizer: "o200k_base", partial: indexedRetrievalPartial };
+      return { context: result, blocks: selected.length, tokens: usedTokens, candidateTokens, tokenizer: "o200k_base", partial: indexedRetrievalPartial, retentionUse };
     },
   );
 }

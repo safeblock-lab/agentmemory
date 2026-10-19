@@ -19,6 +19,10 @@ export const REQUIRED_ENGINE_CAPABILITIES = [
   "state::graph_concept_seeds_v1",
   "state::crystal_page_v1",
   "state::provider_attempt_budget_v1",
+  "state::graph_automatic_recovery_v1",
+  "state::list_page_keyset_live_v1",
+  "state::graph_automatic_unspent_reservation_adoption_v1",
+  "state::compact_copy_chunked_window_v1",
 ] as const;
 export const PINNED_ENGINE_VERSION = "0.22.1";
 export const PINNED_ENGINE_REPOSITORY = "https://github.com/iii-hq/iii.git";

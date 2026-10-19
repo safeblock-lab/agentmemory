@@ -26,7 +26,7 @@ async function countStateRecords<T>(
       for await (const page of kv.pages<T>(scope, {
         limit: COUNT_PAGE_LIMIT,
         maxBytes: COUNT_PAGE_MAX_BYTES,
-        ...(fields ? { fields } : {}),
+        fields: fields ?? ["id"],
       })) {
         for (const value of page.items) {
           if (matches(value)) count++;
@@ -48,7 +48,7 @@ async function countStateRecords<T>(
 export async function readConsolidationCounts(kv: StateKV) {
   const [summaries, recurringPatterns, semanticFacts, procedures, relations] =
     await Promise.all([
-      countStateRecords(kv, KV.summaries).catch(() => 0),
+      countStateRecords(kv, KV.summaries).catch(() => null),
       countStateRecords<PatternCountFields>(
         kv,
         KV.memories,
@@ -58,10 +58,10 @@ export async function readConsolidationCounts(kv: StateKV) {
           (memory.sessionIds?.length ?? 0) >=
             PROCEDURAL_MIN_SESSIONS_PER_PATTERN,
         ["isLatest", "type", "sessionIds"],
-      ).catch(() => 0),
-      countStateRecords(kv, KV.semantic).catch(() => 0),
-      countStateRecords(kv, KV.procedural).catch(() => 0),
-      countStateRecords(kv, KV.relations).catch(() => 0),
+      ).catch(() => null),
+      countStateRecords(kv, KV.semantic).catch(() => null),
+      countStateRecords(kv, KV.procedural).catch(() => null),
+      countStateRecords(kv, KV.relations).catch(() => null),
     ]);
 
   return { summaries, recurringPatterns, semanticFacts, procedures, relations };

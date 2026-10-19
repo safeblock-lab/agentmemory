@@ -1,3 +1,6 @@
+import { observeWorkflowTerminal, markWorkflowStatisticsGap } from "./dashboard-activity.js";
+import { getAgentId } from "../config.js";
+import type { WorkflowTerminalReceipt } from "../types.js";
 import { runWorkflowAttempt, type WorkflowAttemptAccounting } from "./workflow-attempt-accounting.js";
 import type { IIIClient } from "iii-sdk";
 import { createHash } from "node:crypto";
@@ -5,6 +8,7 @@ type SelectedConsolidationControl = { project?: string; sessionId?: string; sour
 type SelectedPipelineTier = "semantic" | "procedural" | "all" | "reflect" | "decay";
 type SelectedPipelineStage = "semantic" | "procedural" | "reflect" | "decay" | "completed";
 interface SelectedPipelineRun {
+  workflowTerminal?: WorkflowTerminalReceipt;
   id: string; tier: SelectedPipelineTier; project: string; selectionId: string; sessionId: string;
   summaryFingerprint: string; sessionIds: string[]; stage: SelectedPipelineStage; createdAt: string;
   semanticManifestId?: string; proceduralManifestId?: string; reflectJobId?: string; decayManifestId?: string;
@@ -29,6 +33,7 @@ import type {
 } from "../types.js";
 import { KV, fingerprintId, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
+import { consolidationRetrievalFailureAction, SelectedObservationPreparationPending } from "./consolidation-selection.js";
 import {
   SEMANTIC_MERGE_SYSTEM,
   buildSemanticMergePrompt,
@@ -38,6 +43,8 @@ import {
   requestInputBytes, type ConsolidationManifest,
 } from "./consolidation-partitions.js";
 import { recordAudit } from "./audit.js";
+import { registerConsolidationResponseRepair } from "./consolidation-response-repair.js";
+import { registerConsolidationPublicationRecovery } from "./consolidation-publication-recovery.js";
 import {
   getConsolidationDecayDays,
   getConsolidationMinNewSummaries,
@@ -58,7 +65,9 @@ import { loadRoot, newRoot, saveRoot, pageKey, immutablePage, boundedBytes, sema
 import { candidatePage, aggregateCandidateKey, publicationCandidate, consolidationPublicationEvidence, type AggregateCandidate } from "./consolidation-reduction.js";
 import { isStateCounter } from "../state/state-transactions.js";
 import { preparePublicationEvidence, evaluatePublicationEvidence, type PublicationEvidenceInput } from "./publication-evidence.js";
-import { publicationCallOptions } from "./publication-call-options.js";
+import { publicationExecutor } from "./publication-call-options.js";
+import { proceduralCallOptions } from "./consolidation-procedural-format.js";
+import { prepareStructuredCall } from "../providers/structured-output-contract.js";
 import { readSource, verifyCapturedSource } from "./consolidation-capture.js";
 import { REFLECT_CONTROL, REFLECT_JOBS, validManualReflectContinuation, type ReflectJob, type ReflectRequest } from "./reflect-queue-types.js";
 import { runSelectedConsolidationDecay, type ConsolidationDecaySelector } from "./consolidation-decay.js";
@@ -320,6 +329,8 @@ export function registerConsolidationPipelineFunction(
   writeCanonical?: ConsolidationCanonicalWriter,
   accounting?: WorkflowAttemptAccounting,
 ): void {
+  registerConsolidationResponseRepair(sdk, kv);
+  registerConsolidationPublicationRecovery(sdk, kv, provider, llmRouter);
   const projectCursorKey = "consolidation-project-cursor";
   type ProjectCursor = { cursor?: string; project?: string; nextCursor?: string; hasMore?: boolean; selected?: ConsolidationSelection[] };
   async function chooseProject(): Promise<string | null> {
@@ -340,18 +351,10 @@ export function registerConsolidationPipelineFunction(
     if (replay.status !== "unavailable" || replay.reason !== "executor_unavailable") return replay;
     const request = preparePublicationEvidence(input);
     if ("status" in request) return request;
-    const options = publicationCallOptions();
-    return evaluatePublicationEvidence(kv, input, async (request, captureRaw) => {
-      const operation = async (target: MemoryProvider) => {
-        const raw = await target.summarize(request.systemPrompt, request.userPrompt, options);
-        await captureRaw(raw); return raw;
-      };
-      const execute = () => llmRouter ? llmRouter.run("consolidation", operation,
-        raw => typeof raw === "string" && raw.trim().length > 0, undefined, options) : operation(provider);
-      return runWorkflowAttempt(accounting, kv, { workflow: "consolidation", functionId: "mem::consolidate-pipeline",
+    return evaluatePublicationEvidence(kv, input, publicationExecutor(provider, llmRouter, "consolidation", {},
+      (request, execute) => runWorkflowAttempt(accounting, kv, { workflow: "consolidation", functionId: "mem::consolidate-pipeline",
         project: input.project, sourceId, sourceFingerprint: sourceId,
-        jobId: sourceId, unitId: request.requestId, phase: "publication", continuation }, execute);
-    });
+        jobId: sourceId, unitId: request.requestId, phase: "publication", continuation }, execute)));
   }
   async function legacyEvidence(kind: "semantic" | "procedural", project: string, operationId: string,
     candidate: string, originals: Array<SessionSummary | Memory>) {
@@ -489,14 +492,41 @@ export function registerConsolidationPipelineFunction(
     }
     if (root.deferred && accounting?.isScoped({ workflow: "consolidation",
       project: root.project, sourceId: root.id })) throw new Error("workflow_scoped_batch_dispatch_unavailable");
-    const runCut = () => runPagedCut(kv, root!.id, current => new ConsolidationRequests(kv, current.id, (system, prompt, request) => {
+    const manifestRequests: { current?: ConsolidationRequests } = {};
+    const runCut = () => runPagedCut(kv, root!.id, current => manifestRequests.current = new ConsolidationRequests(kv, current.id, (system, prompt, request, prepared) => {
       return runWorkflowAttempt(accounting, kv, { workflow: "consolidation", functionId: "mem::consolidate-pipeline",
         project: current.project, sourceId: current.id, sourceFingerprint: current.id, jobId: current.id,
-        unitId: request.id, phase: "generation", continuation: current.phase }, () => llmRouter
-        ? llmRouter.run(assessConsolidationComplexity({ prompt, maxAuxiliaryInputChars: auxiliaryMaxInputChars }).complex ? "conflict_resolution" : "consolidation",
-          selectedProvider => selectedProvider.summarize(system, prompt), response => typeof response === "string" && response.trim().length > 0)
-        : provider.summarize(system, prompt));
-    }, selectedExecution ? undefined : current.deferred ? batchQueue : undefined, undefined, Boolean(current.legacy?.completed)),
+        unitId: request.id, phase: "generation", continuation: current.phase }, async () => {
+          if (prepared) return prepared.execute();
+          const options = proceduralCallOptions(request.outputContract);
+          if (!llmRouter) return provider.summarize(system, prompt, options);
+          const task = assessConsolidationComplexity({ prompt, maxAuxiliaryInputChars: auxiliaryMaxInputChars }).complex ? "conflict_resolution" : "consolidation";
+          if (!request.outputContract) return llmRouter.run(task,
+            selectedProvider => selectedProvider.summarize(system, prompt), response => typeof response === "string" && response.trim().length > 0);
+          // Preserve the chosen route while retaining malformed responses and preventing schema-error fallback calls.
+          const outcome = await llmRouter.run(task, async (selectedProvider): Promise<
+            { ok: true; response: string } | { ok: false; error: unknown }
+          > => {
+            try { return { ok: true, response: await selectedProvider.summarize(system, prompt, options) }; }
+            catch (error) { return { ok: false, error }; }
+          }, () => true);
+          if (!outcome.ok) throw outcome.error;
+          return outcome.response;
+        });
+    }, selectedExecution ? undefined : current.deferred ? batchQueue : undefined, undefined, Boolean(current.legacy?.completed),
+    (system, prompt, contract) => {
+      const responseFormat = contract.options.responseFormat;
+      if (responseFormat.type !== "json_schema") throw new Error("procedural_output_schema_required");
+      const request = { operation: "summarize" as const, systemPrompt: system, userPrompt: prompt,
+        contractVersion: contract.version, options: { responseFormat } };
+      if (!llmRouter) return prepareStructuredCall(provider, request);
+      const task = assessConsolidationComplexity({ prompt, maxAuxiliaryInputChars: auxiliaryMaxInputChars }).complex ? "conflict_resolution" : "consolidation";
+      return llmRouter.prepareStructuredCall(task, request);
+    }, prompt => {
+      if (!llmRouter) return typeof provider.prepareStructuredCall === "function";
+      const task = assessConsolidationComplexity({ prompt, maxAuxiliaryInputChars: auxiliaryMaxInputChars }).complex ? "conflict_resolution" : "consolidation";
+      return llmRouter.canPrepareStructuredCall(task);
+    }),
     async (current, candidate) => {
         const now = current.createdAt;
         const operation = publicationOperation(current, candidate);
@@ -518,6 +548,10 @@ export function registerConsolidationPipelineFunction(
         return evaluateEvidence(await consolidationPublicationEvidence(kv, current, candidate), current.id, current.phase);
       }, (current, candidate) => recoverCanonicalOperation(publicationOperation(current, candidate)));
     const result: Record<string, unknown> = root.callerPolicy ? await withConsolidationAdmission(runCut) : await runCut();
+    if (result.completed !== true && result.queued === true && manifestRequests.current?.pending !== true) {
+      result.queued = false;
+      result.status = result.reason === "consolidation_continuation" ? "awaiting_dependency" : "running";
+    }
     if (result.completed) {
       const completed = (await loadRoot(kv, root.id))!;
       if (completed.typesafeDecision?.pipelineGate !== "skip" && !completed.checkpoint && completed.kind === "semantic") {
@@ -535,7 +569,7 @@ export function registerConsolidationPipelineFunction(
       const previous = await kv.get<{ results?: Record<string, unknown> }>(KV.config, CONSOLIDATION_LAST_RUN_KEY);
       const failed = result.partial === true || result.retained === true || result.success === false || Boolean(result.error);
       await kv.set(KV.config, CONSOLIDATION_LAST_RUN_KEY, { at: new Date().toISOString(), tier: root.kind,
-        results: { ...(previous?.results ?? {}), [root.kind]: result }, status: failed ? "partial" : result.queued === true ? "queued" : "completed" });
+        results: { ...(previous?.results ?? {}), [root.kind]: result }, status: failed ? "partial" : result.completed === true ? "completed" : result.queued === true ? "queued" : "awaiting_dependency" });
     }
     return result;
   }
@@ -614,6 +648,7 @@ export function registerConsolidationPipelineFunction(
     }
     const project = data.project.trim();
     if (data.selected.project !== undefined && data.selected.project !== project) return { success: false, completed: false, error: "selected_consolidation_project_mismatch" };
+    let activeRun: SelectedPipelineRun | undefined;
     try {
       const batchSourceIds = validateBatchSourceIds(data.batchSourceIds);
       const requestedRunId = data.selectedRunId;
@@ -684,6 +719,7 @@ export function registerConsolidationPipelineFunction(
           await kv.set(KV.state, selectedRunKey(run.id), run);
         }
       }
+      activeRun = run;
       if (data.selected.sessionId !== undefined && data.selected.sessionId !== run.sessionId) throw new Error("selected_consolidation_session_mismatch");
       const directSourceRefs = run.batchSourceIds
         ? await selectConsolidationSummaries(kv, project, run.batchSourceIds) : undefined;
@@ -694,14 +730,24 @@ export function registerConsolidationPipelineFunction(
         || currentSummaryFingerprint !== run.summaryFingerprint) {
         throw new Error("selected_consolidation_summary_source_changed");
       }
-      const continuation = { tier, project, force: true, consolidationSelectionId: run.selectionId, selectedRunId: run.id,
+      const continuation = { tier, project, force: true, selected: data.selected, consolidationSelectionId: run.selectionId, selectedRunId: run.id,
         ...(run.batchSourceIds ? { batchSourceIds: run.batchSourceIds } : {}) };
-      const completeResult = () => ({ success: true, completed: true, queued: false, project, selectedRunId: run!.id,
-        selectedSourceIds: run!.sessionIds, sourceCount: run!.sessionIds.length, selectionCoverage: "selected_relevant_sources",
-        results: structuredClone(run!.results) });
-      if (run.terminalReflection) return { success: run.terminalReflection.status === "partial", completed: false,
+      const completeResult = async () => {
+        if (run!.workflowTerminal?.outcome === "completed") await observeWorkflowTerminal(kv, { ...run!.workflowTerminal,
+          workflow: "consolidation", producer: "selected-consolidation-pipeline", executionLevel: "workflow" });
+        else await markWorkflowStatisticsGap(kv, "consolidation");
+        return { success: true, completed: true, queued: false, project, selectedRunId: run!.id,
+          selectedSourceIds: run!.sessionIds, sourceCount: run!.sessionIds.length, selectionCoverage: "selected_relevant_sources",
+          results: structuredClone(run!.results) };
+      };
+      if (run.terminalReflection) {
+        if (run.workflowTerminal) await observeWorkflowTerminal(kv, { ...run.workflowTerminal,
+          workflow: "consolidation", producer: "selected-consolidation-pipeline", executionLevel: "workflow" });
+        else await markWorkflowStatisticsGap(kv, "consolidation");
+        return { success: run.terminalReflection.status === "partial", completed: false,
         terminal: true, partial: true, queued: false, project, selectedRunId: run.id,
         error: run.terminalReflection.error, results: run.results };
+      }
       if (run.stage === "completed") return completeResult();
       const stages = selectedTierStages(tier);
       const nextStage = (current: SelectedPipelineStage): SelectedPipelineStage => {
@@ -775,7 +821,11 @@ export function registerConsolidationPipelineFunction(
             run.results.reflect = { completed: job.status === "completed", jobId: job.id, status: job.status, insightIds };
             if (job.status !== "completed") {
               run.terminalReflection = { status: job.status, error: job.error ?? "selected_reflect_incomplete" };
+              run.workflowTerminal ??= { executionId: run.id, agentId: getAgentId(), occurredAt: new Date().toISOString(),
+                outcome: job.status === "partial" ? "partial" : "failed" };
               await kv.set(KV.state, selectedRunKey(run.id), run);
+              await observeWorkflowTerminal(kv, { ...run.workflowTerminal,
+                workflow: "consolidation", producer: "selected-consolidation-pipeline", executionLevel: "workflow" });
               return { success: job.status === "partial", completed: false, terminal: true, partial: true,
                 queued: false, selectedRunId: run.id, error: run.terminalReflection.error, results: run.results };
             }
@@ -796,9 +846,15 @@ export function registerConsolidationPipelineFunction(
       } else throw new Error("selected_consolidation_stage_invalid");
       run.results[run.stage] = stageResult;
       if (stageResult.completed === true) run.stage = nextStage(run.stage);
+      if (run.stage === "completed") run.workflowTerminal ??= { executionId: run.id,
+        agentId: getAgentId(), occurredAt: new Date().toISOString(), outcome: "completed" };
       await kv.set(KV.state, selectedRunKey(run.id), run);
       return run.stage === "completed" ? completeResult() : continueRun(stageResult);
     } catch (error) {
+      if (consolidationIsPending(error)) return { success: true, completed: false, queued: false, status: "awaiting_dependency",
+        reason: "source_index_pending", project, ...(activeRun ? { selectedRunId: activeRun.id, stage: activeRun.stage, results: structuredClone(activeRun.results) } : {}),
+        ...(error instanceof SelectedObservationPreparationPending ? { diagnostics: error.diagnostics } : {}),
+        continuation: { ...data, ...(activeRun ? { selectedRunId: activeRun.id, consolidationSelectionId: activeRun.selectionId } : {}) } };
       return { success: false, completed: false, partial: true, error: error instanceof Error ? error.message : "selected_consolidation_failed",
         ...(data.selectedRunId ? { selectedRunId: data.selectedRunId } : {}) };
     }
@@ -837,6 +893,8 @@ export function registerConsolidationPipelineFunction(
         };
         const catalogSelected = data?.consolidationCatalogProject === true || !data?.project?.trim();
         let selectedProject = data?.project?.trim();
+        let activeSelectionId = data?.consolidationSelectionId;
+        let selectionPhase = "select_project";
         try {
           const project = selectedProject || await chooseProject(); selectedProject = project ?? undefined;
           if (!project) return { success: true, completed: true, sourceCount: 0, reason: "project_catalog_empty" };
@@ -845,11 +903,13 @@ export function registerConsolidationPipelineFunction(
             throw new Error("consolidation_canonical_commit_unavailable");
           }
           const savedProject = catalogSelected ? await kv.get<ProjectCursor>(KV.config, projectCursorKey) : null;
+          selectionPhase = "load_selection";
           const savedSelection = data?.consolidationSelectionId ? await kv.get<{ project: string; tier: string; selected: ConsolidationSelection[];
             batchSourceIds?: string[]; sourceVersions?: Array<[string, string, string]>; proceduralSources?: ProceduralObservationReference[] }>(KV.state, data.consolidationSelectionId) : null;
           if (data?.consolidationSelectionId && (!savedSelection || savedSelection.project !== project || savedSelection.tier !== tier)) throw new Error("consolidation_selection_identity_mismatch");
           const batchSourceIds = validateBatchSourceIds(data?.batchSourceIds);
           const explicitSummarySources = batchSourceIds !== undefined;
+          selectionPhase = "select_sources";
           const selected = explicitSummarySources && tier !== "procedural" ? [] : savedSelection?.selected ?? savedProject?.selected
             ?? (explicitSummarySources ? selectSources ? await selectSources(project, batchSourceIds) : [] : selectSources ? await selectSources(project) : []);
           if (tier === "procedural" && batchSourceIds?.some(id => !selected.some(reference => reference.sessionId === id))) {
@@ -861,6 +921,7 @@ export function registerConsolidationPipelineFunction(
             selectedSourceIds: [], sourceCount: 0, selectionCoverage: "selected_relevant_sources", results: {
               [tier]: { completed: true, skipped: true, reason: "no_relevant_sources" } } };
           if ((tier === "all" || tier === "decay") && !selectDecay) throw new Error("consolidation_decay_index_unavailable");
+          selectionPhase = "select_summaries";
           const summaries = await selectConsolidationSummaries(kv, project, batchSourceIds,
             selectSources ? async () => selected : undefined);
           const sourceVersions = explicitSummarySources ? summaries.map(summary => [summary.sessionId, summary.sessionVersion ?? "", summary.rowVersion ?? ""] as [string, string, string]) : undefined;
@@ -878,11 +939,14 @@ export function registerConsolidationPipelineFunction(
               || JSON.stringify(savedSelection.sourceVersions) !== JSON.stringify(sourceVersions))) {
             throw new Error("consolidation_selection_identity_mismatch");
           }
+          selectionPhase = "save_selection";
           if (!savedSelection) await kv.set(KV.state, selectionId, { project, tier, selected,
             ...(explicitSummarySources ? { batchSourceIds: summaries.map(summary => summary.sessionId), sourceVersions } : {}) });
+          activeSelectionId = selectionId;
           if (savedProject && !savedProject.selected) await kv.set(KV.config, projectCursorKey, { ...savedProject, selected });
           const results: Record<string, unknown> = {};
           if (tier === "all" || tier === "semantic") {
+            selectionPhase = "semantic_manifest";
             results.semantic = summaries.length >= 5 || data?.batchSourceIds?.length ? await startManifest("semantic", summaries, Boolean(data?.deferred), undefined, undefined, undefined, retrievalCoverage, invocationPolicy, data?.selected)
               : { completed: true, skipped: true, newFacts: 0, reason: "fewer than 5 summaries", sourceCount: summaries.length };
             const stage = results.semantic as Record<string, unknown>;
@@ -890,6 +954,7 @@ export function registerConsolidationPipelineFunction(
               results, continuation: { tier, project, force: data?.force, deferred: data?.deferred, batchSourceIds: data?.batchSourceIds, consolidationSelectionId: selectionId, consolidationCatalogProject: catalogSelected } };
           }
           if (tier === "all" || tier === "procedural") {
+            selectionPhase = "procedural_manifest";
             let proceduralSources = savedSelection?.proceduralSources;
             if (proceduralSources !== undefined) {
               const verified = await selectProceduralObservations(kv, project, summaries, proceduralSources);
@@ -918,6 +983,7 @@ export function registerConsolidationPipelineFunction(
           const continuation = { tier, project, force: data?.force, deferred: data?.deferred, batchSourceIds: data?.batchSourceIds,
             consolidationSelectionId: selectionId, consolidationCatalogProject: catalogSelected };
           if (tier === "all" || tier === "reflect") {
+            selectionPhase = "reflection";
             const foreground = data?.force === true && data.deferred !== true && !catalogSelected;
             if (foreground) {
               const sourceFingerprint = await fingerprintConsolidationSummaries(kv, project, summaries);
@@ -947,10 +1013,11 @@ export function registerConsolidationPipelineFunction(
             } });
             const stage = results.reflect as Record<string, unknown>;
             if (stage.completed !== true || stageFailed(stage)) return { ...stageFailureDetails(stage), success: !stageFailed(stage),
-              completed: false, queued: !stageFailed(stage) && stage.terminal !== true, partial: stageFailed(stage), project,
+              completed: false, queued: !stageFailed(stage) && stage.queued === true, partial: stageFailed(stage), project,
               results, ...(!stageFailed(stage) && stage.terminal !== true ? { continuation } : {}) };
           }
           if (tier === "all") {
+            selectionPhase = "decay";
             results.decay = await runSelectedConsolidationDecay(kv, selectDecay, getConsolidationDecayDays(), {
               project, sessionIds: summaries.map(summary => summary.sessionId), sourceVersion: JSON.stringify(summaries.map(summary => summary.sessionId)),
             });
@@ -960,26 +1027,36 @@ export function registerConsolidationPipelineFunction(
           });
           const stages = Object.values(results) as Record<string, unknown>[];
           const partial = stages.some(stageFailed);
-          const queued = !partial && stages.some(stage => stage.completed !== true);
+          const incomplete = stages.some(stage => stage.completed !== true);
+          const queued = !partial && stages.some(stage => stage.queued === true);
           const failure = stages.find(stage => stage.retained === true)
             ?? stages.find(stage => typeof stage.errorCode === "string" || typeof stage.error === "string") ?? stages.find(stageFailed);
-          if (catalogSelected && !partial && !queued) {
+          if (catalogSelected && !partial && !incomplete) {
             const progress = await kv.get<ProjectCursor>(KV.config, projectCursorKey);
             if (progress?.project === project) await kv.set(KV.config, projectCursorKey,
               { ...(progress.hasMore ? { cursor: progress.nextCursor } : {}) });
           }
-          return { ...stageFailureDetails(failure), success: !partial, partial, queued, completed: !partial && !queued, project,
+          return { ...stageFailureDetails(failure), success: !partial, partial, queued, completed: !partial && !incomplete,
+            status: partial ? "partial" : !incomplete ? "completed" : queued ? "queued" : "awaiting_dependency", project,
             selectedSourceIds: summaries.map(summary => summary.sessionId), sourceCount: summaries.length,
             selectionCoverage: "selected_relevant_sources", retrievalCoverage, results,
-            ...(partial || queued ? { continuation } : {}) };
+            ...(partial || incomplete ? { continuation } : {}) };
         } catch (error) {
+          const message = error instanceof Error ? error.message : "";
+          logger.warn("Consolidation selection failed", { phase: selectionPhase, tier,
+            retrievalAction: consolidationRetrievalFailureAction(error),
+            ...(error instanceof ScopedObservationBudgetError ? { retrievalBudget: error.diagnostics } : {}),
+            errorClass: error instanceof Error ? error.name : undefined,
+            code: message.match(/\bSTATE_[A-Z0-9_]+\b/)?.[0],
+            category: /^[a-z][a-z0-9_]{0,159}$/.test(message) ? message : undefined });
           if (sourceRetrievalLimited(error)) return { success: false, completed: false, partial: true, queued: false,
             errorCode: "STATE_RETRIEVAL_RESOURCE_LIMIT", reason: "source_retrieval_resource_limit", retryable: true,
-            diagnostics: { ...(error instanceof ScopedObservationBudgetError ? error.diagnostics : {}), project: selectedProject, tier }, continuation: { tier, project: selectedProject, force: data?.force,
+            diagnostics: { ...(error instanceof ScopedObservationBudgetError ? error.diagnostics : {}), retrievalAction: consolidationRetrievalFailureAction(error), project: selectedProject, tier }, continuation: { tier, project: selectedProject, force: data?.force,
               deferred: data?.deferred, batchSourceIds: data?.batchSourceIds, consolidationSelectionId: data?.consolidationSelectionId, consolidationCatalogProject: catalogSelected } };
-          if (consolidationIsPending(error)) return { success: true, queued: true, completed: false, reason: "source_index_pending",
-            continuation: { tier, project: selectedProject, force: data?.force, deferred: data?.deferred, batchSourceIds: data?.batchSourceIds,
-              consolidationSelectionId: data?.consolidationSelectionId, consolidationCatalogProject: catalogSelected } };
+          if (consolidationIsPending(error)) return { success: true, queued: false, completed: false, status: "awaiting_dependency", reason: "source_index_pending",
+            ...(error instanceof SelectedObservationPreparationPending ? { diagnostics: error.diagnostics } : {}),
+            continuation: { ...data, tier, project: selectedProject, force: data?.force, deferred: data?.deferred, batchSourceIds: data?.batchSourceIds,
+              consolidationSelectionId: activeSelectionId, consolidationCatalogProject: catalogSelected } };
           return { success: false, partial: true, completed: false, error: error instanceof Error ? error.message : "consolidation_selection_failed" };
         }
       }

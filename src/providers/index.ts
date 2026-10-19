@@ -154,6 +154,9 @@ export function createProvider(config: ProviderConfig): ResilientProvider {
 export function createAuxiliaryProvider(
   config: AuxiliaryLlmConfig,
 ): ResilientProvider {
+  if (config.provider === "ollama" && config.httpProfile && config.httpProfile !== "legacy-native") {
+    throw new Error("OpenAI HTTP profile requires an OpenAI-compatible provider");
+  }
   const provider = config.provider === "ollama"
     ? new OllamaProvider(config)
     : new OpenAIProvider(
@@ -166,6 +169,7 @@ export function createAuxiliaryProvider(
         reasoningEffort: config.reasoningEffort,
         noThink: config.noThink,
         keepAlive: config.keepAlive,
+        httpProfile: config.httpProfile,
       },
     );
   return new ResilientProvider(provider);
@@ -257,6 +261,7 @@ function createBaseProvider(config: ProviderConfig): MemoryProvider {
         config.model,
         config.maxTokens,
         config.baseURL,
+        { httpProfile: config.httpProfile },
       );
     }
     case "noop":

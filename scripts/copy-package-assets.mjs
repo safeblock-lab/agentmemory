@@ -1,4 +1,5 @@
 import {
+  chmodSync,
   copyFileSync,
   existsSync,
   lstatSync,
@@ -18,7 +19,23 @@ const ASSETS = [
   "src/viewer/index.html",
   "src/viewer/favicon.svg",
 ];
-const DIRECT_ASSETS = [["scripts/qwen-reranker.py", "dist/qwen-reranker.py"]];
+const DIRECT_ASSETS = [
+  ["scripts/qwen-reranker.py", "dist/qwen-reranker.py"],
+  ["dist/hooks/session-start.mjs", "plugin/scripts/session-start.mjs", 0o755],
+  ["dist/hooks/prompt-submit.mjs", "plugin/scripts/prompt-submit.mjs", 0o755],
+  ["dist/hooks/pre-tool-use.mjs", "plugin/scripts/pre-tool-use.mjs", 0o755],
+  ["dist/hooks/post-tool-use.mjs", "plugin/scripts/post-tool-use.mjs", 0o755],
+  ["dist/hooks/post-tool-failure.mjs", "plugin/scripts/post-tool-failure.mjs", 0o755],
+  ["dist/hooks/pre-compact.mjs", "plugin/scripts/pre-compact.mjs", 0o755],
+  ["dist/hooks/subagent-start.mjs", "plugin/scripts/subagent-start.mjs", 0o755],
+  ["dist/hooks/subagent-stop.mjs", "plugin/scripts/subagent-stop.mjs", 0o755],
+  ["dist/hooks/notification.mjs", "plugin/scripts/notification.mjs", 0o755],
+  ["dist/hooks/task-completed.mjs", "plugin/scripts/task-completed.mjs", 0o755],
+  ["dist/hooks/stop.mjs", "plugin/scripts/stop.mjs", 0o755],
+  ["dist/hooks/session-end.mjs", "plugin/scripts/session-end.mjs", 0o755],
+  ["dist/hooks/post-commit.mjs", "plugin/scripts/post-commit.mjs", 0o755],
+  ["dist/hooks/antigravity-bridge.mjs", "plugin/scripts/antigravity-bridge.mjs", 0o755],
+];
 
 function isWithinPath(root, candidate) {
   const pathFromRoot = relative(root, candidate);
@@ -83,7 +100,7 @@ export function copyPackageAssets(rootDir, { requireEngineArtifact = false } = {
     mkdirSync(dirname(target), { recursive: true });
     copyFileSync(source, target);
   }
-  for (const [sourceRelativePath, targetRelativePath] of DIRECT_ASSETS) {
+  for (const [sourceRelativePath, targetRelativePath, mode] of DIRECT_ASSETS) {
     const source = assertPackagePath(
       rootDir,
       join(rootDir, sourceRelativePath),
@@ -96,6 +113,7 @@ export function copyPackageAssets(rootDir, { requireEngineArtifact = false } = {
     );
     mkdirSync(dirname(target), { recursive: true });
     copyFileSync(source, target);
+    if (mode !== undefined) chmodSync(target, mode);
   }
   if (!manifest) return;
 
